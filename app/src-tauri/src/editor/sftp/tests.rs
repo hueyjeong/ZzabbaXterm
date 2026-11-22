@@ -31,7 +31,6 @@ enum Scenario {
     ExternalDelete,
     ChangedHandleMetadata,
     ChangedTargetDuringRead,
-    WriteAccessDenied,
     NonRegular,
     NoExtension,
     OtherExtensionVersion,
@@ -230,20 +229,6 @@ impl Fixture {
                     path => panic!("예상하지 않은 파일: {path}"),
                 }
             }
-            Packet::Open(request) if request.pflags.bits() == (OpenFlags::READ | OpenFlags::WRITE).bits() => {
-                self.read_opens += 1;
-                self.reached_eof = false;
-                assert!(request.attrs.permissions.is_none());
-                if self.scenario == Scenario::WriteAccessDenied {
-                    Packet::error(id, StatusCode::PermissionDenied)
-                } else {
-                    match request.filename.to_str().unwrap() {
-                        FILE => handle(b"original\0"),
-                        DECOY_FILE => handle(b"decoy"),
-                        path => panic!("예상하지 않은 파일: {path}"),
-                    }
-                }
-            }
             Packet::Open(request) => {
                 assert_eq!(
                     request.pflags.bits(),
@@ -294,9 +279,11 @@ impl Fixture {
                     b"decoy" => "decoy",
                     other => panic!("예상하지 않은 핸들: {other:?}"),
                 };
-                let contents = fs::read(self.root.join(name)).unwrap();
-                let offset = request.offset as usize;
-                if offset >= contents.len() {
+                use std::io::{Read, Seek, SeekFrom};
+                let mut file = fs::File::open(self.root.join(name)).unwrap();
+                let size = file.metadata().unwrap().len();
+                let offset = request.offset;
+                if offset >= size {
                     self.reached_eof = true;
                     if self.upload_closed {
                         self.original_rechecked = true;
@@ -304,14 +291,14 @@ impl Fixture {
                     Packet::error(id, StatusCode::Eof)
                 } else {
                     // 짧은 DATA를 보내고 소비자가 실제 받은 길이만큼 이동하는지 확인한다.
-                    let chunk_size = if contents.len() < CHUNK { 3 } else { CHUNK };
-                    let end = contents
-                        .len()
-                        .min(offset + chunk_size)
-                        .min(offset + request.len as usize);
+                    let chunk_size = if size < CHUNK as u64 { 3 } else { CHUNK };
+                    let length = (size - offset).min(chunk_size.min(request.len as usize) as u64) as usize;
+                    let mut data = vec![0; length];
+                    file.seek(SeekFrom::Start(offset)).unwrap();
+                    file.read_exact(&mut data).unwrap();
                     Data {
                         id,
-                        data: contents[offset..end].into(),
+                        data,
                     }
                     .into()
                 }
@@ -473,32 +460,42 @@ pub(in crate::editor) async fn in_memory_session(root: &std::path::Path, text: &
 }
 
 #[tokio::test]
-async fn absolute_open_uses_existing_write_access_without_changing_the_original() {
-    for scenario in [Scenario::Normal, Scenario::WriteAccessDenied, Scenario::NonRegular, Scenario::NoExtension] {
+async fn nano_open_is_read_only_and_does_not_require_atomic_replace() {
+    for scenario in [Scenario::Normal, Scenario::NonRegular, Scenario::NoExtension] {
         let root = tempfile::tempdir().unwrap();
         let plan = plan(&root.path().join("trust"), "editor");
         let (mut connection, server) = connect(plan, Fixture::new(root.path().into(), scenario)).await;
         for path in ["/", "한글.txt", "C:/workspace/한글.txt", "/workspace/../한글.txt", "/workspace/.zzabba-edit-other"] {
-            assert!(matches!(connection.open_absolute(path).await, Err(Error::InvalidPath)), "{path}");
+            assert!(matches!(connection.open_nano(path).await, Err(Error::InvalidPath)), "{path}");
         }
-        match (scenario, connection.open_absolute(FILE).await) {
-            (Scenario::Normal, Ok((mut file, text))) => {
+        match (scenario, connection.open_nano(FILE).await) {
+            (Scenario::Normal | Scenario::NoExtension, Ok((file, text))) => {
                 assert_eq!(text, ORIGINAL);
-                assert_eq!(connection.reopen(&file).await.unwrap().1, ORIGINAL);
-                fs::write(root.path().join("original"), EXTERNAL).unwrap();
-                assert!(matches!(connection.save(&mut file, EDITED).await,
-                    SaveOutcome::Conflict { remote: RemoteVersion::Text(text), .. } if text == EXTERNAL));
-                fs::write(root.path().join("original"), ORIGINAL).unwrap();
+                assert_eq!(connection.read_nano(&file).await.unwrap(), ORIGINAL);
             }
-            (Scenario::WriteAccessDenied, Err(Error::Protocol(error))) => assert!(status(&error, StatusCode::PermissionDenied)),
-            (Scenario::NonRegular, Err(Error::NotRegular)) |
-            (Scenario::NoExtension, Err(Error::AtomicReplaceUnavailable)) => (),
+            (Scenario::NonRegular, Err(Error::NotRegular)) => (),
             (_, result) => panic!("예상하지 않은 원격 열기 결과: {:?}", result.err()),
         }
         drop(connection);
         assert!(!server.await.unwrap().renamed);
         assert_eq!(fs::read_to_string(root.path().join("original")).unwrap(), ORIGINAL);
     }
+}
+
+#[tokio::test]
+async fn nano_read_limit_is_independent_of_the_panel_limit() {
+    let root = tempfile::tempdir().unwrap();
+    let plan = plan(&root.path().join("trust"), "editor");
+    let (mut connection, _) = connect(plan, Fixture::new(root.path().into(), Scenario::Normal)).await;
+    let data = vec![b'a'; MAX_CONTENT];
+    let path = root.path().join("original");
+    fs::write(&path, &data).unwrap();
+    let (file, text) = connection.open_nano(FILE).await.unwrap();
+    assert_eq!(text.as_bytes(), data.as_slice());
+    fs::write(&path, [&data[..], b"a"].concat()).unwrap();
+    assert!(matches!(connection.read_nano(&file).await, Err(Error::LimitExceeded)));
+    assert!(matches!(connection.open_nano(FILE).await, Err(Error::LimitExceeded)));
+    assert_eq!(connection.reopen(&file).await.unwrap().1.len(), data.len() + 1);
 }
 
 async fn listed_file(connection: &mut Connection) -> Entry {

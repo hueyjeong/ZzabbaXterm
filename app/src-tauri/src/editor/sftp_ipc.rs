@@ -4,13 +4,18 @@ use std::{
 };
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tauri::{Manager, ipc::{CommandArg, CommandItem, Invoke}};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::terminal::Sessions;
 
-use super::{nano_bridge::NanoBridge, sftp::{self, Entry, File, Session}};
+use super::{
+    nano_bridge::{NanoBridge, PublishError, Publisher},
+    nano_wire::{MAX_CONTENT, Observation, Snapshot},
+    sftp::{self, Entry, File, Session},
+};
 
 mod response;
 use response::{Error, SaveResult, SaveStage};
@@ -213,7 +218,13 @@ impl Transport {
 struct OpenFile {
     file: File,
     unknown: bool,
-    bridge_offer: Option<String>,
+    bridge: Option<BridgeFile>,
+}
+
+struct BridgeFile {
+    offer_id: String,
+    snapshot: Snapshot,
+    publisher: Publisher,
 }
 
 #[derive(Serialize)]
@@ -297,14 +308,17 @@ impl SftpIpc {
         Ok(BridgeSlot { label: label.into(), generation, id: id.into(), slot, cancel })
     }
 
-    pub(super) async fn open_bridge(
+    pub(super) async fn open_verified_bridge(
         &self, bridge: &BridgeSlot, sessions: &Sessions, path: &str, offer_id: &str,
+        snapshot: Snapshot, publisher: Publisher,
     ) -> Result<Opened, BridgeError> {
-        self.open_bridge_with(bridge, path, offer_id, sessions.connect_sftp(&bridge.label, &bridge.id)).await
+        self.open_bridge_with(bridge, path, offer_id, snapshot, publisher,
+            sessions.connect_sftp(&bridge.label, &bridge.id)).await
     }
 
     async fn open_bridge_with(
-        &self, bridge: &BridgeSlot, path: &str, offer_id: &str, connect: impl Future<Output = Result<Session, sftp::Error>>,
+        &self, bridge: &BridgeSlot, path: &str, offer_id: &str, snapshot: Snapshot, publisher: Publisher,
+        connect: impl Future<Output = Result<Session, sftp::Error>>,
     ) -> Result<Opened, BridgeError> {
         bridge.check(self)?;
         let mut guard = bridge.slot.state.lock().await;
@@ -312,18 +326,19 @@ impl SftpIpc {
         let attached = guard.connect(connect).await?;
         bridge.check(self)?;
         // 패널과 채널을 공유하므로 시작한 SFTP 읽기는 기존 제한 시간 안에 회수한다.
-        let result = attached.transport.connected()?.open_absolute(path).await;
+        let result = attached.transport.connected()?.open_nano(path).await;
         let (file, text) = attached.transport.finish(result)?;
         bridge.check(self)?;
+        check_observation(&text, snapshot.observation)?;
         let name = path.rsplit('/').next().expect("absolute file path").into();
-        attached.insert_file(file, name, text, Some(offer_id.into())).map_err(Into::into)
+        attached.insert_file(file, name, text, Some(BridgeFile { offer_id: offer_id.into(), snapshot, publisher })).map_err(Into::into)
     }
 
     pub(super) async fn discard_bridge_file(&self, bridge: &BridgeSlot, offer_id: &str, handle: &str) {
         let mut guard = bridge.slot.state.lock().await;
         if self.current(&bridge.label, bridge.generation, &bridge.id, &bridge.slot).is_ok() {
             if let Attachment::Active(attached) = &mut *guard {
-                if attached.files.get(handle).and_then(|file| file.bridge_offer.as_deref()) == Some(offer_id) {
+                if attached.files.get(handle).and_then(|file| file.bridge.as_ref()).is_some_and(|file| file.offer_id == offer_id) {
                     attached.files.remove(handle);
                 }
             }
@@ -361,7 +376,7 @@ impl SftpIpc {
                 return Ok(());
             }
             let preserve = owners.bridge.as_ref().is_some_and(|token| !token.is_cancelled())
-                || matches!(guard, Attachment::Active(attached) if attached.files.values().any(|file| file.bridge_offer.is_some()));
+                || matches!(guard, Attachment::Active(attached) if attached.files.values().any(|file| file.bridge.is_some()));
             if preserve {
                 owners.panel = None;
             } else {
@@ -372,7 +387,7 @@ impl SftpIpc {
         if preserve_bridge {
             if let Attachment::Active(attached) = guard {
                 attached.browser = Browser::default();
-                attached.files.retain(|_, file| file.bridge_offer.is_some());
+                attached.files.retain(|_, file| file.bridge.is_some());
             }
         } else {
             guard.close().await?;
@@ -387,9 +402,9 @@ impl SftpIpc {
         let mut guard = slot.state.lock().await;
         if self.current(label, generation, id, slot).is_ok() {
             if let Attachment::Active(attached) = &mut *guard {
-                if let Some(offer_id) = attached.files.get(handle).and_then(|file| file.bridge_offer.as_deref()) {
+                if let Some(bridge) = attached.files.get(handle).and_then(|file| file.bridge.as_ref()) {
                     // 슬롯 잠금 안에서 마운트 상태를 먼저 닫아 복구 응답과 파일 제거가 엇갈리지 않게 한다.
-                    nano.file_closed(label, generation, id, offer_id, handle);
+                    nano.file_closed(label, generation, id, &bridge.offer_id, handle);
                 }
                 attached.files.remove(handle);
             }
@@ -512,11 +527,11 @@ impl Attached {
         self.insert_file(file, name, text, None)
     }
 
-    fn insert_file(&mut self, file: File, name: String, text: String, bridge_offer: Option<String>) -> Result<Opened> {
+    fn insert_file(&mut self, file: File, name: String, text: String, bridge: Option<BridgeFile>) -> Result<Opened> {
         let handle = loop {
             let handle = opaque_id()?;
             if let std::collections::hash_map::Entry::Vacant(entry) = self.files.entry(handle.clone()) {
-                entry.insert(OpenFile { file, unknown: false, bridge_offer });
+                entry.insert(OpenFile { file, unknown: false, bridge });
                 break handle;
             }
         };
@@ -527,8 +542,8 @@ impl Attached {
         &self, slot: &Slot, handle: &str, nano: &NanoBridge, label: &str, generation: u64, id: &str,
     ) -> Result<()> {
         let file = self.files.get(handle).ok_or(Error::InvalidHandle)?;
-        if let Some(offer_id) = &file.bridge_offer {
-            if nano.is_mounted(label, generation, id, offer_id, handle) {
+        if let Some(bridge) = &file.bridge {
+            if nano.is_mounted(label, generation, id, &bridge.offer_id, handle) {
                 return Ok(());
             }
             return Err(Error::InvalidHandle);
@@ -540,8 +555,30 @@ impl Attached {
         }
     }
 
-    async fn read(&mut self, handle: &str, reload: bool) -> Result<String> {
+    async fn read(&mut self, handle: &str, reload: bool, mounted: impl Fn(&str) -> bool) -> Result<String> {
         let opened = self.files.get_mut(handle).ok_or(Error::InvalidHandle)?;
+        if let Some(bridge) = &mut opened.bridge {
+            if !mounted(&bridge.offer_id) {
+                return Err(Error::InvalidHandle);
+            }
+            let observation = bridge.publisher.compare().await.map_err(publish_error)?;
+            let text = read_verified(&mut self.transport, &opened.file, observation, None).await?;
+            if !mounted(&bridge.offer_id) {
+                return Err(Error::InvalidHandle);
+            }
+            if reload {
+                let snapshot = bridge.publisher.reload(observation).await.map_err(publish_error)?;
+                if snapshot.observation != observation {
+                    return Err(Error::ReadChanged);
+                }
+                if !mounted(&bridge.offer_id) {
+                    return Err(Error::InvalidHandle);
+                }
+                bridge.snapshot = snapshot;
+                opened.unknown = false;
+            }
+            return Ok(text);
+        }
         let result = self.transport.connected()?.reopen(&opened.file).await;
         let (file, text) = self.transport.finish(result)?;
         if reload {
@@ -551,10 +588,39 @@ impl Attached {
         Ok(text)
     }
 
-    async fn save(&mut self, handle: &str, text: &str) -> Result<SaveResult> {
+    async fn save(&mut self, handle: &str, text: &str, mounted: impl Fn(&str) -> bool) -> Result<SaveResult> {
         let opened = self.files.get_mut(handle).ok_or(Error::InvalidHandle)?;
         if opened.unknown {
             return Ok(SaveResult::failed(SaveStage::Prepare, Error::ReopenRequired));
+        }
+        if let Some(bridge) = &mut opened.bridge {
+            if !mounted(&bridge.offer_id) {
+                return Err(Error::InvalidHandle);
+            }
+            if text.len() > MAX_CONTENT {
+                return Ok(SaveResult::failed(SaveStage::Prepare, Error::LimitExceeded));
+            }
+            if let Err(error) = self.transport.connected() {
+                return Ok(SaveResult::failed(SaveStage::Prepare, error));
+            }
+            let (error, recovery_path) = match bridge.publisher.save(bridge.snapshot.token, text).await {
+                Ok(snapshot) => match read_verified(&mut self.transport, &opened.file, snapshot.observation, Some(text.as_bytes())).await {
+                    Ok(_) if mounted(&bridge.offer_id) => {
+                        bridge.snapshot = snapshot;
+                        return Ok(SaveResult::Saved);
+                    }
+                    Ok(_) => (Error::Disconnected, None),
+                    Err(error) => (error, None),
+                },
+                Err(PublishError::Conflict) => return Ok(SaveResult::Conflict {
+                    remote: response::RemoteVersion::ReadChanged,
+                    cleanup: None,
+                }),
+                Err(PublishError::Unavailable) => return Ok(SaveResult::failed(SaveStage::Prepare, Error::Unavailable)),
+                Err(PublishError::Unknown(path)) => (Error::RemoteFailure, path.and_then(|name| opened.file.recovery_path(&name))),
+            };
+            opened.unknown = true;
+            return Ok(SaveResult::Unknown { error, recovery_path });
         }
         let session = match self.transport.connected() {
             Ok(session) => session,
@@ -566,7 +632,7 @@ impl Attached {
                 self.transport.observe(&error);
                 opened.unknown = true;
                 self.transport.require_reconnect();
-                Ok(SaveResult::Unknown { error: error.into() })
+                Ok(SaveResult::Unknown { error: error.into(), recovery_path: None })
             }
             Ok(outcome) => {
                 if let sftp::SaveOutcome::Failed { error, .. } = &outcome {
@@ -580,6 +646,31 @@ impl Attached {
             }
         }
     }
+}
+
+fn publish_error(error: PublishError) -> Error {
+    match error {
+        PublishError::Conflict => Error::ReadChanged,
+        PublishError::Unavailable => Error::Unavailable,
+        PublishError::Unknown(_) => Error::RemoteFailure,
+    }
+}
+
+fn check_observation(text: &str, observation: Observation) -> Result<()> {
+    if text.len() as u64 != observation.len || <[u8; 32]>::from(Sha256::digest(text.as_bytes())) != observation.digest {
+        return Err(Error::ReadChanged);
+    }
+    Ok(())
+}
+
+async fn read_verified(transport: &mut Transport, file: &File, observation: Observation, submitted: Option<&[u8]>) -> Result<String> {
+    let result = transport.connected()?.read_nano(file).await;
+    let text = transport.finish(result)?;
+    check_observation(&text, observation)?;
+    if submitted.is_some_and(|bytes| bytes != text.as_bytes()) {
+        return Err(Error::ReadChanged);
+    }
+    Ok(text)
 }
 
 pub(crate) fn dispatch(invoke: Invoke) -> bool {
@@ -687,7 +778,7 @@ pub(crate) fn dispatch(invoke: Invoke) -> bool {
             let reload = command == "editor_sftp_reload";
             run!(attached, file_slot,
                 attached.check_file(file_slot, &handle, &webview.state::<NanoBridge>(), webview.label(), generation, &id),
-                attached.read(&handle, reload).await);
+                attached.read(&handle, reload, |offer_id| webview.state::<NanoBridge>().is_mounted(webview.label(), generation, &id, offer_id, &handle)).await);
         }
         "editor_sftp_save" => {
             let handle = arg!(String, "handle");
@@ -700,7 +791,7 @@ pub(crate) fn dispatch(invoke: Invoke) -> bool {
                 };
                 attached.check_file(&slot, &handle, &webview.state::<NanoBridge>(), webview.label(), generation, &id)?;
                 // 교체를 시도한 뒤에는 세션이 닫혀도 코어가 확인한 저장 결과를 돌려준다.
-                attached.save(&handle, &text).await.map_err(Into::into)
+                attached.save(&handle, &text, |offer_id| webview.state::<NanoBridge>().is_mounted(webview.label(), generation, &id, offer_id, &handle)).await.map_err(Into::into)
             });
         }
         "editor_sftp_close" => {

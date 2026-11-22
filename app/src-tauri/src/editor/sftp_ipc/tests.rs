@@ -2,6 +2,17 @@ use serde_json::json;
 
 use super::*;
 
+fn snapshot(token: u8, text: &str) -> Snapshot {
+    Snapshot {
+        token: [token; 16],
+        observation: Observation { len: text.len() as u64, digest: Sha256::digest(text.as_bytes()).into() },
+    }
+}
+
+fn publisher() -> Publisher {
+    Publisher::channel(1, CancellationToken::new()).0
+}
+
 #[test]
 fn only_the_same_document_and_parent_can_revoke_an_attachment() {
     let ipc = SftpIpc::default();
@@ -58,7 +69,8 @@ async fn bridge_and_panel_share_the_parent_transport_but_not_handles_across_pare
     assert!(matches!(ipc.bind_bridge("other", 1, "first", SharedSftpNamespace::AdministratorConfirmed),
         Err(BridgeError(Error::Unavailable))));
     let bridge = ipc.bind_bridge("main", 1, "first", SharedSftpNamespace::AdministratorConfirmed).unwrap();
-    let remote = ipc.open_bridge_with(&bridge, PATH, OFFER, async { Ok(in_memory_session(first_root.path(), "첫 파일").await) }).await.unwrap();
+    let remote = ipc.open_bridge_with(&bridge, PATH, OFFER, snapshot(1, "첫 파일"), publisher(),
+        async { Ok(in_memory_session(first_root.path(), "첫 파일").await) }).await.unwrap();
 
     let (slot, panel) = ipc.reserve("main", 1, "first").unwrap();
     assert!(Arc::ptr_eq(&slot, &bridge.slot));
@@ -73,7 +85,8 @@ async fn bridge_and_panel_share_the_parent_transport_but_not_handles_across_pare
     assert_ne!(remote.handle, listed.handle);
 
     let other = ipc.bind_bridge("main", 1, "second", SharedSftpNamespace::AdministratorConfirmed).unwrap();
-    let same_name = ipc.open_bridge_with(&other, PATH, "second-offer", async { Ok(in_memory_session(second_root.path(), "둘째 파일").await) }).await.unwrap();
+    let same_name = ipc.open_bridge_with(&other, PATH, "second-offer", snapshot(1, "둘째 파일"), publisher(),
+        async { Ok(in_memory_session(second_root.path(), "둘째 파일").await) }).await.unwrap();
     assert_eq!(same_name.name, remote.name);
     assert_ne!(same_name.text, remote.text);
     let handle = remote.handle.clone();
@@ -89,10 +102,10 @@ async fn bridge_and_panel_share_the_parent_transport_but_not_handles_across_pare
         let mut guard = slot.state.lock().await;
         ipc.release_panel("main", 1, "first", &slot, &panel, &mut guard).await.unwrap();
         let Attachment::Active(attached) = &mut *guard else { panic!("패널 분리로 브리지 전송이 종료됨") };
-        assert!(matches!(attached.read(&listed.handle, false).await, Err(Error::InvalidHandle)));
+        assert!(matches!(attached.read(&listed.handle, false, |_| false).await, Err(Error::InvalidHandle)));
         assert_eq!(attached.check_file(&slot, &handle, &nano, "main", 1, "first"), Ok(()));
-        assert_eq!(attached.read(&handle, true).await.unwrap(), "첫 파일");
-        assert!(matches!(attached.save(&handle, "새 내용").await.unwrap(), SaveResult::Saved));
+        assert!(matches!(attached.read(&handle, true, |_| false).await, Err(Error::InvalidHandle)));
+        assert!(matches!(attached.save(&handle, "새 내용", |_| false).await, Err(Error::InvalidHandle)));
         assert!(matches!(attached.open(&listing.entries[0].entry_id).await, Err(Error::InvalidEntry)));
     }
     ipc.close_file(&nano, "main", 1, "second", &other.slot, &handle).await;
@@ -108,7 +121,8 @@ async fn bridge_and_panel_share_the_parent_transport_but_not_handles_across_pare
         let owners = slot.owners.lock().unwrap();
         assert!(Arc::ptr_eq(owners.panel.as_ref().unwrap(), &new_panel));
     }
-    let discarded = ipc.open_bridge_with(&bridge, PATH, "discarded", async { panic!("다시 열기도 같은 전송을 사용해야 함") }).await.unwrap();
+    let discarded = ipc.open_bridge_with(&bridge, PATH, "discarded", snapshot(1, "첫 파일"), publisher(),
+        async { panic!("다시 열기도 같은 전송을 사용해야 함") }).await.unwrap();
     let discarded_handle = discarded.handle.clone();
     let (_, mut unnotified) = nano.offer("discarded".into(), 1, "first", discarded,
         CancellationToken::new(), bridge.cancellation());
@@ -120,7 +134,8 @@ async fn bridge_and_panel_share_the_parent_transport_but_not_handles_across_pare
     let cancelled = bridge.cancellation();
     ipc.navigate("main", 2);
     assert!(cancelled.is_cancelled() && other.cancellation().is_cancelled());
-    assert!(matches!(ipc.open_bridge_with(&bridge, PATH, OFFER, async { panic!("이전 세대의 요청") }).await,
+    assert!(matches!(ipc.open_bridge_with(&bridge, PATH, OFFER, snapshot(1, "첫 파일"), publisher(),
+        async { panic!("이전 세대의 요청") }).await,
         Err(BridgeError(Error::DocumentClosed))));
 }
 
@@ -135,7 +150,7 @@ async fn bridge_cancellation_during_attach_rejects_the_open_without_revoking_the
         cancel.cancel();
         Ok(sftp::tests::in_memory_session(root.path(), "내용").await)
     };
-    assert!(matches!(ipc.open_bridge_with(&bridge, "/workspace/한글.txt", "offer", start).await,
+    assert!(matches!(ipc.open_bridge_with(&bridge, "/workspace/한글.txt", "offer", snapshot(1, "내용"), publisher(), start).await,
         Err(BridgeError(Error::Disconnected))));
 
     let (slot, panel) = ipc.reserve("main", 1, "ssh").unwrap();
@@ -157,7 +172,7 @@ async fn bridge_file_authority_requires_the_exact_live_mount() {
     let nano = NanoBridge::default();
     ipc.navigate("main", 1);
     let bridge = ipc.bind_bridge("main", 1, "ssh", SharedSftpNamespace::AdministratorConfirmed).unwrap();
-    let opened = ipc.open_bridge_with(&bridge, PATH, OFFER, async {
+    let opened = ipc.open_bridge_with(&bridge, PATH, OFFER, snapshot(1, "내용"), publisher(), async {
         Ok(sftp::tests::in_memory_session(root.path(), "내용").await)
     }).await.unwrap();
     let handle = opened.handle.clone();
@@ -196,6 +211,91 @@ async fn bridge_file_authority_requires_the_exact_live_mount() {
     }
     ipc.close_file(&nano, "main", 1, "ssh", &slot, &handle).await;
     assert_eq!(done.try_recv().unwrap(), Outcome::Failed);
+}
+
+#[tokio::test]
+async fn snapshot_mismatch_does_not_create_a_bridge_handle() {
+    let root = tempfile::tempdir().unwrap();
+    let ipc = SftpIpc::default();
+    ipc.navigate("main", 1);
+    let bridge = ipc.bind_bridge("main", 1, "ssh", SharedSftpNamespace::AdministratorConfirmed).unwrap();
+    let opened = ipc.open_bridge_with(&bridge, "/workspace/한글.txt", "offer", snapshot(1, "다른"), publisher(), async {
+        Ok(sftp::tests::in_memory_session(root.path(), "내용").await)
+    }).await;
+    assert!(matches!(opened, Err(BridgeError(Error::ReadChanged))));
+    let guard = bridge.slot.state.lock().await;
+    let Attachment::Active(attached) = &*guard else { panic!("SFTP 전송 없음") };
+    assert!(attached.files.is_empty());
+}
+
+#[tokio::test]
+async fn nano_save_requires_exact_submitted_bytes_and_reload_clears_unknown() {
+    use crate::editor::nano_bridge::{PublicationOperation, PublicationReply};
+
+    let root = tempfile::tempdir().unwrap();
+    let ipc = SftpIpc::default();
+    let nano = NanoBridge::default();
+    ipc.navigate("main", 1);
+    let bridge = ipc.bind_bridge("main", 1, "ssh", SharedSftpNamespace::AdministratorConfirmed).unwrap();
+    let request = CancellationToken::new();
+    let (publisher, mut work) = Publisher::channel(1, request.clone());
+    let opened = ipc.open_bridge_with(&bridge, "/workspace/한글.txt", "offer", snapshot(1, "원본"), publisher, async {
+        Ok(sftp::tests::in_memory_session(root.path(), "원본").await)
+    }).await.unwrap();
+    let handle = opened.handle.clone();
+    let _offer = nano.offer("offer".into(), 1, "ssh", opened, request, bridge.cancellation());
+    let mounted = |offer: &str| nano.is_mounted("main", 1, "ssh", offer, &handle);
+    let mut guard = bridge.slot.state.lock().await;
+    let Attachment::Active(attached) = &mut *guard else { panic!("SFTP 전송 없음") };
+
+    for claim in [false, true] {
+        if claim { nano.claim("main", 1, "offer").unwrap(); }
+        assert!(matches!(attached.save(&handle, "제출", mounted).await, Err(Error::InvalidHandle)));
+        assert_eq!(attached.read(&handle, true, mounted).await, Err(Error::InvalidHandle));
+        assert!(matches!(work.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty)));
+    }
+    assert!(nano.mounted("main", 1, "offer", &handle));
+
+    let (result, ()) = tokio::join!(attached.save(&handle, "제출", mounted), async {
+        let job = work.recv().await.unwrap();
+        assert!(matches!(&job.operation, PublicationOperation::Save { token, text } if *token == [1; 16] && text == "제출"));
+        // SFTP와 반환 관찰값이 일치해도 제출본과 다르면 미확인이다.
+        job.respond(Ok(PublicationReply::Saved(snapshot(2, "원본"))));
+    });
+    assert!(matches!(result.unwrap(), SaveResult::Unknown { error: Error::ReadChanged, recovery_path: None }));
+    assert!(matches!(attached.save(&handle, "제출", mounted).await.unwrap(),
+        SaveResult::Failed { error: Error::ReopenRequired, .. }));
+    assert!(matches!(work.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty)));
+
+    let baseline = snapshot(3, "원본");
+    let (read, ()) = tokio::join!(attached.read(&handle, true, mounted), async {
+        let job = work.recv().await.unwrap();
+        assert!(matches!(&job.operation, PublicationOperation::Compare));
+        job.respond(Ok(PublicationReply::Observed(baseline.observation)));
+        let job = work.recv().await.unwrap();
+        assert!(matches!(&job.operation, PublicationOperation::Reload(observation) if *observation == baseline.observation));
+        job.respond(Ok(PublicationReply::Reloaded(baseline)));
+    });
+    assert_eq!(read.unwrap(), "원본");
+
+    for (token, text) in [(3, "제출"), (4, "둘째")] {
+        let (result, ()) = tokio::join!(attached.save(&handle, text, mounted), async {
+            let job = work.recv().await.unwrap();
+            assert!(matches!(&job.operation, PublicationOperation::Save { token: sent, text: body } if *sent == [token; 16] && body == text));
+            std::fs::write(root.path().join("original"), text).unwrap();
+            job.respond(Ok(PublicationReply::Saved(snapshot(token + 1, text))));
+        });
+        assert!(matches!(result.unwrap(), SaveResult::Saved));
+    }
+
+    let (result, ()) = tokio::join!(attached.save(&handle, "셋째", mounted), async {
+        let job = work.recv().await.unwrap();
+        job.respond(Err(PublishError::Unknown(Some(".zzabba-edit-stage/original".into()))));
+    });
+    assert_eq!(serde_json::to_value(result.unwrap()).unwrap(), json!({
+        "status": "unknown", "error": { "kind": "remoteFailure" },
+        "recoveryPath": "/workspace/.zzabba-edit-stage/original"
+    }));
 }
 
 #[tokio::test]

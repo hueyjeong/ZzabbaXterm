@@ -108,8 +108,12 @@ impl Session {
         self.process.run(self.deadline, self.connection.open(entry)).await
     }
 
-    pub(in crate::editor) async fn open_absolute(&mut self, path: &str) -> Result<(File, String)> {
-        self.process.run(self.deadline, self.connection.open_absolute(path)).await
+    pub(in crate::editor) async fn open_nano(&mut self, path: &str) -> Result<(File, String)> {
+        self.process.run(self.deadline, self.connection.open_nano(path)).await
+    }
+
+    pub(in crate::editor) async fn read_nano(&mut self, file: &File) -> Result<String> {
+        self.process.run(self.deadline, self.connection.read_nano(file)).await
     }
 
     #[cfg(test)]
