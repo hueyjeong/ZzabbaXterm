@@ -72,19 +72,8 @@ pub(super) async fn checked_path(
     })
 }
 
-#[cfg(windows)]
 pub(super) fn validate_aws(path: &Path) -> Result<(), CliError> {
-    super::windows_acl::trusted_chain(path, true).map_err(|_| CliError::InvalidConfiguration)
-}
-
-#[cfg(target_os = "linux")]
-pub(super) fn validate_aws(path: &Path) -> Result<(), CliError> {
-    verify_linux_install(path).map_err(|_| CliError::InvalidConfiguration)
-}
-
-#[cfg(not(any(windows, target_os = "linux")))]
-pub(super) fn validate_aws(_: &Path) -> Result<(), CliError> {
-    Err(CliError::InvalidConfiguration)
+    super::aws_install::validate(path)
 }
 
 #[cfg(target_os = "linux")]

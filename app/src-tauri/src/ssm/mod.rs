@@ -1,3 +1,4 @@
+mod aws_install;
 mod cli;
 mod credentials;
 mod home;

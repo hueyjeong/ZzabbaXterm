@@ -158,6 +158,26 @@ pub(super) fn private_dir(path: &Path) -> io::Result<()> {
 }
 
 pub(super) fn trusted_chain(path: &Path, file: bool) -> io::Result<()> {
+    with_install_validator(|check| {
+        let defining_dir = if file {
+            path.parent().ok_or_else(denied)?
+        } else {
+            path
+        };
+        for entry in path.ancestors() {
+            check(
+                entry,
+                entry != path || !file,
+                entry == path || entry == defining_dir,
+            )?;
+        }
+        Ok(())
+    })
+}
+
+pub(super) fn with_install_validator<T>(
+    validate: impl FnOnce(&dyn Fn(&Path, bool, bool) -> io::Result<()>) -> io::Result<T>,
+) -> io::Result<T> {
     let mut buffer = MaybeUninit::uninit();
     let current = user(&mut buffer)?;
     // Windows Resource Protection의 TrustedInstaller 서비스 SID다.
@@ -167,13 +187,7 @@ pub(super) fn trusted_chain(path: &Path, file: bool) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     let _installer = Local(installer);
-    let defining_dir = if file {
-        path.parent().ok_or_else(denied)?
-    } else {
-        path
-    };
-    for entry in path.ancestors() {
-        let directory = entry != path || !file;
+    validate(&|entry, directory, check_add| {
         let flags = FILE_FLAG_OPEN_REPARSE_POINT
             | if directory {
                 FILE_FLAG_BACKUP_SEMANTICS
@@ -199,12 +213,11 @@ pub(super) fn trusted_chain(path: &Path, file: bool) -> io::Result<()> {
             | GENERIC_ALL
             | GENERIC_WRITE;
         // 기존 조상에 새 형제를 만들 수 있어도 보호된 기존 경로를 바꿀 권한과는 다르다.
-        if entry == path || entry == defining_dir {
+        if check_add {
             mask |= FILE_WRITE_DATA | FILE_APPEND_DATA;
         }
-        check_writers(&object, current, installer, mask)?;
-    }
-    Ok(())
+        check_writers(&object, current, installer, mask)
+    })
 }
 
 fn check_writers(file: &File, current: PSID, installer: PSID, mask: u32) -> io::Result<()> {
@@ -268,6 +281,35 @@ pub(super) mod tests {
         let sid = user_sid_text().unwrap();
         let rules = format!("O:{sid}D:P(A;OICI;FA;;;{sid})(A;OICI;{rights};;;WD)");
         create_dir(path, &descriptor(&rules).unwrap()).unwrap();
+    }
+
+    pub(in crate::ssm) fn grant_everyone_write(path: &Path) {
+        use windows_sys::Win32::Security::{
+            Authorization::SetNamedSecurityInfoW, GetSecurityDescriptorDacl,
+            PROTECTED_DACL_SECURITY_INFORMATION,
+        };
+        let sid = user_sid_text().unwrap();
+        let rules = descriptor(&format!("D:P(A;;FA;;;{sid})(A;;GW;;;WD)")).unwrap();
+        let (mut present, mut defaulted, mut dacl) = (0, 0, null_mut());
+        // 시험이 만든 파일과 보안 설명자에만 적용한다.
+        unsafe {
+            assert_ne!(
+                GetSecurityDescriptorDacl(rules.0, &mut present, &mut dacl, &mut defaulted),
+                0
+            );
+            assert_eq!(
+                SetNamedSecurityInfoW(
+                    wide(path.as_os_str()).as_ptr(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    null_mut(),
+                    null_mut(),
+                    dacl,
+                    null_mut()
+                ),
+                0
+            );
+        }
     }
 
     pub(in crate::ssm) fn assert_user_only(path: &Path, directory: bool, protected: bool) {
