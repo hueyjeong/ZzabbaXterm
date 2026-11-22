@@ -3,6 +3,7 @@ name = "zzabbaxterm"
 version = "0.1.0"
 description = "ZzabbaXterm"
 edition = "2024"
+remote-editor-bridge = []
 default-run = "zzabbaxterm"
 
 [features]
@@ -15,6 +16,12 @@ ai-control = []
 name = "zzabba"
 path = "src/bin/zzabba.rs"
 required-features = ["local-cli"]
+
+# Linux 노드에 별도로 배포한다.
+[[bin]]
+name = "zzabba-editor-bridge"
+path = "src/bin/zzabba-editor-bridge.rs"
+required-features = ["remote-editor-bridge"]
 
 [[bin]]
 name = "zzabba-edit"
