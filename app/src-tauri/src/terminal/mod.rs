@@ -176,14 +176,20 @@ impl Sessions {
 
     fn open_document(&self, owner: &str, document: u64, size: PtySize, command: Launch, send: impl Fn(Event) -> Result<(), String> + Send + 'static) -> Result<String, String> {
         validate_size(size)?;
+        let registration = self.register_document(owner, document, &command, false)?;
+        self.launch_document(registration, size, command, send)
+    }
+
+    fn register_document(&self, owner: &str, document: u64, command: &Launch, remote_editor: bool) -> Result<(String, Arc<Session>), String> {
         let id = self.next_id();
         let mut session = Session::new(owner, command.is_ssm());
         session.document = Some(document);
         let session = Arc::new(session);
-        let ssh = matches!(command, Launch::Ssh(_));
         {
             let mut registry = self.registry.lock().unwrap();
-            if registry.shutdown || registry.destroyed.contains(owner) {
+            if registry.shutdown || registry.destroyed.contains(owner)
+                || remote_editor && (registry.exiting || registry.closing_owner(owner))
+            {
                 return Err("open: 창이 닫혔습니다".into());
             }
             if registry.documents.get(owner).copied().unwrap_or(0) != document {
@@ -191,6 +197,14 @@ impl Sessions {
             }
             registry.sessions.insert(id.clone(), session.clone());
         }
+        Ok((id, session))
+    }
+
+    fn launch_document(&self, (id, session): (String, Arc<Session>), size: PtySize, command: Launch,
+        send: impl Fn(Event) -> Result<(), String> + Send + 'static,
+    ) -> Result<String, String> {
+        let document = session.document.expect("registered document session");
+        let ssh = matches!(command, Launch::Ssh(_));
         let registry = Arc::clone(&self.registry);
         let worker_id = id.clone();
         let result = session.launch(size, command, send, move |session| {

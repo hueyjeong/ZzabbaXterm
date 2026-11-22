@@ -29,11 +29,8 @@ export function LocalTree({ profiles, onOpen, onRegisterSshHost, onRetestS3, onO
           : target.defaultMethod === "s3" ? "S3" : "로컬",
         sshTargetId: target.defaultMethod === "ssh" ? target.id : undefined,
         openRemoteEditor: target.defaultMethod === "ssh" && target.ssh.transport.kind === "direct" &&
-          (target.ssh.auth.kind === "agent" || target.ssh.auth.kind === "keyFile") ? () => {
-            if (window.confirm(`${target.displayName} (${target.ssh.account}@${target.ssh.host}:${target.ssh.port}): 관리자가 SSH 셸과 SFTP에서 같은 경로가 같은 파일을 가리킨다고 확인했습니까?`)) {
-              onOpen(target, { remoteEditor: true });
-            }
-          } : undefined,
+          (target.ssh.auth.kind === "agent" || target.ssh.auth.kind === "keyFile")
+          ? () => onOpen(target, { remoteEditor: true }) : undefined,
         s3TargetId: target.defaultMethod === "s3" && onRetestS3 ? target.id : undefined,
         openTunnel: target.defaultMethod === "ssm" || (target.defaultMethod === "ssh" && target.ssh.transport.kind === "direct")
           ? () => onOpenTunnel(target.id, target.displayName, target.defaultMethod) : undefined,

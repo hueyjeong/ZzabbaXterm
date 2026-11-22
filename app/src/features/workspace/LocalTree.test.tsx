@@ -6,7 +6,7 @@ import type { SavedConnections } from "../connections/connectionIpc";
 import type { SshAuth, SshTransport } from "../connections/profiles";
 import { LocalTree } from "./LocalTree";
 
-it("직접 SSH의 Agent와 키 파일에만 관리자 확인을 거치는 nano 연동을 제공한다", () => {
+it("직접 SSH의 Agent와 키 파일에만 네이티브 nano 연동 승인을 요청한다", () => {
   const ssh = (displayName: string, auth: SshAuth, transport: SshTransport = { kind: "direct" }) => ({
     revision: 1,
     profile: {
@@ -51,15 +51,10 @@ it("직접 SSH의 Agent와 키 파일에만 관리자 확인을 거치는 nano �
     showMenu("Agent 서버");
     act(() => menuItem("SSH")?.click());
     expect(onOpen.mock.calls).toEqual([[direct.profile], [direct.profile], [direct.profile]]);
-    expect(confirm).not.toHaveBeenCalled();
 
     showMenu("Agent 서버");
     act(() => menuItem("nano 연동으로 열기")?.click());
-    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("관리자가 SSH 셸과 SFTP에서 같은 경로가 같은 파일"));
-    expect(onOpen).toHaveBeenCalledTimes(3);
-    confirm.mockReturnValue(true);
-    showMenu("Agent 서버");
-    act(() => menuItem("nano 연동으로 열기")?.click());
+    expect(confirm).not.toHaveBeenCalled();
     expect(onOpen).toHaveBeenCalledTimes(4);
     expect(onOpen).toHaveBeenLastCalledWith(direct.profile, { remoteEditor: true });
   } finally {

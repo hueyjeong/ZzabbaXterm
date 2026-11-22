@@ -1800,7 +1800,7 @@ describe("F01 직접 SSH", () => {
     runSftp = async command => { if (command !== "editor_sftp_close") throw new Error(command); };
     await restartWorkspace();
     const row = [...tree().querySelectorAll<HTMLElement>('[role="treeitem"]')].find(item => item.textContent === "nano 서버")!;
-    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
     await key(row, "ContextMenu");
     await press("nano 연동으로 열기");
     expect(calls("open").slice(-1)[0]).toMatchObject({ targetId: "nano", remoteEditor: true });
@@ -1817,7 +1817,7 @@ describe("F01 직접 SSH", () => {
     expect(editorPane.querySelector<HTMLButtonElement>(".editor-toolbar button")?.disabled).toBe(true);
     expect(connectionCalls("editor_remote_nano_failed")).toContainEqual(["editor_remote_nano_failed", { offerId, handle }]);
     expect(status()).toContain("nano 편집 연결 확인 불가: 응답 유실");
-    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(confirm).not.toHaveBeenCalled();
     expect(connectionCalls("editor_sftp_attach")).toHaveLength(0);
     await press("원격 편집.txt 닫기");
     expect(connectionCalls("editor_sftp_close")).toEqual([["editor_sftp_close", { sessionId, handle }]]);
