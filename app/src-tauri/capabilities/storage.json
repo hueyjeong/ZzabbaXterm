@@ -6,6 +6,7 @@
   "webviews": ["main"],
   "permissions": [
     "allow-storage-open",
+    "allow-storage-relogin",
     "allow-storage-list-buckets",
     "allow-storage-list-objects",
     "allow-storage-select-local-file",

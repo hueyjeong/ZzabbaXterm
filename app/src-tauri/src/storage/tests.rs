@@ -44,7 +44,21 @@ pub(super) fn client(replay: &StaticReplayClient) -> AwsS3 {
     AwsS3 {
         client: Client::from_conf(config),
         endpoint: "https://s3.eu-west-1.amazonaws.com".into(),
+        region: "eu-west-1".into(),
     }
+}
+
+#[tokio::test]
+async fn s01_s3_무응답을_시간_초과로_끝내고_재시도하지_않는다() {
+    let transport = aws_smithy_http_client::test_util::NeverClient::new();
+    let mut s3 = client(&replay([]));
+    s3.client = Client::from_conf(s3.client.config().to_builder()
+        .http_client(transport.clone())
+        .timeout_config(TimeoutConfig::builder().operation_timeout(Duration::from_millis(100)).build())
+        .build());
+    let result = tokio::time::timeout(Duration::from_secs(3), s3.list_buckets(None)).await.unwrap();
+    assert_eq!(result, Err(Error::at(Stage::ListBuckets, Failure::TimedOut)));
+    assert_eq!(transport.num_calls(), 1);
 }
 
 #[tokio::test]

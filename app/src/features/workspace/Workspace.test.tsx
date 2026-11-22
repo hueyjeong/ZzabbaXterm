@@ -739,6 +739,66 @@ describe("C02 SSM 연결", () => {
     expect(connectionCalls("connection_save")).toHaveLength(0);
   });
 
+  it("개설 응답을 기다리지 않고 정확한 스토리지 탭을 취소한다", async () => {
+    loadProfiles = async () => ({
+      version: 1,
+      groups: [{ revision: 1, profile: { id: "dev", displayName: "개발" } }],
+      targets: [{ revision: 1, profile: { id: "saved-ssm", groupId: "dev", displayName: "관리 노드", defaultMethod: "ssm", ssm: node } }],
+    });
+    const opening = Promise.withResolvers<unknown>();
+    runStorage = async command => command === "storage_open" ? opening.promise : true;
+    await restartWorkspace();
+    await press("스토리지 탭 추가");
+    const select = find<HTMLSelectElement>('section[aria-label="AWS S3"] select');
+    await act(async () => {
+      select.value = "saved-ssm";
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await press("스토리지 연결");
+    const id = storageOpenId();
+    await press("S3 2 닫기");
+    expect(button("S3 2")).toBeUndefined();
+    expect(connectionCalls("storage_close")).toEqual([["storage_close", { request: { sessionId: id } }]]);
+    await act(async () => opening.resolve({ ok: true, value: { sessionId: id, profile: node.profile, region: node.region, endpoint: "https://s3.example.invalid" } }));
+    expect(button("S3 2")).toBeUndefined();
+    expect(connectionCalls("storage_list_objects")).toHaveLength(0);
+  });
+
+  it("SSO 만료 응답의 ID만 재로그인에 보내고 개설이나 전송을 재시도하지 않는다", async () => {
+    loadProfiles = async () => ({
+      version: 1,
+      groups: [{ revision: 1, profile: { id: "dev", displayName: "개발" } }],
+      targets: [{ revision: 1, profile: { id: "saved-ssm", groupId: "dev", displayName: "관리 노드", defaultMethod: "ssm", ssm: node } }],
+    });
+    runStorage = async command => {
+      if (command === "storage_open") return { ok: false, error: { stage: "identity", failure: { kind: "ssoLoginRequired" }, bytes: 0 } };
+      if (command === "storage_relogin") return { ok: true, value: null };
+      throw new Error(command);
+    };
+    await restartWorkspace();
+    await press("스토리지 탭 추가");
+    const select = find<HTMLSelectElement>('section[aria-label="AWS S3"] select');
+    await act(async () => {
+      select.value = "saved-ssm";
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await press("스토리지 연결");
+    expect(connectionCalls("storage_relogin")).toHaveLength(0);
+    await press("SSO 재로그인");
+    expect(connectionCalls("storage_relogin")).toEqual([["storage_relogin", { request: { id: storageOpenId() } }]]);
+    expect(select.value).toBe("saved-ssm");
+    expect(connectionCalls("storage_open")).toHaveLength(1);
+    expect(connectionCalls("storage_upload")).toHaveLength(0);
+    expect(connectionCalls("storage_download")).toHaveLength(0);
+  });
+
+  function storageOpenId() {
+    const calls = connectionCalls("storage_open");
+    const request: unknown = calls[calls.length - 1]?.[1]?.request;
+    if (!request || typeof request !== "object" || !("id" in request) || typeof request.id !== "string") throw new Error("개설 ID 없음");
+    return request.id;
+  }
+
   it("S3 탭은 로컬 파일 편집과 터미널 전환 중에도 다운로드를 계속한다", async () => {
     loadProfiles = async () => ({
       version: 1,
@@ -750,9 +810,14 @@ describe("C02 SSM 연결", () => {
     const key = "실험//한글 +%2F.txt";
     const picker = Promise.withResolvers<{ kind: "approved"; approvalId: string }>();
     const downloaded = Promise.withResolvers<unknown>();
-    runStorage = async command => {
+    runStorage = async (command, args) => {
       switch (command) {
-        case "storage_open": return { ok: true, value: session };
+        case "storage_open": {
+          const request = args && typeof args === "object" && "request" in args ? args.request : undefined;
+          if (!request || typeof request !== "object" || !("id" in request) || typeof request.id !== "string") throw new Error("개설 ID 없음");
+          session.sessionId = request.id;
+          return { ok: true, value: session };
+        }
         case "storage_list_objects": return { ok: true, value: { rows: [{ kind: "object", key, bytes: 9 }], nextToken: null } };
         case "storage_select_local_file": return picker.promise;
         case "storage_download": return downloaded.promise;
@@ -767,7 +832,7 @@ describe("C02 SSM 연결", () => {
       select.dispatchEvent(new Event("change", { bubbles: true }));
     });
     await press("스토리지 연결");
-    expect(connectionCalls("storage_open")).toEqual([["storage_open", { request: { targetId: "saved-ssm" } }]]);
+    expect(connectionCalls("storage_open")).toEqual([["storage_open", { request: { targetId: "saved-ssm", id: session.sessionId } }]]);
     await changeInput("버킷", "test-bucket");
     await press("버킷 열기");
     await press(key);
@@ -780,7 +845,7 @@ describe("C02 SSM 연결", () => {
     await act(async () => picker.resolve({ kind: "approved", approvalId: "approved-id" }));
     expect(connectionCalls("storage_download")).toEqual([["storage_download", {
       request: {
-        sessionId: session.sessionId, bucket: "test-bucket", key, approvalId: "approved-id",
+        sessionId: session.sessionId, bucket: "test-bucket", region: node.region, key, approvalId: "approved-id",
       }
     }]]);
     expect(connectionCalls("storage_close")).toHaveLength(0);

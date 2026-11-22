@@ -3,6 +3,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
 };
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tauri::{
@@ -14,11 +15,11 @@ use uuid::Uuid;
 
 use crate::{
     connections::{profile::MethodRef, with_saved_method},
-    ssm::{CliError, Scope},
+    ssm::{AwsCli, CancellationToken, CliError, Scope},
 };
 
 use super::{
-    AwsS3, Downloaded, Error, Failure, ObjectRow, Page, Stage, VerifiedSsoSelection, check_bucket,
+    AwsS3, BucketRow, Downloaded, Error, Failure, ObjectRow, Page, Stage, VerifiedSsoSelection, check_bucket,
 };
 
 #[derive(Clone, PartialEq, Eq)]
@@ -41,6 +42,22 @@ struct Tab {
     client: Arc<AwsS3>,
     closed: Arc<watch::Sender<bool>>,
     selection: Option<Selection>,
+    binding: Option<LoginBinding>,
+    expired: bool,
+    listing: bool,
+    verified_bucket: Option<(String, String)>,
+}
+
+#[derive(Clone)]
+struct LoginBinding {
+    target_id: String,
+    selection: Arc<VerifiedSsoSelection>,
+}
+
+struct Opening {
+    document: Document,
+    cancel: CancellationToken,
+    expired: Option<LoginBinding>,
 }
 
 struct Selection {
@@ -53,6 +70,7 @@ struct Selection {
 #[derive(Default)]
 struct Registry {
     documents: HashMap<String, u64>,
+    openings: HashMap<Uuid, Opening>,
     tabs: HashMap<String, Tab>,
     shutdown: bool,
 }
@@ -83,35 +101,56 @@ impl StorageIpc {
         }
     }
 
-    async fn open(
-        &self,
-        document: Document,
-        request: OpenRequest,
-        directory: PathBuf,
-    ) -> Result<Session, Error> {
-        self.open_with(document, request, directory, |region, config| async move {
-            AwsS3::for_sso_profile(&region, config).await
-        }).await
+    fn reserve_open(&self, document: &Document, id: Uuid) -> Result<CancellationToken, Error> {
+        let mut registry = self.0.lock().unwrap();
+        if !registry.active(document) || registry.tabs.contains_key(&id.to_string()) || registry.openings.contains_key(&id) {
+            return Err(unavailable(Stage::Profile));
+        }
+        let cancel = CancellationToken::new();
+        registry.openings.insert(id, Opening { document: document.clone(), cancel: cancel.clone(), expired: None });
+        Ok(cancel)
     }
 
     async fn open_with<F: Future<Output = Result<AwsS3, Error>>>(
-        &self, document: Document, request: OpenRequest, directory: PathBuf,
+        &self, document: Document, request: OpenRequest, directory: PathBuf, cancel: CancellationToken,
         verify: impl FnOnce(String, crate::ssm::DirectSsoConfig) -> F,
     ) -> Result<Session, Error> {
-        if !self.0.lock().unwrap().active(&document) {
-            return Err(unavailable(Stage::Profile));
+        let OpenRequest { id, target_id } = request;
+        let check_id = target_id.clone();
+        let operation = async {
+            let selection = tauri::async_runtime::spawn_blocking(move || verified_selection(&directory, &check_id))
+                .await.map_err(|_| unavailable(Stage::Profile))??;
+            let result = verify(selection.scope.region().to_owned(), selection.config.clone()).await;
+            Ok::<_, Error>((selection, result))
+        };
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(unavailable(Stage::Profile)),
+            result = tokio::time::timeout(Duration::from_secs(25), operation) =>
+                result.unwrap_or_else(|_| Err(Error::at(Stage::Identity, Failure::TimedOut))),
+        };
+        let mut registry = self.0.lock().unwrap();
+        // 취소 뒤 같은 ID가 다시 예약돼도 이전 작업은 새 예약을 회수할 수 없다.
+        if cancel.is_cancelled() || !registry.active(&document) { return Err(unavailable(Stage::Profile)); }
+        let opening = registry.openings.remove(&id).ok_or_else(|| unavailable(Stage::Profile))?;
+        let (selection, result) = result?;
+        let binding = LoginBinding { target_id, selection: Arc::new(selection) };
+        match result {
+            Ok(client) => {
+                let profile = binding.selection.scope.profile().into();
+                let region = binding.selection.scope.region().into();
+                Ok(Self::insert_tab(&mut registry, id.to_string(), document, profile, region, client, Some(binding)))
+            }
+            Err(error) => {
+                if error.failure == Failure::SsoLoginRequired {
+                    registry.openings.insert(id, Opening { expired: Some(binding), ..opening });
+                }
+                Err(error)
+            }
         }
-        let selection = tauri::async_runtime::spawn_blocking(move || {
-            verified_selection(&directory, &request.target_id)
-        })
-        .await
-        .map_err(|_| unavailable(Stage::Profile))??;
-        let VerifiedSsoSelection { profile, region, config } = selection;
-        let client = verify(region.clone(), config).await?;
-        self.insert(document, profile, region, client)
-            .ok_or_else(|| unavailable(Stage::Profile))
     }
 
+    #[cfg(test)]
     fn insert(
         &self,
         document: Document,
@@ -123,7 +162,17 @@ impl StorageIpc {
         if !registry.active(&document) {
             return None;
         }
-        let session_id = Uuid::new_v4().to_string();
+        Some(Self::insert_tab(&mut registry, Uuid::new_v4().to_string(), document, profile, region, client, None))
+    }
+
+    fn insert_tab(
+        registry: &mut Registry, session_id: String, document: Document, profile: String,
+        region: String, client: AwsS3, binding: Option<LoginBinding>,
+    ) -> Session {
+        #[cfg(test)]
+        let verified_bucket = binding.is_none().then(|| ("selected-bucket".into(), region.clone()));
+        #[cfg(not(test))]
+        let verified_bucket = None;
         let endpoint = client.endpoint().into();
         registry.tabs.insert(
             session_id.clone(),
@@ -132,18 +181,27 @@ impl StorageIpc {
                 client: Arc::new(client),
                 closed: Arc::new(watch::Sender::new(false)),
                 selection: None,
+                binding,
+                expired: false,
+                listing: false,
+                verified_bucket,
             },
         );
-        Some(Session {
+        Session {
             session_id,
             profile,
             region,
             endpoint,
-        })
+        }
     }
 
     fn close(&self, document: &Document, session_id: &str) -> bool {
         let mut registry = self.0.lock().unwrap();
+        if let Ok(id) = Uuid::parse_str(session_id)
+            && registry.openings.get(&id).is_some_and(|opening| opening.document == *document) {
+            registry.openings.remove(&id).unwrap().cancel.cancel();
+            return true;
+        }
         let Some(tab) = registry.tab(document, session_id) else {
             return false;
         };
@@ -155,6 +213,11 @@ impl StorageIpc {
     pub(crate) fn navigate(&self, owner: &str) {
         let mut registry = self.0.lock().unwrap();
         *registry.documents.entry(owner.into()).or_default() += 1;
+        registry.openings.retain(|_, opening| {
+            if opening.document.owner != owner { return true; }
+            opening.cancel.cancel();
+            false
+        });
         registry.tabs.retain(|_, tab| {
             if tab.document.owner != owner {
                 return true;
@@ -167,6 +230,7 @@ impl StorageIpc {
     pub(crate) fn shutdown(&self) {
         let mut registry = self.0.lock().unwrap();
         registry.shutdown = true;
+        for (_, opening) in registry.openings.drain() { opening.cancel.cancel(); }
         for (_, tab) in registry.tabs.drain() {
             tab.closed.send_replace(true);
         }
@@ -186,7 +250,7 @@ impl StorageIpc {
         }
         let mut registry = self.0.lock().unwrap();
         let tab = registry.tab(document, &target.session_id)?;
-        if tab.selection.is_some() {
+        if tab.selection.is_some() || !bucket_verified(tab, &target) {
             return None;
         }
         let id = Uuid::new_v4().to_string();
@@ -255,6 +319,7 @@ impl StorageIpc {
     ) -> Option<Transfer> {
         let mut registry = self.0.lock().unwrap();
         let tab = registry.tab(document, &request.target.session_id)?;
+        if !bucket_verified(tab, &request.target) { return None; }
         let selection = tab.selection.as_ref()?;
         if selection.id != request.approval_id
             || selection.direction != direction
@@ -276,14 +341,11 @@ impl StorageIpc {
         &self,
         document: &Document,
         request: BucketPageRequest,
-    ) -> Result<Page<String>, Error> {
+    ) -> Result<Page<BucketRow>, Error> {
         let (client, closed) = self.client(document, &request.session_id, Stage::ListBuckets)?;
-        until_closed(
-            &closed,
-            Stage::ListBuckets,
-            client.list_buckets(request.token.as_deref()),
-        )
-        .await
+        let result = until_closed(&closed, Stage::ListBuckets, client.list_buckets(request.token.as_deref())).await;
+        self.record_expiration(document, &request.session_id, &result);
+        result
     }
 
     async fn list_objects(
@@ -291,13 +353,90 @@ impl StorageIpc {
         document: &Document,
         request: ObjectPageRequest,
     ) -> Result<Page<ObjectRow>, Error> {
-        let (client, closed) = self.client(document, &request.session_id, Stage::ListObjects)?;
-        until_closed(
-            &closed,
-            Stage::ListObjects,
-            client.list_objects(&request.bucket, &request.prefix, request.token.as_deref()),
-        )
-        .await
+        let stage = Stage::ListObjects;
+        let (client, closed) = {
+            let mut registry = self.0.lock().unwrap();
+            let tab = registry.tab(document, &request.session_id).ok_or_else(|| unavailable(stage))?;
+            if tab.listing || tab.expired { return Err(unavailable(stage)); }
+            if request.token.is_none() {
+                tab.verified_bucket = None;
+                tab.selection = None;
+            } else if !tab.verified_bucket.as_ref().is_some_and(|(bucket, region)| *bucket == request.bucket && *region == request.region) {
+                return Err(unavailable(stage));
+            }
+            tab.listing = true;
+            (tab.client.clone(), tab.closed.subscribe())
+        };
+        let result = until_closed(&closed, stage, async {
+            let regional = client.in_region(&request.region, Stage::HeadBucket)?;
+            if request.token.is_none() { regional.check_bucket_region(&request.bucket).await?; }
+            regional.list_objects(&request.bucket, &request.prefix, request.token.as_deref()).await
+        }).await;
+        let mut registry = self.0.lock().unwrap();
+        let tab = registry.tab(document, &request.session_id).ok_or_else(|| unavailable(stage))?;
+        tab.listing = false;
+        mark_expired(tab, &result);
+        if result.is_ok() && request.token.is_none() && !tab.expired {
+            tab.verified_bucket = Some((request.bucket, request.region));
+        }
+        result
+    }
+
+    fn record_expiration<T>(&self, document: &Document, id: &str, result: &Result<T, Error>) {
+        if is_login_required(result) && let Some(tab) = self.0.lock().unwrap().tab(document, id) {
+            mark_expired(tab, result);
+        }
+    }
+
+    async fn relogin(&self, document: &Document, id: Uuid, directory: PathBuf) -> Result<(), Error> {
+        self.relogin_with(document, id, directory, |current, cancel| async move {
+            let cli = AwsCli::probe(&cancel).await?;
+            cli.relogin_saved(&current.scope, &current.config, &cancel).await
+        }).await
+    }
+
+    async fn relogin_with<F: Future<Output = Result<(), CliError>>>(
+        &self, document: &Document, id: Uuid, directory: PathBuf,
+        login: impl FnOnce(VerifiedSsoSelection, CancellationToken) -> F,
+    ) -> Result<(), Error> {
+        let (binding, cancel, closed) = {
+            let mut registry = self.0.lock().unwrap();
+            if !registry.active(document) { return Err(unavailable(Stage::Profile)); }
+            if let Some(opening) = registry.openings.get_mut(&id).filter(|opening| opening.document == *document) {
+                let binding = opening.expired.take().ok_or_else(|| unavailable(Stage::Profile))?;
+                (binding, opening.cancel.clone(), None)
+            } else {
+                let tab = registry.tab(document, &id.to_string()).ok_or_else(|| unavailable(Stage::Profile))?;
+                let binding = tab.binding.as_ref().filter(|_| tab.expired && !tab.listing).ok_or_else(|| unavailable(Stage::Profile))?.clone();
+                tab.expired = false;
+                tab.verified_bucket = None;
+                (binding, CancellationToken::new(), Some(tab.closed.subscribe()))
+            }
+        };
+        let operation = async {
+            let current = tauri::async_runtime::spawn_blocking(move || verified_selection(&directory, &binding.target_id))
+                .await.map_err(|_| unavailable(Stage::Profile))??;
+            if current != *binding.selection { return Err(Error::at(Stage::Profile, Failure::AccountMismatch)); }
+            login(current, cancel.clone()).await.map_err(|error| Error::at(Stage::Profile, match error {
+                CliError::CallerChanged => Failure::AccountMismatch,
+                CliError::TimedOut => Failure::TimedOut,
+                _ => Failure::LoginFailed,
+            }))
+        };
+        if let Some(closed) = closed {
+            let _cancel_on_drop = cancel.clone().drop_guard();
+            until_closed(&closed, Stage::Profile, operation).await
+        } else {
+            let result = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(unavailable(Stage::Profile)),
+                result = operation => result,
+            };
+            let mut registry = self.0.lock().unwrap();
+            if cancel.is_cancelled() || !registry.active(document) { return Err(unavailable(Stage::Profile)); }
+            registry.openings.remove(&id);
+            result
+        }
     }
 
     fn client(
@@ -317,16 +456,11 @@ impl StorageIpc {
         let transfer = self
             .consume(document, request, Direction::Upload)
             .ok_or_else(|| unavailable(Stage::UploadSource))?;
-        until_closed(
-            &transfer.closed.subscribe(),
-            Stage::PutObject,
-            transfer.client.upload(
-                &transfer.target.bucket,
-                &transfer.target.key,
-                &transfer.path,
-            ),
-        )
-        .await
+        let target = transfer.target;
+        let regional = transfer.client.in_region(&target.region, Stage::PutObject)?;
+        let result = until_closed(&transfer.closed.subscribe(), Stage::PutObject, regional.upload(&target.bucket, &target.key, &transfer.path)).await;
+        self.record_expiration(document, &target.session_id, &result);
+        result
     }
 
     async fn download(
@@ -337,16 +471,28 @@ impl StorageIpc {
         let transfer = self
             .consume(document, request, Direction::Download)
             .ok_or_else(|| unavailable(Stage::GetObject))?;
-        transfer
-            .client
-            .download(
-                &transfer.target.bucket,
-                &transfer.target.key,
-                &transfer.path,
-                &transfer.closed,
-            )
-            .await
+        let target = transfer.target;
+        let regional = transfer.client.in_region(&target.region, Stage::GetObject)?;
+        let result = regional.download(&target.bucket, &target.key, &transfer.path, &transfer.closed).await;
+        self.record_expiration(document, &target.session_id, &result);
+        result
     }
+}
+
+fn is_login_required<T>(result: &Result<T, Error>) -> bool {
+    result.as_ref().is_err_and(|error| error.failure == Failure::SsoLoginRequired)
+}
+
+fn mark_expired<T>(tab: &mut Tab, result: &Result<T, Error>) {
+    if is_login_required(result) {
+        tab.expired = true;
+        tab.selection = None;
+    }
+}
+
+fn bucket_verified(tab: &Tab, target: &Target) -> bool {
+    !tab.expired && !tab.listing && tab.verified_bucket.as_ref()
+        .is_some_and(|(bucket, region)| *bucket == target.bucket && *region == target.region)
 }
 
 struct Transfer {
@@ -389,11 +535,7 @@ fn verified_selection(directory: &std::path::Path, target_id: &str) -> Result<Ve
     if config.account != account {
         return Err(Error::at(Stage::Profile, Failure::AccountMismatch));
     }
-    Ok(VerifiedSsoSelection {
-        profile: scope.profile().to_owned(),
-        region: scope.region().to_owned(),
-        config,
-    })
+    Ok(VerifiedSsoSelection { scope, config })
 }
 
 #[derive(Deserialize, PartialEq, Eq)]
@@ -401,6 +543,7 @@ fn verified_selection(directory: &std::path::Path, target_id: &str) -> Result<Ve
 struct Target {
     session_id: String,
     bucket: String,
+    region: String,
     key: String,
 }
 
@@ -437,8 +580,13 @@ struct ApprovalId {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct OpenRequest {
+    id: Uuid,
     target_id: String,
 }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LoginRequest { id: Uuid }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -459,6 +607,7 @@ struct ObjectPageRequest {
     session_id: String,
     token: Option<String>,
     bucket: String,
+    region: String,
     prefix: String,
 }
 
@@ -502,7 +651,7 @@ async fn select_file(
         Direction::Upload => "업로드",
         Direction::Download => "다운로드",
     };
-    let title = format!("S3 {action} · {} / {:?}", target.bucket, target.key);
+    let title = format!("S3 {action} · {} / {:?} · {}", target.bucket, target.key, target.region);
     let Some(id) = state.begin_selection(document, target, direction) else {
         return LocalFileApproval::Denied;
     };
@@ -513,13 +662,31 @@ async fn select_file(
     state.finish_selection(document, &session_id, id, selected)
 }
 
-#[cfg(not(target_os = "linux"))]
-async fn pick_local_file<R: tauri::Runtime>(window: tauri::Window<R>, title: String, direction: Direction, _: watch::Receiver<bool>) -> Option<PathBuf> {
-    let dialog = rfd::AsyncFileDialog::new().set_parent(&window).set_title(title);
-    match direction {
-        Direction::Upload => dialog.pick_file().await,
-        Direction::Download => dialog.save_file().await,
-    }.map(|file| file.path().to_owned())
+#[cfg(windows)]
+#[path = "dialogs_windows.rs"]
+mod dialogs_windows;
+#[cfg(windows)]
+use dialogs_windows::pick as pick_local_file;
+
+#[cfg(not(any(windows, target_os = "linux")))]
+async fn pick_local_file<R: tauri::Runtime>(window: tauri::Window<R>, title: String, direction: Direction, mut closed: watch::Receiver<bool>) -> Option<PathBuf> {
+    let confirmation = rfd::AsyncMessageDialog::new().set_parent(&window)
+        .set_title("S3 파일 선택").set_description(&title).set_buttons(rfd::MessageButtons::OkCancel);
+    let confirmed = tokio::select! {
+        biased;
+        _ = closed.wait_for(|closed| *closed) => return None,
+        result = confirmation.show() => result == rfd::MessageDialogResult::Ok,
+    };
+    if !confirmed { return None; }
+    let dialog = rfd::AsyncFileDialog::new().set_parent(&window).set_title("S3 파일 선택");
+    tokio::select! {
+        biased;
+        _ = closed.wait_for(|closed| *closed) => None,
+        result = async { match direction {
+            Direction::Upload => dialog.pick_file().await,
+            Direction::Download => dialog.save_file().await,
+        }} => result.map(|file| file.path().to_owned()),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -598,12 +765,29 @@ pub(crate) fn dispatch<R: tauri::Runtime>(invoke: Invoke<R>) -> bool {
         }};
     }
     match name {
-        "storage_open" => handle!(
-            "storage_open",
-            OpenRequest,
-            async |webview: tauri::Webview<R>, document, request| {
+        "storage_open" => {
+            let item = CommandItem { name: "storage_open", key: "request", plugin: None, message: &message, acl: &acl };
+            let request = match OpenRequest::from_command(item) {
+                Ok(request) => request,
+                Err(error) => { resolver.invoke_error(error); return true; }
+            };
+            let prepared = webview.path().app_config_dir().map_err(|_| unavailable(Stage::Profile))
+                .and_then(|directory| webview.state::<StorageIpc>().reserve_open(&document, request.id).map(|cancel| (directory, cancel)));
+            resolver.respond_async(async move {
+                let result = match prepared {
+                    Ok((directory, cancel)) => webview.state::<StorageIpc>().open_with(document, request, directory, cancel, |region, config| async move {
+                        AwsS3::for_sso_profile(&region, config).await
+                    }).await,
+                    Err(error) => Err(error),
+                };
+                Ok(S3Result::from(result))
+            });
+        }
+        "storage_relogin" => handle!(
+            "storage_relogin", LoginRequest,
+            async |webview: tauri::Webview<R>, document, request: LoginRequest| {
                 let result = match webview.path().app_config_dir() {
-                    Ok(directory) => webview.state::<StorageIpc>().open(document, request, directory).await,
+                    Ok(directory) => webview.state::<StorageIpc>().relogin(&document, request.id, directory).await,
                     Err(_) => Err(unavailable(Stage::Profile)),
                 };
                 Ok(S3Result::from(result))
@@ -701,6 +885,7 @@ mod tests {
         Target {
             session_id: session.session_id.clone(),
             bucket: "selected-bucket".into(),
+            region: session.region.clone(),
             key: KEY.into(),
         }
     }
@@ -737,7 +922,7 @@ mod tests {
         let (send, received) = std::sync::mpsc::channel();
         let webview: &tauri::Webview<test::MockRuntime> = window.as_ref();
         webview.clone().on_message(request("storage_download", json!({
-            "sessionId": session.session_id, "bucket": "selected-bucket", "key": KEY, "approvalId": approval,
+            "sessionId": session.session_id, "bucket": "selected-bucket", "region": session.region, "key": KEY, "approvalId": approval,
         })), Box::new(move |_, _, reply, _, _| { send.send(reply).unwrap(); }));
         let timeout = std::time::Duration::from_secs(5);
         tauri::async_runtime::block_on(async { tokio::time::timeout(timeout, paused).await.unwrap().unwrap(); });
@@ -804,37 +989,58 @@ mod tests {
         tauri::async_runtime::block_on(async {
             let state = StorageIpc::default();
             let document = state.document("main");
-            let request = |id: &str| OpenRequest { target_id: id.to_owned() };
+            let request = |target_id: &str| OpenRequest { id: Uuid::new_v4(), target_id: target_id.to_owned() };
             let home = crate::ssm::user_home().unwrap();
             assert_eq!(home, root.join(if cfg!(windows) { "profile" } else { "home" }));
             let token = home.join(crate::ssm::sso_cache_entry("fixture"));
             std::fs::create_dir_all(token.parent().unwrap()).unwrap();
             std::fs::write(&token, r#"{"accessToken":"fixture-token","expiresAt":"2099-01-01T00:00:00Z"}"#).unwrap();
             let clock = super::super::tests::Clock::default();
+            let head = |status, region| http::Response::builder().status(status)
+                .header("x-amz-bucket-region", region).body(SdkBody::empty()).unwrap().try_into().unwrap();
             let replay = replay([
                 super::super::tests::role_credentials("WRONG", &clock, 60),
                 super::super::tests::caller_identity("000000000000"),
                 super::super::tests::role_credentials("FIRST", &clock, 60),
                 super::super::tests::caller_identity("123456789012"),
-                response(200, "<ListAllMyBucketsResult><Buckets/></ListAllMyBucketsResult>"),
+                response(200, "<ListAllMyBucketsResult><Buckets><Bucket><Name>selected-bucket</Name><BucketRegion>us-west-2</BucketRegion></Bucket></Buckets></ListAllMyBucketsResult>"),
+                head(301, "us-west-2"),
+                head(200, "us-west-2"),
+                response(200, "<ListBucketResult><EncodingType>url</EncodingType><IsTruncated>false</IsTruncated></ListBucketResult>"),
+                head(403, "us-west-2"),
                 super::super::tests::role_credentials("SECOND", &clock, 120),
                 response(200, "<ListAllMyBucketsResult><Buckets/></ListAllMyBucketsResult>"),
             ]);
-            let open = || state.open_with(document.clone(), request("saved-sso"), directory.clone(), |region, config| {
+            let open = |request: OpenRequest| {
+              let cancel = state.reserve_open(&document, request.id).unwrap();
+              state.open_with(document.clone(), request, directory.clone(), cancel, |region, config| {
                 let transport = super::super::SharedHttpClient::new(replay.clone());
                 let clock = super::super::SharedTimeSource::new(clock.clone());
                 async move { AwsS3::verified(&region, config, crate::ssm::user_home().unwrap(), transport, clock).await }
-            });
-            assert_eq!(open().await.err().unwrap().failure, Failure::AccountMismatch);
+              })
+            };
+            assert_eq!(open(request("saved-sso")).await.err().unwrap().failure, Failure::AccountMismatch);
             assert!(state.0.lock().unwrap().tabs.is_empty());
-            let session = open().await.unwrap();
-            for elapsed in [0, 61] {
-                clock.advance(elapsed);
-                state.list_buckets(&document, BucketPageRequest { session_id: session.session_id.clone(), token: None }).await.unwrap();
-            }
+            let session = open(request("saved-sso")).await.unwrap();
+            let list = || state.list_buckets(&document, BucketPageRequest { session_id: session.session_id.clone(), token: None });
+            assert_eq!(list().await.unwrap().rows, [BucketRow { name: "selected-bucket".into(), region: "us-west-2".into() }]);
+            let objects = |region: &str| state.list_objects(&document, ObjectPageRequest {
+                session_id: session.session_id.clone(), bucket: "selected-bucket".into(),
+                region: region.into(), prefix: "실험/".into(), token: None,
+            });
+            assert_eq!(objects("eu-west-1").await.unwrap_err().failure, Failure::BucketRegionMismatch { region: "us-west-2".into() });
+            let regional = || Target { region: "us-west-2".into(), ..self::target(&session) };
+            assert!(state.begin_selection(&document, regional(), Direction::Upload).is_none());
+            assert!(objects("us-west-2").await.unwrap().rows.is_empty());
+            let approval = state.begin_selection(&document, regional(), Direction::Upload).unwrap();
+            assert!(matches!(state.finish_selection(&document, &session.session_id, approval, None), LocalFileApproval::Cancelled));
+            assert!(matches!(objects("us-west-2").await.unwrap_err().failure, Failure::Service { status: 403, .. }));
+            assert!(state.begin_selection(&document, regional(), Direction::Upload).is_none());
+            clock.advance(61);
+            assert!(list().await.unwrap().rows.is_empty());
             let requests: Vec<_> = replay.actual_requests().collect();
-            assert_eq!(requests.len(), 7);
-            for index in [0, 2, 5] {
+            assert_eq!(requests.len(), 11);
+            for index in [0, 2, 9] {
                 let uri: http::Uri = requests[index].uri().parse().unwrap();
                 assert_eq!(uri.host(), Some("portal.sso.us-east-1.amazonaws.com"));
                 assert_eq!(uri.path(), "/federation/credentials");
@@ -844,25 +1050,66 @@ mod tests {
                 assert_eq!(requests[index].headers().get("x-amz-sso_bearer_token"), Some("fixture-token"));
             }
             for (index, scheme, region, key) in [(1, "sts", "eu-west-1", "WRONG"), (3, "sts", "eu-west-1", "FIRST"),
-                (4, "s3", "eu-west-1", "FIRST"), (6, "s3", "eu-west-1", "SECOND")] {
+                (4, "s3", "eu-west-1", "FIRST"), (5, "s3", "eu-west-1", "FIRST"),
+                (6, "s3", "us-west-2", "FIRST"), (7, "s3", "us-west-2", "FIRST"),
+                (8, "s3", "us-west-2", "FIRST"), (10, "s3", "eu-west-1", "SECOND")] {
                 assert!(requests[index].uri().starts_with(&format!("https://{scheme}.{region}.amazonaws.com/")));
-                assert!(requests[index].headers().get("authorization").unwrap().contains(&format!("Credential={key}/")));
+                let authorization = requests[index].headers().get("authorization").unwrap();
+                assert!(authorization.contains(&format!("Credential={key}/")));
+                assert!(authorization.contains(&format!("/{region}/{scheme}/aws4_request")));
             }
+            assert_eq!(requests[5].method(), "HEAD");
+            assert_eq!(requests[6].method(), "HEAD");
+            assert!(requests[7].uri().contains("list-type=2"));
             assert_eq!(std::fs::read_to_string(&token).unwrap(), r#"{"accessToken":"fixture-token","expiresAt":"2099-01-01T00:00:00Z"}"#);
             assert!(Uuid::parse_str(&session.session_id).is_ok());
             assert_eq!(serde_json::to_value(&session).unwrap(), json!({
                 "sessionId": session.session_id, "profile": "chosen team", "region": "eu-west-1",
                 "endpoint": "https://s3.eu-west-1.amazonaws.com"
             }));
-            let missing = state.open(document.clone(), request("chosen team"), directory.clone()).await.err().unwrap();
+            let missing = open(request("chosen team")).await.err().unwrap();
             assert_eq!(missing.failure, Failure::InvalidSsoProfile);
 
+            let opening = request("saved-sso");
+            let id = opening.id;
+            let cancel = state.reserve_open(&document, id).unwrap();
+            let work = state.open_with(document.clone(), opening, directory.clone(), cancel, |_, _| std::future::pending());
+            let (result, ()) = tokio::join!(work, async {
+                assert!(!state.close(&state.document("other"), &id.to_string()));
+                assert!(state.close(&document, &id.to_string()));
+            });
+            assert!(result.is_err());
+            assert!(!state.close(&document, &id.to_string()));
+
+            clock.advance(120);
+            std::fs::remove_file(&token).unwrap();
+            assert_eq!(list().await.unwrap_err().failure, Failure::SsoLoginRequired);
+            let session_id = Uuid::parse_str(&session.session_id).unwrap();
+            let unexpected = |_, _| async { panic!("재로그인 권한 없음"); };
+            assert!(state.relogin_with(&state.document("other"), session_id, directory.clone(), unexpected).await.is_err());
+            state.relogin_with(&document, session_id, directory.clone(), |current, _| async move {
+                assert_eq!(current.scope.profile(), "chosen team");
+                assert_eq!(current.config.account, "123456789012");
+                Ok(())
+            }).await.unwrap();
+            assert!(state.relogin_with(&document, session_id, directory.clone(), unexpected).await.is_err());
+            assert!(state.begin_selection(&document, regional(), Direction::Upload).is_none());
+
+            let expired = request("saved-sso");
+            let expired_id = expired.id;
+            assert_eq!(open(expired).await.err().unwrap().failure, Failure::SsoLoginRequired);
+            write_config("000000000000");
+            assert_eq!(state.relogin_with(&document, expired_id, directory.clone(), unexpected).await.unwrap_err().failure, Failure::AccountMismatch);
+            write_config("123456789012");
+            assert!(state.relogin_with(&document, expired_id, directory.clone(), unexpected).await.is_err());
+            assert_eq!(replay.actual_requests().count(), 11);
+
             std::fs::write(root.join("credentials"), "[chosen team]\naws_access_key_id=fixture\n").unwrap();
-            let changed = state.open(document.clone(), request("saved-sso"), directory.clone()).await.err().unwrap();
+            let changed = open(request("saved-sso")).await.err().unwrap();
             assert_eq!(changed.failure, Failure::InvalidSsoProfile);
             state.navigate("main");
             assert!(!state.close(&state.document("main"), &session.session_id));
-            assert!(state.open(document, request("saved-sso"), directory).await.is_err());
+            assert!(state.reserve_open(&document, Uuid::new_v4()).is_err());
         });
     }
 

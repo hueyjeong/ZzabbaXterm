@@ -12,6 +12,7 @@ fn main() {
         "ssm_discovery",
         "storage_open", "storage_list_buckets", "storage_list_objects", "storage_select_local_file",
         "storage_upload", "storage_download", "storage_cancel_approval", "storage_close",
+        "storage_relogin",
         "ai_cli_review", "ai_cli_draft",
         "ai_policy", "ai_set_policy",
     ]);

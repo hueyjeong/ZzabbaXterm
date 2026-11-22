@@ -9,6 +9,7 @@ use std::{
 
 const CONFIG_LIMIT: u64 = 1024 * 1024;
 
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct DirectSsoConfig {
     pub(crate) account: String,
     pub(crate) role: String,
@@ -19,8 +20,13 @@ pub(crate) struct DirectSsoConfig {
 
 impl DirectSsoConfig {
     pub(super) fn cli_ini(&self) -> String {
+        self.cli_ini_for("default")
+    }
+
+    pub(super) fn cli_ini_for(&self, profile: &str) -> String {
         let Self { account, role, region, start_url, session } = self;
-        let mut config = format!("[default]\nsso_account_id = {account}\nsso_role_name = {role}\n");
+        let section = if profile == "default" { "default".to_owned() } else { format!("profile \"{}\"", profile.replace('"', "\\\"")) };
+        let mut config = format!("[{section}]\nsso_account_id = {account}\nsso_role_name = {role}\n");
         if let Some(name) = session {
             config.push_str(&format!("sso_session = {name}\n[sso-session \"{name}\"]\n"));
         }

@@ -1,8 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { S3Actions, S3Result, S3Session } from "./s3";
 
-export function openStorage(targetId: string) {
-  return invoke<S3Result<S3Session>>("storage_open", { request: { targetId } });
+export function openStorage(targetId: string, id: string) {
+  return invoke<S3Result<S3Session>>("storage_open", { request: { targetId, id } });
+}
+
+export function reloginStorage(id: string) {
+  return invoke<S3Result<null>>("storage_relogin", { request: { id } });
 }
 
 export function closeStorage(sessionId: string) {

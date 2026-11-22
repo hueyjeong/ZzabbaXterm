@@ -1,7 +1,7 @@
 import type { Downloaded, S3Error, S3Session } from "./s3";
 
 export type Problem = S3Error | "unavailable";
-export type Transfer = Readonly<{ direction: "upload" | "download"; bucket: string; key: string }> & (
+export type Transfer = Readonly<{ direction: "upload" | "download"; bucket: string; region: string; key: string }> & (
   | Readonly<{ state: "selecting" | "running" | "cancelled" | "denied" }>
   | Readonly<{ state: "failed"; problem: Problem }>
   | Readonly<{ state: "uploaded"; bytes: number }>
@@ -9,7 +9,7 @@ export type Transfer = Readonly<{ direction: "upload" | "download"; bucket: stri
 );
 
 const stages = {
-  profile: "SSO 프로필", listBuckets: "버킷 목록", listObjects: "객체 목록", uploadSource: "업로드 원본",
+  profile: "SSO 프로필", listBuckets: "버킷 목록", headBucket: "버킷 확인", listObjects: "객체 목록", uploadSource: "업로드 원본",
   identity: "AWS 신원 확인",
   putObject: "객체 업로드", getObject: "객체 받기", downloadBody: "다운로드 본문",
   downloadWrite: "다운로드 파일 쓰기", downloadCommit: "다운로드 파일 확정",
@@ -20,7 +20,7 @@ const failures = {
   retestRequired: "저장된 연결을 다시 시험하고 저장해야 합니다",
   accountMismatch: "SSO 프로필의 승인 계정과 AWS 신원이 다릅니다",
   invalidResponse: "잘못된 서비스 응답", credentials: "SSO 자격 증명 오류", ssoLoginRequired: "같은 SSO 프로필로 다시 로그인 필요",
-  request: "요청 실패", bodyRead: "본문 읽기 실패", checksum: "체크섬 검증 실패",
+  request: "요청 실패", timedOut: "응답 시간 초과", loginFailed: "SSO 재로그인 실패", bodyRead: "본문 읽기 실패", checksum: "체크섬 검증 실패",
 };
 
 export function StorageProblem({ problem, session }: { problem: Problem; session?: S3Session }) {
@@ -38,6 +38,7 @@ export function StorageProblem({ problem, session }: { problem: Problem; session
       }
       case "localIo": message = `로컬 파일 오류 (${failure.errorKind})`; break;
       case "length": message = failure.expected === null ? "예상 길이 없음" : `길이 불일치 (예상 ${failure.expected} 바이트)`; break;
+      case "bucketRegionMismatch": message = `버킷 리전: ${failure.region}`; break;
       default: message = failures[failure.kind];
     }
     detail = `${stages[stage]}: ${message} · ${bytes} 바이트`;
@@ -60,7 +61,7 @@ export function TransferStatus({ transfer, session }: { transfer: Transfer; sess
       break;
   }
   return <div className="storage-transfer">
-    <p role="status">{status} · {transfer.bucket} / <code>{transfer.key}</code></p>
-    {transfer.state === "failed" && <StorageProblem problem={transfer.problem} session={session} />}
+    <p role="status">{status} · {transfer.bucket} / <code>{transfer.key}</code> · {transfer.region}</p>
+    {transfer.state === "failed" && <StorageProblem problem={transfer.problem} session={{ ...session, region: transfer.region }} />}
   </div>;
 }

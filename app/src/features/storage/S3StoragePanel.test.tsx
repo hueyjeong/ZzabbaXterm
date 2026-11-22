@@ -71,7 +71,7 @@ it("승인 대기 중 탭과 객체를 바꿔도 최초 전체 키로 다운로�
   await fill("버킷", "other-bucket");
   await click("버킷 열기");
   await act(async () => picker.resolve({ kind: "approved", approvalId: "download-approval" }));
-  const target = { sessionId: first.sessionId, bucket: "direct-bucket", key };
+  const target = { sessionId: first.sessionId, bucket: "direct-bucket", region: first.region, key };
   expect(selectLocalFile).toHaveBeenCalledExactlyOnceWith({ ...target, direction: "download" });
   expect(download).toHaveBeenCalledExactlyOnceWith({ ...target, approvalId: "download-approval" });
   expect(host.textContent).not.toContain("다운로드 완료");
@@ -102,7 +102,7 @@ it("버킷 권한이 없어도 지정 버킷을 열고, 다음 페이지 실패 
   expect(button(key).getAttribute("aria-pressed")).toBe("true");
   expect(host.textContent).toContain(first.endpoint);
   await click("다음 페이지");
-  const next = { sessionId: first.sessionId, bucket: "direct-bucket", prefix: "실험//", token };
+  const next = { sessionId: first.sessionId, bucket: "direct-bucket", prefix: "실험//", region: first.region, token };
   expect(listObjects.mock.calls.slice(2)).toEqual([[next], [next]]);
   expect(button(key).getAttribute("aria-pressed")).toBe("true");
   expect(button("다음 + %.txt")).toBeTruthy();
@@ -110,8 +110,8 @@ it("버킷 권한이 없어도 지정 버킷을 열고, 다음 페이지 실패 
 
 it("버킷 목록의 연속 토큰을 그대로 넘기고 업로드 파일 승인이 거부되면 목록과 선택을 유지한다", async () => {
   const listBuckets = vi.fn<S3Actions["listBuckets"]>()
-    .mockResolvedValueOnce({ ok: true, value: { rows: ["first-bucket"], nextToken: token } })
-    .mockResolvedValueOnce({ ok: true, value: { rows: ["second-bucket"], nextToken: null } });
+    .mockResolvedValueOnce({ ok: true, value: { rows: [{ name: "first-bucket", region: "us-west-2" }], nextToken: token } })
+    .mockResolvedValueOnce({ ok: true, value: { rows: [{ name: "second-bucket", region: first.region }], nextToken: null } });
   const listObjects = vi.fn<S3Actions["listObjects"]>().mockResolvedValue({
     ok: true, value: {
       rows: [{ kind: "object", key, bytes: 12 }], nextToken: null,
@@ -139,7 +139,7 @@ it("버킷 목록의 연속 토큰을 그대로 넘기고 업로드 파일 승�
   expect(host.textContent).toContain("업로드 파일 승인 거부");
   expect(upload).not.toHaveBeenCalled();
   await click("업로드");
-  expect(upload).toHaveBeenCalledExactlyOnceWith({ sessionId: first.sessionId, bucket: "first-bucket", key, approvalId: "upload-approval" });
+  expect(upload).toHaveBeenCalledExactlyOnceWith({ sessionId: first.sessionId, bucket: "first-bucket", region: "us-west-2", key, approvalId: "upload-approval" });
   expect(host.textContent).toContain("업로드 완료: 16 바이트");
   await click("다운로드");
   expect(host.textContent).toContain("다운로드 미완료");
@@ -160,4 +160,55 @@ it("SSO 재로그인, AWS 자격 증명 만료, 권한 거부를 구분한다", 
     await click("버킷 목록");
     expect(host.querySelector('[role="alert"]')?.textContent).toContain(label);
   }
+});
+
+it("실패한 버킷 이동 뒤에는 이전 목록에서 전송할 수 없고 리전을 명시적으로 확인한다", async () => {
+  const listObjects = vi.fn<S3Actions["listObjects"]>()
+    .mockResolvedValueOnce({ ok: true, value: { rows: [{ kind: "object", key, bytes: 9 }], nextToken: token } })
+    .mockResolvedValueOnce({ ok: false, error: { stage: "headBucket", failure: { kind: "bucketRegionMismatch", region: "us-west-2" }, bytes: 0 } })
+    .mockResolvedValueOnce({ ok: true, value: { rows: [], nextToken: null } });
+  const selectLocalFile = vi.fn<S3Actions["selectLocalFile"]>().mockResolvedValue({ kind: "cancelled" });
+  await render({ listBuckets: unused, listObjects, selectLocalFile, upload: unused, download: unused });
+  await fill("버킷", "first-bucket");
+  await click("버킷 열기");
+  await click(key);
+  await fill("업로드 전체 키", key);
+  await fill("버킷", "new-bucket");
+  expect(button("업로드").disabled).toBe(true);
+  await click("버킷 열기");
+  expect(button("다운로드").disabled).toBe(true);
+  expect(button("다음 페이지").disabled).toBe(true);
+  await click("업로드");
+  await click("다운로드");
+  await click("us-west-2 선택");
+  expect(listObjects).toHaveBeenCalledTimes(2);
+  expect(selectLocalFile).not.toHaveBeenCalled();
+  await click("버킷 열기");
+  await click("업로드");
+  expect(selectLocalFile).toHaveBeenCalledExactlyOnceWith({ sessionId: first.sessionId, bucket: "new-bucket", region: "us-west-2", key, direction: "upload" });
+});
+
+it("한 줄 입력에서 LF와 CR 붙여넣기를 거부하고 승인에는 기존 원문 키를 전달한다", async () => {
+  const literal = "  실험//../한글 +%2F.txt  ";
+  const listObjects = vi.fn<S3Actions["listObjects"]>().mockResolvedValue({ ok: true, value: { rows: [], nextToken: null } });
+  const selectLocalFile = vi.fn<S3Actions["selectLocalFile"]>().mockResolvedValue({ kind: "approved", approvalId: "literal" });
+  const upload = vi.fn<S3Actions["upload"]>().mockResolvedValue({ ok: true, value: 12 });
+  await render({ listBuckets: unused, listObjects, selectLocalFile, upload, download: unused });
+  await fill("버킷", "literal-bucket");
+  await click("버킷 열기");
+  await fill("업로드 전체 키", literal);
+  const field = [...host.querySelectorAll("input")].find(input => input.value === literal)!;
+  for (const value of ["다른\n키", "다른\r키", "다른\r\n키"]) {
+    const event = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(event, "clipboardData", { value: { getData: (type: string) => type === "text/plain" ? value : "" } });
+    await act(async () => { field.dispatchEvent(event); });
+    expect(event.defaultPrevented).toBe(true);
+    expect(field.value).toBe(literal);
+    expect(host.querySelector('[role="alert"]')?.textContent).toContain("줄바꿈");
+  }
+  expect(upload).not.toHaveBeenCalled();
+  await click("업로드");
+  const target = { sessionId: first.sessionId, bucket: "literal-bucket", region: first.region, key: literal };
+  expect(selectLocalFile).toHaveBeenCalledExactlyOnceWith({ ...target, direction: "upload" });
+  expect(upload).toHaveBeenCalledExactlyOnceWith({ ...target, approvalId: "literal" });
 });

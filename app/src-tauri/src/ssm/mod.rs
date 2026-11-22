@@ -193,6 +193,17 @@ impl AwsCli {
         self.relogin_command(scope, cause)?.login(cancel).await
     }
 
+    pub(crate) async fn relogin_saved(
+        &self, scope: &Scope, approved: &DirectSsoConfig, cancel: &CancellationToken,
+    ) -> Result<(), CliError> {
+        use std::io::Write;
+
+        if scope.direct_sso_config()? != *approved { return Err(CliError::CallerChanged); }
+        let mut snapshot = tempfile::NamedTempFile::new().map_err(|_| CliError::ProcessIo)?;
+        snapshot.write_all(approved.cli_ini_for(scope.profile()).as_bytes()).map_err(|_| CliError::ProcessIo)?;
+        self.login_command(scope.profile()).login_with_config(snapshot.path(), cancel).await
+    }
+
     fn login_command(&self, profile: &str) -> CommandSpec {
         // 로그인 리전은 관리 노드 리전이 아니라 프로필의 IAM Identity Center 설정을 따른다.
         CommandSpec::aws(&self.0, &["sso", "login", "--profile", profile])

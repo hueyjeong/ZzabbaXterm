@@ -49,6 +49,8 @@ impl Provider {
             .endpoint_url(endpoint)
             .http_client(transport)
             .retry_config(RetryConfig::disabled())
+            .timeout_config(super::response_timeout())
+            .sleep_impl(aws_smithy_async::rt::sleep::TokioSleep::new())
             .build());
         Self { client, account: config.account, role: config.role, token_path, clock,
             cache: ExpiringCache::new(Duration::from_secs(15)) }

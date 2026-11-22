@@ -266,6 +266,14 @@ impl CommandSpec {
             .success()?;
         Ok(())
     }
+
+    pub(super) async fn login_with_config(&self, config: &Path, cancel: &CancellationToken) -> Result<(), CliError> {
+        super::plugin::validate_aws(self.program())?;
+        let mut command = self.command();
+        super::export_env(config, |key, value| { command.env(key, value); });
+        capture(command, self.tool, LOGIN_TIMEOUT, cancel).await?.success()?;
+        Ok(())
+    }
 }
 
 // CLI 본문과 원본 오류는 모듈 밖의 진단이나 Debug 출력으로 전달하지 않는다.

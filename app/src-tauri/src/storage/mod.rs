@@ -4,7 +4,7 @@ pub(crate) mod ipc;
 #[cfg(test)]
 mod tests;
 
-use std::{error::Error as StdError, path::Path};
+use std::{error::Error as StdError, path::Path, time::Duration};
 
 use aws_credential_types::provider::{SharedCredentialsProvider, error::CredentialsError};
 use aws_sdk_s3::{
@@ -18,6 +18,13 @@ use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 use percent_encoding::percent_decode_str;
 use aws_smithy_async::time::SharedTimeSource;
 use aws_smithy_runtime_api::client::http::SharedHttpClient;
+use aws_smithy_types::timeout::TimeoutConfig;
+
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct BucketRow {
+    name: String,
+    region: String,
+}
 
 #[derive(Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,6 +46,7 @@ pub(crate) enum Stage {
     Profile,
     Identity,
     ListBuckets,
+    HeadBucket,
     ListObjects,
     UploadSource,
     PutObject,
@@ -60,11 +68,14 @@ pub(crate) enum Failure {
     AccountMismatch,
     InvalidRegion,
     InvalidBucket,
+    BucketRegionMismatch { region: String },
     InvalidResponse,
     Credentials,
     SsoLoginRequired,
+    LoginFailed,
     Service { status: u16, code: Option<String> },
     Request,
+    TimedOut,
     LocalIo { error_kind: String },
     BodyRead,
     Checksum,
@@ -102,15 +113,17 @@ impl Error {
 }
 
 // SDK에는 C02 검증을 통과한 공급자 설정만 전달한다.
+#[derive(PartialEq, Eq)]
 struct VerifiedSsoSelection {
-    profile: String,
-    region: String,
+    scope: crate::ssm::Scope,
     config: crate::ssm::DirectSsoConfig,
 }
 
+#[derive(Clone)]
 pub(crate) struct AwsS3 {
     client: Client,
     endpoint: String,
+    region: String,
 }
 
 impl AwsS3 {
@@ -132,6 +145,7 @@ impl AwsS3 {
             .endpoint_url(format!("https://sts.{region}.{}", dns_suffix(region)))
             .http_client(transport.clone()).time_source(clock.clone())
             .identity_cache(aws_sdk_sts::config::IdentityCache::no_cache())
+            .timeout_config(response_timeout()).sleep_impl(aws_smithy_async::rt::sleep::TokioSleep::new())
             .credentials_provider(provider.clone()).build());
         let identity = sts.get_caller_identity().send().await.map_err(|error| sdk_error(Stage::Identity, error))?;
         let account = identity.account().ok_or_else(|| Error::at(Stage::Identity, Failure::InvalidResponse))?;
@@ -144,14 +158,14 @@ impl AwsS3 {
         let client = Client::from_conf(s3_config(region).http_client(transport).time_source(clock)
             .identity_cache(aws_sdk_s3::config::IdentityCache::no_cache())
             .credentials_provider(provider).build());
-        Ok(Self { client, endpoint: format!("https://s3.{region}.{}", dns_suffix(region)) })
+        Ok(Self { client, endpoint: endpoint(region), region: region.into() })
     }
 
     pub(crate) fn endpoint(&self) -> &str {
         &self.endpoint
     }
 
-    pub(crate) async fn list_buckets(&self, token: Option<&str>) -> Result<Page<String>, Error> {
+    pub(crate) async fn list_buckets(&self, token: Option<&str>) -> Result<Page<BucketRow>, Error> {
         let output = self
             .client
             .list_buckets()
@@ -165,15 +179,52 @@ impl AwsS3 {
             .unwrap_or_default()
             .into_iter()
             .map(|bucket| {
-                bucket
-                    .name
-                    .ok_or_else(|| Error::at(Stage::ListBuckets, Failure::InvalidResponse))
+                let invalid = || Error::at(Stage::ListBuckets, Failure::InvalidResponse);
+                let name = bucket.name.ok_or_else(invalid)?;
+                let region = bucket.bucket_region.filter(|region| self.accepts_region(region)).ok_or_else(invalid)?;
+                Ok(BucketRow { name, region })
             })
             .collect::<Result<_, _>>()?;
         Ok(Page {
             rows,
             next_token: output.continuation_token,
         })
+    }
+
+    fn accepts_region(&self, region: &str) -> bool {
+        crate::ssm::valid_region(region) && partition(&self.region) == partition(region)
+    }
+
+    fn in_region(&self, region: &str, stage: Stage) -> Result<std::borrow::Cow<'_, Self>, Error> {
+        if !self.accepts_region(region) {
+            return Err(Error::at(stage, Failure::InvalidRegion));
+        }
+        if region == self.region {
+            return Ok(std::borrow::Cow::Borrowed(self));
+        }
+        let client = Client::from_conf(self.client.config().to_builder().region(Region::new(region.to_owned())).build());
+        Ok(std::borrow::Cow::Owned(Self { client, endpoint: endpoint(region), region: region.into() }))
+    }
+
+    async fn check_bucket_region(&self, bucket: &str) -> Result<(), Error> {
+        let stage = Stage::HeadBucket;
+        check_bucket(bucket, stage)?;
+        let result = self.client.head_bucket().bucket(bucket).send().await;
+        let actual = match &result {
+            Ok(output) => output.bucket_region(),
+            Err(error) => error.raw_response().and_then(|response| response.headers().get("x-amz-bucket-region")),
+        };
+        if let Some(actual) = actual {
+            if !self.accepts_region(actual) {
+                return Err(Error::at(stage, Failure::InvalidResponse));
+            }
+            if actual != self.region {
+                return Err(Error::at(stage, Failure::BucketRegionMismatch { region: actual.to_owned() }));
+            }
+        } else if result.is_ok() {
+            return Err(Error::at(stage, Failure::InvalidResponse));
+        }
+        result.map(|_| ()).map_err(|error| sdk_error(stage, error))
     }
 
     pub(crate) async fn list_objects(
@@ -281,6 +332,19 @@ impl AwsS3 {
     }
 }
 
+fn endpoint(region: &str) -> String {
+    format!("https://s3.{region}.{}", dns_suffix(region))
+}
+
+fn partition(region: &str) -> &str {
+    ["us-iso-", "us-isob-", "us-isof-", "eu-isoe-", "us-gov-", "cn-", "eusc-"].into_iter()
+        .find(|prefix| region.starts_with(prefix)).unwrap_or("aws")
+}
+
+fn response_timeout() -> TimeoutConfig {
+    TimeoutConfig::builder().connect_timeout(Duration::from_secs(5)).operation_timeout(Duration::from_secs(20)).build()
+}
+
 fn single_attempt() -> aws_sdk_s3::config::Builder {
     aws_sdk_s3::config::Builder::new()
         .retry_config(aws_smithy_types::retry::RetryConfig::disabled())
@@ -292,6 +356,9 @@ fn s3_config(region: &str) -> aws_sdk_s3::config::Builder {
         .behavior_version_latest()
         .region(Region::new(region.to_owned()))
         .force_path_style(true)
+        .timeout_config(response_timeout())
+        .sleep_impl(aws_smithy_async::rt::sleep::TokioSleep::new())
+        .retry_config(aws_smithy_types::retry::RetryConfig::disabled())
 }
 
 fn dns_suffix(region: &str) -> &'static str {
@@ -323,6 +390,9 @@ fn sdk_error<E: ProvideErrorMetadata + StdError + 'static>(
     stage: Stage,
     error: SdkError<E, HttpResponse>,
 ) -> Error {
+    if matches!(error, SdkError::TimeoutError(_)) {
+        return Error::at(stage, Failure::TimedOut);
+    }
     let failure =
         if let Some(response) = error.raw_response().filter(|r| r.status().as_u16() >= 300) {
             let code = error
