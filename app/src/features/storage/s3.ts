@@ -1,14 +1,25 @@
+import type { ApprovedEditorFile, EditorTransport } from "../editor/contract";
+
+export type S3Location = Readonly<{ bucket: string; prefix: string; region: string }>;
+
 export type S3Session = Readonly<{
   sessionId: string;
   profile: string;
   region: string;
   endpoint: string;
+  location?: S3Location;
 }>;
 
 export type BucketRow = Readonly<{ name: string; region: string }>;
 export type ObjectRow =
   | Readonly<{ kind: "prefix"; prefix: string }>
-  | Readonly<{ kind: "object"; key: string; bytes: number | null }>;
+  | Readonly<{ kind: "object"; key: string; bytes: number | null; rowId?: string }>;
+
+export type StorageEditorOpen = Readonly<{
+  file: ApprovedEditorFile;
+  transport: EditorTransport;
+  close(): Promise<void>;
+}>;
 
 type Page<T> = Readonly<{ rows: readonly T[]; nextToken: string | null }>;
 type Stage = "profile" | "identity" | "listBuckets" | "headBucket" | "listObjects" | "uploadSource" | "putObject" |
