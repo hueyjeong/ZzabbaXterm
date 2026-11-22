@@ -1,5 +1,4 @@
 use portable_pty::CommandBuilder;
-use serde::Deserialize;
 use std::path::Path;
 use crate::connections::profile::{Ssh, SshAuth, SshTransport};
 
@@ -44,19 +43,6 @@ impl DirectLaunch {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct PinReference {
-    host: String,
-    port: u16,
-    host_key_fingerprint: String,
-}
-
-pub(crate) fn verify_pin(config: &Path, pin: &PinReference) -> Result<(), String> {
-    let endpoint = super::Endpoint::new(&pin.host, pin.port).map_err(pin_error)?;
-    let approved = ApprovedHost::confirm(&endpoint, &endpoint, &pin.host_key_fingerprint).map_err(pin_error)?;
-    trust_store(config)?.pin(&approved).map(|_| ()).map_err(pin_error)
-}
 
 pub(crate) fn saved(config: &Path, ssh: &Ssh) -> Result<DirectLaunch, String> {
     if !matches!(ssh.transport, SshTransport::Direct {}) {
@@ -75,7 +61,7 @@ pub(crate) fn saved(config: &Path, ssh: &Ssh) -> Result<DirectLaunch, String> {
 }
 
 fn trust_store(config: &Path) -> Result<TrustStore, String> {
-    match TrustStore::open(&config.join("ssh-trust")) {
+    match TrustStore::open(&config.join(super::TRUST_DIRECTORY)) {
         Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Err(pin_error(Error::UnregisteredHost)),
         result => result.map_err(pin_error),
     }

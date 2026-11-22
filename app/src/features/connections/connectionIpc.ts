@@ -23,9 +23,21 @@ export function createLocalConnectionIpc(): Omit<LocalConnectionActions, "onClos
 
   return {
     load: () => invoke<SavedConnections>("connections_load", {}),
-    async verifySshHost({ host, port, hostKeyFingerprint }) {
-      const result = await invoke<unknown>("connection_ssh_verify_pin", { pin: { host, port, hostKeyFingerprint } });
-      if (result !== null) throw new Error("등록된 SSH 호스트 키 확인 응답이 올바르지 않습니다");
+    async verifySshHost({ targetId, host, port, hostKeyFingerprint }, draft) {
+      const request = { targetId, host, port, expectedFingerprint: hostKeyFingerprint };
+      const result = await invoke<{ targetId: string; host: string; port: number; fingerprint: string }>("verify_ssh_host", { request, draft })
+        .catch((error: unknown) => {
+          switch (error) {
+            case "cancelled": throw new Error("SSH 호스트 키 등록이 취소되었습니다");
+            case "fingerprint_mismatch": throw new Error("선택한 SSH 호스트 키의 지문이 다릅니다");
+            case "existing_pin_conflict": throw new Error("다른 SSH 호스트 키가 이미 등록되어 있습니다");
+            case "store_unavailable": throw new Error("SSH 신뢰 저장소를 사용할 수 없습니다");
+            default: throw error;
+          }
+        });
+      if (result?.targetId !== targetId || result.port !== port || result.fingerprint !== hostKeyFingerprint || result.host !== host) {
+        throw new Error("SSH 호스트 키 확인 응답이 현재 초안과 일치하지 않습니다");
+      }
     },
     async test(attempt) {
       const started = invoke<ConnectionTestRun>("connection_test_start", attempt);

@@ -1,3 +1,4 @@
+pub(crate) mod registration;
 pub(crate) mod terminal;
 mod trust;
 #[cfg(windows)]
@@ -14,6 +15,8 @@ use std::{
 };
 
 pub(crate) use trust::{ApprovedHost, Endpoint, TrustStore};
+
+pub(crate) const TRUST_DIRECTORY: &str = "ssh-trust";
 
 #[derive(Debug)]
 pub(crate) enum Error {

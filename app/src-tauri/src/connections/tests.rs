@@ -132,6 +132,17 @@ fn ssh_draft(dir: &Path) -> Value {
 }
 
 #[test]
+fn f01_pin_registration_resolves_only_the_validated_draft_target() {
+    let dir = TestDir::new();
+    let input = ssh_draft(dir.path());
+    let fingerprint = input["target"]["ssh"]["hostKeyFingerprint"].as_str().unwrap();
+    let draft = serde_json::from_value::<Draft>(input.clone()).unwrap().validate().unwrap();
+    assert_eq!(draft.ssh_pin_endpoint("ssh-server", fingerprint), Some(crate::ssh::Endpoint::new("dev.example.test", 2222).unwrap()));
+    assert_eq!(draft.ssh_pin_endpoint("other-server", fingerprint), None);
+    assert_eq!(draft.ssh_pin_endpoint("ssh-server", "SHA256:other"), None);
+}
+
+#[test]
 fn f01_loads_existing_local_and_ssm_v1_with_ssh_reference() {
     let dir = TestDir::new();
     let local = draft(dir.path(), "work", "local-shell");

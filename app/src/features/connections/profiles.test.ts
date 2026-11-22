@@ -232,8 +232,8 @@ describe("F01 SSH 마법사", () => {
     expect(ipc).not.toHaveBeenCalled();
     await wizard.verifySshHost(peer);
     expect(verifySshHost.mock.calls).toEqual([
-      [{ targetId: draft.target.id, host: host.host, port: 2222, hostKeyFingerprint: host.hostKeyFingerprint }],
-      [{ targetId: draft.target.id, host: "second.actual.test", port: 2222, hostKeyFingerprint: host.hostKeyFingerprint }],
+      [{ targetId: draft.target.id, host: host.host, port: 2222, hostKeyFingerprint: host.hostKeyFingerprint }, expect.any(Object)],
+      [{ targetId: draft.target.id, host: "second.actual.test", port: 2222, hostKeyFingerprint: host.hostKeyFingerprint }, expect.any(Object)],
     ]);
     ipc.mockRejectedValueOnce("SSH 연결 시험을 실행할 수 없습니다");
     await wizard.test(peer);

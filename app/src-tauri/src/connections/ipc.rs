@@ -16,17 +16,7 @@ pub(crate) fn handle(invoke: Invoke, other: fn(Invoke) -> bool) -> bool {
                 probe::start(&caller.state::<Sessions>(), caller.label(), document, draft_id, draft_version, draft, config)
             })
         }),
-        "connection_ssh_verify_pin" => dispatch(invoke, "connection_ssh_verify_pin", |args| {
-            let pin = args.get("pin")?;
-            Ok(move |caller: Webview, document| {
-                let sessions = caller.state::<Sessions>();
-                let check = || sessions.with_probes(caller.label(), document, |_| Ok(()));
-                check()?;
-                let config = caller.path().app_config_dir().map_err(|error| format!("앱 설정 디렉터리: {error}"))?;
-                crate::ssh::terminal::verify_pin(&config, &pin)?;
-                check()
-            })
-        }),
+        crate::ssh::registration::COMMAND => crate::ssh::registration::verify_ssh_host(invoke),
         "connection_test_wait" => dispatch(invoke, "connection_test_wait", |args| {
             let run = args.get("run")?;
             Ok(move |caller: Webview, document| probe::wait(&caller.state::<Sessions>(), caller.label(), document, &run))
@@ -92,6 +82,18 @@ where
 fn store(caller: &Webview) -> Result<Store, String> {
     let directory = caller.path().app_config_dir().map_err(|error| format!("앱 설정 디렉터리: {error}"))?;
     store_at(&directory)
+}
+
+pub(crate) fn initialize_ssh_registration(app: &tauri::App) -> Result<crate::ssh::registration::Registration, String> {
+    use crate::ssh::{Error, TrustStore, registration::Registration};
+    let config = app.path().app_config_dir().map_err(|error| format!("앱 설정 디렉터리: {error}"))?;
+    store_at(&config)?.load().map_err(|error| format!("프로필 읽기: {error:?}"))?;
+    let root = config.join(crate::ssh::TRUST_DIRECTORY);
+    let store = match TrustStore::open(&root) {
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => TrustStore::create(&root),
+        result => result,
+    }.map_err(|error| format!("SSH 신뢰 저장소: {error:?}"))?;
+    Ok(Registration::new(store))
 }
 
 fn store_at(directory: &Path) -> Result<Store, String> {

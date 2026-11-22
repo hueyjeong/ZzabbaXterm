@@ -228,6 +228,14 @@ impl Draft {
 }
 
 impl ValidatedDraft {
+    pub(crate) fn ssh_pin_endpoint(&self, target_id: &str, fingerprint: &str) -> Option<crate::ssh::Endpoint> {
+        let MethodRef::Ssh { ssh } = self.method() else { return None; };
+        if self.0.target.id.as_str() != target_id || ssh.host_key_fingerprint != fingerprint {
+            return None;
+        }
+        crate::ssh::Endpoint::new(&ssh.host, ssh.port).ok()
+    }
+
     pub(crate) fn method(&self) -> MethodRef<'_> {
         self.0.target.method()
     }

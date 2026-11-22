@@ -4,7 +4,7 @@ fn main() {
         "terminal_close", "workspace_window",
         "connection_test_start", "connection_test_wait", "connection_test_cancel", "connection_save",
         "connections_load",
-        "connection_ssh_verify_pin",
+        "verify_ssh_host",
         "ssm_discovery",
     ]);
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(app))

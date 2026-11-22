@@ -107,7 +107,7 @@ function Wizard(props: LocalConnectionWizardProps) {
             {ssh && <>
               <SshReview ssh={ssh} />
               <button type="button" disabled={!props.verifySshHost || sshPin.kind === "checking" || sshPin.kind === "verified"}
-                onClick={() => void wizard.verifySshHost(props)}>등록된 호스트 키 확인</button>
+                onClick={() => void wizard.verifySshHost(props)}>호스트 키 선택 및 등록</button>
               {!props.verifySshHost && <div role="status">호스트 키 확인 사용 불가</div>}
               {sshPin.kind === "checking" && <div role="status">호스트 키 확인 중</div>}
               {sshPin.kind === "verified" && <div role="status">호스트 키 확인 완료</div>}
@@ -118,7 +118,7 @@ function Wizard(props: LocalConnectionWizardProps) {
             <button type="button" disabled={!canSave} onClick={() => void wizard.save(props)}>저장</button>
           </>
         )}
-        {step !== "target" && <button type="button" onClick={() => wizard.go(-1)}>이전</button>}
+        {step !== "target" && <button type="button" disabled={sshPin.kind === "checking"} onClick={() => wizard.go(-1)}>이전</button>}
         {step !== "verify" && <button type="button"
           disabled={step === "auth" && ((useSsm && !ssm.selection) || (!!ssh && !wizard.canReviewSsh(ssm.selection)))}
           onClick={() => wizard.go(1, ssm.selection)}>다음</button>}

@@ -68,7 +68,7 @@ export type ConnectionClose =
   | Readonly<{ kind: "saved"; draftId: string; targetId: string }>;
 
 export interface LocalConnectionActions {
-  verifySshHost?(approval: SshHostApproval): Promise<void>;
+  verifySshHost?(approval: SshHostApproval, draft: ConnectionProfileDraft): Promise<void>;
   test(attempt: ConnectionTestDraft): Promise<ConnectionTestRun>;
   cancelTest(attempt: ConnectionTestDraft): Promise<void>;
   // Rust의 저장 성공만 이행하고 충돌과 저장 오류는 실제 메시지로 거절한다.
@@ -219,7 +219,8 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Local
     const checking = { kind: "checking" } as const;
     update({ sshPin: checking });
     try {
-      await actions.verifySshHost({ targetId: draft.target.id, host: ssh.host, port: ssh.port, hostKeyFingerprint: ssh.hostKeyFingerprint });
+      await actions.verifySshHost({ targetId: draft.target.id, host: ssh.host, port: ssh.port, hostKeyFingerprint: ssh.hostKeyFingerprint },
+        { ...draft, target: { ...draft.target, ssh } });
       if (state.sshPin === checking && state.status.kind !== "closing" && state.status.kind !== "closed") update({ sshPin: { kind: "verified" } });
     } catch (error) {
       if (state.sshPin === checking && state.status.kind !== "closing" && state.status.kind !== "closed") update({ sshPin: { kind: "failed", error: errorText(error) } });

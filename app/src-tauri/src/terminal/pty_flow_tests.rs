@@ -146,7 +146,7 @@ impl<'a> Pty<'a> {
 
 #[test]
 fn f01_two_saved_ssh_launches_reap_only_the_owned_plan_and_child() {
-    use crate::ssh::{ApprovedHost, Endpoint, TrustStore, terminal::verify_pin};
+    use crate::ssh::{ApprovedHost, Endpoint, TrustStore, TRUST_DIRECTORY};
     use serde_json::json;
 
     bounded(|| {
@@ -155,12 +155,6 @@ fn f01_two_saved_ssh_launches_reap_only_the_owned_plan_and_child() {
         let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti";
         let sha = "SHA256:UCUiLr7Pjs9wFFJMDByLgc3NrtdU344OgUM45wZPcIQ";
         let pin = json!({"host":"dev.example.invalid", "port":2222, "hostKeyFingerprint":sha});
-        let reference = serde_json::from_value(pin.clone()).unwrap();
-        assert_eq!(verify_pin(config, &reference).unwrap_err(), "등록된 SSH 호스트 키가 없습니다");
-        let store = TrustStore::create(&config.join("ssh-trust")).unwrap();
-        let endpoint = Endpoint::new("dev.example.invalid", 2222).unwrap();
-        store.register(&ApprovedHost::confirm(&endpoint, &endpoint, sha).unwrap(), key).unwrap();
-        verify_pin(config, &reference).unwrap();
         let key_path = config.join("fixture.pub");
         std::fs::write(&key_path, key).unwrap();
         let mut ssh = pin;
@@ -171,6 +165,11 @@ fn f01_two_saved_ssh_launches_reap_only_the_owned_plan_and_child() {
             "targets":[{"revision":1,"profile":{"id":"ssh","groupId":"work","displayName":"개발 서버","defaultMethod":"ssh","ssh":ssh}}]});
         let profile = config.join("connections.json");
         let save = |file: &serde_json::Value| std::fs::write(&profile, serde_json::to_vec(file).unwrap()).unwrap();
+        save(&file);
+        assert!(matches!(super::saved::launch(config, "ssh"), Err(error) if error == "등록된 SSH 호스트 키가 없습니다"));
+        let store = TrustStore::create(&config.join(TRUST_DIRECTORY)).unwrap();
+        let endpoint = Endpoint::new("dev.example.invalid", 2222).unwrap();
+        store.register(&ApprovedHost::confirm(&endpoint, &endpoint, sha).unwrap(), key).unwrap();
         let fingerprint = file.pointer_mut("/targets/0/profile/ssh/hostKeyFingerprint").unwrap();
         let correct = std::mem::replace(fingerprint, json!(format!("SHA256:{}", "A".repeat(43))));
         save(&file);

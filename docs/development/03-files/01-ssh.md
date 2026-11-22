@@ -29,10 +29,10 @@
 
 `defaultMethod: "ssh"`인 대상에는 `ssh`만 저장한다. `ssh`는 실제 서버의 `host`, `port`, `account`, 해당 서버·포트에 등록된 호스트 키를 가리키는 `hostKeyFingerprint`, `transport`, `auth`로 구성된다. `transport`는 `direct` 또는 `ssm`이며, `ssm`에는 기존 C02의 `profile`, `region`, `instanceId` 참조 세 개가 필요하다.
 
-`auth`는 `agent`(`publicKeyPath`), `keyFile`(`privateKeyPath`), `manualPassword`, `storedPassword`(`itemId`) 중 하나다. 호스트 공개 키 파일 경로는 핀 확인·등록 요청에만 쓰며 프로필에 저장하지 않는다. 기존 `local`·`ssm` 설정은 v1 그대로 읽는다.
+`auth`는 `agent`(`publicKeyPath`), `keyFile`(`privateKeyPath`), `manualPassword`, `storedPassword`(`itemId`) 중 하나다. 호스트 공개 키 파일 경로는 네이티브 선택에만 쓰며 프로필에 저장되지 않는다. 기존 `local`·`ssm` 설정은 v1 그대로 읽는다.
 
 ## 직접 SSH 통합 후보
 
-마법사의 `connection_ssh_verify_pin`은 앱 설정 디렉터리의 `ssh-trust`에서 이미 등록된 호스트·포트·지문만 확인한다. 네이티브 등록은 `verify_ssh_host`에서 같은 저장소에 연결할 경계다. SSH-over-SSM과 저장 암호는 이 후보에서 사용 불가다.
+마법사의 `verify_ssh_host`는 Rust에서 검증한 초안의 대상·호스트·포트·지문을 대조한다. 네이티브 파일 선택과 별도 확인을 모두 거친 공개 키만 앱 설정 디렉터리의 `ssh-trust`에 등록한다. SSH-over-SSM과 저장 암호는 이 후보에서 사용 불가다.
 
 저장 대상은 `terminal_open` → `terminal::saved::launch` → `ssh::terminal::DirectLaunch`를 거친다. Rust는 각 PTY ID에 독립 계획을 만들고 자식을 회수한 뒤 임시 파일을 해제한다. 연결 시험은 고정 원격 명령의 출력과 종료 코드를 확인한다. 화면 없는 시험에서 사용자 입력이 필요한 인증은 성공할 수 없다.

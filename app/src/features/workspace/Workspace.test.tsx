@@ -92,7 +92,7 @@ beforeEach(async () => {
   runDiscovery = async () => { throw new Error("예상하지 않은 SSM 검색"); };
   native.invoke.mockImplementation(async (command, args) => {
     if (command === "connections_load") return loadProfiles();
-    if (command.startsWith("connection_")) return runConnectionCommand(command, args);
+    if (command.startsWith("connection_") || command === "verify_ssh_host") return runConnectionCommand(command, args);
     if (command === "ssm_discovery") return runDiscovery(args);
     if (command === "terminal_start") return starts.get(args.id);
     if (command === "terminal_close") return closeTerminal(args.id);
@@ -767,8 +767,8 @@ describe("C02 SSM 연결", () => {
 describe("F01 직접 SSH", () => {
   const fingerprint = `SHA256:${"A".repeat(43)}`;
 
-  it("등록된 핀이 없으면 연결 시험과 저장을 차단한다", async () => {
-    runConnectionCommand = async () => { throw "등록된 SSH 호스트 키가 없습니다"; };
+  it("네이티브 PIN 등록을 취소하면 연결 시험과 저장을 차단한다", async () => {
+    runConnectionCommand = async () => { throw "cancelled"; };
     const select = async (label: string, value: string) => {
       const control = [...find("dialog").querySelectorAll("label")]
         .find(item => item.firstChild?.textContent?.trim() === label)?.querySelector("select");
@@ -780,6 +780,8 @@ describe("F01 직접 SSH", () => {
       return control;
     };
     await press("연결 추가");
+    await changeInput("그룹", "작업");
+    await changeInput("표시명", "개발 서버");
     await press("다음");
     await select("접속 방식", "ssh");
     expect(find<HTMLOptionElement>('option[value="ssm"][disabled]').textContent).toContain("SSH-over-SSM");
@@ -792,11 +794,19 @@ describe("F01 직접 SSH", () => {
     expect(auth.querySelector<HTMLOptionElement>('option[value="storedPassword"]')?.disabled).toBe(true);
     await press("다음");
     expect(find('[aria-label="SSH 연결 대상"]').textContent).toContain("deploy");
-    await press("등록된 호스트 키 확인");
-    expect(connectionCalls("connection_ssh_verify_pin")).toEqual([["connection_ssh_verify_pin", {
-      pin: { host: "dev.example.invalid", port: 2222, hostKeyFingerprint: fingerprint },
+    await press("호스트 키 선택 및 등록");
+    expect(connectionCalls("verify_ssh_host")).toEqual([["verify_ssh_host", {
+      request: { targetId: expect.any(String), host: "dev.example.invalid", port: 2222, expectedFingerprint: fingerprint },
+      draft: expect.objectContaining({
+        target: expect.objectContaining({
+          ssh: {
+            host: "dev.example.invalid", port: 2222, account: "deploy", hostKeyFingerprint: fingerprint,
+            transport: { kind: "direct" }, auth: { kind: "manualPassword" },
+          }
+        })
+      }),
     }]]);
-    expect(find("dialog [role=alert]").textContent).toBe("등록된 SSH 호스트 키가 없습니다");
+    expect(find("dialog [role=alert]").textContent).toBe("SSH 호스트 키 등록이 취소되었습니다");
     expect(button("연결 테스트")?.disabled).toBe(true);
     expect(button("저장")?.disabled).toBe(true);
     expect(connectionCalls("connection_test_start")).toEqual([]);
