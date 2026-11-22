@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ApprovedEditorFile, EditorFileError, EditorFileHandle, EditorReadResult, EditorTransport } from "../editor/contract";
+import type { ApprovedEditorFile, EditorFileError, EditorFileHandle, EditorReadResult, EditorSaveResult, EditorTransport } from "../editor/contract";
 import type { FileEntry } from "../files/FileBrowser";
 
 const errors = {
@@ -57,6 +57,7 @@ export interface SftpSession {
   open(entryId: string): Promise<ApprovedEditorFile>;
   close(handle: EditorFileHandle): Promise<void>;
   detach(): Promise<void>;
+  disconnect(message: string): void;
   readonly transport: EditorTransport;
 }
 
@@ -83,14 +84,17 @@ function listing(result: Listing): SftpListing {
   return { entries, parentEntryId: result.parentEntryId };
 }
 
-export function sftpSession(sessionId: string): SftpSession {
+export function sftpSession(sessionId: string, { trackDisconnect = false } = {}): SftpSession {
   const args = { sessionId };
   const listeners = new Set<(message: string) => void>();
   let disconnect: string | undefined;
+  let lastSave: Promise<EditorSaveResult> | undefined;
   async function read(command: "editor_sftp_compare" | "editor_sftp_reload", handle: EditorFileHandle): Promise<EditorReadResult> {
     if (disconnect) return { kind: "disconnected", message: disconnect };
     try {
-      return { kind: "read", text: await invoke<string>(command, { ...args, handle }) };
+      const text = await invoke<string>(command, { ...args, handle });
+      if (command === "editor_sftp_reload" && !disconnect) lastSave = undefined;
+      return { kind: "read", text };
     } catch (error) {
       return sftpError(error);
     }
@@ -103,38 +107,43 @@ export function sftpSession(sessionId: string): SftpSession {
       else listeners.add(notify);
       return () => { listeners.delete(notify); };
     },
-    async save(handle, text) {
-      if (disconnect) return { kind: "disconnected", message: disconnect };
-      // IPC 응답이 없으면 교체 여부는 호출자가 미확인으로 처리한다.
-      let result: SaveResult;
-      try {
-        result = await invoke<SaveResult>("editor_sftp_save", { ...args, handle, text });
-      } catch (error) {
-        if (error && typeof error === "object" && "kind" in error) return sftpError(error);
-        return { kind: "unknown", message: sftpError(error).message };
-      }
-      switch (result.status) {
-        case "saved": return { kind: "saved" };
-        case "unknown": return {
-          kind: "unknown", message: result.recoveryPath
-            ? `${sftpError(result.error).message} · 복구 파일: ${result.recoveryPath}`
-            : sftpError(result.error).message
-        };
-        case "failed": {
-          const error = sftpError(result.error);
-          return { ...error, message: `${stages[result.stage]}: ${error.message}${cleanupMessage(result.cleanup)}` };
-        }
-        case "conflict": {
-          const { remote, cleanup } = result;
-          const current = remote.kind === "text" ? remote.text : remote.kind === "missing" ? null : undefined;
-          const message = remote.kind === "text" || remote.kind === "missing" ? "" : unreadable[remote.kind];
-          const cleanupDetail = cleanupMessage(cleanup);
-          return { kind: "conflict", current, message: cleanupDetail ? `${message || "원격 파일 변경"}${cleanupDetail}` : message || undefined };
-        }
-        default: return { kind: "unknown", message: "알 수 없는 SFTP 저장 결과" };
-      }
+    save(handle, text) {
+      if (disconnect) return Promise.resolve({ kind: "disconnected", message: disconnect });
+      const result = save(handle, text);
+      if (trackDisconnect) lastSave = result;
+      return result;
     },
   };
+  async function save(handle: EditorFileHandle, text: string): Promise<EditorSaveResult> {
+    // IPC 응답이 없으면 교체 여부는 호출자가 미확인으로 처리한다.
+    let result: SaveResult;
+    try {
+      result = await invoke<SaveResult>("editor_sftp_save", { ...args, handle, text });
+    } catch (error) {
+      if (error && typeof error === "object" && "kind" in error) return sftpError(error);
+      return { kind: "unknown", message: sftpError(error).message };
+    }
+    switch (result.status) {
+      case "saved": return { kind: "saved" };
+      case "unknown": return {
+        kind: "unknown", message: result.recoveryPath
+          ? `${sftpError(result.error).message} · 복구 파일: ${result.recoveryPath}`
+          : sftpError(result.error).message
+      };
+      case "failed": {
+        const error = sftpError(result.error);
+        return { ...error, message: `${stages[result.stage]}: ${error.message}${cleanupMessage(result.cleanup)}` };
+      }
+      case "conflict": {
+        const { remote, cleanup } = result;
+        const current = remote.kind === "text" ? remote.text : remote.kind === "missing" ? null : undefined;
+        const message = remote.kind === "text" || remote.kind === "missing" ? "" : unreadable[remote.kind];
+        const cleanupDetail = cleanupMessage(cleanup);
+        return { kind: "conflict", current, message: cleanupDetail ? `${message || "원격 파일 변경"}${cleanupDetail}` : message || undefined };
+      }
+      default: return { kind: "unknown", message: "알 수 없는 SFTP 저장 결과" };
+    }
+  }
   return {
     async attach() { return listing(await invoke<Listing>("editor_sftp_attach", args)); },
     async list(entryId: string | null) { return listing(await invoke<Listing>("editor_sftp_list", { ...args, entryId })); },
@@ -148,6 +157,16 @@ export function sftpSession(sessionId: string): SftpSession {
       } catch (error) {
         throw new Error(sftpError(error).message);
       }
+    },
+    disconnect(message) {
+      if (disconnect) return;
+      disconnect = message;
+      const publish = () => { for (const notify of listeners) notify(message); };
+      // 편집기가 먼저 저장 결과를 반영하도록 하고 미확인 복구 경로는 유지한다.
+      if (lastSave) void lastSave.then(result => {
+        if (result.kind !== "unknown") publish();
+      }, () => {});
+      else publish();
     },
     async detach() {
       disconnect = "SFTP 세션을 닫는 중입니다";

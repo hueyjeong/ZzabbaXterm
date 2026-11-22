@@ -9,7 +9,7 @@ import { subscribeLocalCliOpen } from "../editor/cliOpen";
 import { EditorTab, type EditorTabActions } from "../editor/EditorTab";
 import type { ApprovedEditorFile, ConfirmEditorDiscard, EditorTransport } from "../editor/contract";
 import { closeLocalFile, localEditorError, localEditorTransport, openLocalFile } from "../editor/localEditorIpc";
-import { subscribeRemoteNanoOpen } from "../editor/nanoOpen";
+import { subscribeRemoteNanoOpen, type RemoteNanoFile } from "../editor/nanoOpen";
 import { RdpTab, type RdpTabActions } from "../rdp/RdpTab";
 import { SftpPanel, type SftpPanelActions } from "../sftp/SftpPanel";
 import { sftpError } from "../sftp/sftpIpc";
@@ -31,7 +31,7 @@ type Split = { left: number; right: number };
 type DesktopKind = "rdp" | "vnc";
 type Tab = { id: number; label: string } & (
   | { kind: "terminal"; targetId?: string; remoteEditor?: true; ssm?: SsmTarget; ssh?: SshTransport["kind"]; status: TerminalStatus; sessionId?: string; sftpSessionId?: string; closeStatus?: CloseStatus }
-  | { kind: "editor"; file: ApprovedEditorFile; transport: EditorTransport; close: () => Promise<void>; source: EditorSource; attaching?: true; readOnly?: true }
+  | { kind: "editor"; file: ApprovedEditorFile; transport: EditorTransport; close: () => Promise<void>; source: EditorSource; attaching?: true; readOnly?: true; nano?: Pick<RemoteNanoFile, "sessionId" | "disconnect"> }
   | { kind: "tunnel"; handle: string; targetId: string; name: string; method: "ssh" | "ssm"; closeStatus?: CloseStatus; closeError?: string }
   | { kind: "rdp"; source?: DesktopTunnelSource; closeStatus?: CloseStatus }
   | { kind: "vnc"; source?: DesktopTunnelSource; closeStatus?: CloseStatus }
@@ -97,6 +97,14 @@ export function Workspace() {
     const mountingEditors = pendingEditorMounts.current.size;
     for (const tab of tabs) {
       if (tab.kind !== "editor") continue;
+      if (tab.nano) {
+        const { sessionId, disconnect } = tab.nano;
+        const parent = tabs.find(item => item.kind === "terminal" && item.remoteEditor && item.sessionId === sessionId);
+        if (parent?.kind !== "terminal" || parent.closeStatus ||
+          parent.status.kind === "exited" || parent.status.kind === "disconnected" || parent.status.kind === "failed") {
+          disconnect("부모 SSH 연결을 사용할 수 없습니다");
+        }
+      }
       pendingEditorMounts.current.delete(tab.id);
       if (tab.attaching) cliMounts.current.get(tab.id)?.(editorActions.current.has(tab.id));
     }
@@ -224,7 +232,9 @@ export function Workspace() {
     const reportLocal = (error: unknown) => setFileError(`CLI 파일 열기 실패: ${localEditorError(error).message}`);
     const reportNano = (error: unknown) => setFileError(`nano 편집 연결 확인 불가: ${sftpError(error).message}`);
     async function attach(file: ApprovedEditorFile, transport: EditorTransport, close: () => Promise<void>,
-      source: "local" | "sftp", acknowledge: () => Promise<"mounted" | "unconfirmed" | "unavailable">, signal: AbortSignal) {
+      source: "local" | "sftp", acknowledge: () => Promise<"mounted" | "unconfirmed" | "unavailable">, signal: AbortSignal,
+      nano?: Pick<RemoteNanoFile, "sessionId" | "disconnect">) {
+      // 오퍼에 기록된 백엔드 세션은 활성 탭이나 SFTP 패널과 독립적이다.
       if (closingWindow.current || signal.aborted || attachingHandles.has(file.handle) || liveTabs.current.some(tab =>
         tab.kind === "editor" && tab.source === source && tab.file.handle === file.handle)) return;
       attachingHandles.add(file.handle);
@@ -237,7 +247,7 @@ export function Workspace() {
         removePreview();
       };
       signal.addEventListener("abort", abort, { once: true });
-      setTabs(current => [...current, { id, label: file.label, kind: "editor", file, source, transport, close, attaching: true }]);
+      setTabs(current => [...current, { id, label: file.label, kind: "editor", file, source, transport, close, attaching: true, nano }]);
       try {
         const committed = await mounted;
         if (signal.aborted) return;
@@ -264,14 +274,16 @@ export function Workspace() {
         return "mounted";
       }, signal).catch(error => { if (!signal.aborted) reportLocal(error); throw error; }), reportLocal);
     const nano = subscribeRemoteNanoOpen((file, acknowledge, signal) => {
-      if (!liveTabs.current.some(tab => tab.kind === "terminal" && tab.remoteEditor && tab.sessionId === file.sessionId && !tab.closeStatus)) {
+      if (!liveTabs.current.some(tab => tab.kind === "terminal" && tab.remoteEditor && tab.sessionId === file.sessionId &&
+        !tab.closeStatus && !closingTabs.current.has(tab.id) &&
+        tab.status.kind !== "exited" && tab.status.kind !== "disconnected" && tab.status.kind !== "failed")) {
         return Promise.resolve();
       }
       return attach(file, file.transport, file.close, "sftp", async () => {
         const result = await acknowledge();
         if (result.kind === "unconfirmed" && !signal.aborted) reportNano(result.error);
         return result.kind === "aborted" ? "unavailable" : result.kind;
-      }, signal).catch(error => { if (!signal.aborted) reportNano(error); throw error; });
+      }, signal, file).catch(error => { if (!signal.aborted) reportNano(error); throw error; });
     }, reportNano);
     const unsubscribe = () => { local(); nano(); };
     window.addEventListener("pagehide", unsubscribe);

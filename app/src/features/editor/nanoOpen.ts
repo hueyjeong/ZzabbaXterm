@@ -8,6 +8,7 @@ type NanoOffer = { readonly offerId: string; readonly sessionId: string };
 export type RemoteNanoFile = ApprovedEditorFile & NanoOffer & {
   readonly transport: EditorTransport;
   readonly close: () => Promise<void>;
+  readonly disconnect: (message: string) => void;
 };
 
 export type NanoMountResult =
@@ -44,10 +45,13 @@ export function subscribeRemoteNanoOpen(
   const lifetime = new AbortController();
   const { signal } = lifetime;
   const seen = new Set<string>();
+  const claimed = new Map<string, { sessionId: string; disconnect: RemoteNanoFile["disconnect"] }>();
 
   async function claim({ offerId, sessionId }: NanoOffer) {
     let failed = false;
     let acknowledgment: Promise<NanoMountResult> | undefined;
+    const sftp = sftpSession(sessionId, { trackDisconnect: true });
+    claimed.set(offerId, { sessionId, disconnect: sftp.disconnect });
     function fail() {
       if (failed) return;
       failed = true;
@@ -67,15 +71,18 @@ export function subscribeRemoteNanoOpen(
       if (!isOpaqueId(rawHandle) || rawHandle === offerId || typeof label !== "string" || typeof text !== "string") return;
 
       const handle = rawHandle as EditorFileHandle;
-      const sftp = sftpSession(sessionId);
-      await attach({ offerId, sessionId, handle, label, text,
-        transport: sftp.transport, close: () => sftp.close(handle) }, () => {
+      await attach({ offerId, sessionId, handle, label, text, transport: sftp.transport, disconnect: sftp.disconnect,
+        close: () => {
+          claimed.delete(offerId);
+          return sftp.close(handle);
+        } }, () => {
         if (acknowledgment) return acknowledgment;
         if (signal.aborted || failed) return Promise.resolve({ kind: "aborted" });
         acknowledgment = invoke<void>("editor_remote_nano_mounted", { offerId, handle }).then(
           (): NanoMountResult => ({ kind: "mounted" }),
           async (error: unknown): Promise<NanoMountResult> => {
             const status = await invoke<unknown>("editor_remote_nano_failed", { offerId, handle }).catch(() => undefined);
+            if (status === "unavailable") claimed.delete(offerId);
             if (status === "mounted" || status === "unavailable") return { kind: status };
             return { kind: "unconfirmed", error };
           },
@@ -85,6 +92,7 @@ export function subscribeRemoteNanoOpen(
     } finally {
       signal.removeEventListener("abort", abortBeforeMount);
       abortBeforeMount();
+      if (!acknowledgment) claimed.delete(offerId);
     }
   }
 
@@ -96,13 +104,24 @@ export function subscribeRemoteNanoOpen(
     void claim(offer).catch(() => {});
   }
 
-  const registration = (async () => {
+  const target = { kind: "Webview", label: "main" } as const;
+  const disconnectRegistration = (async () => {
     if (!isTauri() || getCurrentWebview().label !== "main") return;
-    return listen<unknown>("editor-remote-nano-open", ({ payload }) => receive(payload), {
-      target: { kind: "Webview", label: "main" },
-    });
+    return listen<unknown>("editor-remote-nano-disconnected", ({ payload }) => {
+      if (signal.aborted) return;
+      const offer = parseOffer(payload);
+      if (!offer) return;
+      const file = claimed.get(offer.offerId);
+      if (file?.sessionId !== offer.sessionId) return;
+      claimed.delete(offer.offerId);
+      file.disconnect("원격 nano 연결이 종료되었습니다");
+    }, { target });
   })();
-  void registration.then(async (unlisten) => {
+  const openRegistration = disconnectRegistration.then(unlisten => {
+    if (!unlisten || signal.aborted) return;
+    return listen<unknown>("editor-remote-nano-open", ({ payload }) => receive(payload), { target });
+  });
+  void openRegistration.then(async (unlisten) => {
     if (!unlisten || signal.aborted) return;
     const pending = await invoke<unknown>("editor_remote_nano_pending");
     if (Array.isArray(pending)) pending.forEach(receive);
@@ -114,6 +133,9 @@ export function subscribeRemoteNanoOpen(
     if (signal.aborted) return;
     lifetime.abort();
     seen.clear();
-    void registration.then((unlisten) => unlisten?.()).catch(() => {});
+    claimed.clear();
+    for (const registration of [disconnectRegistration, openRegistration]) {
+      void registration.then((unlisten) => unlisten?.()).catch(() => {});
+    }
   };
 }

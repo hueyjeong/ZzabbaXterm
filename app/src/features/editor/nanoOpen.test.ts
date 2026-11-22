@@ -9,6 +9,7 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 vi.mock("@tauri-apps/api/webview", () => ({ getCurrentWebview: vi.fn() }));
 
 const event = "editor-remote-nano-open";
+const disconnected = "editor-remote-nano-disconnected";
 const pending = "editor_remote_nano_pending";
 const claim = "editor_remote_nano_claim";
 const mounted = "editor_remote_nano_mounted";
@@ -29,8 +30,8 @@ function subscribe(attach: Attach) {
   return unsubscribe;
 }
 
-function deliver(payload: unknown = offer) {
-  register.mock.calls[0][1]({ event, id: 1, payload });
+function deliver(payload: unknown = offer, name = event) {
+  register.mock.calls.find(([type]) => type === name)?.[1]({ event: name, id: 1, payload });
 }
 
 beforeEach(() => {
@@ -50,7 +51,7 @@ afterEach(() => {
 it("구독 후 대기 목록을 읽고 중복 이벤트를 한 번만 클레임하며, 실제 부착 뒤 정확한 핸들을 승인한다", async () => {
   const registration = Promise.withResolvers<UnlistenFn>();
   const snapshot = Promise.withResolvers<unknown>();
-  register.mockReturnValueOnce(registration.promise);
+  register.mockResolvedValueOnce(unlisten).mockReturnValueOnce(registration.promise);
   ipc.mockImplementation(async (command) => command === pending ? snapshot.promise : command === claim ? opened : undefined);
   const editorMounted = Promise.withResolvers<void>();
   const attach = vi.fn<Attach>(async (file, acknowledge) => {
@@ -60,7 +61,8 @@ it("구독 후 대기 목록을 읽고 중복 이벤트를 한 번만 클레임�
     await file.close();
   });
   subscribe(attach);
-  expect(register).toHaveBeenCalledExactlyOnceWith(event, expect.any(Function), { target: { kind: "Webview", label: "main" } });
+  await vi.waitFor(() => expect(register.mock.calls.map(([name]) => name)).toEqual([disconnected, event]));
+  expect(register).toHaveBeenLastCalledWith(event, expect.any(Function), { target: { kind: "Webview", label: "main" } });
   expect(ipc).not.toHaveBeenCalled();
   registration.resolve(unlisten);
   await vi.waitFor(() => expect(ipc).toHaveBeenCalledWith(pending));
@@ -82,6 +84,7 @@ it("대기 목록에만 남은 정상 오퍼를 처리하고 잘못된 페이로
   ipc.mockResolvedValueOnce([null, { ...offer, sessionId: 7 }, { ...offer, sessionId: "7\n" }, offer]);
   const attach = vi.fn<Attach>(async () => {});
   subscribe(attach);
+  await vi.waitFor(() => expect(register).toHaveBeenCalledWith(event, expect.any(Function), expect.anything()));
   deliver({ ...offer, offerId: "a".repeat(31) + "\n" });
   deliver({ ...offer, path: "/etc/example" });
   await vi.waitFor(() => expect(ipc.mock.calls).toEqual([[pending], [claim, { offerId }], [failed, { offerId }]]));
@@ -104,6 +107,7 @@ it("부착 전 구독을 해제하면 뒤늦은 부착 보고를 승인하지 �
     expect(await acknowledge()).toEqual({ kind: "aborted" });
   });
   const stop = subscribe(attach);
+  await vi.waitFor(() => expect(register).toHaveBeenCalledWith(event, expect.any(Function), expect.anything()));
   deliver();
   await vi.waitFor(() => expect(attach).toHaveBeenCalledTimes(1));
   stop();
@@ -112,7 +116,7 @@ it("부착 전 구독을 해제하면 뒤늦은 부착 보고를 승인하지 �
   await attach.mock.results[0].value;
   expect(ipc.mock.calls.filter(([command]) => command === failed)).toEqual([[failed, { offerId }]]);
   expect(ipc).not.toHaveBeenCalledWith(mounted, expect.anything());
-  expect(unlisten).toHaveBeenCalledTimes(1);
+  expect(unlisten).toHaveBeenCalledTimes(2);
 });
 
 it.each([
@@ -158,6 +162,28 @@ it("클레임 중 구독을 해제하면 클레임 응답 뒤 같은 오퍼를 �
   response.resolve(opened);
   await vi.waitFor(() => expect(ipc).toHaveBeenCalledWith(failed, { offerId }));
   expect(attach).not.toHaveBeenCalled();
+});
+
+it("클레임 응답 전에 도착한 단절을 같은 오퍼와 세션에 한 번만 전달한다", async () => {
+  const response = Promise.withResolvers<unknown>();
+  ipc.mockImplementation(async (command) => command === pending ? [offer] : command === claim ? response.promise : undefined);
+  const notify = vi.fn();
+  const attach = vi.fn<Attach>(async (file, acknowledge) => {
+    file.transport.subscribeDisconnect?.(file.handle, notify);
+    await acknowledge();
+    expect(await file.transport.compare(file.handle)).toMatchObject({ kind: "disconnected" });
+  });
+  subscribe(attach);
+  await vi.waitFor(() => expect(ipc).toHaveBeenCalledWith(claim, { offerId }));
+  deliver({ ...offer, sessionId: "7" }, disconnected);
+  deliver({ ...offer, offerId: "3".repeat(32) }, disconnected);
+  deliver(offer, disconnected);
+  response.resolve(opened);
+  await vi.waitFor(() => expect(attach).toHaveBeenCalledTimes(1));
+  await attach.mock.results[0].value;
+  deliver(offer, disconnected);
+  expect(notify.mock.calls).toEqual([["원격 nano 연결이 종료되었습니다"]]);
+  expect(ipc.mock.calls.map(([command]) => command)).toEqual([pending, claim, mounted]);
 });
 
 it("보조 웹뷰에서는 구독도 대기 목록 조회도 시작하지 않는다", async () => {
