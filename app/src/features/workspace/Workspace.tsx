@@ -453,8 +453,6 @@ export function Workspace() {
           <button className="local-file-open" type="button" disabled={filePickerBusy} onClick={() => void openEditor()}>파일 열기</button>
           {profileLoad.kind === "ready" && <button className="local-file-open" type="button" onClick={reloadProfiles}>새로고침</button>}
           {profileLoad.kind === "loading" && <div className="connection-status" role="status">저장된 연결 불러오는 중</div>}
-          {profileLoad.kind === "ready" && profileLoad.profiles?.targets.length === 0 &&
-            <div className="connection-status" role="status">저장된 연결 없음</div>}
           {profileLoad.kind === "error" && <div className="connection-status">
             <div role="alert">연결 불러오기 실패: {profileLoad.error}</div>
             <button onClick={reloadProfiles}>다시 불러오기</button>

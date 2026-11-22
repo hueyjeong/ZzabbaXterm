@@ -787,7 +787,7 @@ describe("C01 저장된 로컬 연결", () => {
   });
 
   it("빈 저장소에서 + 마법사로 시험한 뒤 Rust 저장 응답 이후에만 다시 읽고 재시작 시 표시한다", async () => {
-    expect(find(".workspace-tree").textContent).toContain("저장된 연결 없음");
+    expect([...tree().querySelectorAll('[role="treeitem"] > .tree-row > span:not([aria-hidden])')].map(item => item.textContent)).toEqual(["로컬", "내 PC"]);
     const save = Promise.withResolvers<void>();
     const reload = Promise.withResolvers<SavedConnections>();
     let store = emptyStore;
@@ -846,7 +846,6 @@ describe("C01 저장된 로컬 연결", () => {
     loadProfiles = async () => { throw "설정 읽기 실패"; };
     await restartWorkspace();
     expect(find(".workspace-tree [role=alert]").textContent).toContain("설정 읽기 실패");
-    expect(find(".workspace-tree").textContent).not.toContain("저장된 연결 없음");
     loadProfiles = async () => emptyStore;
     await press("다시 불러오기");
     const before = tree().textContent;
