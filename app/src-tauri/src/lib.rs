@@ -48,8 +48,17 @@ pub fn run() {
             ai::cli::start(app.handle().clone());
             Ok(())
         })
+        .on_window_event(|window, event| {
+            if window.label() == workspace_window::MAIN
+                && let tauri::WindowEvent::CloseRequested { api, .. } = event
+            {
+                api.prevent_close();
+                workspace_window::request_close(window);
+            }
+        })
         .on_page_load(|webview, payload| {
             if payload.event() == tauri::webview::PageLoadEvent::Started {
+                webview.state::<LocalEditors>().navigate(webview.label());
                 let main = webview.label() == "main" && webview.window_ref().label() == "main";
                 if main {
                     webview.state::<rdp::ipc::Sessions>().retire();
@@ -63,7 +72,6 @@ pub fn run() {
                 webview.state::<ai::session_selection::State>()
                     .document_changed(webview.label(), sessions.document(webview.label()));
                 webview.state::<SftpIpc>().navigate(webview.label(), sessions.document(webview.label()));
-                webview.state::<LocalEditors>().navigate(webview.label());
                 webview.state::<StorageIpc>().navigate(webview.label());
                 if main {
                     webview.state::<tunnels::ipc::TunnelTabs>().navigate(false);
@@ -110,7 +118,7 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| match event {
             tauri::RunEvent::WindowEvent { label, event: tauri::WindowEvent::CloseRequested { api, .. }, .. } => {
-                if !app.state::<Sessions>().close_ssh_probes(Some(&label)) {
+                if label != workspace_window::MAIN && !app.state::<Sessions>().close_ssh_probes(Some(&label)) {
                     api.prevent_close();
                 }
             }

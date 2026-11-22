@@ -1,4 +1,5 @@
 mod auth;
+mod compatible;
 mod download;
 pub(crate) mod ipc;
 mod object_edit;
@@ -77,6 +78,10 @@ pub(crate) enum Failure {
     InvalidResponse,
     Credentials,
     SsoLoginRequired,
+    Destination,
+    Tls,
+    Redirect { status: u16, code: Option<String> },
+    SigningRegion { status: u16, code: String },
     LoginFailed,
     Service { status: u16, code: Option<String> },
     Request,
@@ -182,33 +187,11 @@ impl AwsS3 {
     }
 
     pub(crate) async fn list_buckets(&self, token: Option<&str>) -> Result<Page<BucketRow>, Error> {
-        let output = self
-            .client
-            .list_buckets()
-            .set_continuation_token(token.map(str::to_owned))
-            .max_buckets(1000)
-            .send()
-            .await
-            .map_err(|err| sdk_error(Stage::ListBuckets, err))?;
-        let rows = output
-            .buckets
-            .unwrap_or_default()
-            .into_iter()
-            .map(|bucket| {
-                let invalid = || Error::at(Stage::ListBuckets, Failure::InvalidResponse);
-                let name = bucket.name.ok_or_else(invalid)?;
-                let region = bucket.bucket_region.filter(|region| self.accepts_region(region)).ok_or_else(invalid)?;
-                Ok(BucketRow { name, region })
-            })
-            .collect::<Result<_, _>>()?;
-        Ok(Page {
-            rows,
-            next_token: output.continuation_token,
-        })
+        self.operations().list_buckets(token, &self.region).await
     }
 
     fn accepts_region(&self, region: &str) -> bool {
-        crate::ssm::valid_region(region) && partition(&self.region) == partition(region)
+        accepts_region(&self.region, region)
     }
 
     fn in_region(&self, region: &str, stage: Stage) -> Result<std::borrow::Cow<'_, Self>, Error> {
@@ -251,9 +234,73 @@ impl AwsS3 {
         prefix: &str,
         token: Option<&str>,
     ) -> Result<Page<ObjectRow>, Error> {
+        self.operations().list_objects(bucket, prefix, token).await
+    }
+
+    pub(crate) async fn upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        source: File,
+    ) -> Result<u64, Error> {
+        self.operations().upload(bucket, key, source).await
+    }
+
+    pub(crate) async fn download(
+        &self,
+        bucket: &str,
+        key: &str,
+        target: &DownloadTarget,
+        closed: &tokio::sync::watch::Sender<bool>,
+    ) -> Result<Downloaded, Error> {
+        self.operations().download(bucket, key, target, closed).await
+    }
+
+    fn operations(&self) -> S3Operations<&Client> {
+        S3Operations { client: &self.client, compatible: false }
+    }
+}
+
+struct S3Operations<C = Client> {
+    client: C,
+    compatible: bool,
+}
+
+impl<C: std::borrow::Borrow<Client>> S3Operations<C> {
+    fn sdk_error<E: ProvideErrorMetadata + StdError + 'static>(&self, stage: Stage, error: SdkError<E, HttpResponse>) -> Error {
+        if self.compatible {
+            Error::at(stage, compatible::request_failure(&error))
+        } else {
+            sdk_error(stage, error)
+        }
+    }
+
+    async fn list_buckets(&self, token: Option<&str>, region: &str) -> Result<Page<BucketRow>, Error> {
+        let stage = Stage::ListBuckets;
+        let output = self.client.borrow().list_buckets()
+            .set_continuation_token(token.map(str::to_owned))
+            .max_buckets(1000)
+            .send()
+            .await
+            .map_err(|err| self.sdk_error(stage, err))?;
+        let rows = output.buckets.unwrap_or_default().into_iter().map(|bucket| {
+            let invalid = || Error::at(stage, Failure::InvalidResponse);
+            let name = bucket.name.ok_or_else(invalid)?;
+            let region = if self.compatible {
+                region.to_owned()
+            } else {
+                bucket.bucket_region.filter(|actual| accepts_region(region, actual)).ok_or_else(invalid)?
+            };
+            Ok(BucketRow { name, region })
+        }).collect::<Result<_, _>>()?;
+        Ok(Page { rows, next_token: output.continuation_token })
+    }
+
+    async fn list_objects(&self, bucket: &str, prefix: &str, token: Option<&str>) -> Result<Page<ObjectRow>, Error> {
         check_bucket(bucket, Stage::ListObjects)?;
         let output = self
             .client
+            .borrow()
             .list_objects_v2()
             .bucket(bucket)
             .prefix(prefix)
@@ -262,7 +309,7 @@ impl AwsS3 {
             .set_continuation_token(token.map(str::to_owned))
             .send()
             .await
-            .map_err(|err| sdk_error(Stage::ListObjects, err))?;
+            .map_err(|err| self.sdk_error(Stage::ListObjects, err))?;
         let invalid = || Error::at(Stage::ListObjects, Failure::InvalidResponse);
         if output.encoding_type() != Some(&EncodingType::Url)
             || output.is_truncated().unwrap_or_default() != output.next_continuation_token.is_some()
@@ -314,18 +361,13 @@ impl AwsS3 {
         })
     }
 
-    pub(crate) async fn upload(
-        &self,
-        bucket: &str,
-        key: &str,
-        source: File,
-    ) -> Result<u64, Error> {
+    async fn upload(&self, bucket: &str, key: &str, source: File) -> Result<u64, Error> {
         check_bucket(bucket, Stage::PutObject)?;
         let body = ByteStream::read_from().file(tokio::fs::File::from_std(source)).build()
             .await
             .map_err(|_| Error::at(Stage::UploadSource, Failure::Request))?;
         let bytes = body.size_hint().0;
-        self.client
+        self.client.borrow()
             .put_object()
             .bucket(bucket)
             .key(key)
@@ -334,11 +376,11 @@ impl AwsS3 {
             .config_override(single_attempt())
             .send()
             .await
-            .map_err(|err| sdk_error(Stage::PutObject, err))?;
+            .map_err(|err| self.sdk_error(Stage::PutObject, err))?;
         Ok(bytes)
     }
 
-    pub(crate) async fn download(
+    async fn download(
         &self,
         bucket: &str,
         key: &str,
@@ -346,7 +388,7 @@ impl AwsS3 {
         closed: &tokio::sync::watch::Sender<bool>,
     ) -> Result<Downloaded, Error> {
         check_bucket(bucket, Stage::GetObject)?;
-        download::download(&self.client, bucket, key, target, closed).await
+        download::download(self, bucket, key, target, closed).await
     }
 }
 
@@ -357,6 +399,10 @@ fn endpoint(region: &str) -> String {
 fn partition(region: &str) -> &str {
     ["us-iso-", "us-isob-", "us-isof-", "eu-isoe-", "us-gov-", "cn-", "eusc-"].into_iter()
         .find(|prefix| region.starts_with(prefix)).unwrap_or("aws")
+}
+
+fn accepts_region(region: &str, actual: &str) -> bool {
+    crate::ssm::valid_region(actual) && partition(region) == partition(actual)
 }
 
 fn response_timeout() -> TimeoutConfig {

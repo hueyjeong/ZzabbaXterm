@@ -1,12 +1,12 @@
 // @vitest-environment jsdom
 import { invoke } from "@tauri-apps/api/core";
 import { editor, Uri } from "monaco-editor/editor";
-import { act, createElement } from "react";
+import { act, createElement, createRef } from "react";
 import { createRoot } from "react-dom/client";
 import { describe, expect, it, vi } from "vitest";
 import type { ApprovedEditorFile, EditorFileHandle, EditorReadResult, EditorSaveResult, EditorTransport } from "./contract";
 import { connectEditor, type EditorState } from "./editor";
-import { EditorTab } from "./EditorTab";
+import { EditorTab, type EditorTabActions } from "./EditorTab";
 import { localEditorTransport } from "./localEditorIpc";
 import { createFileModel } from "./monaco";
 
@@ -237,6 +237,7 @@ describe("파일 편집 버퍼", () => {
     try {
       tab.model.setValue("미저장");
       const first = tab.session.compare();
+      expect(tab.session.closeState()).toEqual({ dirty: true, uncertain: false, pending: false });
       tab.session.setActive(false);
       const inactiveState = tab.state;
       await tab.session.save();
@@ -259,7 +260,7 @@ describe("파일 편집 버퍼", () => {
     }
   });
 
-  it("다시 읽기 확인 이후 편집하거나 탭을 전환하면 이전 요청이 버퍼를 바꾸지 못한다", async () => {
+  it("다시 읽기 승인 전의 추가 편집은 요청을 막고, 전송 뒤 탭 전환은 확정 결과를 유지한다", async () => {
     const approved = file("stale-reload");
     const confirmation = Promise.withResolvers<boolean>();
     const reply = Promise.withResolvers<EditorReadResult>();
@@ -268,18 +269,22 @@ describe("파일 편집 버퍼", () => {
     try {
       tab.model.setValue("편집 1");
       const first = tab.session.reload(() => confirmation.promise);
+      expect(tab.session.closeState()).toEqual({ dirty: true, uncertain: false, pending: true });
       tab.model.setValue("편집 2");
       confirmation.resolve(true);
       await first;
+      expect(tab.session.closeState().pending).toBe(false);
       expect(reload).not.toHaveBeenCalled();
       const second = tab.session.reload(async () => true);
       await vi.waitFor(() => expect(reload).toHaveBeenCalledWith(approved.handle));
       tab.session.setActive(false);
-      tab.session.setActive(true);
+      expect(tab.session.closeState()).toEqual({ dirty: true, uncertain: false, pending: true });
       reply.resolve({ kind: "read", text: "디스크" });
       await second;
-      expect(tab.text()).toBe("편집 2");
-      expect(tab.state).toMatchObject({ dirty: true, needsReload: true });
+      expect(tab.text()).toBe("디스크");
+      expect(tab.session.closeState()).toEqual({ dirty: false, uncertain: false, pending: false });
+      tab.session.setActive(true);
+      expect(tab.state).toMatchObject({ dirty: false, needsReload: false });
     } finally {
       tab.close();
     }
@@ -307,7 +312,7 @@ describe("파일 편집 버퍼", () => {
     }
   });
 
-  it("탭을 바꾼 사이 도착한 저장 결과는 다른 탭이나 원래 버퍼에 적용되지 않는다", async () => {
+  it("숨은 탭의 저장 결과를 다시 선택할 때 표시하고 다른 버퍼는 유지한다", async () => {
     const first = file("delayed-left");
     const second = file("delayed-right");
     const io = transport(first, second);
@@ -319,18 +324,20 @@ describe("파일 편집 버퍼", () => {
       a.model.setValue("첫 파일 저장본");
       const saving = a.session.save();
       a.session.setActive(false);
+      expect(a.session.closeState()).toEqual({ dirty: true, uncertain: false, pending: true });
       b.session.setActive(true);
       b.model.setValue("둘째 파일 편집본");
       const inactiveState = a.state;
       const otherState = b.state;
       gate.resolve();
       await saving;
+      expect(a.session.closeState()).toEqual({ dirty: false, uncertain: false, pending: false });
       expect(a.state).toBe(inactiveState);
       expect(b.state).toBe(otherState);
       expect(io.backing.get(first.handle)).toBe("첫 파일 저장본");
       expect(io.backing.get(second.handle)).toBe(second.text);
       a.session.setActive(true);
-      expect(a.state).toMatchObject({ saving: false, dirty: true, status: { kind: "unknown" } });
+      expect(a.state).toMatchObject({ saving: false, dirty: false, status: { kind: "saved" } });
       expect(b.text()).toBe("둘째 파일 편집본");
     } finally {
       a.close();
@@ -438,6 +445,7 @@ describe("파일 편집 버퍼", () => {
       .mockResolvedValueOnce({ kind: "conflict", message: "원본 읽기 권한 없음" })
       .mockResolvedValueOnce({ kind: "unknown", message: "전송 응답 유실" });
     const host = document.body.appendChild(document.createElement("div"));
+    const actions = createRef<EditorTabActions>();
     const root = createRoot(host);
     vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
     vi.stubGlobal("CSS", { escape: (value: string) => value.replace(/[^\w-]/g, "\\$&") });
@@ -447,9 +455,10 @@ describe("파일 편집 버퍼", () => {
       clearRect() {}, fillRect() {}, beginPath() {}, moveTo() {}, lineTo() {}, stroke() {},
     }) as unknown as CanvasRenderingContext2D);
     try {
-      await act(async () => root.render(createElement(EditorTab, {
-        file: approved, active: true, transport: { ...io, save }, confirmDiscard: async () => false, onClose() {},
-      })));
+      const props = {
+        ref: actions, file: approved, transport: { ...io, save }, confirmDiscard: async () => false, onClose() {},
+      };
+      await act(async () => root.render(createElement(EditorTab, { ...props, active: true })));
       const section = host.querySelector("section")!;
       const status = section.querySelector('output[role="status"]')!;
       const model = editor.getModel(Uri.from({ scheme: "zzabba-editor", path: "/file", query: approved.handle }))!;
@@ -466,6 +475,9 @@ describe("파일 편집 버퍼", () => {
       expect(section.querySelector("button")?.disabled).toBe(true);
       await shortcut();
       expect(save.mock.calls).toEqual([[approved.handle, "미저장"], [approved.handle, "미저장"]]);
+      await act(async () => root.render(createElement(EditorTab, { ...props, active: false })));
+      expect(section.hidden).toBe(true);
+      expect(actions.current?.closeState()).toEqual({ dirty: true, uncertain: true, pending: false });
       expect(model.getValue()).toBe("미저장");
     } finally {
       await act(async () => root.unmount());
@@ -493,6 +505,7 @@ describe("파일 편집 버퍼", () => {
       tab.model.setValue("미저장 편집본");
       disconnect?.("lost final response");
       expect(tab.state).toMatchObject({ saving: true, busy: null, dirty: true, needsReload: true, status: { kind: "unknown" } });
+      expect(tab.session.closeState()).toEqual({ dirty: true, uncertain: true, pending: true });
       const close = vi.fn();
       await tab.session.requestClose(async () => true, close);
       expect(close).not.toHaveBeenCalled();
@@ -500,6 +513,7 @@ describe("파일 편집 버퍼", () => {
       expect(tab.state).toMatchObject({ comparison: approved.text, status: { kind: "compare" }, dirty: true });
       reply.resolve();
       await saving;
+      expect(tab.session.closeState()).toEqual({ dirty: true, uncertain: true, pending: false });
       expect(io.backing.get(approved.handle)).toBe("서버가 받은 내용");
       expect(tab.state).toMatchObject({ saving: false, status: { kind: "compare" }, dirty: true, needsReload: true });
       await tab.session.compare();
@@ -528,10 +542,12 @@ describe("파일 편집 버퍼", () => {
       const reading = tab.session.reload(async () => true);
       await vi.waitFor(() => expect(reload).toHaveBeenCalledTimes(1));
       disconnect?.("다시 읽기 중 채널이 끊어졌습니다");
+      expect(tab.session.closeState().pending).toBe(true);
       await tab.session.reload(async () => true);
       expect(reload).toHaveBeenCalledTimes(1);
       reply.resolve({ kind: "read", text: "늦은 원본" });
       await reading;
+      expect(tab.session.closeState().pending).toBe(false);
       expect(tab.state).toMatchObject({ dirty: true, needsReload: true, busy: null,
         status: { kind: "disconnected", message: "다시 읽기 중 채널이 끊어졌습니다" } });
       expect(tab.text()).toBe("미저장");
@@ -545,7 +561,8 @@ describe("파일 편집 버퍼", () => {
     const io = transport(approved);
     const save = vi.fn<EditorTransport["save"]>().mockResolvedValue({ kind: "unknown", message: "응답 유실" });
     const tab = open(approved, { ...io, save });
-    const confirm = vi.fn(async () => false);
+    const confirmation = Promise.withResolvers<boolean>();
+    const confirm = vi.fn(() => confirmation.promise);
     const close = vi.fn();
     try {
       tab.model.pushEditOperations(null, [{ range: { startLineNumber: 1, startColumn: 1, endLineNumber: 1, endColumn: 1 }, text: "수정 " }], () => null);
@@ -553,7 +570,12 @@ describe("파일 편집 버퍼", () => {
       await tab.model.undo();
       expect(tab.text()).toBe(approved.text);
       expect(tab.state).toMatchObject({ dirty: true, needsReload: true });
-      await tab.session.requestClose(confirm, close);
+      expect(tab.session.closeState()).toEqual({ dirty: false, uncertain: true, pending: false });
+      const closing = tab.session.requestClose(confirm, close);
+      expect(tab.session.closeState()).toEqual({ dirty: false, uncertain: true, pending: true });
+      confirmation.resolve(false);
+      await closing;
+      expect(tab.session.closeState()).toEqual({ dirty: false, uncertain: true, pending: false });
       expect(confirm).toHaveBeenCalledWith({ handle: approved.handle, label: approved.label, reason: "close" });
       expect(close).not.toHaveBeenCalled();
     } finally {
