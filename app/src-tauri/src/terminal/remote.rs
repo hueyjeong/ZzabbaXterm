@@ -281,10 +281,10 @@ fn submitted_control_start_shutdown_case(program: &std::path::Path, exit_started
                         pending: 1, ..ControlExitReport::default()
                     }));
                     assert!(matches!(selected.control_submit.try_lock(), Err(std::sync::TryLockError::WouldBlock)));
-                    assert!(sessions.queue_control_exit(OWNER, DOCUMENT, "first", &destroy).is_err());
+                    assert!(sessions.queue_control_exit(OWNER, DOCUMENT, "first", Some(41), &destroy).is_err());
                     assert_eq!(destroy_count.get(), 0);
                     assert!(!sessions.close_ssh_probes(None));
-                    assert!(!sessions.consume_control_exit_approval());
+                    assert!(!sessions.consume_control_exit_approval(Some(41)));
                     assert_eq!(sessions.check_control_exit_ssh(OWNER, DOCUMENT, "first", |_| unreachable!()), Some(false));
                     assert_eq!(binding.admit(|| unreachable!()), Err::<(), _>(CENTRAL_UNAVAILABLE.into()));
                     sessions.release_control_exit(OWNER, DOCUMENT, "first");
@@ -324,12 +324,13 @@ fn submitted_control_start_shutdown_case(program: &std::path::Path, exit_started
         remote_unconfirmed: usize::from(exit_started), ..ControlExitReport::default()
     }));
     assert_eq!(sessions.close_ssh_probes_for_exit(OWNER, DOCUMENT, "closing"), Some(true));
-    sessions.queue_control_exit(OWNER, DOCUMENT, "closing", &destroy).unwrap();
+    sessions.queue_control_exit(OWNER, DOCUMENT, "closing", None, &destroy).unwrap();
     assert_eq!(destroy_count.get(), 1);
-    assert!(!sessions.consume_control_exit_approval());
-    sessions.destroy(OWNER);
-    assert!(sessions.consume_control_exit_approval());
-    assert!(!sessions.consume_control_exit_approval());
+    assert!(!sessions.consume_control_exit_approval(None));
+    assert_eq!(sessions.destroy(OWNER), None);
+    assert!(!sessions.consume_control_exit_approval(Some(41)));
+    assert!(sessions.consume_control_exit_approval(None));
+    assert!(!sessions.consume_control_exit_approval(None));
     assert!(program.with_file_name("History").is_file());
 }
 
@@ -364,9 +365,11 @@ fn close_attempt_release_only_affects_the_current_unsealed_document() {
 
     let document = sessions.document(OWNER);
     assert_eq!(sessions.drain_controls_for_close(OWNER, old, "navigation", Duration::ZERO), None);
-    let expired = sessions.queue_control_exit(OWNER, old, "navigation", || unreachable!());
+    let expired = sessions.queue_control_exit(OWNER, old, "navigation", Some(41), || unreachable!());
     assert_eq!(expired, Err("창 닫기 요청이 만료되었습니다".into()));
-    let failed = sessions.queue_control_exit(OWNER, document, "retry", || Err("폐기 예약 실패".into()));
+    assert_eq!(sessions.queue_control_exit(OWNER, document, "other", Some(41), || unreachable!()),
+        Err("창 닫기 요청이 만료되었습니다".into()));
+    let failed = sessions.queue_control_exit(OWNER, document, "retry", Some(42), || Err("폐기 예약 실패".into()));
     assert_eq!(failed, Err("폐기 예약 실패".into()));
 
     let central = sessions.insert_live_ssm_fixture(OWNER, document, "123456789012", "us-west-2", "i-01234567");
@@ -374,15 +377,22 @@ fn close_attempt_release_only_affects_the_current_unsealed_document() {
     assert_eq!(binding.admit(|| Ok(())), Ok(()));
     assert!(sessions.begin_control_exit(OWNER, document, "success"));
     assert_eq!(sessions.close_ssh_probes_for_exit(OWNER, document, "success"), Some(true));
-    sessions.queue_control_exit(OWNER, document, "success", || Ok(())).unwrap();
+    sessions.queue_control_exit(OWNER, document, "success", Some(43), || Ok(())).unwrap();
     sessions.release_control_exit(OWNER, document, "success");
     assert_eq!(binding.admit(|| unreachable!()), Err::<(), _>(CENTRAL_UNAVAILABLE.into()));
     sessions.navigate(OWNER);
     assert!(!sessions.begin_control_exit(OWNER, sessions.document(OWNER), "after-queue"));
-    assert!(!sessions.consume_control_exit_approval());
-    sessions.destroy(OWNER);
-    assert!(sessions.consume_control_exit_approval());
-    assert!(!sessions.consume_control_exit_approval());
+    assert_eq!(sessions.destroy("other"), None);
+    assert!(!sessions.consume_control_exit_approval(Some(43)));
+    assert_eq!(sessions.destroy(OWNER), Some(43));
+    assert_eq!(sessions.destroy(OWNER), None);
+    assert!(!sessions.consume_control_exit_approval(None));
+    assert!(!sessions.consume_control_exit_approval(Some(41)));
+    assert!(!sessions.consume_control_exit_approval(Some(42)));
+    assert!(!sessions.close_ssh_probes(None));
+    assert!(sessions.consume_control_exit_approval(Some(43)));
+    assert!(!sessions.consume_control_exit_approval(Some(43)));
+    assert!(Sessions::default().close_ssh_probes(None));
 }
 
 fn start_error(error: CliError) -> String {

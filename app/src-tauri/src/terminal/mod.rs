@@ -129,8 +129,8 @@ enum ControlExitPhase {
     Draining,
     CheckingSsh,
     Ready,
-    DestroyQueued,
-    Destroyed,
+    DestroyQueued(Option<i32>),
+    Destroyed(Option<i32>),
     Consumed,
 }
 
@@ -140,7 +140,7 @@ impl ControlExit {
     }
 
     fn sealed(&self) -> bool {
-        matches!(self.phase, ControlExitPhase::DestroyQueued | ControlExitPhase::Destroyed | ControlExitPhase::Consumed)
+        matches!(self.phase, ControlExitPhase::DestroyQueued(_) | ControlExitPhase::Destroyed(_) | ControlExitPhase::Consumed)
     }
 }
 
@@ -544,8 +544,9 @@ impl Sessions {
         self.stop_owner(owner, false);
     }
 
-    pub(crate) fn destroy(&self, owner: &str) {
-        self.stop_owner(owner, true);
+    /// 폐기 사건을 처음 받은 창의 명시적 종료 코드만 재요청한다.
+    pub(crate) fn destroy(&self, owner: &str) -> Option<i32> {
+        self.stop_owner(owner, true)
     }
 
     pub(crate) fn close_ssh_probes(&self, owner: Option<&str>) -> bool {
@@ -565,7 +566,7 @@ impl Sessions {
         confirmed
     }
 
-    fn stop_owner(&self, owner: &str, destroyed: bool) {
+    fn stop_owner(&self, owner: &str, destroyed: bool) -> Option<i32> {
         let mut registry = self.registry.lock().unwrap();
         let document = registry.documents.entry(owner.into()).or_default();
         let previous = *document;
@@ -575,12 +576,14 @@ impl Sessions {
             registry.closing.remove(owner);
             registry.destroyed.insert(owner.into());
         }
+        let mut replay = None;
         if let Some(exit) = registry.control_exit.as_mut().filter(|exit| exit.owner == owner) {
             if !exit.sealed() {
                 registry.control_exit = None;
                 self.controls_changed.notify_all();
-            } else if destroyed && exit.phase == ControlExitPhase::DestroyQueued {
-                exit.phase = ControlExitPhase::Destroyed;
+            } else if destroyed && let ControlExitPhase::DestroyQueued(code) = exit.phase {
+                exit.phase = ControlExitPhase::Destroyed(code);
+                replay = code;
             }
         }
         registry.probes.stop_owner(owner, previous);
@@ -592,6 +595,7 @@ impl Sessions {
         // 제출은 control_submit → 레지스트리 순서다. 먼저 세션을 중지하고 레지스트리 밖에서 생성 호출을 회수한다.
         drop(registry);
         for session in ssm { session.wait_control_submit(); }
+        replay
     }
 
     /// 사용자 승인 뒤에만 진입을 막고, 현재 작업의 미확인 증거는 시도가 끝나도 보존한다.
@@ -661,21 +665,22 @@ impl Sessions {
     }
 
     /// 두 레지스트리를 잠근 상태에서는 이벤트를 큐에 넣는 호출만 실행한다.
-    pub(crate) fn queue_control_exit(&self, owner: &str, document: u64, request_id: &str, destroy: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    pub(crate) fn queue_control_exit(&self, owner: &str, document: u64, request_id: &str, code: Option<i32>, destroy: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
         let mut registry = self.registry.lock().unwrap();
         if !registry.controls.is_empty() { return Err("전용 제어 작업 종료 대기 중".into()); }
         if !registry.control_exit_in(owner, document, request_id, ControlExitPhase::Ready) {
             return Err("창 닫기 요청이 만료되었습니다".into());
         }
-        registry.control_exit.as_mut().unwrap().phase = ControlExitPhase::DestroyQueued;
+        registry.control_exit.as_mut().unwrap().phase = ControlExitPhase::DestroyQueued(code);
         let result = destroy();
         if result.is_err() { registry.control_exit = None; }
         result
     }
 
-    pub(crate) fn consume_control_exit_approval(&self) -> bool {
+    /// 마지막 창의 자동 종료는 `None`, 명시적 재요청은 예약한 코드와 일치해야 한다.
+    pub(crate) fn consume_control_exit_approval(&self, code: Option<i32>) -> bool {
         let mut registry = self.registry.lock().unwrap();
-        let Some(exit) = registry.control_exit.as_mut().filter(|exit| exit.phase == ControlExitPhase::Destroyed) else { return false; };
+        let Some(exit) = registry.control_exit.as_mut().filter(|exit| exit.phase == ControlExitPhase::Destroyed(code)) else { return false; };
         exit.phase = ControlExitPhase::Consumed;
         true
     }
