@@ -1,5 +1,7 @@
 use std::{
     collections::HashMap,
+    fs::File,
+    io,
     path::Path,
     sync::{Arc, Mutex},
 };
@@ -56,6 +58,7 @@ pub(super) enum EditorError {
     InvalidUtf8,
     ReadFailed { os_code: Option<i32> },
     SaveFailed { stage: SaveStage, os_code: Option<i32> },
+    PublicationUnconfirmed { recovery_path: String },
     Conflict { conflict: Conflict },
     Unavailable,
 }
@@ -111,6 +114,10 @@ impl From<SaveError> for EditorError {
         match error {
             SaveError::Conflict(conflict) => conflict.into(),
             SaveError::Io { stage, source } => Self::SaveFailed { stage, os_code: source.raw_os_error() },
+            SaveError::Revoked => Self::DocumentClosed,
+            SaveError::PublicationUnconfirmed { recovery_path } => Self::PublicationUnconfirmed {
+                recovery_path: recovery_path.to_str().map_or_else(|| format!("{recovery_path:?}"), str::to_owned),
+            },
         }
     }
 }
@@ -218,7 +225,22 @@ impl LocalEditors {
     }
 
     pub(super) fn save(&self, label: &str, document: Document, handle: &str, text: &str) -> Result<(), EditorError> {
-        self.with_file(label, document, handle, |file| file.save(text).map_err(Into::into))
+        self.save_with_sync(label, document, handle, text, File::sync_all)
+    }
+
+    pub(super) fn save_with_sync(
+        &self, label: &str, document: Document, handle: &str, text: &str,
+        sync: impl FnOnce(&File) -> io::Result<()>,
+    ) -> Result<(), EditorError> {
+        let file = Arc::clone(self.0.lock().unwrap().file(label, document, handle)?);
+        let mut file = file.lock().map_err(|_| EditorError::Unavailable)?;
+        self.0.lock().unwrap().file(label, document, handle)?;
+        file.save_checked(text, sync, || {
+            // 파일 게시와 기준 갱신이 끝날 때까지 문서와 탭을 유지한다.
+            let registry = self.0.lock().unwrap();
+            registry.file(label, document, handle).map_err(|_| SaveError::Revoked)?;
+            Ok(registry)
+        }).map_err(Into::into)
     }
 
     pub(super) fn compare(&self, label: &str, document: Document, handle: &str) -> Result<String, EditorError> {

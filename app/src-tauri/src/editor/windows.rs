@@ -336,6 +336,16 @@ impl Access {
         Ok(access)
     }
 
+    pub(super) fn read_editor(file: &File) -> io::Result<Self> {
+        check_auxiliary_data(file)?;
+        Self::read(file)
+    }
+
+    pub(super) fn matches_editor(&self, file: &File) -> io::Result<bool> {
+        check_auxiliary_data(file)?;
+        self.matches(file)
+    }
+
     pub(super) fn matches(&self, file: &File) -> io::Result<bool> {
         let other = Self::read(file)?;
         // SAFETY: owner and group SIDs are held by the two live descriptors.
@@ -516,8 +526,34 @@ impl Temporary<'_> {
         self.rename(name, replace).map(drop)
     }
 
-    pub(super) fn replace(self, name: &OsStr) -> io::Result<File> {
-        self.rename(name, true)
+    pub(super) fn publish_editor(
+        self,
+        name: &OsStr,
+        expected: &File,
+        verify: impl FnOnce(&File) -> io::Result<()>,
+    ) -> Result<File, DownloadPublicationError> {
+        self.publish_editor_inner(name, expected, verify, || {})
+    }
+
+    fn publish_editor_inner(
+        self,
+        name: &OsStr,
+        expected: &File,
+        verify: impl FnOnce(&File) -> io::Result<()>,
+        after_backup: impl FnOnce(),
+    ) -> Result<File, DownloadPublicationError> {
+        let directory = self.directory;
+        self.publish_existing(
+            name,
+            expected,
+            |file| verify(file),
+            after_backup,
+            |published| {
+                // 공유를 막는 임시 핸들을 닫아야 원래 이름으로 읽기 핸들을 열 수 있다.
+                drop(published);
+                directory.open_file(name)?.ok_or_else(|| io::ErrorKind::NotFound.into())
+            },
+        )
     }
 
     pub(super) fn publish_download(
@@ -530,12 +566,23 @@ impl Temporary<'_> {
     }
 
     fn publish_download_inner(
-        mut self,
+        self,
         name: &OsStr,
         current: &File,
         verify: impl FnOnce(&mut File) -> io::Result<()>,
         after_backup: impl FnOnce(),
     ) -> Result<(), DownloadPublicationError> {
+        self.publish_existing(name, current, verify, after_backup, Ok).map(drop)
+    }
+
+    fn publish_existing(
+        mut self,
+        name: &OsStr,
+        current: &File,
+        verify: impl FnOnce(&mut File) -> io::Result<()>,
+        after_backup: impl FnOnce(),
+        retain: impl FnOnce(File) -> io::Result<File>,
+    ) -> Result<File, DownloadPublicationError> {
         let directory = self.directory;
         let backup = temporary_name()?;
         let original_id = file_id(current)?;
@@ -544,15 +591,14 @@ impl Temporary<'_> {
         if file_id(&original)? != original_id {
             return Err(io::Error::from(io::ErrorKind::AlreadyExists).into());
         }
-        let access = Access::read(&original)?;
+        let access = Access::read_editor(&original)?;
         let staged_id = file_id(self.file())?;
-        check_auxiliary_data(&original)?;
         verify(&mut original)?;
         if directory.entry_id(name)? != Some(original_id) {
             return Err(io::Error::from(io::ErrorKind::AlreadyExists).into());
         }
         access.finish_staging(self.file())?;
-        if !directory.still_at_path()? {
+        if !directory.still_at_path()? || !access.matches_editor(&original)? {
             return Err(io::Error::from(io::ErrorKind::AlreadyExists).into());
         }
 
@@ -570,17 +616,18 @@ impl Temporary<'_> {
         };
         after_backup();
         if directory.entry_id(&backup).ok() != Some(Some(original_id))
-            || !matches!(access.matches(&original), Ok(true))
+            || !matches!(access.matches_editor(&original), Ok(true))
             || !matches!(directory.still_at_path(), Ok(true))
         {
             return Err(unconfirmed());
         }
         rename_at(directory, self.file(), name, 0).map_err(|_| unconfirmed())?;
-        // Retain the exclusive handle, but disarm staging cleanup as soon as the name is public.
+        // 게시가 끝나면 임시 파일 정리를 해제한다.
         let published = self.file.take().expect("temporary file is open");
+        let published = retain(published).map_err(|_| unconfirmed())?;
         if access.finish_staging(&published).is_err()
-            || !matches!(access.matches(&original), Ok(true))
-            || check_auxiliary_data(&original).is_err()
+            || file_id(&published).ok() != Some(staged_id)
+            || !matches!(access.matches_editor(&original), Ok(true))
             || directory.entry_id(name).ok() != Some(Some(staged_id))
             || directory.entry_id(&backup).ok() != Some(Some(original_id))
             || !matches!(directory.still_at_path(), Ok(true))
@@ -604,7 +651,7 @@ impl Temporary<'_> {
             return Err(unconfirmed());
         }
         drop(original);
-        Ok(())
+        Ok(published)
     }
 
     fn rename(mut self, name: &OsStr, replace: bool) -> io::Result<File> {
@@ -798,5 +845,172 @@ mod tests {
             }
             assert_eq!(fs::read_dir(&directory.path).unwrap().count(), 1 + usize::from(claimed));
         }
+    }
+
+    #[test]
+    fn editor_returns_a_reader_or_preserves_both_original_and_late_claim() {
+        use std::{fs, io::{Read, Write}};
+
+        for claimed in [false, true] {
+            let sandbox = tempfile::tempdir().unwrap();
+            let directory = Directory::open(fs::canonicalize(sandbox.path()).unwrap()).unwrap();
+            let name = OsStr::new("target.txt");
+            let path = directory.path.join(name);
+            fs::write(&path, b"original").unwrap();
+            let current = directory.open_file(name).unwrap().unwrap();
+            let access = Access::read_editor(&current).unwrap();
+            let mut stage = directory.stage(Some(&access)).unwrap();
+            stage.file().write_all(b"edited").unwrap();
+            let staged_id = file_id(stage.file()).unwrap();
+            let result = stage.publish_editor_inner(name, &current, |mut file| {
+                let mut bytes = [0; 8];
+                file.read_exact(&mut bytes)?;
+                assert_eq!(&bytes, b"original");
+                Ok(())
+            }, || {
+                if claimed {
+                    File::create_new(&path).unwrap().write_all(b"outside").unwrap();
+                }
+            });
+            if claimed {
+                let Err(DownloadPublicationError::Unconfirmed(recovery)) = result else {
+                    panic!("{result:?}");
+                };
+                assert_eq!(fs::read(recovery).unwrap(), b"original");
+                assert_eq!(fs::read(&path).unwrap(), b"outside");
+            } else {
+                let mut file = result.unwrap();
+                let mut bytes = [0; 6];
+                file.read_exact(&mut bytes).unwrap();
+                assert_eq!(&bytes, b"edited");
+                assert_eq!(file_id(&file).unwrap(), staged_id);
+                assert_eq!(directory.entry_id(name).unwrap(), Some(staged_id));
+            }
+            assert_eq!(fs::read_dir(&directory.path).unwrap().count(), 1 + usize::from(claimed));
+        }
+    }
+
+    #[test]
+    fn editor_preserves_auxiliary_data_on_rejection() {
+        use std::{fs, io::Write};
+
+        for kind in ["ADS", "EA", "hard link"] {
+            let sandbox = tempfile::tempdir().unwrap();
+            let directory = Directory::open(fs::canonicalize(sandbox.path()).unwrap()).unwrap();
+            let name = OsStr::new("target.txt");
+            let path = directory.path.join(name);
+            let stream = directory.path.join("target.txt:outside");
+            let link = directory.path.join("outside.txt");
+            fs::write(&path, b"original").unwrap();
+            let current = directory.open_file(name).unwrap().unwrap();
+            let access = Access::read_editor(&current).unwrap();
+            let mut stage = directory.stage(Some(&access)).unwrap();
+            stage.file().write_all(b"edited").unwrap();
+
+            #[repr(align(4))]
+            struct EaRecord([u8; 17]);
+            // FILE_FULL_EA_INFORMATION: 다음 항목 없음, 이름 X, 값 outside.
+            let ea = EaRecord(*b"\0\0\0\0\0\x01\x07\0X\0outside");
+            match kind {
+                "ADS" => fs::write(&stream, b"outside").unwrap(),
+                "EA" => {
+                    let file = reopen(&current, FILE_WRITE_EA, SHARE).unwrap();
+                    // SAFETY: 동기 파일 핸들과 EA 레코드가 호출 동안 유효하다.
+                    let status = unsafe {
+                        NtSetEaFile(file.as_raw_handle(), &mut IO_STATUS_BLOCK::default(),
+                            ea.0.as_ptr().cast(), ea.0.len() as u32)
+                    };
+                    assert_eq!(status, 0, "{}", nt_error(status));
+                }
+                _ => fs::hard_link(&path, &link).unwrap(),
+            }
+
+            assert!(access.matches_editor(&current).is_err(), "{kind}");
+            assert!(matches!(stage.publish_editor(name, &current, |_| Ok(())),
+                Err(DownloadPublicationError::Io(_))), "{kind}");
+            assert_eq!(fs::read(&path).unwrap(), b"original");
+            match kind {
+                "ADS" => assert_eq!(fs::read(&stream).unwrap(), b"outside"),
+                "EA" => {
+                    let mut output = [0u32; 8];
+                    let file = File::open(&path).unwrap();
+                    // SAFETY: 동기 파일 핸들과 정렬된 쓰기 버퍼가 호출 동안 유효하다.
+                    let status = unsafe {
+                        NtQueryEaFile(file.as_raw_handle(), &mut IO_STATUS_BLOCK::default(),
+                            output.as_mut_ptr().cast(), size_of_val(&output) as u32,
+                            1, null(), 0, null(), 1)
+                    };
+                    assert_eq!(status, 0, "{}", nt_error(status));
+                    // SAFETY: 데이터 범위가 초기화된 출력 버퍼 안에 있다.
+                    let bytes = unsafe { slice::from_raw_parts(output.as_ptr().cast::<u8>(), ea.0.len()) };
+                    assert_eq!(bytes, ea.0);
+                }
+                _ => assert_eq!(fs::read(&link).unwrap(), b"original"),
+            }
+            assert_eq!(fs::read_dir(&directory.path).unwrap().count(), if kind == "hard link" { 2 } else { 1 });
+        }
+    }
+
+    #[test]
+    fn editor_preserves_changes_made_before_the_original_is_frozen() {
+        use std::{fs, io::{Read, Write}};
+
+        for replaced in [false, true] {
+            let sandbox = tempfile::tempdir().unwrap();
+            let directory = Directory::open(fs::canonicalize(sandbox.path()).unwrap()).unwrap();
+            let name = OsStr::new("target.txt");
+            let path = directory.path.join(name);
+            let moved = directory.path.join("moved.txt");
+            fs::write(&path, b"original").unwrap();
+            let current = directory.open_file(name).unwrap().unwrap();
+            let access = Access::read_editor(&current).unwrap();
+            let mut stage = directory.stage(Some(&access)).unwrap();
+            stage.file().write_all(b"edited").unwrap();
+            if replaced {
+                fs::rename(&path, &moved).unwrap();
+            }
+            fs::write(&path, b"external").unwrap();
+            let result = stage.publish_editor(name, &current, |mut file| {
+                let mut bytes = [0; 8];
+                file.read_exact(&mut bytes)?;
+                if &bytes != b"original" {
+                    return Err(io::ErrorKind::InvalidData.into());
+                }
+                Ok(())
+            });
+            let Err(DownloadPublicationError::Io(error)) = result else { panic!("{result:?}") };
+            let expected = if replaced { io::ErrorKind::AlreadyExists } else { io::ErrorKind::InvalidData };
+            assert_eq!(error.kind(), expected);
+            assert_eq!(fs::read(&path).unwrap(), b"external");
+            if replaced {
+                assert_eq!(fs::read(&moved).unwrap(), b"original");
+            }
+            assert_eq!(fs::read_dir(&directory.path).unwrap().count(), 1 + usize::from(replaced));
+        }
+    }
+
+    #[test]
+    fn editor_preserves_an_open_writers_content_on_sharing_violation() {
+        use std::{fs, io::Write};
+        use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+
+        let sandbox = tempfile::tempdir().unwrap();
+        let directory = Directory::open(fs::canonicalize(sandbox.path()).unwrap()).unwrap();
+        let name = OsStr::new("target.txt");
+        let path = directory.path.join(name);
+        fs::write(&path, b"original").unwrap();
+        let current = directory.open_file(name).unwrap().unwrap();
+        let access = Access::read_editor(&current).unwrap();
+        let mut stage = directory.stage(Some(&access)).unwrap();
+        stage.file().write_all(b"edited").unwrap();
+        let mut writer = File::options().append(true).share_mode(SHARE).open(&path).unwrap();
+        writer.write_all(b" outside").unwrap();
+        let result = stage.publish_editor(name, &current, |_| panic!("writer still holds the original"));
+        let Err(DownloadPublicationError::Io(error)) = result else { panic!("{result:?}") };
+        assert_eq!(error.raw_os_error(), Some(ERROR_SHARING_VIOLATION as i32));
+        writer.write_all(b" writer").unwrap();
+        drop(writer);
+        assert_eq!(fs::read(&path).unwrap(), b"original outside writer");
+        assert_eq!(fs::read_dir(&directory.path).unwrap().count(), 1);
     }
 }
