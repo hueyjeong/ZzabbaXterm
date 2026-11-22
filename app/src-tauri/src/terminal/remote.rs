@@ -1,7 +1,8 @@
 use portable_pty::{Child, PtyPair, PtySize};
+use std::sync::Arc;
 
-use crate::ssm::{AwsCli, CancellationToken, CliError, Scope, SessionDocument, StartRequest};
-use super::LiveSsmIdentity;
+use crate::ssm::{AwsCli, CancellationToken, CliError, Scope, SessionDocument, StartPermit, StartRequest};
+use super::{ControlBinding, LiveSsmIdentity};
 
 const START_DIAGNOSTIC_LIMIT: usize = 8 * 1024;
 
@@ -53,6 +54,12 @@ impl Target {
         })
     }
 
+    pub(super) async fn prepare_control(&self, binding: &Arc<ControlBinding>) -> Result<Remote, String> {
+        let mut remote = self.prepare(Some(binding.identity()), binding.cancel_token()).await?;
+        remote.control = Some(Arc::clone(binding));
+        Ok(remote)
+    }
+
     pub(super) async fn prepare(&self, central: Option<&LiveSsmIdentity>, cancel: &CancellationToken) -> Result<Remote, String> {
         let document = match central {
             Some(identity) if self.scope.profile() == identity.profile && self.scope.region() == identity.region
@@ -67,7 +74,7 @@ impl Target {
         if let Some(program) = &self.fixture {
             if central.is_some() { return Err(start_error(CliError::InvalidTarget)); }
             let (cli, scope, request, permit) = crate::ssm::fixture_start(program);
-            return Ok(Remote { cli, scope, request, spawned: false, fixture: Some(permit), is_fixture: true });
+            return Ok(Remote { cli, scope, request, spawned: false, control: None, fixture: Some(permit), is_fixture: true });
         }
         let cli = AwsCli::probe(cancel).await.map_err(start_error)?;
         let node = cli.online_nodes(&self.scope, cancel).await.map_err(start_error)?
@@ -77,6 +84,7 @@ impl Target {
         let request = cli.prepare_document_start(&self.scope, &node, document, cancel).map_err(start_error)?;
         Ok(Remote {
             cli, scope: self.scope.clone(), request, spawned: false,
+            control: None,
             #[cfg(test)]
             fixture: None,
             #[cfg(test)]
@@ -119,8 +127,9 @@ pub(super) struct Remote {
     scope: Scope,
     request: StartRequest,
     spawned: bool,
+    control: Option<Arc<ControlBinding>>,
     #[cfg(test)]
-    fixture: Option<crate::ssm::StartPermit>,
+    fixture: Option<StartPermit>,
     #[cfg(test)]
     is_fixture: bool,
 }
@@ -139,20 +148,23 @@ impl Remote {
     }
 
     pub(super) fn spawn(&mut self, size: PtySize, cancel: &CancellationToken) -> Result<(PtyPair, Box<dyn Child + Send + Sync>), String> {
-        #[cfg(test)]
-        if let Some(permit) = self.fixture.take() {
-            return self.record_spawn(permit.spawn_fixture(size));
-        }
-        let permit = tauri::async_runtime::block_on(self.cli.authorize_start(&mut self.request, &self.scope, cancel))
-            .map_err(start_error)?.ok_or_else(|| start_error(CliError::Cancelled))?;
-        if cancel.is_cancelled() { return Err(start_error(CliError::Cancelled)); }
-        self.record_spawn(permit.spawn(size))
-    }
-
-    fn record_spawn(&mut self, child: std::io::Result<(PtyPair, Box<dyn Child + Send + Sync>)>) -> Result<(PtyPair, Box<dyn Child + Send + Sync>), String> {
-        let child = child.map_err(|_| "SSM PTY: 시작 실패".to_owned())?;
+        let control = self.control.take();
+        let cancel = control.as_deref().map_or(cancel, ControlBinding::cancel_token);
+        let permit = self.authorize(cancel)?;
+        let child = start_authorized(permit, cancel, control.as_deref(), |permit| {
+            #[cfg(test)]
+            if self.is_fixture { return permit.spawn_fixture(size); }
+            permit.spawn(size)
+        })?.map_err(|_| "SSM PTY: 시작 실패".to_owned())?;
         self.spawned = true;
         Ok(child)
+    }
+
+    fn authorize(&mut self, cancel: &CancellationToken) -> Result<StartPermit, String> {
+        #[cfg(test)]
+        if let Some(permit) = self.fixture.take() { return Ok(permit); }
+        tauri::async_runtime::block_on(self.cli.authorize_start(&mut self.request, &self.scope, cancel))
+            .map_err(start_error)?.ok_or_else(|| start_error(CliError::Cancelled))
     }
 
     pub(super) fn wait_connected(&self, cancel: &CancellationToken, work_tab: bool) -> Result<Option<SsmIdentity>, String> {
@@ -183,6 +195,21 @@ impl Remote {
     pub(super) fn recheck_closed(&self) -> bool {
         tauri::async_runtime::block_on(self.cli.recheck_closed(&self.request, &self.scope)).is_ok()
     }
+}
+
+pub(crate) fn start_authorized<T>(permit: StartPermit, cancel: &CancellationToken, control: Option<&ControlBinding>, start: impl FnOnce(StartPermit) -> T) -> Result<T, String> {
+    let require_active = || {
+        if let Some(binding) = control { binding.check_request()?; }
+        if cancel.is_cancelled() { Err(start_error(CliError::Cancelled)) } else { Ok(()) }
+    };
+    // 거절된 허가가 보유한 플러그인과 자격 증명도 잠금 밖에서 해제한다.
+    let mut permit = Some(permit);
+    let permit = match control {
+        Some(binding) => binding.admit(|| { require_active()?; Ok(permit.take().unwrap()) })?,
+        None => permit.take().unwrap(),
+    };
+    require_active()?;
+    Ok(start(permit))
 }
 
 fn start_error(error: CliError) -> String {

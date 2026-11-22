@@ -8,7 +8,8 @@ use portable_pty::PtySize;
 use crate::{
     ssm::CancellationToken,
     terminal::{
-        CloseResult, Event, LiveSsmIdentity, Sessions,
+        CENTRAL_UNAVAILABLE as UNAVAILABLE, CONTROL_CANCELLED as CANCELLED, CloseResult,
+        ControlBinding, Event, LiveSsmIdentity, Sessions,
         process::{Launch, Session, Stop},
         remote::Target,
     },
@@ -19,9 +20,7 @@ const READ_TIMEOUT: Duration = Duration::from_secs(15);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(10);
 const MAX_INPUT: usize = 4096;
-const CANCELLED: &str = "제어 세션이 취소되었습니다";
 const TIMED_OUT: &str = "제어 세션 대기 시간이 초과되었습니다";
-const UNAVAILABLE: &str = "선택한 중앙 SSM 세션을 확인할 수 없습니다";
 
 #[derive(Debug)]
 pub(crate) enum Output {
@@ -31,15 +30,12 @@ pub(crate) enum Output {
     CliExited(u32),
 }
 
-/// 중앙 세션은 신원 확인에만 사용하며, 새 PTY는 세션 레지스트리나 IPC에 등록하지 않는다.
+/// 독립 PTY의 수명을 중앙 세션에 결부한다. PTY는 세션 레지스트리나 IPC에 등록하지 않는다.
 #[must_use]
-pub(crate) struct ControlTransport<'a> {
-    sessions: &'a Sessions,
-    owner: &'a str,
-    identity: &'a LiveSsmIdentity,
+pub(crate) struct ControlTransport {
+    binding: Arc<ControlBinding>,
     session: Arc<Session>,
     output: mpsc::Receiver<Event>,
-    cancel: CancellationToken,
     open_deadline: Instant,
     connected: bool,
     received: u64,
@@ -47,34 +43,28 @@ pub(crate) struct ControlTransport<'a> {
     cursor_query: usize,
 }
 
-impl<'a> ControlTransport<'a> {
+impl ControlTransport {
     /// 승인된 중앙 세션과 프로필로 블로킹 작업자에서 독립 운반을 연다.
     pub(crate) fn open(
-        sessions: &'a Sessions,
-        owner: &'a str,
-        identity: &'a LiveSsmIdentity,
+        sessions: &Sessions,
+        owner: &str,
+        identity: &LiveSsmIdentity,
         cancel: &CancellationToken,
     ) -> Result<Self, String> {
-        if cancel.is_cancelled() {
-            return Err(CANCELLED.into());
-        }
-        require_live(sessions, owner, identity)?;
-        if identity.role.is_none() {
-            return Err(UNAVAILABLE.into());
-        }
+        let binding = sessions.bind_ssm_control(owner, identity, cancel)?;
         let target = Target::new(&identity.profile, &identity.region, &identity.instance_id)?;
-        let session = Arc::new(Session::dedicated(cancel.child_token()));
+        let session = Arc::new(Session::dedicated(&binding));
         // 미확인 PTY 출력 크레딧이 바이트 큐를 제한한다. 블로킹 전송은 종료를 막을 수 있다.
         let (tx, output) = mpsc::channel();
         let open_deadline = Instant::now() + OPEN_TIMEOUT;
         let transport = Self {
-            sessions, owner, identity, session, output, cancel: cancel.clone(),
+            binding, session, output,
             open_deadline, connected: false, received: 0,
             #[cfg(windows)]
             cursor_query: 0,
         };
         let result = transport.session.launch(
-            PtySize::default(), Launch::AiControl(target, identity.clone()),
+            PtySize::default(), Launch::AiControl(target, Arc::clone(&transport.binding)),
             move |event| tx.send(event).map_err(|_| CANCELLED.into()),
             |_| {},
         ).and_then(|()| transport.session.start_until(Some(open_deadline)));
@@ -104,7 +94,7 @@ impl<'a> ControlTransport<'a> {
                 Event::Connecting => continue,
                 Event::Ready { account_id } => {
                     self.require_active()?;
-                    if account_id != self.identity.account_id || !self.session.connected() {
+                    if account_id != self.binding.identity().account_id || !self.session.connected() {
                         return Err(UNAVAILABLE.into());
                     }
                     self.connected = true;
@@ -138,7 +128,7 @@ impl<'a> ControlTransport<'a> {
                 self.cursor_query += 1;
                 if self.cursor_query == QUERY.len() {
                     // ConPTY의 초기 커서 상속 질의에 한 번만 응답한다.
-                    return self.session.control_input(b"\x1b[1;1R", Instant::now() + WRITE_TIMEOUT);
+                    return self.session.control_input(&self.binding, b"\x1b[1;1R", Instant::now() + WRITE_TIMEOUT, false);
                 }
             } else {
                 self.cursor_query = usize::from(byte == QUERY[0]);
@@ -169,10 +159,7 @@ impl<'a> ControlTransport<'a> {
     }
 
     fn require_active(&self) -> Result<(), String> {
-        if self.cancel.is_cancelled() {
-            return Err(CANCELLED.into());
-        }
-        require_live(self.sessions, self.owner, self.identity)
+        self.binding.admit(|| Ok(()))
     }
 
     /// 공식 연결 확인 후에만 프레임을 넣는다. 부분 쓰기 오류는 세션을 닫고 반환한다.
@@ -180,12 +167,11 @@ impl<'a> ControlTransport<'a> {
         if bytes.is_empty() || bytes.len() > MAX_INPUT {
             return Err("제어 세션 입력 크기가 범위를 벗어났습니다".into());
         }
-        let result = self.require_active().and_then(|()| {
-            if !self.connected || !self.session.connected() {
-                return Err("공식 SSM 연결을 확인할 수 없습니다".into());
-            }
-            self.session.control_input(bytes, Instant::now() + WRITE_TIMEOUT)
-        });
+        let result = if self.connected {
+            self.session.control_input(&self.binding, bytes, Instant::now() + WRITE_TIMEOUT, true)
+        } else {
+            self.require_active().and(Err("공식 SSM 연결을 확인할 수 없습니다".into()))
+        };
         if let Err(error) = &result {
             self.session.stop(Stop::Disconnected(error.clone()));
         }
@@ -200,14 +186,10 @@ impl<'a> ControlTransport<'a> {
     }
 }
 
-impl Drop for ControlTransport<'_> {
+impl Drop for ControlTransport {
     fn drop(&mut self) {
         self.session.stop(Stop::Closed);
     }
-}
-
-fn require_live(sessions: &Sessions, owner: &str, identity: &LiveSsmIdentity) -> Result<(), String> {
-    sessions.with_live_ssm_session(owner, identity, || ()).ok_or_else(|| UNAVAILABLE.into())
 }
 
 #[cfg(test)]

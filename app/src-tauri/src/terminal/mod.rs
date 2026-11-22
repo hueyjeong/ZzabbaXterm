@@ -1,4 +1,5 @@
 use crate::connections::probe::Runs;
+use crate::ssm::CancellationToken;
 use portable_pty::{CommandBuilder, PtySize};
 use std::{
     collections::{HashMap, HashSet},
@@ -79,6 +80,57 @@ pub(crate) struct LiveSsmIdentity {
     pub(crate) instance_id: String,
 }
 
+pub(crate) const CONTROL_CANCELLED: &str = "제어 세션이 취소되었습니다";
+pub(crate) const CENTRAL_UNAVAILABLE: &str = "선택한 중앙 SSM 세션을 확인할 수 없습니다";
+
+pub(crate) struct ControlBinding {
+    registry: Arc<Mutex<Registry>>,
+    owner: String,
+    identity: LiveSsmIdentity,
+    request: CancellationToken,
+    cancel: CancellationToken,
+}
+
+impl ControlBinding {
+    pub(crate) fn identity(&self) -> &LiveSsmIdentity {
+        &self.identity
+    }
+
+    pub(crate) fn cancel_token(&self) -> &CancellationToken {
+        &self.cancel
+    }
+
+    #[cfg(test)]
+    pub(crate) fn registry_unlocked_fixture(&self) -> bool {
+        self.registry.try_lock().is_ok()
+    }
+
+    pub(crate) fn forward_request_cancel(&self) {
+        let request = self.request.clone();
+        let cancel = self.cancel.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::select! {
+                _ = cancel.cancelled() => {},
+                _ = request.cancelled() => cancel.cancel(),
+            };
+        });
+    }
+
+    fn check_request(&self) -> Result<(), String> {
+        if self.request.is_cancelled() { Err(CONTROL_CANCELLED.into()) } else { Ok(()) }
+    }
+
+    // 여기서는 시작 허가 이동과 입력 예약만 처리한다. AWS 조회와 PTY 입출력은 잠금 밖에서 처리한다.
+    pub(crate) fn admit<T>(&self, action: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+        let registry = self.registry.lock().unwrap();
+        self.check_request()?;
+        registry.with_live_ssm_session(&self.owner, &self.identity, |_| {
+            self.check_request()?;
+            action()
+        }).ok_or(CENTRAL_UNAVAILABLE)?
+    }
+}
+
 #[derive(Default)]
 struct Registry {
     sessions: HashMap<String, Arc<Session>>,
@@ -101,6 +153,14 @@ impl Registry {
         let session = self.sessions.get(id)?;
         (session.owner == owner && session.document == Some(document)).then(|| session.as_ref())
     }
+
+    fn with_live_ssm_session<T>(&self, owner: &str, identity: &LiveSsmIdentity, check: impl FnOnce(&CancellationToken) -> T) -> Option<T> {
+        self.main_session(owner, identity.document, &identity.id)?.with_ssm_identity(|live, cancel| {
+            (live.account_id == identity.account_id && live.profile == identity.profile
+                && live.region == identity.region && live.instance_id == identity.instance_id
+                && live.role == identity.role).then(|| check(cancel))
+        }).flatten()
+    }
 }
 
 impl Sessions {
@@ -115,7 +175,7 @@ impl Sessions {
 
     pub(crate) fn live_ssm_identity(&self, owner: &str, document: u64, id: &str) -> Option<LiveSsmIdentity> {
         let registry = self.registry.lock().unwrap();
-        registry.main_session(owner, document, id)?.with_ssm_identity(|identity| LiveSsmIdentity {
+        registry.main_session(owner, document, id)?.with_ssm_identity(|identity, _| LiveSsmIdentity {
             id: id.into(),
             document,
             account_id: identity.account_id.clone(),
@@ -128,12 +188,17 @@ impl Sessions {
 
     // 콜백은 두 잠금 아래에서 실행되므로 터미널에 다시 접근하거나 대기하면 안 된다.
     pub(crate) fn with_live_ssm_session<T>(&self, owner: &str, identity: &LiveSsmIdentity, check: impl FnOnce() -> T) -> Option<T> {
-        let registry = self.registry.lock().unwrap();
-        registry.main_session(owner, identity.document, &identity.id)?.with_ssm_identity(|live| {
-            (live.account_id == identity.account_id && live.profile == identity.profile
-                && live.region == identity.region && live.instance_id == identity.instance_id
-                && live.role == identity.role).then(check)
-        }).flatten()
+        self.registry.lock().unwrap().with_live_ssm_session(owner, identity, |_| check())
+    }
+
+    pub(crate) fn bind_ssm_control(&self, owner: &str, identity: &LiveSsmIdentity, request: &CancellationToken) -> Result<Arc<ControlBinding>, String> {
+        if request.is_cancelled() { return Err(CONTROL_CANCELLED.into()); }
+        if identity.role.is_none() { return Err(CENTRAL_UNAVAILABLE.into()); }
+        let cancel = self.registry.lock().unwrap()
+            .with_live_ssm_session(owner, identity, CancellationToken::child_token).ok_or(CENTRAL_UNAVAILABLE)?;
+        Ok(Arc::new(ControlBinding {
+            registry: Arc::clone(&self.registry), owner: owner.into(), identity: identity.clone(), request: request.clone(), cancel,
+        }))
     }
 
     pub(crate) fn with_probes<T>(&self, owner: &str, document: u64, use_probes: impl FnOnce(&mut Runs) -> Result<T, String>) -> Result<T, String> {
