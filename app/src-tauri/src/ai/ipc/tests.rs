@@ -67,6 +67,7 @@ fn stored_generation_and_document_gate_late_results_and_decisions() {
 #[test]
 fn cli_receipt_requires_saved_revision_and_a_one_shot_local_review() {
     let root = TestDir::new();
+    let ssh = connections::tests::ssh_draft(root.path());
     let draft = draft(root.path(), "work", "local-a");
     fs::write(root.path().join("connections.json"), json!({
         "version": 1,
@@ -74,14 +75,17 @@ fn cli_receipt_requires_saved_revision_and_a_one_shot_local_review() {
         "targets": [
             {"revision": 1,"profile": draft["target"]},
             {"revision": 4,"profile": {"id":"ssm-a", "groupId":"work", "displayName":"원격 시험",
-                "defaultMethod":"ssm", "ssm":{"profile":"fixture-secret", "region":"ap-northeast-2", "instanceId":"i-0123456789abcdef0"}}}
+                "defaultMethod":"ssm", "ssm":{"profile":"fixture-secret", "region":"ap-northeast-2", "instanceId":"i-0123456789abcdef0"}}},
+            {"revision": 5,"profile": ssh["target"]}
         ]
     }).to_string()).unwrap();
     let aliases = serde_json::to_value(connections::ai_aliases(root.path()).unwrap()).unwrap();
+    assert_eq!(aliases.as_array().unwrap().len(), 2);
     assert_eq!(aliases[1], json!({"id":"ssm-a", "method":"ssm", "displayName":"원격 시험", "generation":"4"}));
     assert!(!aliases.to_string().contains("fixture-secret"));
     assert!(!aliases.to_string().contains("i-0123456789abcdef0"));
     let targets = connections::with_ai_targets(root.path(), |targets| targets).unwrap();
+    assert_eq!(targets.len(), 2);
     let state = State::default();
     let request = |generation: &str| CliProposal { target_id: "ssm-a".into(), generation: generation.into(), operation: Query::Uptime };
     let deadline = Instant::now() + Duration::from_secs(3);

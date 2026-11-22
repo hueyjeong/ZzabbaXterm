@@ -216,7 +216,7 @@ fn dispatch(request: Request, requests: &impl Requests, deadline: Instant) -> Re
             .list()
             .map(|connections| Receipt::Listed { connections }),
         Request::Draft { draft } => requests
-            .open_draft(draft.validate().map_err(|_| Error::InvalidRequest)?, deadline)
+            .open_draft(validate_draft(draft)?, deadline)
             .map(|draft_id| Receipt::Drafted { draft_id }),
         Request::Propose { proposal } => {
             proposal.validate()?;
@@ -226,6 +226,14 @@ fn dispatch(request: Request, requests: &impl Requests, deadline: Instant) -> Re
         }
     };
     result.map_err(|_| Error::Rejected)
+}
+
+fn validate_draft(draft: Draft) -> Result<ValidatedDraft> {
+    let draft = draft.validate().map_err(|_| Error::InvalidRequest)?;
+    if matches!(draft.method(), connections::profile::MethodRef::Ssh { .. }) {
+        return Err(Error::InvalidRequest);
+    }
+    Ok(draft)
 }
 
 fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
@@ -251,7 +259,7 @@ fn parse(command: &str, input: impl Read) -> Result<Outbound> {
     if command == "draft" {
         let draft: Draft = decode(&bytes)?;
         Ok(Outbound::Draft {
-            draft: draft.validate().map_err(|_| Error::InvalidRequest)?,
+            draft: validate_draft(draft)?,
         })
     } else {
         let proposal: Proposal = decode(&bytes)?;

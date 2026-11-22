@@ -23,18 +23,19 @@ pub(crate) fn with_ai_targets<T>(
     ipc::prepare_config_parent(directory)?;
     store::Store::new(directory)
         .with_loaded(|file| {
-            let targets = file.targets.into_iter().map(|entry| {
+            let targets = file.targets.into_iter().filter_map(|entry| {
                 let (region, node_id) = match entry.profile.method() {
                     profile::MethodRef::Local { .. } => (String::new(), "내 PC".into()),
                     profile::MethodRef::Ssm { region, instance_id, .. } => (region.into(), instance_id.into()),
+                    profile::MethodRef::Ssh { .. } => return None,
                 };
-                crate::ai::SelectedTarget {
+                Some(crate::ai::SelectedTarget {
                     profile_id: entry.profile.id.as_str().to_owned(),
                     display_name: entry.profile.display_name,
                     region,
                     node_id,
                     generation: entry.revision,
-                }
+                })
             }).collect();
             read(targets)
         })
@@ -45,13 +46,17 @@ pub(crate) fn ai_aliases(directory: &Path) -> Result<Vec<crate::ai::cli::Alias>,
     ipc::prepare_config_parent(directory)?;
     let file = store::Store::new(directory).load()
         .map_err(|_| "저장된 조회 대상을 읽을 수 없습니다")?;
-    Ok(file.targets.into_iter().map(|entry| crate::ai::cli::Alias {
-        id: entry.profile.id.as_str().into(),
-        generation: entry.revision.to_string(),
-        method: match entry.profile.method() {
+    Ok(file.targets.into_iter().filter_map(|entry| {
+        let method = match entry.profile.method() {
             profile::MethodRef::Local { .. } => "local",
             profile::MethodRef::Ssm { .. } => "ssm",
-        }.into(),
-        display_name: entry.profile.display_name,
+            profile::MethodRef::Ssh { .. } => return None,
+        };
+        Some(crate::ai::cli::Alias {
+            id: entry.profile.id.as_str().into(),
+            generation: entry.revision.to_string(),
+            method: method.into(),
+            display_name: entry.profile.display_name,
+        })
     }).collect())
 }

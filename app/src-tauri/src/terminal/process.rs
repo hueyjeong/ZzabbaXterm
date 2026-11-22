@@ -1,5 +1,6 @@
 use super::remote;
 use crate::ssm::CancellationToken;
+use crate::ssh::{ConnectionPlan, terminal::DirectLaunch};
 use super::{CHUNK, CLOSED, CloseResult, Event, LocalClose, WINDOW, stage};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::{
@@ -57,6 +58,7 @@ impl Flow {
 pub(super) enum Launch {
     Local(CommandBuilder),
     Ssm(remote::Target),
+    Ssh(DirectLaunch),
 }
 
 impl Launch {
@@ -71,9 +73,15 @@ pub(super) struct Session {
     cancel: Option<CancellationToken>,
     close_result: Mutex<CloseResult>,
     unconfirmed: Mutex<Option<remote::Remote>>,
+    ssh_pending: Mutex<Option<OwnedSsh>>,
     writer: Mutex<Option<Box<dyn Write + Send>>>,
     flow: Mutex<Flow>,
     wake: Condvar,
+}
+
+struct OwnedSsh {
+    child: Box<dyn Child + Send + Sync>,
+    _plan: ConnectionPlan,
 }
 
 impl Session {
@@ -83,6 +91,7 @@ impl Session {
             cancel: ssm.then(CancellationToken::new),
             close_result: Mutex::new(CloseResult::default()),
             unconfirmed: Mutex::new(None),
+            ssh_pending: Mutex::new(None),
             master: Mutex::new(None),
             writer: Mutex::new(None),
             flow: Mutex::new(Flow::default()),
@@ -116,7 +125,14 @@ impl Session {
         let (ready, opened) = mpsc::sync_channel(1);
         let ssm = command.is_ssm();
         if let Err(error) = thread::Builder::new().name("terminal-pty".into()).spawn(move || {
-            let result = this.run(size, command, send, &ready);
+            let mut retired = Some(retired);
+            let mut complete = || {
+                if let Some(retired) = retired.take() {
+                    retired(&this);
+                    this.finish();
+                }
+            };
+            let result = this.run(size, command, send, &ready, &mut complete);
             if let Err(error) = result {
                 if ssm {
                     this.flow.lock().unwrap().attach_error = Some(error);
@@ -124,8 +140,11 @@ impl Session {
                     let _ = ready.send(Err(error));
                 }
             }
-            retired(&this);
-            this.finish();
+            complete();
+            // 문서나 탭이 사라져도 자식과 계획은 실제 종료 확인까지 감독자가 소유한다.
+            while this.observe_ssh() {
+                thread::sleep(Duration::from_millis(250));
+            }
         }) {
             self.finish();
             return Err(stage("PTY worker", error));
@@ -139,6 +158,7 @@ impl Session {
         command: Launch,
         send: impl Fn(Event) -> Result<(), String> + Send + 'static,
         ready: &mpsc::SyncSender<Result<(), String>>,
+        complete: &mut impl FnMut(),
     ) -> Result<(), String> {
         let ssm = command.is_ssm();
         if ssm {
@@ -154,12 +174,13 @@ impl Session {
         }
         let mut remote = match &command {
             Launch::Ssm(target) => Some(tauri::async_runtime::block_on(target.prepare(self.cancel.as_ref().unwrap()))?),
-            Launch::Local(_) => None,
+            Launch::Local(_) | Launch::Ssh(_) => None,
         };
         if self.flow.lock().unwrap().stop.is_some() {
             return Err(stage("open", CLOSED));
         }
         if ssm { send(Event::Connecting)?; }
+        let mut ssh_plan = None;
         #[cfg(windows)]
         let job = remote.as_ref().map(|_| process_job::Job::new()).transpose()
             .map_err(|error| stage("SSM Job", error))?;
@@ -236,9 +257,18 @@ impl Session {
                     return Err(self.after_failed_spawn(stage("reader worker", error), remote.take()));
                 }
             };
+            let command = match command {
+                Launch::Ssm(_) => None,
+                Launch::Local(command) => Some(command),
+                Launch::Ssh(launch) => {
+                    let (command, plan) = launch.into_parts();
+                    ssh_plan = Some(plan);
+                    Some(command)
+                }
+            };
             let mut child = match command {
-                Launch::Ssm(_) => remote_child.take().unwrap(),
-                Launch::Local(command) => {
+                None => remote_child.take().unwrap(),
+                Some(command) => {
                     if self.flow.lock().unwrap().stop.is_some() {
                         self.teardown(pair, writer, event_tx, drain);
                         return Err(stage("open", CLOSED));
@@ -277,10 +307,17 @@ impl Session {
                         }
                     });
                 }
-                let event = self.reap(child.as_mut());
+                let event = self.reap(child.as_mut(), ssh_plan.is_some());
                 if let Some(cancel) = &self.cancel { cancel.cancel(); }
                 event
             });
+            if let Some(plan) = ssh_plan
+                && self.close_result().local == LocalClose::Unconfirmed
+            {
+                *self.ssh_pending.lock().unwrap() = Some(OwnedSsh { child, _plan: plan });
+                // ConPTY 해제와 출력 스레드 대기는 회수 오류 응답을 지연시키지 않는다.
+                complete();
+            }
             #[cfg(windows)]
             drop(job);
             let master = self.master.lock().unwrap().take();
@@ -328,12 +365,42 @@ impl Session {
     }
 
     pub(super) fn recheck_cleanup(&self) -> CloseResult {
+        {
+            let mut pending = self.ssh_pending.lock().unwrap();
+            if let Some(ssh) = pending.as_mut() {
+                match terminate_ssh(ssh.child.as_mut()) {
+                    Ok(_) => self.confirm_ssh(&mut pending),
+                    Err(error) => self.set_ssh_error(error),
+                }
+            }
+        }
         let mut request = self.unconfirmed.lock().unwrap();
         if request.as_ref().is_some_and(remote::Remote::recheck_closed) {
             request.take();
             self.close_result.lock().unwrap().remote = remote::RemoteClose::Confirmed;
         }
         self.close_result()
+    }
+
+    fn confirm_ssh(&self, pending: &mut Option<OwnedSsh>) {
+        pending.take();
+        let mut result = self.close_result.lock().unwrap();
+        result.local = LocalClose::CliReaped;
+        result.local_error = None;
+    }
+
+    fn observe_ssh(&self) -> bool {
+        let mut pending = self.ssh_pending.lock().unwrap();
+        if let Some(ssh) = pending.as_mut()
+            && matches!(poll_ssh(ssh.child.as_mut()), Ok(Some(_)))
+        {
+            self.confirm_ssh(&mut pending);
+        }
+        pending.is_some()
+    }
+
+    fn set_ssh_error(&self, error: String) {
+        self.close_result.lock().unwrap().local_error = Some(stage("SSH 자식 종료 확인 불가", error));
     }
 
     fn teardown(
@@ -350,7 +417,7 @@ impl Session {
         let _ = drain.join();
     }
 
-    fn reap(&self, child: &mut dyn Child) -> Option<Event> {
+    fn reap(&self, child: &mut dyn Child, ssh: bool) -> Option<Event> {
         loop {
             let mut flow = self.flow.lock().unwrap();
             flow.expire_start();
@@ -358,6 +425,9 @@ impl Session {
             if flow.stop.is_some() {
                 self.wake.notify_all();
                 drop(flow);
+                if ssh {
+                    return self.ssh_exit(terminate_ssh(child).map(|_| None));
+                }
                 self.terminate(child, self.master.lock().unwrap().as_deref().map(|master| master as &dyn MasterPty));
                 return None;
             }
@@ -365,6 +435,18 @@ impl Session {
                 // Keep the ConPTY reader ready to drain on start or timeout.
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 drop(self.wake.wait_timeout(flow, remaining).unwrap());
+                continue;
+            }
+            if ssh {
+                match poll_ssh(child) {
+                    Ok(None) => drop(self.wake.wait_timeout(flow, POLL).unwrap()),
+                    result => {
+                        flow.child_exited = true;
+                        self.wake.notify_all();
+                        drop(flow);
+                        return self.ssh_exit(result.map_err(|error| stage("wait", error)));
+                    }
+                }
                 continue;
             }
             match child_ready(child) {
@@ -388,6 +470,25 @@ impl Session {
                     self.terminate(child, self.master.lock().unwrap().as_deref().map(|master| master as &dyn MasterPty));
                     return None;
                 }
+            }
+        }
+    }
+
+    fn ssh_exit(&self, result: Result<Option<portable_pty::ExitStatus>, String>) -> Option<Event> {
+        match result {
+            Ok(status) => {
+                self.close_result.lock().unwrap().local = LocalClose::CliReaped;
+                status.map(|status| Event::Exited(status.exit_code()))
+            }
+            Err(error) => {
+                self.set_ssh_error(error);
+                // 종료 상태 조회 실패 후에도 입출력을 깨우고 출력 크레딧 대기를 푼다.
+                let mut flow = self.flow.lock().unwrap();
+                if flow.stop.is_none() {
+                    flow.stop = Some(Stop::Closed);
+                }
+                self.wake.notify_all();
+                None
             }
         }
     }
@@ -585,15 +686,7 @@ fn child_ready(child: &mut dyn Child) -> io::Result<bool> {
 
 #[cfg(windows)]
 fn child_ready(child: &mut dyn Child) -> io::Result<bool> {
-    use windows_sys::Win32::{Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT}, System::Threading::WaitForSingleObject};
-    let handle = child.as_raw_handle().ok_or(io::ErrorKind::InvalidInput)?;
-    // portable-pty 0.9 treats the valid exit code 259 as STILL_ACTIVE in try_wait.
-    // A signaled process handle distinguishes it from a running process.
-    match unsafe { WaitForSingleObject(handle, 0) } {
-        WAIT_OBJECT_0 => Ok(true),
-        WAIT_TIMEOUT => Ok(false),
-        _ => Err(io::Error::last_os_error()),
-    }
+    ssh_child::ready(child)
 }
 
 #[cfg(unix)]
@@ -619,3 +712,6 @@ fn kill_foreground(master: &dyn MasterPty, pid: libc::pid_t) {
 
 #[cfg(windows)]
 mod process_job;
+
+mod ssh_child;
+use ssh_child::{poll as poll_ssh, terminate as terminate_ssh};

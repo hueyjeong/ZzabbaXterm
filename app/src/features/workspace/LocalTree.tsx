@@ -20,7 +20,7 @@ export function LocalTree({ profiles, onOpen }: { profiles?: SavedConnections; o
       key: `group:${profile.id}`, name: profile.displayName, id: profile.id,
       targets: profiles.targets.filter(({ profile: target }) => target.groupId === profile.id).map(({ profile: target }) => ({
         key: `target:${target.id}`, name: target.displayName, id: target.id, open: () => onOpen(target),
-        method: target.defaultMethod === "ssm" ? "AWS Systems Manager" : "로컬",
+        method: target.defaultMethod === "ssm" ? "AWS Systems Manager" : target.defaultMethod === "ssh" ? "SSH" : "로컬",
       })),
     })) ?? []),
   ].flatMap((group) => {

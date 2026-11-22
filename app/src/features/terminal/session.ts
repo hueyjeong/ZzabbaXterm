@@ -1,4 +1,5 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
+import type { ConnectionTestRun } from "../connections/profiles";
 
 export type TerminalStatus =
   | { kind: "opening" | "connecting" | "running" }
@@ -29,6 +30,14 @@ const tauriIpc: LocalTerminalIpc = {
   close: (id) => invoke("terminal_close", { id }),
 };
 
+export function sshTestIpc(run: ConnectionTestRun, cancel: () => Promise<void>): LocalTerminalIpc {
+  return {
+    ...tauriIpc,
+    open: (size, receive) => invoke("connection_ssh_test_attach", { run, ...size, output: new Channel(receive) }),
+    close: cancel,
+  };
+}
+
 export interface LocalTerminal {
   input(data: string, source?: "user" | "terminal"): void;
   resize(size: Dimensions): void;
@@ -43,6 +52,7 @@ export function connectLocalTerminal(
   ipc = tauriIpc,
   targetId?: string,
   remote = false,
+  confirmExit = remote,
 ): LocalTerminal {
   let id: string | undefined;
   let stopped = false;
@@ -74,7 +84,7 @@ export function connectLocalTerminal(
     const sessionId = id;
     stopped = true;
     earlyOutput.length = 0;
-    if (!remote) release();
+    if (!confirmExit) release();
     status({ kind: started ? "disconnected" : "failed", value: String(error) }, sessionId);
   };
   const receive = (message: Message) => {
@@ -105,7 +115,7 @@ export function connectLocalTerminal(
     if (message.kind !== "exited" && message.kind !== "disconnected") return;
     const sessionId = id;
     stopped = true;
-    if (!remote) id = undefined;
+    if (!confirmExit) id = undefined;
     status(message, sessionId);
   };
 
@@ -129,7 +139,7 @@ export function connectLocalTerminal(
     if (sessionId === undefined) return;
     if (stopped) {
       if (remote) status({ kind: "opening" }, sessionId);
-      if (!remote) release();
+      if (!confirmExit) release();
       return;
     }
     status({ kind: "opening" }, sessionId);
@@ -167,7 +177,7 @@ export function connectLocalTerminal(
     close() {
       stopped = true;
       earlyOutput.length = 0;
-      if (remote) void this.confirmClose().catch(console.error);
+      if (confirmExit) void this.confirmClose().catch(console.error);
       else release();
     },
     confirmClose() {

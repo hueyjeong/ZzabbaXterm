@@ -31,6 +31,8 @@ pub(crate) enum LocalClose {
 pub(crate) struct CloseResult {
     local: LocalClose,
     remote: RemoteClose,
+    #[serde(skip_serializing)]
+    local_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     target: Option<String>,
 }
@@ -40,7 +42,7 @@ impl CloseResult {
         if self.remote == RemoteClose::Unconfirmed {
             return self.target.as_ref().map(|target| format!("종료 확인 불가: {target}"));
         }
-        (self.local == LocalClose::Unconfirmed).then(|| "로컬 자식 종료 확인 불가".into())
+        self.local_error.clone().or_else(|| (self.local == LocalClose::Unconfirmed).then(|| "로컬 자식 종료 확인 불가".into()))
     }
 }
 
@@ -114,6 +116,7 @@ impl Sessions {
         validate_size(size)?;
         let id = self.next_id();
         let session = Arc::new(Session::new(owner, command.is_ssm()));
+        let ssh = matches!(command, Launch::Ssh(_));
         {
             let mut registry = self.registry.lock().unwrap();
             if registry.shutdown || registry.destroyed.contains(owner) {
@@ -129,7 +132,7 @@ impl Sessions {
         let result = session.launch(size, command, send, move |session| {
             let mut registry = registry.lock().unwrap();
             let result = session.close_result();
-            if session.is_ssm() && !registry.shutdown
+            if (session.is_ssm() || ssh && result.local != LocalClose::NotStarted) && !registry.shutdown
                 && registry.documents.get(&session.owner).copied().unwrap_or(0) == document
             {
                 let retired = if result.warning().is_some() {
@@ -148,21 +151,39 @@ impl Sessions {
         }
         Ok(id)
     }
+    #[cfg(test)]
+    pub(crate) fn reopen_ssh_fixture(&self, config: &std::path::Path, id: &str, output: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>) -> Result<String, String> {
+        self.open_document("main", self.document("main"), size(24, 100), saved::launch(config, id)?,
+            move |event| event.send(&output).map_err(|error| error.to_string()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn close_ssh_fixture(&self, id: &str) {
+        assert!(self.close("other", id).is_err());
+        let result = self.close("main", id).unwrap();
+        assert_eq!(result.local, LocalClose::CliReaped);
+        assert_eq!(result.warning(), None);
+        assert!(self.input("main", id, b"closed").is_err());
+    }
+
 
     fn get(&self, owner: &str, id: &str) -> Result<Arc<Session>, String> {
-        let session = self.registry.lock().unwrap().sessions.get(id).cloned()
-            .ok_or(CLOSED)?;
+        let registry = self.registry.lock().unwrap();
+        let session = registry.sessions.get(id).cloned().or_else(|| {
+            let probe = registry.probes.attached_probe(owner, id)?;
+            probe.attached().then(|| probe.session())
+        }).ok_or(CLOSED)?;
         if session.owner != owner {
             return Err("다른 창의 세션입니다".into());
         }
         Ok(session)
     }
 
-    fn start(&self, owner: &str, id: &str) -> Result<(), String> {
+    pub(crate) fn start(&self, owner: &str, id: &str) -> Result<(), String> {
         self.get(owner, id)?.start()
     }
 
-    fn input(&self, owner: &str, id: &str, bytes: &[u8]) -> Result<(), String> {
+    pub(crate) fn input(&self, owner: &str, id: &str, bytes: &[u8]) -> Result<(), String> {
         self.get(owner, id)?.input(bytes)
     }
 
@@ -171,7 +192,7 @@ impl Sessions {
         self.get(owner, id)?.resize(size)
     }
 
-    fn ack(&self, owner: &str, id: &str, position: u64) -> Result<(), String> {
+    pub(crate) fn ack(&self, owner: &str, id: &str, position: u64) -> Result<(), String> {
         self.get(owner, id)?.ack(position)
     }
 
@@ -248,6 +269,12 @@ fn validate_size(size: PtySize) -> Result<(), String> {
 
 fn stage(name: &str, error: impl std::fmt::Display) -> String {
     format!("{name}: {error}")
+}
+
+pub(crate) fn probe_size(rows: u16, cols: u16) -> Result<PtySize, String> {
+    let size = size(rows, cols);
+    validate_size(size)?;
+    Ok(size)
 }
 
 fn size(rows: u16, cols: u16) -> PtySize {
