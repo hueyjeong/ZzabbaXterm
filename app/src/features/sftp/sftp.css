@@ -1,0 +1,27 @@
+.sftp-panel {
+  flex: 1;
+  min-width: 0;
+  overflow: auto;
+  padding: 8px;
+}
+
+.sftp-location {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  overflow-wrap: anywhere;
+}
+
+.sftp-location button {
+  padding: 4px 8px;
+  border: 1px solid var(--border, #36454b);
+  border-radius: 3px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}
+
+.sftp-location button:focus-visible {
+  outline: 2px solid var(--accent, #9cd9bf);
+}
