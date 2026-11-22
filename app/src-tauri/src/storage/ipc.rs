@@ -1500,11 +1500,10 @@ mod tests {
             stored["targets"][0]["profile"]["s3"]["prefix"] = json!("바뀐 접두어/");
             std::fs::write(directory.join("connections.json"), serde_json::to_vec(&stored).unwrap()).unwrap();
             assert_eq!(state.relogin_with(&document, expired_s3_id, directory.clone(), unexpected).await.unwrap_err().failure, Failure::AccountMismatch);
-            stored["targets"][0]["profile"] = target;
+            stored["targets"][0]["profile"]["s3"]["prefix"] = json!("실험//");
             std::fs::write(directory.join("connections.json"), serde_json::to_vec(&stored).unwrap()).unwrap();
-
             std::fs::write(root.join("credentials"), "[chosen team]\naws_access_key_id=fixture\n").unwrap();
-            let changed = open(request("saved-sso")).await.err().unwrap();
+            let changed = open(request("saved-s3")).await.err().unwrap();
             assert_eq!(changed.failure, Failure::InvalidSsoProfile);
             std::fs::remove_file(root.join("credentials")).unwrap();
             state.0.lock().unwrap().tab(&document, &saved_s3.session_id).unwrap().expired = true;
@@ -1513,10 +1512,10 @@ mod tests {
                 Ok(())
             }).await.unwrap_err();
             assert_eq!(interrupted.failure, Failure::Request);
+            assert!(state.reserve_open(&document, Uuid::new_v4()).is_err());
             assert!(!state.0.lock().unwrap().tabs.contains_key(&saved_s3.session_id));
             assert!(state.0.lock().unwrap().openings.is_empty());
             assert!(!state.close(&state.document("main"), &session.session_id));
-            assert!(state.reserve_open(&document, Uuid::new_v4()).is_err());
         });
     }
 
