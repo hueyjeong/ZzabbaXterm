@@ -286,8 +286,7 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
     let dns = draft.host.to_ascii_lowercase();
     let description = draft.approval_text(&dns).map_err(message)?;
     let size = DesktopSize { width: 1024, height: 768 };
-    let mut lease;
-    let (target, loss, target_name) = if let Some(source) = draft.source {
+    let (target, loss, target_name, lease) = if let Some(source) = draft.source {
         let directory = window.path().app_config_dir().map_err(|error| error.to_string())?;
         let load_directory = directory.clone();
         let target_id = source.target_id.clone();
@@ -303,21 +302,20 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
         let caller = window.clone();
         let live = prompt.clone();
         // 발급 중 취소되어도 작업을 기다려 인계 소켓과 임대를 이 경로에서 정리한다.
-        let (issued, approved_destination) = tauri::async_runtime::spawn_blocking(move || {
+        let (mut lease, approved_destination) = tauri::async_runtime::spawn_blocking(move || {
             if live.is_cancelled() { return Err(CLOSED.into()); }
             let lease = caller.state::<TunnelTabs>().open_desktop(tunnel_epoch, &directory,
                 (&source.tab_handle, &source.tunnel_id), &source.target_id, &destination, Protocol::Rdp, (revision, &ssh))?;
             Ok::<_, String>((lease, destination))
         }).await.map_err(|_| message(Error::Transport))??;
-        lease = issued;
         if life.is_cancelled() { return Err(CLOSED.into()); }
         let loss = lease.loss();
         let target = route::forwarded(dns, &approved_destination, size, &mut lease).map_err(message)?;
-        (target, Some(loss), target_name)
+        (target, Some(loss), target_name, Some(lease))
     } else {
         native::confirm(window.clone(), description, prompt.clone(), approval.clone()).await.map_err(message)?;
         let target_name = format!("{dns}:{}", draft.port);
-        (route::direct(dns, draft.port, size), None, target_name)
+        (route::direct(dns, draft.port, size), None, target_name, None)
     };
     let stopped = async {
         tokio::select! { biased;
@@ -332,7 +330,7 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
             return Err(message(error).into());
         },
         session = Session::open(target, tokio_rustls::rustls::RootCertStore::empty(),
-            || native::account(window.clone(), target_name, prompt.clone(), approval.clone())) => session.map_err(message)?,
+            || native::account(window.clone(), target_name, prompt.clone(), approval.clone()), lease.as_ref()) => session.map_err(message)?,
     };
     drop(approval);
     let operation = async {

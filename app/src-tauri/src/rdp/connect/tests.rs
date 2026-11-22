@@ -19,6 +19,51 @@ use tokio_rustls::{TlsAcceptor, rustls::pki_types::PrivatePkcs8KeyDer};
 
 use super::*;
 
+#[test]
+fn routed_credssp_does_not_resume_write_or_flush_after_revocation() {
+    use std::{io, task::{Context, Waker}};
+
+    #[derive(Default)]
+    struct Writer {
+        limit: usize,
+        writes: Vec<Vec<u8>>,
+        flushes: usize,
+    }
+
+    impl AsyncWrite for Writer {
+        fn poll_write(mut self: Pin<&mut Self>, _: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> {
+            self.writes.push(bytes.to_vec());
+            let count = self.limit.min(bytes.len());
+            self.limit -= count;
+            if count == 0 { Poll::Pending } else { Poll::Ready(Ok(count)) }
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.flushes += 1;
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            panic!("철회된 TLS 송신에서 shutdown 호출")
+        }
+    }
+
+    for limit in [0, 1, 3] {
+        let (tabs, lease) = crate::tunnels::ipc::rdp_test_lease();
+        let mut writer = Writer { limit, ..Writer::default() };
+        let mut cx = Context::from_waker(Waker::noop());
+        {
+            let mut send = std::pin::pin!(write_routed_credssp(&mut writer, b"abc", &lease));
+            assert!(send.as_mut().poll(&mut cx).is_pending());
+            tabs.navigate(false);
+            assert!(matches!(send.as_mut().poll(&mut cx), Poll::Ready(Err(Error::Transport))));
+        }
+        let expected: &[&[u8]] = if limit == 1 { &[b"abc", b"bc"] } else { &[b"abc"] };
+        assert!(writer.writes.iter().map(Vec::as_slice).eq(expected.iter().copied()));
+        assert_eq!(writer.flushes, usize::from(limit == 3));
+    }
+}
+
 const REMOTE: &str = "rdp.example.test";
 
 fn root() -> CertifiedIssuer<'static, KeyPair> {
@@ -133,6 +178,7 @@ async fn exercise(
             })
         },
         ironrdp::displaycontrol::client::DisplayControlClient::new(|_| Ok(Vec::new())),
+        None,
     );
     let client = TEST_PEER_POLICY.scope(policy, client);
     let (result, saw_nla) = timeout(Duration::from_secs(5), async {
@@ -439,6 +485,7 @@ async fn activates_and_delivers_pixels_and_key_input_only_for_the_authenticated_
                     })
                 },
                 SLOTS.try_acquire().unwrap(),
+                None,
             ))
             .await?;
             let id = session.id();

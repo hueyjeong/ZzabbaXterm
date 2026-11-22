@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{future::poll_fn, pin::Pin, sync::Arc, task::Poll};
 
 use ironrdp::{
     connector::{
@@ -22,6 +22,7 @@ use tokio_rustls::{
 };
 use x509_cert::{Certificate, der::Decode as _};
 
+use crate::tunnels::ipc::DesktopLease;
 use super::{Account, Error, Target, clipboard::TextClipboard, route::Endpoint};
 
 pub(super) type Transport = TokioFramed<TlsStream<TcpStream>>;
@@ -220,6 +221,7 @@ pub(super) async fn connect<F, Fut>(
     tls: Arc<rustls::ClientConfig>,
     resolve: F,
     display: ironrdp::displaycontrol::client::DisplayControlClient,
+    lease: Option<&DesktopLease>,
 ) -> Result<(ConnectionResult, Transport), Error>
 where
     F: FnOnce() -> Fut,
@@ -228,7 +230,7 @@ where
     let mut verified = tokio::time::timeout(super::CONNECT_TIMEOUT, verify(target, name, tls))
         .await.map_err(|_| Error::Timeout)??;
     let account = resolve().await?;
-    tokio::time::timeout(super::CONNECT_TIMEOUT, verified.authenticate(account))
+    tokio::time::timeout(super::CONNECT_TIMEOUT, verified.authenticate(account, lease))
         .await.map_err(|_| Error::Timeout)??;
     verified
         .connector
@@ -262,7 +264,7 @@ where
 }
 
 impl Verified {
-    async fn authenticate(&mut self, mut account: Account) -> Result<(), Error> {
+    async fn authenticate(&mut self, mut account: Account, lease: Option<&DesktopLease>) -> Result<(), Error> {
         if account.username.is_empty()
             || account.password.is_empty()
             || [account.username.as_str(), account.password.as_str()]
@@ -298,10 +300,11 @@ impl Verified {
                 .size()
                 .is_some()
             {
-                self.transport
-                    .write_all(output.filled())
-                    .await
-                    .map_err(|_| Error::Authentication)?;
+                if let Some(lease) = lease {
+                    write_routed_credssp(self.transport.get_inner_mut().0, output.filled(), lease).await?;
+                } else {
+                    self.transport.write_all(output.filled()).await.map_err(|_| Error::Authentication)?;
+                }
             }
             let Some(hint) = sequence.next_pdu_hint() else {
                 break;
@@ -324,6 +327,32 @@ impl Verified {
         self.connector.config.domain = account.domain;
         Ok(())
     }
+}
+
+async fn write_routed_credssp<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    mut bytes: &[u8],
+    lease: &DesktopLease,
+) -> Result<(), Error> {
+    // TLS가 보관한 바이트는 flush에서도 전송되므로 각 poll을 철회와 직렬화한다.
+    while !bytes.is_empty() {
+        let count = poll_fn(|cx| {
+            match lease.while_live(|| Pin::new(&mut *stream).poll_write(cx, bytes)) {
+                Some(poll) => poll.map_err(|_| Error::Authentication),
+                None => Poll::Ready(Err(Error::Transport)),
+            }
+        }).await?;
+        if count == 0 {
+            return Err(Error::Authentication);
+        }
+        bytes = &bytes[count..];
+    }
+    poll_fn(|cx| {
+        match lease.while_live(|| Pin::new(&mut *stream).poll_flush(cx)) {
+            Some(poll) => poll.map_err(|_| Error::Authentication),
+            None => Poll::Ready(Err(Error::Transport)),
+        }
+    }).await
 }
 
 pub(super) async fn step<S: AsyncRead + AsyncWrite + Send + Sync + Unpin>(
