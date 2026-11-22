@@ -19,7 +19,8 @@ function setup() {
     models: ["local:latest"], targets: [alpha, beta], proposals: [] as Proposal[],
     onSendChat: vi.fn<AiPanelProps["onSendChat"]>().mockResolvedValue({ kind: "reply", content: "응답" }),
     onRequestProposal: vi.fn<AiPanelProps["onRequestProposal"]>().mockResolvedValue(card),
-    onDecideProposal: vi.fn<AiPanelProps["onDecideProposal"]>().mockResolvedValue("recorded"),
+    onDecideProposal: vi.fn<AiPanelProps["onDecideProposal"]>().mockImplementation(async ({ decision }) =>
+      ({ approve: "approved", reject: "rejected", cancel: "cancelled" })[decision] as "approved" | "rejected" | "cancelled"),
   };
 }
 
@@ -150,9 +151,9 @@ describe("제안 검토", () => {
     await select("조회 대상", "개발 (a)");
     await type("채팅 초안");
     await click("가동 시간 조회 제안");
-    expect(props.onRequestProposal.mock.calls).toEqual([[{
+    expect(props.onRequestProposal.mock.calls[0][0]).toEqual({
       model: "local:latest", target: { targetId: "a", generation: "1" }, operation: "uptime",
-    }]]);
+    });
     if (change === "target") {
       await select("조회 대상", "개발 (b)");
       await select("조회 대상", "개발 (a)");
@@ -162,6 +163,7 @@ describe("제안 검토", () => {
     } else {
       await click("요청 취소");
     }
+    expect(props.onRequestProposal.mock.calls[0][1].aborted).toBe(true);
     await act(async () => { pending.resolve(card); });
     expect(host.querySelector("article")).toBeNull();
     expect(host.querySelector(".a01-proposals [role=status]")?.textContent).toBe("대기");
@@ -216,18 +218,50 @@ describe("제안 검토", () => {
 
   it("검토 중 대상을 바꾸면 이전 결정 응답을 다른 카드에 적용하지 않는다", async () => {
     const props = setup();
-    const decision = Promise.withResolvers<"recorded">();
+    const decision = Promise.withResolvers<"approved">();
     props.onDecideProposal.mockReturnValueOnce(decision.promise);
     const second = { ...card, id: "p2", node: "dev-02", target: beta };
     await render({ ...props, proposals: [card, second] });
     await select("조회 대상", "개발 (a)");
     await click("승인");
     await select("조회 대상", "개발 (b)");
-    await act(async () => { decision.resolve("recorded"); });
+    await act(async () => { decision.resolve("approved"); });
     expect(host.querySelector("article dd")?.textContent).toBe("dev-02");
     expect(host.querySelector("article [role=status]")).toBeNull();
     await select("조회 대상", "개발 (a)");
     expect(host.querySelector("article [role=status]")?.textContent).toBe("검토 종료");
     expect(button("승인")).toBeUndefined();
+  });
+
+  it("같은 노드 ID라도 실제 SSM 프로필과 리전을 구분해 표시한다", async () => {
+    const first = { ...card, ssm: { profile: "ops-a", region: "ap-northeast-2" } };
+    const second = {
+      ...card, kind: "blocked" as const, id: "p2", target: beta,
+      ssm: { profile: "ops-b", region: "us-west-2" }
+    };
+    await render({ ...setup(), proposals: [first, second] });
+    const values = () => [...host.querySelectorAll("article dd")].map((item) => item.textContent);
+    await select("조회 대상", "개발 (a)");
+    expect(values()).toEqual(["ops-a", "ap-northeast-2", "dev-01\\u{1b}", "uptime", card.interpretation]);
+    await select("조회 대상", "개발 (b)");
+    expect(values()).toEqual(["ops-b", "us-west-2", "dev-01\\u{1b}"]);
+  });
+
+  it.each([false, true])("결정 활성화 후 포커스를 이어 받고 다른 탭 입력은 유지한다 (%s)", async (move) => {
+    const props = setup();
+    const response = Promise.withResolvers<"rejected">();
+    props.onDecideProposal.mockReturnValueOnce(response.promise);
+    await render({ ...props, proposals: [card] });
+    await select("조회 대상", "개발 (a)");
+    button("승인")!.focus();
+    await click("승인");
+    const status = host.querySelector("article [role=status]");
+    expect(status?.textContent).toBe("결정 기록 중");
+    expect(document.activeElement).toBe(status);
+    const terminal = host.querySelector("textarea")!;
+    if (move) terminal.focus();
+    await act(async () => { response.resolve("rejected"); });
+    expect(status?.textContent).toBe("거절 기록됨");
+    expect(document.activeElement).toBe(move ? terminal : status);
   });
 });

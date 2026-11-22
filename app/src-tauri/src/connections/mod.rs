@@ -24,14 +24,15 @@ pub(crate) fn with_ai_targets<T>(
     store::Store::new(directory)
         .with_loaded(|file| {
             let targets = file.targets.into_iter().filter_map(|entry| {
-                let (region, node_id) = match entry.profile.method() {
-                    profile::MethodRef::Local { .. } => (String::new(), "내 PC".into()),
-                    profile::MethodRef::Ssm { region, instance_id, .. } => (region.into(), instance_id.into()),
+                let (ssm_profile, region, node_id) = match entry.profile.method() {
+                    profile::MethodRef::Local { .. } => (None, String::new(), "내 PC".into()),
+                    profile::MethodRef::Ssm { profile, region, instance_id } => (Some(profile.into()), region.into(), instance_id.into()),
                     profile::MethodRef::Ssh { .. } => return None,
                 };
                 Some(crate::ai::SelectedTarget {
                     profile_id: entry.profile.id.as_str().to_owned(),
                     display_name: entry.profile.display_name,
+                    ssm_profile,
                     region,
                     node_id,
                     generation: entry.revision,

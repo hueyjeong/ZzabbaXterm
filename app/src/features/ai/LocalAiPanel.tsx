@@ -12,6 +12,7 @@ const sendChat: AiPanelProps["onSendChat"] = async (request) => {
 };
 
 const decide: AiPanelProps["onDecideProposal"] = (request) => invoke("ai_decide", request);
+let nextRequestId = 0;
 
 export function LocalAiPanel({ profilesVersion }: { profilesVersion: number }) {
   const [models, setModels] = useState<readonly string[]>([]);
@@ -80,10 +81,18 @@ export function LocalAiPanel({ profilesVersion }: { profilesVersion: number }) {
     });
   }
 
-  const propose: AiPanelProps["onRequestProposal"] = async (request) => {
+  const propose: AiPanelProps["onRequestProposal"] = async (request, signal) => {
     const selected = selection.current;
     if (!await selected || selection.current !== selected) throw new Error("조회 대상을 다시 선택하세요");
-    return invoke<Proposal>("ai_propose", request);
+    signal.throwIfAborted();
+    const requestId = ++nextRequestId;
+    const cancel = () => { void invoke("ai_cancel_proposal", { requestId }).catch(console.error); };
+    signal.addEventListener("abort", cancel, { once: true });
+    try {
+      return await invoke<Proposal>("ai_propose", { ...request, requestId });
+    } finally {
+      signal.removeEventListener("abort", cancel);
+    }
   };
 
   async function openCliReview() {

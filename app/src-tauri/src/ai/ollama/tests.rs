@@ -137,6 +137,7 @@ fn reply(content: &str) -> Value {
 fn target(id: &str) -> SelectedTarget {
     SelectedTarget {
         profile_id: "dev-a".into(),
+        ssm_profile: Some("fixture".into()),
         region: "ap-northeast-2".into(),
         node_id: id.to_owned(),
         display_name: "개발 노드".into(),

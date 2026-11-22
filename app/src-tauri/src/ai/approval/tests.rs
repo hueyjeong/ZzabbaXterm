@@ -10,6 +10,7 @@ fn chat(target: &SelectedTarget) -> Candidate<'static> {
 fn target() -> SelectedTarget {
     SelectedTarget {
         profile_id: "dev-a".into(),
+        ssm_profile: Some("development".into()),
         region: "ap-northeast-2".into(),
         node_id: "node-a".into(),
         display_name: "개발 노드".into(),
@@ -30,7 +31,7 @@ fn local() -> LocalReview {
 
 fn propose_and_open(reviews: &mut Reviews, target: &SelectedTarget, policy: Policy) -> u32 {
     let id = reviews.propose(chat(target), Some(target), policy).unwrap();
-    reviews.open(&local(), id, Some(target), policy).unwrap();
+    reviews.open(&local(), id, Some(target), policy, None).unwrap();
     id
 }
 
@@ -81,7 +82,7 @@ fn chat_and_cli_show_the_same_registered_query_on_the_ui_selection() {
         )
         .unwrap();
     for (id, source) in [(chat, Source::Chat), (cli, Source::Cli)] {
-        let card = reviews.open(&local(), id, Some(&target), policy()).unwrap();
+        let card = reviews.open(&local(), id, Some(&target), policy(), None).unwrap();
         assert_eq!(card.source, source);
         assert_eq!(card.target, target);
         assert_eq!(card.command, Some("uptime"));
@@ -89,18 +90,10 @@ fn chat_and_cli_show_the_same_registered_query_on_the_ui_selection() {
             card.explanation,
             "선택한 노드의 가동 시간과 부하를 조회합니다"
         );
-        let record = reviews
-            .decide(
-                &local(),
-                request(id, Choice::Approve),
-                Some(&target),
-                policy(),
-            )
-            .unwrap();
-        let json = serde_json::to_value(&record).unwrap();
-        assert_eq!(json["decision"], "approved");
-        assert_eq!(json["card"]["target"]["nodeId"], "node-a");
-        assert!(json["card"]["target"].get("generation").is_none());
+        assert_eq!(
+            reviews.decide(&local(), request(id, Choice::Approve), Some(&target), policy()),
+            Ok(Decision::Approved)
+        );
         assert_eq!(
             reviews.decide(
                 &local(),
@@ -108,7 +101,7 @@ fn chat_and_cli_show_the_same_registered_query_on_the_ui_selection() {
                 Some(&target),
                 policy()
             ),
-            Err(ReviewError::Missing)
+            Ok(Decision::Approved)
         );
     }
 }
@@ -161,7 +154,7 @@ fn blocked_policy_precedes_the_registered_query_and_other_input_is_display_only(
                 policy,
             )
             .unwrap();
-        let card = reviews.open(&local(), id, Some(&target), policy).unwrap();
+        let card = reviews.open(&local(), id, Some(&target), policy, None).unwrap();
         assert_eq!(card.operation, expected);
         assert_eq!(card.command, None);
         assert_eq!(
@@ -221,7 +214,7 @@ fn main_local_review_and_strict_payload_are_required() {
         Err(ReviewError::NotReviewed)
     );
     assert!(matches!(
-        reviews.open(&local(), id, Some(&target), policy()),
+        reviews.open(&local(), id, Some(&target), policy(), None),
         Err(ReviewError::Missing)
     ));
 }
@@ -269,7 +262,7 @@ fn changed_target_generation_policy_or_document_discards_the_review() {
             Err(ReviewError::Stale)
         );
         assert!(matches!(
-            reviews.open(local, id, Some(&target), policy()),
+            reviews.open(local, id, Some(&target), policy(), None),
             Err(ReviewError::Missing)
         ));
     }
@@ -287,7 +280,7 @@ fn cancellation_rejection_and_expiry_are_final() {
         let record = reviews
             .decide(&local(), request(id, choice), Some(&target), policy())
             .unwrap();
-        assert_eq!(record.decision, decision);
+        assert_eq!(record, decision);
         assert_eq!(
             reviews.decide(
                 &local(),
@@ -295,7 +288,7 @@ fn cancellation_rejection_and_expiry_are_final() {
                 Some(&target),
                 policy()
             ),
-            Err(ReviewError::Missing)
+            Ok(decision)
         );
     }
     let expired = propose_and_open(&mut reviews, &target, policy());
@@ -310,7 +303,26 @@ fn cancellation_rejection_and_expiry_are_final() {
         Err(ReviewError::Expired)
     );
     assert!(matches!(
-        reviews.open(&local(), expired, Some(&target), policy()),
+        reviews.open(&local(), expired, Some(&target), policy(), None),
         Err(ReviewError::Missing)
     ));
+}
+
+#[test]
+fn decision_history_releases_pending_slots_and_evicts_oldest_records() {
+    let mut reviews = Reviews::default();
+    let target = target();
+    let ids: Vec<_> = (0..32).map(|_| propose_and_open(&mut reviews, &target, policy())).collect();
+    assert_eq!(reviews.propose(chat(&target), Some(&target), policy()), Err(ReviewError::Capacity));
+    for &id in &ids {
+        assert_eq!(reviews.decide(&local(), request(id, Choice::Reject), Some(&target), policy()), Ok(Decision::Rejected));
+    }
+    let latest = propose_and_open(&mut reviews, &target, policy());
+    assert_eq!(reviews.decide(&local(), request(latest, Choice::Approve), Some(&target), policy()), Ok(Decision::Approved));
+    assert_eq!(reviews.decide(&local(), request(ids[0], Choice::Cancel), Some(&target), policy()), Err(ReviewError::Missing));
+    assert_eq!(reviews.decide(&local(), request(ids[1], Choice::Cancel), Some(&target), policy()), Ok(Decision::Rejected));
+    let reloaded = LocalReview::check("main", "main", true, 2).unwrap();
+    assert_eq!(reviews.decide(&reloaded, request(latest, Choice::Cancel), Some(&target), policy()), Err(ReviewError::Stale));
+    reviews.decisions.back_mut().unwrap().0.expires_at = Instant::now();
+    assert_eq!(reviews.decide(&local(), request(latest, Choice::Cancel), Some(&target), policy()), Err(ReviewError::Expired));
 }

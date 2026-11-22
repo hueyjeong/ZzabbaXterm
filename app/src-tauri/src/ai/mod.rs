@@ -14,6 +14,7 @@ use std::{borrow::Cow, collections::BTreeMap, num::NonZeroU64};
 #[serde(rename_all = "camelCase")]
 pub struct SelectedTarget {
     pub profile_id: String,
+    pub ssm_profile: Option<String>,
     pub region: String,
     pub node_id: String,
     pub display_name: String,
