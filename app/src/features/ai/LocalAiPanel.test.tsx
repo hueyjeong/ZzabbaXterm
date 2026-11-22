@@ -31,6 +31,8 @@ const render = (profilesVersion = 0, topTabs?: AiTopTabs, sessionCandidates?: re
     sessionCandidates={sessionCandidates} focused={focused} />));
 const selects = () => [...host.querySelectorAll("select")];
 const button = (name: string) => [...host.querySelectorAll("button")].find((item) => item.textContent === name);
+const proposalSettings = () => host.querySelector("details")!;
+const toggleProposalSettings = () => act(async () => proposalSettings().querySelector("summary")!.click());
 async function select(index: number, option: number) {
   const field = selects()[index];
   await act(async () => {
@@ -42,6 +44,7 @@ async function select(index: number, option: number) {
 it("passes the exact saved generation through selection and keeps decisions separate from chat", async () => {
   const selected = Promise.withResolvers<boolean>();
   invoke.mockImplementation(async (command) => {
+    if (command === "ai_policy") return false;
     if (command === "ai_decisions") return [];
     if (command === "ai_models") return ["fixture:latest"];
     if (command === "ai_targets") return [{ ...target, label: "작업 셸" }];
@@ -52,6 +55,7 @@ it("passes the exact saved generation through selection and keeps decisions sepa
     throw new Error(command);
   });
   await render();
+  await toggleProposalSettings();
   await select(0, 1);
   await select(1, 1);
   await act(async () => button("가동 시간 조회 제안")?.click());
@@ -73,20 +77,58 @@ it("passes the exact saved generation through selection and keeps decisions sepa
   expect(host.querySelector('[role="alert"]')?.textContent).toContain("설치되어 있지 않습니다");
 });
 
-it("exposes model discovery failure and refreshes target properties after a saved profile changes", async () => {
+it("모델 조회 실패 중에는 작성 폼을 숨기고 새로고침 후 초안을 복원한다", async () => {
+  const modelRoster = vi.fn().mockResolvedValueOnce(["fixture:latest"])
+    .mockRejectedValueOnce("설치된 로컬 모델 없음").mockResolvedValueOnce(["fixture:latest"]);
   invoke.mockImplementation(async (command) => {
-    if (command === "ai_decisions") return [];
-    if (command === "ai_models") throw "설치된 로컬 모델 없음";
-    if (command === "ai_targets") return [{ ...target, label: "작업 셸" }];
-    throw new Error(command);
+    if (command === "ai_models") return modelRoster();
+    if (command === "ai_policy") return false;
+    return [];
   });
   await render();
+  await select(0, 1);
+  const draft = host.querySelector("textarea")!;
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(draft, "보존할 초안");
+    draft.dispatchEvent(new InputEvent("input", { bubbles: true }));
+  });
+  await act(async () => button("새로고침")!.click());
   expect(host.querySelector('[role="alert"]')?.textContent).toBe("설치된 로컬 모델 없음");
-  expect(button("전송")?.hasAttribute("disabled")).toBe(true);
-  await select(1, 1);
-  invoke.mockImplementation(async (command) => command === "ai_targets" ? [{ ...target, generation: "9007199254740994", label: "작업 셸" }] : true);
+  expect(host.querySelector("select, form")).toBeNull();
+  await act(async () => button("새로고침")!.click());
+  expect(host.querySelector('[role="alert"]')).toBeNull();
+  expect(selects()[0].value).toBe("fixture:latest");
+  expect(host.querySelector("textarea")?.value).toBe("보존할 초안");
+});
+
+it("저장된 조회 대상의 세대가 바뀌면 이전 선택을 사용하지 않는다", async () => {
+  invoke.mockImplementation(async (command) => {
+    if (command === "ai_targets") return [{ ...target, label: "작업 셸" }];
+    if (command === "ai_select") return true;
+    if (command === "ai_policy") return false;
+    return [];
+  });
+  await render();
+  await toggleProposalSettings();
+  await select(0, 1);
+  invoke.mockImplementation(async (command) => command === "ai_targets"
+    ? [{ ...target, generation: "9007199254740994", label: "작업 셸" }] : true);
   await render(1);
-  expect(selects()[1].value).toBe("");
+  expect(selects()[0].value).toBe("");
+});
+
+it("기본 채팅 화면에는 빈 선택기와 대기 문구 없이 조회 설정을 접어 둔다", async () => {
+  invoke.mockImplementation(async (command) => command === "ai_policy" ? false : []);
+  await render(0, filesTab, []);
+  expect(host.querySelector("select, form, article")).toBeNull();
+  expect(host.querySelector('[role="status"]')?.textContent).toBe("선택할 SSM 세션 없음");
+  expect(host.textContent).not.toContain("대기");
+  expect(button("새로고침")?.getAttribute("aria-label")).toBe("모델 및 대상 새로고침");
+  expect(proposalSettings().open).toBe(false);
+  expect(proposalSettings().querySelector("summary")?.textContent).toBe("작업 제안");
+  await toggleProposalSettings();
+  expect(proposalSettings().open).toBe(true);
+  expect(proposalSettings().querySelector('input[type="checkbox"]')).not.toBeNull();
 });
 
 it("SFTP 탭 버튼이 없는 동안에도 Workspace가 주입한 패널을 유지한다", async () => {
@@ -199,9 +241,12 @@ it.each([["승인", "approve", "승인 기록됨"], ["거절", "reject", "거절
       throw new Error(command);
     });
     await render();
-    await select(1, 1);
+    await toggleProposalSettings();
+    await select(0, 1);
     expect(button("승인")).toBeUndefined();
     await act(async () => button("CLI 제안 열기")?.click());
+    await toggleProposalSettings();
+    expect(host.querySelector("article")?.closest("details")).toBeNull();
     expect(host.querySelector("article")?.textContent).toContain("i-0123456789abcdef0");
     await act(async () => button(label)?.click());
     expect(invoke).toHaveBeenCalledWith("ai_decide", { proposalId: "9", decision });
@@ -228,13 +273,21 @@ it.each([false, true])("cancels before IPC starts or cancels only its own in-fli
     throw new Error(command);
   });
   await render();
+  await toggleProposalSettings();
   await select(0, 1);
   await select(1, 1);
   if (inFlight) await act(async () => { selection.resolve(true); });
   await act(async () => button("가동 시간 조회 제안")?.click());
+  if (inFlight) {
+    await toggleProposalSettings();
+    expect(proposalSettings().open).toBe(false);
+    expect(button("요청 취소")?.closest("details")).toBeNull();
+    expect(host.querySelector('[role="status"]')?.textContent).toBe("제안 요청 중");
+  }
   button("요청 취소")?.focus();
   await act(async () => button("요청 취소")?.click());
-  expect(document.activeElement).toBe(button("가동 시간 조회 제안"));
+  expect(document.activeElement).toBe(inFlight ? proposalSettings().querySelector("summary") : button("가동 시간 조회 제안"));
+  if (inFlight) await toggleProposalSettings();
   if (!inFlight) await act(async () => { selection.resolve(true); });
   const first = invoke.mock.calls.find(([command]) => command === "ai_propose");
   if (inFlight) expect(invoke).toHaveBeenCalledWith("ai_cancel_proposal", { requestId: first?.[1].requestId });
@@ -266,6 +319,7 @@ it.each([false, true])("recovers a lost decision response without another write 
     throw Error(command);
   });
   await render();
+  await toggleProposalSettings();
   await select(0, 1);
   await select(1, 1);
   await act(async () => button("가동 시간 조회 제안")?.click());

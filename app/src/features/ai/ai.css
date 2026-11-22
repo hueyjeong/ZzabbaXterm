@@ -27,6 +27,14 @@
   border-block-start: 1px solid var(--border, #36454b);
 }
 
+.a01-discovery { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; }
+.a01-discovery p { flex: 1 1 12em; overflow-wrap: anywhere; }
+.a01-disclosure > summary { cursor: pointer; font-weight: 600; }
+.a01-proposal-controls { display: grid; gap: 8px; margin-top: 8px; }
+.a01-proposal-controls button { justify-self: start; }
+.a01-disclosure:not([open]) ~ .a01-request:not(:has(.a01-request-cancel)),
+.a01-disclosure:not([open]) ~ .a01-request .a01-request-start { display: none; }
+
 .a01-chat h2 { margin: 0; font-size: 13px; }
 .a01-chat p { margin: 0; }
 .a01-field, .a01-composer { display: grid; gap: 6px; }

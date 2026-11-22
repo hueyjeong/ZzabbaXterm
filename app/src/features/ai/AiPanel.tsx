@@ -1,4 +1,4 @@
-import { useId, useLayoutEffect, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
+import { useId, useLayoutEffect, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode, type RefObject } from "react";
 import type { AiPanelProps, ChatMessage, Proposal, ProposalTarget, RecordedDecision } from "./contracts";
 import { SessionSelection, type SessionSelectionProps } from "./SessionSelection";
 import "./ai.css";
@@ -38,7 +38,7 @@ function navigateTopTabs(event: KeyboardEvent<HTMLDivElement>) {
   next.click();
 }
 
-export function AiPanel(props: AiPanelProps & { topTabs?: AiTopTabs; sessionSelection?: SessionSelectionProps }) {
+export function AiPanel(props: AiPanelProps & { topTabs?: AiTopTabs; sessionSelection?: SessionSelectionProps; policyStatus?: ReactNode }) {
   const [modelName, setModelName] = useState("");
   const [selected, setSelected] = useState("");
   const model = props.models.includes(modelName) ? modelName : "";
@@ -46,6 +46,7 @@ export function AiPanel(props: AiPanelProps & { topTabs?: AiTopTabs; sessionSele
   const attempted = useRef(new Set<string>());
   const chatTitle = useId();
   const proposalTitle = useId();
+  const proposalSettings = useRef<HTMLDetailsElement>(null);
   const { topTabs } = props;
   const visibleTabs = topTabs && !topTabs.item.hidden ? topTabs : undefined;
   const chatPanel = `${chatTitle}-panel`;
@@ -71,29 +72,36 @@ export function AiPanel(props: AiPanelProps & { topTabs?: AiTopTabs; sessionSele
         {!visibleTabs && <h2 id={chatTitle}>AI 채팅</h2>}
         {props.sessionSelection && <SessionSelection {...props.sessionSelection}
           visible={props.sessionSelection.visible !== false && !itemSelected} />}
-        {props.modelError && <p role="alert">{props.modelError}</p>}
-        {props.onRefresh && <button type="button" onClick={props.onRefresh}>모델 및 대상 새로고침</button>}
+        {(props.modelError || props.onRefresh) && <div className="a01-discovery">
+          {props.modelError && <p role="alert">{props.modelError}</p>}
+          {props.onRefresh && <button type="button" aria-label="모델 및 대상 새로고침" onClick={props.onRefresh}>새로고침</button>}
+        </div>}
         <Chat models={props.models} model={model} onModelChange={setModelName} onSendChat={props.onSendChat} />
         <div className="a01-proposals" role="region" aria-labelledby={proposalTitle}>
-          <h2 id={proposalTitle}>작업 제안</h2>
+          <details className="a01-disclosure" ref={proposalSettings}>
+            <summary id={proposalTitle}>작업 제안</summary>
+            <div className="a01-proposal-controls">
+              {props.policyControl}
+              {props.targets.length > 0 && <label className="a01-field">조회 대상
+                <select value={target ? selected : ""} onChange={(event) => {
+                  const key = event.target.value;
+                  setSelected(key);
+                  const next = props.targets.find((candidate) => targetKey(candidate) === key);
+                  props.onSelectTarget?.(next ? { targetId: next.targetId, generation: next.generation } : null);
+                }}>
+                  <option value="">대상 선택</option>
+                  {props.targets.map((candidate) => <option key={targetKey(candidate)} value={targetKey(candidate)}>
+                    {visibleText(candidate.label)} ({visibleText(candidate.targetId)})
+                  </option>)}
+                </select>
+              </label>}
+              {target && props.onOpenCliReview && <button type="button" onClick={props.onOpenCliReview}>CLI 제안 열기</button>}
+            </div>
+          </details>
           {props.targetError && <p role="alert">{props.targetError}</p>}
-          {props.policyControl}
-          <label className="a01-field">조회 대상
-            <select value={target ? selected : ""} onChange={(event) => {
-              const key = event.target.value;
-              setSelected(key);
-              const next = props.targets.find((candidate) => targetKey(candidate) === key);
-              props.onSelectTarget?.(next ? { targetId: next.targetId, generation: next.generation } : null);
-            }}>
-              <option value="">대상 선택</option>
-              {props.targets.map((candidate) => <option key={targetKey(candidate)} value={targetKey(candidate)}>
-                {visibleText(candidate.label)} ({visibleText(candidate.targetId)})
-              </option>)}
-            </select>
-          </label>
-          {target && props.onOpenCliReview && <button type="button" onClick={props.onOpenCliReview}>CLI 제안 열기</button>}
+          {props.policyStatus}
           <ProposalReview key={JSON.stringify([selected, !!target, target && props.policyVersion])} model={model} target={target}
-            proposals={props.proposals} history={props.history} attempted={attempted.current}
+            proposals={props.proposals} history={props.history} attempted={attempted.current} settings={proposalSettings}
             onRequestProposal={props.onRequestProposal} onDecideProposal={props.onDecideProposal} onReadDecision={props.onReadDecision} />
         </div>
       </section>
@@ -140,41 +148,42 @@ function Chat({ models, model, onModelChange, onSendChat }: Pick<AiPanelProps, "
   }
 
   return <>
-    <label className="a01-field">Ollama 모델
+    {models.length > 0 && <label className="a01-field">Ollama 모델
       <select value={model} disabled={state.kind === "sending"} onChange={(event) => onModelChange(event.target.value)}>
         <option value="">모델 선택</option>
         {models.map((name) => <option key={name} value={name}>{name}</option>)}
       </select>
-    </label>
+    </label>}
     <ol className="a01-transcript" role="log" aria-label="대화 기록">
       {messages.map(({ role, content }, index) => <li key={index}>
         <strong>{role === "user" ? "나" : "AI"}</strong>
         <p>{content}</p>
       </li>)}
     </ol>
-    <form className="a01-composer" onSubmit={send}>
+    {state.kind === "failed" && <p role="alert">전송 실패: {state.message}</p>}
+    {models.length === 0 && state.kind === "sending" && <p role="status">전송 중</p>}
+    {models.length > 0 && <form className="a01-composer" onSubmit={send}>
       <textarea ref={input} aria-label="메시지 입력" placeholder="메시지 입력" value={draft}
         readOnly={state.kind === "sending"} onChange={(event) => setDraft(event.target.value)} />
-      {state.kind === "failed" && <p role="alert">전송 실패: {state.message}</p>}
       <button type="submit" disabled={!model || !draft.trim() || state.kind === "sending"}>
         {state.kind === "sending" ? "전송 중" : "전송"}
       </button>
-    </form>
+    </form>}
   </>;
 }
 
-function ProposalReview({ model, target, proposals, history, attempted, onRequestProposal, onDecideProposal, onReadDecision }:
+function ProposalReview({ model, target, proposals, history, attempted, settings, onRequestProposal, onDecideProposal, onReadDecision }:
   Pick<AiPanelProps, "proposals" | "history" | "onRequestProposal" | "onDecideProposal" | "onReadDecision"> & {
     model: string;
     target: ProposalTarget | undefined;
     attempted: Set<string>;
+    settings: RefObject<HTMLDetailsElement | null>;
   }) {
   const [request, setRequest] = useState<ProposalState>({ kind: "idle" });
   const [created, setCreated] = useState<Proposal[]>([]);
   const [decisions, setDecisions] = useState<ReadonlyMap<string, DecisionState>>(new Map());
   const pending = useRef<AbortController | null>(null);
   const mounted = useRef(false);
-  const requestActions = useRef<HTMLDivElement>(null);
   const proposeButton = useRef<HTMLButtonElement>(null);
   const cancelButton = useRef<HTMLButtonElement>(null);
   useLayoutEffect(() => {
@@ -192,7 +201,8 @@ function ProposalReview({ model, target, proposals, history, attempted, onReques
   function keepRequestFocus() {
     const cancel = cancelButton.current;
     if (cancel && cancel.ownerDocument.activeElement === cancel) {
-      (proposeButton.current?.disabled ? requestActions.current : proposeButton.current)?.focus({ preventScroll: true });
+      const next = settings.current?.open && model ? proposeButton.current : settings.current?.querySelector("summary");
+      next?.focus({ preventScroll: true });
     }
   }
 
@@ -244,10 +254,10 @@ function ProposalReview({ model, target, proposals, history, attempted, onReques
   }
 
   return <>
-    {target && <div className="a01-actions" ref={requestActions} tabIndex={-1}>
-      <button type="button" ref={proposeButton} disabled={!model} aria-disabled={request.kind === "requesting" || undefined}
+    {target && (model || request.kind === "requesting") && <div className="a01-actions a01-request">
+      <button type="button" className="a01-request-start" ref={proposeButton} disabled={!model} aria-disabled={request.kind === "requesting" || undefined}
         onClick={propose}>가동 시간 조회 제안</button>
-      {request.kind === "requesting" && <button type="button" ref={cancelButton} onClick={() => {
+      {request.kind === "requesting" && <button type="button" className="a01-request-cancel" ref={cancelButton} onClick={() => {
         keepRequestFocus();
         pending.current?.abort();
         pending.current = null;
@@ -256,7 +266,6 @@ function ProposalReview({ model, target, proposals, history, attempted, onReques
     </div>}
     {request.kind === "requesting" && <p role="status">제안 요청 중</p>}
     {request.kind === "failed" && <p role="alert">제안 요청 실패</p>}
-    {request.kind === "idle" && cards.size === 0 && <p role="status">대기</p>}
     {[...cards.values()].map((proposal) => {
       const decision = recorded.get(proposal.id) ?? decisions.get(proposal.id) ?? (attempted.has(proposal.id) ? "closed" : undefined);
       return <article key={proposal.id} className="a01-proposal" aria-label="조회 제안" tabIndex={-1}>

@@ -126,7 +126,8 @@ beforeEach(async () => {
   saveFile = async () => null;
   native.invoke.mockImplementation(async (command, args) => {
     if (command === "connections_load") return loadProfiles();
-    if (command === "ai_models" || command === "ai_targets" || command === "ai_decisions") return [];
+    if (command === "ai_models") return ["local:latest"];
+    if (command === "ai_targets" || command === "ai_decisions") return [];
     if (command.startsWith("connection_") || ["verify_ssh_host", "commit_ssh_host", "cancel_ssh_host", "register_saved_ssh_host"].includes(command)) return runConnectionCommand(command, args);
     if (command === "ssm_discovery") return runDiscovery(args);
     if (command.startsWith("storage_")) return runStorage(command, args);
@@ -617,6 +618,7 @@ describe("L02", () => {
     await press("모델 및 대상 새로고침");
     const aiTarget = find<HTMLSelectElement>(".a01-proposals select");
     await act(async () => {
+      aiTarget.closest("details:not([open])")?.querySelector("summary")?.click();
       aiTarget.selectedIndex = 1;
       aiTarget.dispatchEvent(new Event("change", { bubbles: true }));
     });
