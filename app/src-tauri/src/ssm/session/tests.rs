@@ -342,7 +342,7 @@ async fn start_requires_an_online_node_from_the_same_scope() {
     assert_eq!(cli.prepare_document_start(&scope, node, shared, &cancelled).err(), Some(CliError::Cancelled));
 
     let mut reasons = Vec::new();
-    for (document, mut start) in [
+    for (uses_shared_document, mut start) in [
         (false, cli.prepare_start(&scope, node, &cancel).await.unwrap()),
         (true, cli.prepare_document_start(&scope, node, shared, &cancel).unwrap()),
     ] {
@@ -366,14 +366,13 @@ async fn start_requires_an_online_node_from_the_same_scope() {
             .unwrap()
             .unwrap();
         assert_eq!(permit.0.get_argv()[0], cli.0.as_os_str());
-        let args = ["ssm", "start-session", "--region", "us-west-2", "--output", "json",
-            "--target", TARGET, "--reason", start.reason.as_str(),
-            "--document-name", "ZzabbaAiSharedControl"];
-        let expected = if document { &args[..] } else { &args[..10] };
-        assert!(permit.0.get_argv()[1..]
-            .iter()
-            .map(|arg| arg.as_os_str())
-            .eq(expected.iter().map(|arg| OsStr::new(*arg))));
+        let mut expected = vec!["ssm", "start-session", "--region", "us-west-2", "--output", "json",
+            "--target", TARGET, "--reason", start.reason.as_str()];
+        if uses_shared_document {
+            expected.extend(["--document-name", "ZzabbaAiSharedControl"]);
+        }
+        expected.extend(["--no-cli-pager", "--no-cli-auto-prompt"]);
+        assert_eq!(&permit.0.get_argv()[1..], expected.as_slice());
         assert_eq!(
             permit.0.get_env("PATH"),
             Some(OsStr::new("fixture-plugin-path"))

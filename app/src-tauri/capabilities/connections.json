@@ -15,6 +15,11 @@
     "allow-connection-test-cancel",
     "allow-connection-save",
     "allow-connections-load",
-    "allow-ssm-discovery"
+    "allow-ssm-discovery",
+    "allow-tunnel-tab-open",
+    "allow-tunnel-start",
+    "allow-tunnel-status",
+    "allow-tunnel-share",
+    "allow-tunnel-tab-close"
   ]
 }

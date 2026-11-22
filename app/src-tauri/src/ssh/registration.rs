@@ -13,6 +13,8 @@ pub(crate) const COMMAND: &str = "verify_ssh_host";
 pub(crate) const COMMIT: &str = "commit_ssh_host";
 pub(crate) const CANCEL: &str = "cancel_ssh_host";
 
+const HOST_CONFIRM_TITLE: &str = "SSH 서버 키 등록";
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Request {
@@ -190,8 +192,13 @@ pub(crate) fn register_saved(caller: &Webview, document: u64, target_id: String)
     let window = caller.window();
     state.register_saved(&config, target_id, &caller.state::<Sessions>(), document,
         || dialogs::pick(&window),
-        |endpoint, fingerprint| dialogs::confirm(&window, confirmation_message(endpoint, fingerprint)),
+        |endpoint, fingerprint| dialogs::confirm(&window, HOST_CONFIRM_TITLE, confirmation_message(endpoint, fingerprint)),
     ).map_err(|error| error.saved_message().into())
+}
+
+pub(crate) fn confirm_tunnel(window: &tauri::Window, description: String) -> Result<bool, String> {
+    dialogs::confirm(window, "SSH 터널 승인", description)
+        .map_err(|_| "SSH 터널 승인 창을 열 수 없습니다".into())
 }
 
 fn confirmation_message(endpoint: &Endpoint, fingerprint: &Fingerprint) -> String {
@@ -276,7 +283,7 @@ pub(crate) fn dispatch(invoke: Invoke) {
                 request,
                 |id| draft.ssh_pin_endpoint(id, &expected_fingerprint),
                 || dialogs::pick(&window),
-                |endpoint, fingerprint| dialogs::confirm(&window, confirmation_message(endpoint, fingerprint)),
+                |endpoint, fingerprint| dialogs::confirm(&window, HOST_CONFIRM_TITLE, confirmation_message(endpoint, fingerprint)),
             )?;
             let host = prepared.host.clone();
             reservation.ready(prepared)?;

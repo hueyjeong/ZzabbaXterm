@@ -11,12 +11,12 @@ pub(super) fn pick(window: &Window) -> Result<Option<PathBuf>, Rejection> {
         .set_title("SSH 서버 공개 키 선택").add_filter("OpenSSH 공개 키", &["pub"]).pick_file())
 }
 
-pub(super) fn confirm(window: &Window, description: String) -> Result<bool, Rejection> {
+pub(super) fn confirm(window: &Window, title: &'static str, description: String) -> Result<bool, Rejection> {
     #[cfg(target_os = "linux")]
-    return on_gtk(window, move |parent| confirm_gtk(parent, &description));
+    return on_gtk(window, move |parent| confirm_gtk(parent, title, &description));
     #[cfg(not(target_os = "linux"))]
     Ok(rfd::MessageDialog::new().set_parent(window)
-        .set_title("SSH 서버 키 등록").set_description(description)
+        .set_title(title).set_description(description)
         .set_buttons(rfd::MessageButtons::OkCancel).show() == rfd::MessageDialogResult::Ok)
 }
 
@@ -50,12 +50,12 @@ fn key_dialog(parent: &gtk::ApplicationWindow) -> gtk::FileChooserDialog {
 }
 
 #[cfg(target_os = "linux")]
-fn confirmation_dialog(parent: &gtk::ApplicationWindow, description: &str) -> gtk::MessageDialog {
+fn confirmation_dialog(parent: &gtk::ApplicationWindow, title: &str, description: &str) -> gtk::MessageDialog {
     let dialog = gtk::MessageDialog::new(
         Some(parent), gtk::DialogFlags::MODAL | gtk::DialogFlags::DESTROY_WITH_PARENT,
         gtk::MessageType::Question, gtk::ButtonsType::OkCancel, description,
     );
-    dialog.set_title("SSH 서버 키 등록");
+    dialog.set_title(title);
     dialog.set_default_response(gtk::ResponseType::Cancel);
     dialog
 }
@@ -69,8 +69,8 @@ fn pick_gtk(parent: &gtk::ApplicationWindow) -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
-fn confirm_gtk(parent: &gtk::ApplicationWindow, description: &str) -> bool {
-    let dialog = confirmation_dialog(parent, description);
+fn confirm_gtk(parent: &gtk::ApplicationWindow, title: &str, description: &str) -> bool {
+    let dialog = confirmation_dialog(parent, title, description);
     let approved = dialog.run() == gtk::ResponseType::Ok;
     dialog.close();
     approved
@@ -85,7 +85,7 @@ fn native_dialogs_are_modal_transients_of_the_same_window() {
     app.register(None::<&gtk::gio::Cancellable>).unwrap();
     let parent = gtk::ApplicationWindow::new(&app);
     let picker = key_dialog(&parent);
-    let confirm = confirmation_dialog(&parent, "dev.example.invalid:2222");
+    let confirm = confirmation_dialog(&parent, super::HOST_CONFIRM_TITLE, "dev.example.invalid:2222");
     let parent: gtk::Window = parent.upcast();
     for dialog in [picker.upcast::<gtk::Window>(), confirm.upcast::<gtk::Window>()] {
         assert_eq!(dialog.transient_for().as_ref(), Some(&parent));

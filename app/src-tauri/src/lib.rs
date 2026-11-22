@@ -6,6 +6,7 @@ mod ssh;
 pub mod ssm;
 mod storage;
 mod terminal;
+mod tunnels;
 mod workspace_window;
 
 use editor::registry::LocalEditors;
@@ -28,6 +29,7 @@ pub fn run() {
         .manage(StorageIpc::default())
         .manage(ai::ipc::State::default())
         .manage(ai::session_selection::State::default())
+        .manage(tunnels::ipc::TunnelTabs::default())
         .plugin(ssm::ipc::lifecycle())
         .setup(|app| {
             if let Ok(registration) = connections::ipc::initialize_ssh_registration(app) {
@@ -48,6 +50,9 @@ pub fn run() {
                 webview.state::<SftpIpc>().navigate(webview.label(), sessions.document(webview.label()));
                 webview.state::<LocalEditors>().navigate(webview.label());
                 webview.state::<StorageIpc>().navigate(webview.label());
+                if webview.label() == "main" && webview.window_ref().label() == "main" {
+                    webview.state::<tunnels::ipc::TunnelTabs>().navigate(false);
+                }
             }
         })
         .invoke_handler(move |invoke| {
@@ -62,6 +67,9 @@ pub fn run() {
                 true
             } else if invoke.message.command() == ssm::ipc::COMMAND {
                 ssm::ipc::dispatch(invoke);
+                true
+            } else if tunnels::ipc::handles(invoke.message.command()) {
+                tunnels::ipc::dispatch(invoke);
                 true
             } else if invoke.message.command().starts_with("editor_sftp_") {
                 editor::sftp_ipc::dispatch(invoke)
@@ -98,8 +106,12 @@ pub fn run() {
                 app.state::<SftpIpc>().destroy(&label);
                 app.state::<LocalEditors>().destroy(&label);
                 app.state::<StorageIpc>().navigate(&label);
+                if label == "main" {
+                    app.state::<tunnels::ipc::TunnelTabs>().navigate(true);
+                }
             }
             tauri::RunEvent::Exit => {
+                app.state::<tunnels::ipc::TunnelTabs>().navigate(true);
                 app.state::<SftpIpc>().shutdown();
                 app.state::<StorageIpc>().shutdown();
                 app.state::<Sessions>().shutdown();

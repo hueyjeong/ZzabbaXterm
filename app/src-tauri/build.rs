@@ -16,6 +16,7 @@ fn main() {
         "connections_load",
         "verify_ssh_host", "commit_ssh_host", "cancel_ssh_host",
         "register_saved_ssh_host",
+        "tunnel_tab_open", "tunnel_start", "tunnel_status", "tunnel_share", "tunnel_tab_close",
         "editor_local_open", "editor_local_save", "editor_local_compare", "editor_local_reload",
         "editor_local_close",
         "editor_sftp_attach", "editor_sftp_list", "editor_sftp_open", "editor_sftp_compare",
