@@ -37,8 +37,18 @@ pub(super) struct OpenCommand {
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum OpenScope {
+    #[serde(deserialize_with = "deserialize_service_browse")]
     ServiceBrowse,
     Bucket { bucket: String, prefix: String },
+}
+
+fn deserialize_service_browse<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<(), D::Error> {
+    // 내부 태그를 제거한 뒤 남은 필드는 모두 거부한다.
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Empty {}
+
+    Empty::deserialize(deserializer).map(|_| ())
 }
 
 impl OpenScope {
