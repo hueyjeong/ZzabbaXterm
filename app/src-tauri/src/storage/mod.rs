@@ -1,6 +1,8 @@
 mod auth;
 mod download;
 pub(crate) mod ipc;
+mod object_edit;
+pub(crate) mod profile_test;
 #[cfg(test)]
 mod tests;
 mod versions;
@@ -132,16 +134,26 @@ pub(crate) struct AwsS3 {
 
 impl AwsS3 {
     async fn for_sso_profile(region: &str, config: crate::ssm::DirectSsoConfig) -> Result<Self, Error> {
+        Self::for_sso_profile_with_account(region, config).await.map(|(client, _)| client)
+    }
+
+    async fn for_sso_profile_with_account(region: &str, config: crate::ssm::DirectSsoConfig) -> Result<(Self, String), Error> {
         let home = crate::ssm::user_home().map_err(|_| Error::at(Stage::Profile, Failure::InvalidSsoProfile))?;
         let transport = aws_smithy_http_client::Builder::new()
             .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
                 aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
             )).build_https();
-        Self::verified(region, config, home, SharedHttpClient::new(transport), SharedTimeSource::default()).await
+        Self::verified_with_account(region, config, home, SharedHttpClient::new(transport), SharedTimeSource::default()).await
     }
 
+    #[cfg(test)]
     async fn verified(region: &str, config: crate::ssm::DirectSsoConfig, home: std::path::PathBuf,
         transport: SharedHttpClient, clock: SharedTimeSource) -> Result<Self, Error> {
+        Self::verified_with_account(region, config, home, transport, clock).await.map(|(client, _)| client)
+    }
+
+    async fn verified_with_account(region: &str, config: crate::ssm::DirectSsoConfig, home: std::path::PathBuf,
+        transport: SharedHttpClient, clock: SharedTimeSource) -> Result<(Self, String), Error> {
         let expected = config.account.clone();
         let provider = SharedCredentialsProvider::new(auth::Provider::new(config, home, transport.clone(), clock.clone()));
         let sts = aws_sdk_sts::Client::from_conf(aws_sdk_sts::Config::builder()
@@ -152,17 +164,17 @@ impl AwsS3 {
             .timeout_config(response_timeout()).sleep_impl(aws_smithy_async::rt::sleep::TokioSleep::new())
             .credentials_provider(provider.clone()).build());
         let identity = sts.get_caller_identity().send().await.map_err(|error| sdk_error(Stage::Identity, error))?;
-        let account = identity.account().ok_or_else(|| Error::at(Stage::Identity, Failure::InvalidResponse))?;
+        let account = identity.account.ok_or_else(|| Error::at(Stage::Identity, Failure::InvalidResponse))?;
         if account != expected {
             return Err(Error::at(Stage::Identity, Failure::AccountMismatch));
         }
-        if identity.arn().and_then(|arn| arn.split(':').nth(4)) != Some(account) {
+        if identity.arn.as_deref().and_then(|arn| arn.split(':').nth(4)) != Some(account.as_str()) {
             return Err(Error::at(Stage::Identity, Failure::InvalidResponse));
         }
         let client = Client::from_conf(s3_config(region).http_client(transport).time_source(clock)
             .identity_cache(aws_sdk_s3::config::IdentityCache::no_cache())
             .credentials_provider(provider).build());
-        Ok(Self { client, endpoint: endpoint(region), region: region.into() })
+        Ok((Self { client, endpoint: endpoint(region), region: region.into() }, account))
     }
 
     pub(crate) fn endpoint(&self) -> &str {
