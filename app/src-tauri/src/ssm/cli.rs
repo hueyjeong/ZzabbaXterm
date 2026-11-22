@@ -1,5 +1,12 @@
 use serde::Deserialize;
-use std::{io, process::Stdio, time::Duration};
+use std::{
+    ffi::OsStr,
+    io,
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::Command,
@@ -26,6 +33,7 @@ pub enum CliError {
     UnsupportedProfile,
     InvalidRegion,
     InvalidTarget,
+    CallerChanged,
     InvalidConfiguration,
     CredentialsUnavailable,
     CredentialsExpired,
@@ -49,17 +57,51 @@ pub(super) enum Tool {
     Plugin,
 }
 
+impl Tool {
+    pub(super) fn resolve(self) -> Result<Arc<Path>, CliError> {
+        let (name, missing) = match self {
+            Self::Aws => ("aws", CliError::AwsCliMissing),
+            Self::Plugin => ("session-manager-plugin", CliError::PluginMissing),
+        };
+        let file = if cfg!(windows) {
+            format!("{name}.exe")
+        } else {
+            name.to_owned()
+        };
+        let path = std::env::var_os("PATH").ok_or(missing)?;
+        resolve_on_path(&file, &path).map(Arc::from).ok_or(missing)
+    }
+}
+
+fn resolve_on_path(file: &str, path: &OsStr) -> Option<PathBuf> {
+    std::env::split_paths(path)
+        .filter(|dir| dir.is_absolute())
+        .find_map(|dir| {
+            let candidate = dir.join(file);
+            let metadata = candidate.metadata().ok()?;
+            if !metadata.is_file() {
+                return None;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if metadata.permissions().mode() & 0o111 == 0 {
+                    return None;
+                }
+            }
+            candidate.canonicalize().ok()
+        })
+}
+
 pub struct CommandSpec {
     tool: Tool,
+    program: Arc<Path>,
     args: Vec<String>,
 }
 
 impl CommandSpec {
-    pub fn program(&self) -> &'static str {
-        match self.tool {
-            Tool::Aws => "aws",
-            Tool::Plugin => "session-manager-plugin",
-        }
+    pub fn program(&self) -> &Path {
+        &self.program
     }
 
     pub fn args(&self) -> &[String] {
@@ -113,21 +155,25 @@ impl CommandSpec {
             ("AWS_CLI_HISTORY_FILE", HISTORY_PATH),
             ("AWS_CLI_ERROR_FORMAT", "enhanced"),
             ("PYTHONIOENCODING", "utf-8"),
+            // 한 번의 CLI 실행에서 같은 AWS 요청을 다시 전송할 수 없도록 한다.
+            ("AWS_MAX_ATTEMPTS", "1"),
         ]
     }
 
-    pub(super) fn aws(args: &[&str]) -> Self {
+    pub(super) fn aws(program: &Arc<Path>, args: &[&str]) -> Self {
         let mut args: Vec<_> = args.iter().map(|arg| (*arg).to_owned()).collect();
         args.extend(["--no-cli-pager".into(), "--no-cli-auto-prompt".into()]);
         Self {
             tool: Tool::Aws,
+            program: program.clone(),
             args,
         }
     }
 
-    pub(super) fn version(tool: Tool) -> Self {
+    pub(super) fn version(tool: Tool, program: Arc<Path>) -> Self {
         Self {
             tool,
+            program,
             args: vec!["--version".into()],
         }
     }

@@ -147,16 +147,6 @@ impl ValidatedDraft {
         self.0.target.method()
     }
 
-    pub(crate) fn shell(&self) -> Shell {
-        let MethodRef::Local { shell, .. } = self.method() else { unreachable!("로컬 시험에서만 호출") };
-        shell
-    }
-
-    pub(crate) fn start_directory(&self) -> &Path {
-        let MethodRef::Local { start_directory, .. } = self.method() else { unreachable!("로컬 시험에서만 호출") };
-        start_directory
-    }
-
     pub(super) fn into_parts(self) -> (Group, Option<Revision>, Target, Option<Revision>) {
         let Draft { group, group_revision, target, target_revision, .. } = self.0;
         (group, group_revision, target, target_revision)

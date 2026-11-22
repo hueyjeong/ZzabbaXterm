@@ -301,7 +301,7 @@ fn c01_saved_pty_selects_exact_id_and_keeps_sessions_after_open_errors() {
         let delayed = super::saved::command(config, "second").unwrap();
         std::fs::remove_dir_all(removed).unwrap();
         for (id, expected) in [("FIRST", "저장된 연결 대상을 찾을 수 없습니다"), ("second", "작업 디렉터리:")] {
-            let result = super::saved::command(config, id).and_then(|command| {
+            let result = super::saved::launch(config, id).and_then(|command| {
                 sessions.open_document("main", sessions.document("main"), size(24, 120), command, |_| Ok(()))
             });
             let error = result.unwrap_err();
@@ -323,4 +323,28 @@ fn c01_saved_pty_selects_exact_id_and_keeps_sessions_after_open_errors() {
         read(&mut first, b"C01-CWD:first;");
         sessions.close("main", &first.id).unwrap();
     }));
+}
+
+#[test]
+fn c02_close_before_start_retires_only_the_unstarted_pty() {
+    bounded(|| {
+        let sessions = Sessions::default();
+        let document = sessions.document("main");
+        let open = || {
+            let target = super::remote::Target::new("fixture", "us-east-1", "i-0123456789abcdef0").unwrap();
+            let (send, events) = mpsc::channel();
+            let id = sessions.open_document("main", document, size(24, 80), super::Launch::Ssm(target), move |event| {
+                send.send(event).map_err(|error| error.to_string())
+            }).unwrap();
+            (id, events)
+        };
+        let (first, first_events) = open();
+        let (peer, peer_events) = open();
+        sessions.close("main", &first).unwrap();
+        assert!(matches!(first_events.try_recv(), Err(mpsc::TryRecvError::Disconnected)));
+        assert_eq!(sessions.start("main", &first), Err(CLOSED.into()));
+        assert!(matches!(peer_events.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        sessions.close("main", &peer).unwrap();
+        assert!(matches!(peer_events.try_recv(), Err(mpsc::TryRecvError::Disconnected)));
+    });
 }

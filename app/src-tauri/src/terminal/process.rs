@@ -1,3 +1,5 @@
+use super::remote;
+use crate::ssm::CancellationToken;
 use super::{CHUNK, CLOSED, Event, WINDOW, stage};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::{
@@ -20,6 +22,8 @@ pub(super) enum Stop {
 #[derive(Default)]
 struct Flow {
     started: bool,
+    attached: bool,
+    attach_error: Option<String>,
     start_deadline: Option<std::time::Instant>,
     child_exited: bool,
     finished: bool,
@@ -50,18 +54,33 @@ impl Flow {
     }
 }
 
+pub(super) enum Launch {
+    Local(CommandBuilder),
+    Ssm(remote::Target),
+}
+
+impl Launch {
+    pub(super) fn is_ssm(&self) -> bool {
+        matches!(self, Self::Ssm(_))
+    }
+}
+
 pub(super) struct Session {
     pub(super) owner: String,
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
+    cancel: Option<CancellationToken>,
+    cleanup_error: Mutex<Option<String>>,
     writer: Mutex<Option<Box<dyn Write + Send>>>,
     flow: Mutex<Flow>,
     wake: Condvar,
 }
 
 impl Session {
-    pub(super) fn new(owner: &str) -> Self {
+    pub(super) fn new(owner: &str, ssm: bool) -> Self {
         Self {
             owner: owner.into(),
+            cancel: ssm.then(CancellationToken::new),
+            cleanup_error: Mutex::new(None),
             master: Mutex::new(None),
             writer: Mutex::new(None),
             flow: Mutex::new(Flow::default()),
@@ -69,10 +88,14 @@ impl Session {
         }
     }
 
+    pub(super) fn is_ssm(&self) -> bool {
+        self.cancel.is_some()
+    }
+
     pub(super) fn launch(
         self: &Arc<Self>,
         size: PtySize,
-        command: CommandBuilder,
+        command: Launch,
         send: impl Fn(Event) -> Result<(), String> + Send + 'static,
         retired: impl FnOnce() + Send + 'static,
     ) -> Result<(), String> {
@@ -83,16 +106,21 @@ impl Session {
     pub(super) fn begin_launch(
         self: &Arc<Self>,
         size: PtySize,
-        command: CommandBuilder,
+        command: Launch,
         send: impl Fn(Event) -> Result<(), String> + Send + 'static,
         retired: impl FnOnce() + Send + 'static,
     ) -> Result<mpsc::Receiver<Result<(), String>>, String> {
         let this = Arc::clone(self);
         let (ready, opened) = mpsc::sync_channel(1);
+        let ssm = command.is_ssm();
         if let Err(error) = thread::Builder::new().name("terminal-pty".into()).spawn(move || {
             let result = this.run(size, command, send, &ready);
             if let Err(error) = result {
-                let _ = ready.send(Err(error));
+                if ssm {
+                    this.flow.lock().unwrap().attach_error = Some(error);
+                } else {
+                    let _ = ready.send(Err(error));
+                }
             }
             retired();
             this.finish();
@@ -106,53 +134,132 @@ impl Session {
     fn run(
         &self,
         size: PtySize,
-        command: CommandBuilder,
+        command: Launch,
         send: impl Fn(Event) -> Result<(), String> + Send + 'static,
         ready: &mpsc::SyncSender<Result<(), String>>,
     ) -> Result<(), String> {
-        let pair = native_pty_system().openpty(size).map_err(|e| stage("openpty", e))?;
-        #[cfg(unix)]
-        set_nonblocking(pair.master.as_ref()).map_err(|e| stage("nonblocking", e))?;
-        let reader = pair.master.try_clone_reader().map_err(|e| stage("clone reader", e))?;
-        let writer = pair.master.take_writer().map_err(|e| stage("take writer", e))?;
+        let ssm = command.is_ssm();
+        if ssm {
+            self.flow.lock().unwrap().start_deadline = Some(std::time::Instant::now() + START_TIMEOUT);
+            let _ = ready.send(Ok(()));
+            let mut flow = self.flow.lock().unwrap();
+            while let Some(deadline) = flow.start_deadline {
+                flow.expire_start();
+                if flow.stop.is_some() { return Err(CLOSED.into()); }
+                flow = self.wake.wait_timeout(flow, deadline.saturating_duration_since(std::time::Instant::now())).unwrap().0;
+            }
+            if flow.stop.is_some() { return Err(CLOSED.into()); }
+        }
+        let mut remote = match &command {
+            Launch::Ssm(target) => Some(tauri::async_runtime::block_on(target.prepare(self.cancel.as_ref().unwrap()))?),
+            Launch::Local(_) => None,
+        };
+        if self.flow.lock().unwrap().stop.is_some() {
+            return Err(stage("open", CLOSED));
+        }
+        #[cfg(windows)]
+        let job = remote.as_ref().map(|_| process_job::Job::new()).transpose()
+            .map_err(|error| stage("SSM Job", error))?;
+        let (pair, mut remote_child) = if let Some(request) = remote.as_mut() {
+            match request.spawn(size, self.cancel.as_ref().unwrap()) {
+                Ok((pair, child)) => (pair, Some(child)),
+                Err(error) => return Err(self.after_failed_spawn(error, remote.take())),
+            }
+        } else {
+            (native_pty_system().openpty(size).map_err(|e| stage("openpty", e))?, None)
+        };
+        let setup = || {
+            #[cfg(windows)]
+            if let (Some(job), Some(child)) = (&job, &remote_child) {
+                job.assign(child.as_ref()).map_err(|error| stage("SSM Job", error))?;
+            }
+            #[cfg(unix)]
+            set_nonblocking(pair.master.as_ref()).map_err(|e| stage("nonblocking", e))?;
+            let reader = pair.master.try_clone_reader().map_err(|e| stage("clone reader", e))?;
+            let writer = pair.master.take_writer().map_err(|e| stage("take writer", e))?;
+            Ok((reader, writer))
+        };
+        let (reader, writer) = match setup() {
+            Ok(io) => io,
+            Err(error) => {
+                if let Some(child) = remote_child.as_mut() { self.terminate(child.as_mut(), Some(pair.master.as_ref())); }
+                #[cfg(windows)]
+                drop(job);
+                drop(pair);
+                return Err(self.after_failed_spawn(error, remote.take()));
+            }
+        };
         thread::scope(|scope| {
             let (event_tx, event_rx) = mpsc::sync_channel(1);
             let drain = thread::Builder::new().name("terminal-output".into()).spawn_scoped(scope, move || {
+                if ssm {
+                    drop(self.wake.wait_while(self.flow.lock().unwrap(), |flow| {
+                        !flow.attached && flow.stop.is_none()
+                    }).unwrap());
+                }
                 let end = self.drain(reader, &send);
                 if let Err(error) = end {
                     self.stop(Stop::Disconnected(error));
                 }
                 // Only this worker sends, including the final status, so channel order is stable.
                 if let Ok(event) = event_rx.recv() {
-                    let event = match self.flow.lock().unwrap().stop.as_ref() {
+                    let mut event = match self.flow.lock().unwrap().stop.as_ref() {
                         Some(Stop::Closed) => None,
                         Some(Stop::Disconnected(error)) => Some(Event::Disconnected(error.clone())),
                         None => event,
                     };
+                    if let Some(error) = self.cleanup_error.lock().unwrap().as_ref() {
+                        event = Some(Event::Disconnected(match event {
+                            Some(Event::Disconnected(reason)) => format!("{reason}; {error}"),
+                            _ => error.clone(),
+                        }));
+                    }
                     if let Some(event) = event {
                         let _ = send(event);
                     }
                 }
-            }).map_err(|e| stage("reader worker", e))?;
-
-            if self.flow.lock().unwrap().stop.is_some() {
-                self.teardown(pair, writer, event_tx, drain);
-                return Err(stage("open", CLOSED));
-            }
-            let mut child = match pair.slave.spawn_command(command) {
-                Ok(child) => child,
+            });
+            let drain = match drain {
+                Ok(drain) => drain,
                 Err(error) => {
-                    self.teardown(pair, writer, event_tx, drain);
-                    return Err(stage("spawn", format_args!("{error:#}")));
+                    if let Some(child) = remote_child.as_mut() { self.terminate(child.as_mut(), Some(pair.master.as_ref())); }
+                    #[cfg(windows)]
+                    drop(job);
+                    drop(writer);
+                    drop(pair);
+                    return Err(self.after_failed_spawn(stage("reader worker", error), remote.take()));
+                }
+            };
+            let mut child = match command {
+                Launch::Ssm(_) => remote_child.take().unwrap(),
+                Launch::Local(command) => {
+                    if self.flow.lock().unwrap().stop.is_some() {
+                        self.teardown(pair, writer, event_tx, drain);
+                        return Err(stage("open", CLOSED));
+                    }
+                    match pair.slave.spawn_command(command) {
+                        Ok(child) => child,
+                        Err(error) => {
+                            self.teardown(pair, writer, event_tx, drain);
+                            return Err(stage("spawn", format_args!("{error:#}")));
+                        }
+                    }
                 }
             };
             drop(pair.slave);
             *self.writer.lock().unwrap() = Some(writer);
             *self.master.lock().unwrap() = Some(pair.master);
-            self.flow.lock().unwrap().start_deadline = Some(std::time::Instant::now() + START_TIMEOUT);
-            let _ = ready.send(Ok(()));
+            {
+                let mut flow = self.flow.lock().unwrap();
+                flow.attached = true;
+                if !ssm { flow.start_deadline = Some(std::time::Instant::now() + START_TIMEOUT); }
+                self.wake.notify_all();
+            }
+            if !ssm { let _ = ready.send(Ok(())); }
 
             let event = self.reap(child.as_mut());
+            #[cfg(windows)]
+            drop(job);
             let master = self.master.lock().unwrap().take();
             #[cfg(windows)]
             if let Ok(mut writer) = self.writer.try_lock() {
@@ -162,10 +269,29 @@ impl Session {
             // and drains/discards until the console releases its output pipe.
             drop(master);
             self.writer.lock().unwrap().take();
+            self.cleanup(remote.take());
             let _ = event_tx.send(event);
             let _ = drain.join();
             Ok(())
         })
+    }
+
+    fn cleanup(&self, remote: Option<remote::Remote>) {
+        if let Some(Err(error)) = remote.map(remote::Remote::close) {
+            *self.cleanup_error.lock().unwrap() = Some(error);
+        }
+    }
+
+    fn after_failed_spawn(&self, error: String, remote: Option<remote::Remote>) -> String {
+        self.cleanup(remote);
+        match self.cleanup_result() {
+            Ok(()) => error,
+            Err(cleanup) => format!("{error}; {cleanup}"),
+        }
+    }
+
+    pub(super) fn cleanup_result(&self) -> Result<(), String> {
+        self.cleanup_error.lock().unwrap().clone().map_or(Ok(()), Err)
     }
 
     fn teardown(
@@ -190,7 +316,7 @@ impl Session {
             if flow.stop.is_some() {
                 self.wake.notify_all();
                 drop(flow);
-                self.terminate(child);
+                self.terminate(child, self.master.lock().unwrap().as_deref().map(|master| master as &dyn MasterPty));
                 return None;
             }
             if let Some(deadline) = flow.start_deadline {
@@ -214,18 +340,17 @@ impl Session {
                     flow.child_exited = true;
                     drop(flow);
                     self.stop(Stop::Disconnected(stage("wait", error)));
-                    self.terminate(child);
+                    self.terminate(child, self.master.lock().unwrap().as_deref().map(|master| master as &dyn MasterPty));
                     return None;
                 }
             }
         }
     }
 
-    fn terminate(&self, child: &mut dyn Child) {
+    fn terminate(&self, child: &mut dyn Child, _master: Option<&dyn MasterPty>) {
         #[cfg(unix)]
         if let Some(pid) = child.process_id() {
-            let master = self.master.lock().unwrap();
-            if let Some(master) = master.as_deref() {
+            if let Some(master) = _master {
                 kill_foreground(master, pid as libc::pid_t);
             }
             // Only the supervisor reaps the child, so its PID cannot yet be recycled.
@@ -313,6 +438,10 @@ impl Session {
     }
 
     pub(super) fn start(&self) -> Result<(), String> {
+        self.start_until(None)
+    }
+
+    pub(super) fn start_until(&self, deadline: Option<std::time::Instant>) -> Result<(), String> {
         let mut flow = self.flow.lock().unwrap();
         flow.expire_start();
         if flow.stop.is_some() || flow.finished || (!flow.started && flow.start_deadline.is_none()) {
@@ -322,6 +451,19 @@ impl Session {
         flow.started = true;
         flow.start_deadline = None;
         self.wake.notify_all();
+        if self.cancel.is_some() {
+            let pending = |flow: &mut Flow| !flow.attached && !flow.finished && flow.stop.is_none();
+            flow = match deadline {
+                Some(deadline) => {
+                    let (state, timeout) = self.wake.wait_timeout_while(flow, deadline.saturating_duration_since(std::time::Instant::now()), pending).unwrap();
+                    if timeout.timed_out() { return Err(super::probe::TIMED_OUT.into()); }
+                    state
+                }
+                None => self.wake.wait_while(flow, pending).unwrap(),
+            };
+            if let Some(error) = flow.attach_error.as_ref() { return Err(error.clone()); }
+            if !flow.attached || flow.stop.is_some() { return Err(CLOSED.into()); }
+        }
         Ok(())
     }
 
@@ -370,6 +512,7 @@ impl Session {
     }
 
     pub(super) fn stop(&self, reason: Stop) {
+        if let Some(cancel) = &self.cancel { cancel.cancel(); }
         let mut flow = self.flow.lock().unwrap();
         if flow.stop.is_none() || matches!(reason, Stop::Closed) {
             flow.stop = Some(reason);
@@ -425,3 +568,6 @@ fn kill_foreground(master: &dyn MasterPty, pid: libc::pid_t) {
         }
     }
 }
+
+#[cfg(windows)]
+mod process_job;

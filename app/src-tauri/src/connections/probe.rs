@@ -95,7 +95,7 @@ pub(super) fn start(sessions: &Sessions, owner: &str, document: u64, draft_id: S
         let draft = Arc::new(draft.validate().map_err(|error| format!("초안 검증: {error:?}"))?);
         let key = RunKey { draft_id, draft_version, run_id: sessions.next_id() };
         let session_id = sessions.next_id();
-        let probe = Arc::new(Probe::new(owner));
+        let probe = Arc::new(Probe::for_draft(owner, &draft));
         let worker = Arc::clone(&probe);
         let tested = Arc::clone(&draft);
         let completed = sessions.probe_completion(key.run_id.clone());
@@ -126,9 +126,14 @@ pub(super) fn wait(sessions: &Sessions, owner: &str, document: u64, key: &RunKey
 }
 
 pub(super) fn cancel(sessions: &Sessions, owner: &str, document: u64, key: &RunKey) -> Result<(), String> {
-    sessions.with_probes(owner, document, |runs| {
-        if runs.get(owner, key).is_ok() {
-            return remove_run(runs, owner, key);
+    let probe = sessions.with_probes(owner, document, |runs| {
+        if let Ok(run) = runs.get(owner, key) {
+            let probe = Arc::clone(&run.probe);
+            remove_run(runs, owner, key)?;
+            return Ok(Some(probe));
+        }
+        if let Some((_, _, probe)) = runs.retiring.iter().find(|(previous, old, _)| previous == owner && old == key) {
+            return Ok(Some(Arc::clone(probe)));
         }
         let belongs_to_other = runs.retiring.iter().any(|(previous_owner, old, _)| {
             previous_owner != owner && old.run_id == key.run_id
@@ -138,8 +143,9 @@ pub(super) fn cancel(sessions: &Sessions, owner: &str, document: u64, key: &RunK
         if belongs_to_other {
             return Err(UNTESTED.into());
         }
-        Ok(())
-    })
+        Ok(None)
+    })?;
+    probe.map_or(Ok(()), |probe| probe.cancel_result())
 }
 
 fn remove_run(runs: &mut Runs, owner: &str, key: &RunKey) -> Result<(), String> {

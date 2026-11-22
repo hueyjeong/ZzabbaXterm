@@ -4,15 +4,15 @@ mod profile;
 mod session;
 
 pub use cli::{CliError, CommandSpec};
-pub use session::{SessionLookup, StartRequest, VerificationError, VerifiedSession};
+pub use session::{SessionLookup, StartPermit, StartRequest, VerificationError, VerifiedSession};
 pub use tokio_util::sync::CancellationToken;
 
 use cli::{Captured, Tool};
 use profile::Profiles;
 use serde::{Deserialize, de::DeserializeOwned};
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
-pub struct AwsCli(());
+pub struct AwsCli(Arc<Path>);
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct Scope {
@@ -40,7 +40,13 @@ impl Scope {
         &self.region
     }
 
-    fn command(&self, service: &str, action: &str, extras: &[&str]) -> CommandSpec {
+    fn command(
+        &self,
+        program: &Arc<Path>,
+        service: &str,
+        action: &str,
+        extras: &[&str],
+    ) -> CommandSpec {
         let mut args = vec![
             service,
             action,
@@ -52,24 +58,27 @@ impl Scope {
             "json",
         ];
         args.extend_from_slice(extras);
-        CommandSpec::aws(&args)
+        CommandSpec::aws(program, &args)
     }
 }
 
 impl AwsCli {
     pub async fn probe(cancel: &CancellationToken) -> Result<Self, CliError> {
         Profiles::load()?;
-        let result = CommandSpec::version(Tool::Aws).capture(cancel).await?;
+        let program = Tool::Aws.resolve()?;
+        let result = CommandSpec::version(Tool::Aws, program.clone())
+            .capture(cancel)
+            .await?;
         if !result.stdout.starts_with(b"aws-cli/2.") && !result.stderr.starts_with(b"aws-cli/2.") {
             result.success()?;
             return Err(CliError::AwsCliNotV2);
         }
         result.success()?;
-        Ok(Self(()))
+        Ok(Self(program))
     }
 
     pub async fn check_plugin(&self, cancel: &CancellationToken) -> Result<(), CliError> {
-        CommandSpec::version(Tool::Plugin)
+        CommandSpec::version(Tool::Plugin, Tool::Plugin.resolve()?)
             .capture(cancel)
             .await?
             .success()?;
@@ -78,7 +87,7 @@ impl AwsCli {
 
     pub async fn profiles(&self, cancel: &CancellationToken) -> Result<Vec<String>, CliError> {
         let profiles = Profiles::load()?;
-        let output = profiles_command().capture(cancel).await?.success()?;
+        let output = self.profiles_command().capture(cancel).await?.success()?;
         filter_profiles(&profiles, &output)
     }
 
@@ -89,7 +98,7 @@ impl AwsCli {
     ) -> Result<Option<String>, CliError> {
         validate_profile(profile)?;
         require_direct_profile(profile)?;
-        parse_region(region_command(profile).capture(cancel).await?)
+        parse_region(self.region_command(profile).capture(cancel).await?)
     }
 
     pub async fn online_nodes(
@@ -98,7 +107,29 @@ impl AwsCli {
         cancel: &CancellationToken,
     ) -> Result<Vec<OnlineNode>, CliError> {
         require_direct_profile(scope.profile())?;
-        parse_online_nodes(scope, nodes_command(scope).capture(cancel).await?)
+        self.online_nodes_with(scope, |spec| async move { spec.capture(cancel).await })
+            .await
+    }
+
+    // Tauri 작업으로 넘길 수 있도록 각 캡처 퓨처가 클로저의 가변 참조를 빌리지 않게 한다.
+    async fn online_nodes_with<F>(
+        &self,
+        scope: &Scope,
+        mut capture: impl FnMut(CommandSpec) -> F + Send,
+    ) -> Result<Vec<OnlineNode>, CliError>
+    where
+        F: Future<Output = Result<Captured, CliError>> + Send,
+    {
+        let identity = || session::identity_command(&self.0, scope);
+        let owner = session::captured_caller_arn(capture(identity()).await?)?;
+        let result = capture(self.nodes_command(scope)).await?;
+        let nodes = self.parse_online_nodes(scope, Arc::from(owner), result)?;
+        if let Some(node) = nodes.first()
+            && session::captured_caller_arn(capture(identity()).await?)? != node.owner.as_ref()
+        {
+            return Err(CliError::CallerChanged);
+        }
+        Ok(nodes)
     }
 
     pub fn relogin_command(&self, scope: &Scope, cause: CliError) -> Result<CommandSpec, CliError> {
@@ -106,7 +137,7 @@ impl AwsCli {
             return Err(CliError::SsoLoginNotApplicable);
         }
         require_direct_profile(scope.profile())?;
-        Ok(login_command(scope.profile()))
+        Ok(self.login_command(scope.profile()))
     }
 
     pub async fn relogin(
@@ -116,6 +147,26 @@ impl AwsCli {
         cancel: &CancellationToken,
     ) -> Result<(), CliError> {
         self.relogin_command(scope, cause)?.login(cancel).await
+    }
+
+    fn login_command(&self, profile: &str) -> CommandSpec {
+        // 로그인 리전은 관리 노드 리전이 아니라 프로필의 IAM Identity Center 설정을 따른다.
+        CommandSpec::aws(&self.0, &["sso", "login", "--profile", profile])
+    }
+
+    fn profiles_command(&self) -> CommandSpec {
+        CommandSpec::aws(&self.0, &["configure", "list-profiles"])
+    }
+
+    fn region_command(&self, profile: &str) -> CommandSpec {
+        CommandSpec::aws(
+            &self.0,
+            &["configure", "get", "region", "--profile", profile],
+        )
+    }
+
+    fn nodes_command(&self, scope: &Scope) -> CommandSpec {
+        scope.command(&self.0, "ssm", "describe-instance-information", &[])
     }
 }
 
@@ -128,23 +179,6 @@ fn filter_profiles(profiles: &Profiles, output: &[u8]) -> Result<Vec<String>, Cl
 }
 fn require_direct_profile(profile: &str) -> Result<(), CliError> {
     Profiles::load()?.require(profile)
-}
-
-fn login_command(profile: &str) -> CommandSpec {
-    // 로그인 리전은 관리 노드 리전이 아니라 프로필의 IAM Identity Center 설정을 따른다.
-    CommandSpec::aws(&["sso", "login", "--profile", profile])
-}
-
-fn profiles_command() -> CommandSpec {
-    CommandSpec::aws(&["configure", "list-profiles"])
-}
-
-fn region_command(profile: &str) -> CommandSpec {
-    CommandSpec::aws(&["configure", "get", "region", "--profile", profile])
-}
-
-fn nodes_command(scope: &Scope) -> CommandSpec {
-    scope.command("ssm", "describe-instance-information", &[])
 }
 
 pub(crate) fn validate_profile(profile: &str) -> Result<(), CliError> {
@@ -193,6 +227,8 @@ fn parse_region(captured: Captured) -> Result<Option<String>, CliError> {
 pub struct OnlineNode {
     scope: Scope,
     instance_id: String,
+    owner: Arc<str>,
+    program: Arc<Path>,
 }
 
 impl OnlineNode {
@@ -222,24 +258,33 @@ enum PingStatus {
     Inactive,
 }
 
-fn parse_online_nodes(scope: &Scope, captured: Captured) -> Result<Vec<OnlineNode>, CliError> {
-    let inventory: InstanceInformation = decode(&captured.success()?)?;
-    if inventory.next_token.is_some() {
-        return Err(CliError::InvalidResponse);
-    }
-    let mut nodes = Vec::new();
-    for node in inventory.instance_information_list {
-        if !valid_instance_id(&node.instance_id) {
+impl AwsCli {
+    fn parse_online_nodes(
+        &self,
+        scope: &Scope,
+        owner: Arc<str>,
+        captured: Captured,
+    ) -> Result<Vec<OnlineNode>, CliError> {
+        let inventory: InstanceInformation = decode(&captured.success()?)?;
+        if inventory.next_token.is_some() {
             return Err(CliError::InvalidResponse);
         }
-        if matches!(node.ping_status, PingStatus::Online) {
-            nodes.push(OnlineNode {
-                scope: scope.clone(),
-                instance_id: node.instance_id,
-            });
+        let mut nodes = Vec::new();
+        for node in inventory.instance_information_list {
+            if !valid_instance_id(&node.instance_id) {
+                return Err(CliError::InvalidResponse);
+            }
+            if matches!(node.ping_status, PingStatus::Online) {
+                nodes.push(OnlineNode {
+                    scope: scope.clone(),
+                    instance_id: node.instance_id,
+                    owner: owner.clone(),
+                    program: self.0.clone(),
+                });
+            }
         }
+        Ok(nodes)
     }
-    Ok(nodes)
 }
 
 pub(crate) fn valid_instance_id(id: &str) -> bool {

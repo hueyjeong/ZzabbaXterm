@@ -51,6 +51,8 @@ JS는 문서에서 `window.__ZZABBA_SSM_DOCUMENT__`를 읽는다. 아직 값이 
 
 Rust는 두 방식이 섞인 레코드와 비밀·실행 파일·임의 인자 등 정의되지 않은 필드를 거부한다. 마법사는 [C01 시험·저장 IPC](01-profiles.md#로컬-마법사-ipc)를 그대로 사용한다. 현재 초안의 실제 연결 시험이 성공한 경우에만 저장할 수 있다. 저장된 SSM 행을 열 때 `terminal_open`의 연결 인자는 `targetId`뿐이며, Rust가 파일에서 대상의 방식을 다시 읽는다.
 
+`terminal_open`이 PTY ID를 발급하면 SSM은 해당 ID의 `terminal_start`가 도착한 뒤에만 시작한다. 연결 시험은 같은 PTY에서 Linux 셸 표식과 종료 코드 0을 확인하고, 서비스 이력에서 종료까지 확인한 뒤 C01 저장 자격을 발급한다. `terminal_close`는 로컬 프로세스를 회수한 뒤 소유한 원격 세션의 종료 결과를 반환한다. 권한 거부 등으로 확인할 수 없는 경우 결과는 `종료 확인 불가: <대상>`이다.
+
 **완료 증거:** `Windows SSM T1 / Ubuntu SSM T1 / Windows T3 / Ubuntu T3` 네 결과에 OS·WebView·입력기·CLI/플러그인 버전과 실제 관찰을 적는다. T3에는 실패별 화면 상태와 마법사 시험·탭별 세션 정리 근거를 포함한다. 계정·노드·세션 ID는 일관된 별칭으로 가리고 토큰·로그인 URL은 제외한다. 접근할 수 없는 조합은 `미실행(사유)`, macOS는 후속 실기기 검증이다.
 
 참고: [Session Manager 시작](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-sessions-start.html) · [세션 상태 조회](https://docs.aws.amazon.com/cli/latest/reference/ssm/describe-sessions.html)

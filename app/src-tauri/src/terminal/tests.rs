@@ -164,7 +164,7 @@ fn l01_terminal_navigation_retires_old_document_and_accepts_new_document() {
     let sessions = Sessions::default();
     let old = Peer::open(&sessions);
     let document = sessions.document("main");
-    let delayed_open = || sessions.open_document("main", document, SIZE, shell(), |_| Ok(()));
+    let delayed_open = || sessions.open_document("main", document, SIZE, super::Launch::Local(shell()), |_| Ok(()));
     sessions.navigate("main");
     assert!(sessions.input("main", &old.id, b"x").is_err());
     assert_eq!(delayed_open().unwrap_err(), "open: 문서가 바뀌었습니다");

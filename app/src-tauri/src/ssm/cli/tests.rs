@@ -125,8 +125,13 @@ async fn missing_tool_is_attributed_and_pre_cancel_wins() {
 
 #[test]
 fn child_environment_leaves_config_and_cache_to_cli() {
-    let spec = CommandSpec::aws(&["ssm", "describe-instance-information"]);
+    let cli = super::super::tests::fixture_cli();
+    let spec = CommandSpec::aws(
+        &cli.0,
+        &["ssm", "terminate-session", "--session-id", "fixture"],
+    );
     let cmd = spec.command();
+    assert_eq!(cmd.as_std().get_program(), cli.0.as_os_str());
     let env: std::collections::BTreeMap<_, _> = cmd.as_std().get_envs().collect();
     for key in [
         "AWS_ACCESS_KEY_ID",
@@ -147,6 +152,7 @@ fn child_environment_leaves_config_and_cache_to_cli() {
         ("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "true"),
         ("AWS_EC2_METADATA_DISABLED", "true"),
         ("AWS_CLI_HISTORY_FILE", "./."),
+        ("AWS_MAX_ATTEMPTS", "1"),
     ] {
         assert_eq!(
             env.get(std::ffi::OsStr::new(key)),
@@ -163,6 +169,19 @@ fn child_environment_leaves_config_and_cache_to_cli() {
         assert!(!env.contains_key(std::ffi::OsStr::new(key)));
     }
 }
+
+#[test]
+fn executable_resolution_skips_relative_path_and_pins_the_chosen_file() {
+    let exe = std::env::current_exe().unwrap();
+    let name = exe.file_name().unwrap().to_str().unwrap();
+    let path = std::env::join_paths([Path::new("."), exe.parent().unwrap()]).unwrap();
+    assert_eq!(
+        resolve_on_path(name, &path),
+        Some(exe.canonicalize().unwrap())
+    );
+    assert_eq!(resolve_on_path(name, OsStr::new(".")), None);
+}
+
 // 테스트 바이너리의 자식은 로컬 파이프에만 쓴다.
 #[test]
 fn process_fixture() {

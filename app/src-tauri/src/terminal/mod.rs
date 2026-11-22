@@ -8,13 +8,14 @@ use std::{
 pub(crate) mod ipc;
 mod process;
 pub(crate) mod probe;
+mod remote;
 mod saved;
 #[cfg(all(test, any(windows, unix)))]
 mod pty_flow_tests;
 #[cfg(test)]
 pub(crate) mod tests;
 
-use process::Session;
+use process::{Launch, Session};
 
 #[derive(Default)]
 pub(crate) struct Sessions {
@@ -34,7 +35,7 @@ struct Registry {
 impl Sessions {
     #[cfg(test)]
     fn open(&self, owner: &str, size: PtySize, command: CommandBuilder, send: impl Fn(Event) -> Result<(), String> + Send + 'static) -> Result<String, String> {
-        self.open_document(owner, self.document(owner), size, command, send)
+        self.open_document(owner, self.document(owner), size, Launch::Local(command), send)
     }
 
     pub(crate) fn document(&self, owner: &str) -> u64 {
@@ -65,10 +66,10 @@ impl Sessions {
         self.next.fetch_add(1, Ordering::Relaxed).to_string()
     }
 
-    fn open_document(&self, owner: &str, document: u64, size: PtySize, command: CommandBuilder, send: impl Fn(Event) -> Result<(), String> + Send + 'static) -> Result<String, String> {
+    fn open_document(&self, owner: &str, document: u64, size: PtySize, command: Launch, send: impl Fn(Event) -> Result<(), String> + Send + 'static) -> Result<String, String> {
         validate_size(size)?;
         let id = self.next_id();
-        let session = Arc::new(Session::new(owner));
+        let session = Arc::new(Session::new(owner, command.is_ssm()));
         {
             let mut registry = self.registry.lock().unwrap();
             if registry.shutdown || registry.destroyed.contains(owner) {
@@ -122,7 +123,7 @@ impl Sessions {
         let session = self.get(owner, id)?;
         session.stop(process::Stop::Closed);
         session.wait_finished();
-        Ok(())
+        session.cleanup_result()
     }
 
     pub(crate) fn navigate(&self, owner: &str) {

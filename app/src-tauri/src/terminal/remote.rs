@@ -1,0 +1,68 @@
+use portable_pty::{Child, PtyPair, PtySize};
+
+use crate::ssm::{AwsCli, CancellationToken, CliError, Scope, StartRequest};
+
+pub(super) struct Target {
+    scope: Scope,
+    instance_id: String,
+}
+
+impl Target {
+    pub(super) fn new(profile: &str, region: &str, instance_id: &str) -> Result<Self, String> {
+        let scope = Scope::new(profile.into(), region.into()).map_err(start_error)?;
+        Ok(Self { scope, instance_id: instance_id.into() })
+    }
+
+    pub(super) async fn prepare(&self, cancel: &CancellationToken) -> Result<Remote, String> {
+        let cli = AwsCli::probe(cancel).await.map_err(start_error)?;
+        let node = cli.online_nodes(&self.scope, cancel).await.map_err(start_error)?
+            .into_iter().find(|node| node.instance_id() == self.instance_id)
+            .ok_or_else(|| start_error(CliError::TargetNotConnected))?;
+        cli.check_plugin(cancel).await.map_err(start_error)?;
+        let request = cli.prepare_start(&self.scope, &node, cancel).await.map_err(start_error)?;
+        Ok(Remote { cli, scope: self.scope.clone(), request, spawn_attempted: false })
+    }
+}
+
+pub(super) struct Remote {
+    cli: AwsCli,
+    scope: Scope,
+    request: StartRequest,
+    spawn_attempted: bool,
+}
+
+impl Remote {
+    pub(super) fn spawn(&mut self, size: PtySize, cancel: &CancellationToken) -> Result<(PtyPair, Box<dyn Child + Send + Sync>), String> {
+        let permit = tauri::async_runtime::block_on(self.cli.authorize_start(&mut self.request, &self.scope, cancel))
+            .map_err(start_error)?.ok_or_else(|| start_error(CliError::Cancelled))?;
+        if cancel.is_cancelled() { return Err(start_error(CliError::Cancelled)); }
+        self.spawn_attempted = true;
+        permit.spawn(size).map_err(|_| "SSM PTY: 시작 실패".into())
+    }
+
+    pub(super) fn close(mut self) -> Result<(), String> {
+        if !self.spawn_attempted {
+            return Ok(());
+        }
+        // 문서 취소 토큰은 시작만 중단한다. 종료 조회에는 새 토큰을 사용한다.
+        let cancel = CancellationToken::new();
+        tauri::async_runtime::block_on(self.cli.close_session(&mut self.request, &self.scope, &cancel))
+            .map_err(|_| format!("종료 확인 불가: {}", self.request.target()))
+    }
+}
+
+fn start_error(error: CliError) -> String {
+    let status = match error {
+        CliError::AwsCliMissing => "AWS CLI 없음",
+        CliError::AwsCliNotV2 => "AWS CLI v2 필요",
+        CliError::PluginMissing => "Session Manager 플러그인 없음",
+        CliError::TargetNotConnected => "노드 연결 불가",
+        CliError::AccessDenied => "권한 거부",
+        CliError::SsoLoginRequired => "SSO 재로그인 필요",
+        CliError::CredentialsExpired => "자격 증명 만료",
+        CliError::Cancelled => "시작 취소",
+        CliError::CallerChanged => "AWS 프로필의 신원이 바뀌었습니다",
+        _ => return format!("SSM: {error:?}"),
+    };
+    format!("SSM: {status}")
+}

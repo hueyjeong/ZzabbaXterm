@@ -1,5 +1,9 @@
 use super::*;
 
+pub(super) fn fixture_cli() -> AwsCli {
+    AwsCli(Arc::from(std::env::current_exe().unwrap()))
+}
+
 fn response(exit_code: i32, stdout: &str, stderr: &str) -> Captured {
     Captured {
         exit_code: Some(exit_code),
@@ -118,7 +122,11 @@ fn online_list_only_accepts_complete_inventory() {
         ),
     ];
     for (exit, stdout, stderr, expected) in rows {
-        let result = parse_online_nodes(&scope, response(*exit, stdout, stderr));
+        let result = fixture_cli().parse_online_nodes(
+            &scope,
+            Arc::from("fixture-owner"),
+            response(*exit, stdout, stderr),
+        );
         match expected {
             Ok(ids) => {
                 let nodes = result.unwrap();
@@ -140,15 +148,15 @@ fn online_list_only_accepts_complete_inventory() {
 fn discovery_commands_use_literal_arguments_and_never_fallback() {
     let profile = "team & admin";
     let scope = Scope::new(profile.into(), "us-west-2".into()).unwrap();
-    let cli = AwsCli(());
+    let cli = fixture_cli();
     for (spec, expected) in [
-        (profiles_command(), vec!["configure", "list-profiles"]),
+        (cli.profiles_command(), vec!["configure", "list-profiles"]),
         (
-            region_command(profile),
+            cli.region_command(profile),
             vec!["configure", "get", "region", "--profile", profile],
         ),
         (
-            nodes_command(&scope),
+            cli.nodes_command(&scope),
             vec![
                 "ssm",
                 "describe-instance-information",
@@ -161,11 +169,11 @@ fn discovery_commands_use_literal_arguments_and_never_fallback() {
             ],
         ),
         (
-            login_command(profile),
+            cli.login_command(profile),
             vec!["sso", "login", "--profile", profile],
         ),
     ] {
-        assert_eq!(spec.program(), "aws");
+        assert_eq!(spec.program(), cli.0.as_ref());
         assert_eq!(
             spec.args(),
             [expected, vec!["--no-cli-pager", "--no-cli-auto-prompt"]].concat()
@@ -183,8 +191,8 @@ fn discovery_commands_use_literal_arguments_and_never_fallback() {
             Some(CliError::SsoLoginNotApplicable)
         );
     }
-    let plugin = CommandSpec::version(Tool::Plugin);
-    assert_eq!(plugin.program(), "session-manager-plugin");
+    let plugin = CommandSpec::version(Tool::Plugin, cli.0.clone());
+    assert_eq!(plugin.program(), cli.0.as_ref());
     assert_eq!(plugin.args(), ["--version"]);
     assert_eq!(
         Scope::new("--debug".into(), "us-west-2".into()).err(),

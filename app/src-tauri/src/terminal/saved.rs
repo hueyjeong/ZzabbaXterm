@@ -2,11 +2,27 @@ use std::path::Path;
 
 use portable_pty::CommandBuilder;
 
-use crate::connections::{profile::Shell, saved_local};
+use crate::connections::{profile::{MethodRef, Shell}, with_saved_method};
 
+use super::{process::Launch, remote};
+
+pub(super) fn launch(config: &Path, id: &str) -> Result<Launch, String> {
+    with_saved_method(config, id, |method| match method {
+        MethodRef::Local { shell, start_directory } => local(shell, start_directory).map(Launch::Local),
+        MethodRef::Ssm { profile, region, instance_id } => remote::Target::new(profile, region, instance_id).map(Launch::Ssm),
+    })
+}
+
+#[cfg(test)]
 pub(super) fn command(config: &Path, id: &str) -> Result<CommandBuilder, String> {
-    let (shell, directory) = saved_local(config, id)?;
-    super::validate_working_directory(&directory)?;
+    match launch(config, id)? {
+        Launch::Local(command) => Ok(command),
+        Launch::Ssm(_) => Err("로컬 연결이 아닙니다".into()),
+    }
+}
+
+fn local(shell: Shell, directory: &Path) -> Result<CommandBuilder, String> {
+    super::validate_working_directory(directory)?;
 
     // portable-pty는 시작 직전에 경로가 사라지면 홈을 선택할 수 있다. 프롬프트 전에 실제 위치를 확인한다.
     let mut command = match shell {
@@ -45,7 +61,7 @@ pub(super) fn command(config: &Path, id: &str) -> Result<CommandBuilder, String>
         }
         _ => return Err("지원하지 않는 셸입니다".into()),
     };
-    command.cwd(&directory);
+    command.cwd(directory);
     command.env("ZZABBA_C01_CWD", directory);
     command.env("TERM", "xterm-256color");
     Ok(command)

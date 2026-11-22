@@ -1,5 +1,5 @@
 use super::*;
-use crate::ssm::{AwsCli, CancellationToken, OnlineNode, Scope, filter_profiles};
+use crate::ssm::{CancellationToken, OnlineNode, Scope, filter_profiles, tests::fixture_cli};
 
 #[test]
 fn profile_fixture() {
@@ -27,11 +27,13 @@ fn profile_fixture() {
     }
     assert_eq!(profiles.require("missing"), Err(CliError::ProfileNotFound));
     let scope = Scope::new("via-process".into(), "us-east-1".into()).unwrap();
-    let cli = AwsCli(());
+    let cli = fixture_cli();
     let cancel = CancellationToken::new();
     let node = OnlineNode {
         scope: scope.clone(),
         instance_id: "i-01234567".into(),
+        owner: "fixture-owner".into(),
+        program: cli.0.clone(),
     };
     assert_eq!(
         cli.relogin_command(&scope, CliError::SsoLoginRequired)

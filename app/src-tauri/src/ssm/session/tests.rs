@@ -1,3 +1,4 @@
+use super::super::tests::fixture_cli;
 use super::*;
 use serde_json::{Value, json};
 use std::{collections::VecDeque, ffi::OsStr};
@@ -13,6 +14,7 @@ fn request() -> StartRequest {
         target: TARGET.into(),
         reason: REASON.into(),
         owner: OWNER.into(),
+        program: fixture_cli().0,
         command_issued: true,
         termination_id: None,
     }
@@ -34,17 +36,13 @@ fn capture(stdout: Vec<u8>) -> super::super::Captured {
 #[test]
 fn start_identity_and_lookup_commands_preserve_selected_scope() {
     let request = request();
-    let mut request = StartRequest {
-        command_issued: false,
-        ..request
-    };
     let cwd = std::path::Path::new("fixture-cwd");
-    let start = request.issue_start_command(cwd).unwrap();
+    let start = request.start_command(cwd);
     assert_eq!(start.get_cwd().unwrap(), cwd.as_os_str());
+    assert_eq!(start.get_argv()[0], request.program.as_os_str());
     assert_eq!(
-        start.get_argv(),
+        &start.get_argv()[1..],
         &[
-            if cfg!(windows) { "aws.exe" } else { "aws" },
             "ssm",
             "start-session",
             "--profile",
@@ -72,7 +70,7 @@ fn start_identity_and_lookup_commands_preserve_selected_scope() {
     let flags = ["--no-cli-pager", "--no-cli-auto-prompt"];
     for (spec, command, args) in [
         (
-            identity_command(&request.scope),
+            identity_command(&request.program, &request.scope),
             ["sts", "get-caller-identity"],
             vec![],
         ),
@@ -97,7 +95,7 @@ fn start_identity_and_lookup_commands_preserve_selected_scope() {
             ],
         ),
     ] {
-        assert_eq!(spec.program(), "aws");
+        assert_eq!(spec.program(), request.program.as_ref());
         assert_eq!(
             spec.args(),
             command
@@ -108,7 +106,6 @@ fn start_identity_and_lookup_commands_preserve_selected_scope() {
                 .collect::<Vec<_>>()
         );
     }
-    assert!(request.take_start_command().unwrap().is_none());
 }
 
 #[test]
@@ -214,7 +211,10 @@ fn owner_is_a_validated_sts_arn() {
 
 #[test]
 fn pty_filters_fixture_environment_without_mutating_the_process() {
-    let spec = request().scope.command("ssm", "start-session", &[]);
+    let request = request();
+    let spec = request
+        .scope
+        .command(&request.program, "ssm", "start-session", &[]);
     let mut command = CommandBuilder::new(spec.program());
     command.env("EXTRA_BASE_ENV", "discarded");
     let inherited = spec.env_remove().iter().map(|key| (*key, "discarded"));
@@ -247,41 +247,106 @@ fn pty_filters_fixture_environment_without_mutating_the_process() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn start_requires_an_online_node_from_the_same_scope() {
+    let cli = fixture_cli();
     let scope = request().scope;
-    let node = super::super::parse_online_nodes(
-        &scope,
-        fixture(json!({"InstanceInformationList": [
-            {"InstanceId": TARGET, "PingStatus": "Online"},
-            {"InstanceId": "i-11111111", "PingStatus": "ConnectionLost"}
-        ]})),
-    )
-    .unwrap()
-    .pop()
-    .unwrap();
-    let other = Scope::new("other".into(), "us-west-2".into()).unwrap();
-    let bad = prepare_start_with(&other, &node, async |_| panic!("unexpected command")).await;
-    assert_eq!(bad.err(), Some(CliError::InvalidTarget));
-    let mut reasons = Vec::new();
-    for _ in 0..2 {
-        let mut start = prepare_start_with(&scope, &node, async |spec| {
-            assert_eq!(&spec.args()[..2], ["sts", "get-caller-identity"]);
-            Ok(identity())
+    let mut captured = Vec::new();
+    let nodes = cli
+        .online_nodes_with(&scope, |spec| {
+            assert_eq!(spec.program(), cli.0.as_ref());
+            let action = spec.args()[1].clone();
+            let reply = if action == "describe-instance-information" {
+                fixture(json!({"InstanceInformationList": [
+                    {"InstanceId": TARGET, "PingStatus": "Online"},
+                    {"InstanceId": "i-11111111", "PingStatus": "ConnectionLost"}
+                ]}))
+            } else {
+                identity()
+            };
+            captured.push(action);
+            std::future::ready(Ok(reply))
         })
         .await
         .unwrap();
+    assert_eq!(
+        captured,
+        [
+            "get-caller-identity",
+            "describe-instance-information",
+            "get-caller-identity"
+        ]
+    );
+    assert_eq!(nodes.len(), 1);
+    let node = &nodes[0];
+    let other = Scope::new("other".into(), "us-west-2".into()).unwrap();
+    let other_program = cli.0.with_file_name("other-aws.exe");
+    assert_eq!(
+        require_node_scope(&cli.0, &other, node),
+        Err(CliError::InvalidTarget)
+    );
+    assert_eq!(
+        require_node_scope(&other_program, &scope, node),
+        Err(CliError::InvalidTarget)
+    );
+    let mut reasons = Vec::new();
+    for _ in 0..2 {
+        let mut start = prepare_start(&scope, node).unwrap();
+        for (program, scope) in [(other_program.as_path(), &scope), (cli.0.as_ref(), &other)] {
+            let invalid = start
+                .authorize_with(program, scope, async |_| panic!("unexpected command"))
+                .await;
+            assert_eq!(invalid.err(), Some(CliError::InvalidTarget));
+        }
+        let changed = start
+            .authorize_with(&cli.0, &scope, async |_| {
+                Ok(fixture(
+                    json!({"Arn": "arn:aws:sts::123456789012:assumed-role/Sample/Other"}),
+                ))
+            })
+            .await;
+        assert_eq!(changed.err(), Some(CliError::CallerChanged));
+        let permit = start
+            .authorize_with(&cli.0, &scope, async |spec| {
+                assert_eq!(spec.program(), cli.0.as_ref());
+                assert_eq!(&spec.args()[..2], ["sts", "get-caller-identity"]);
+                Ok(identity())
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(permit.0.get_argv()[0], cli.0.as_os_str());
         assert_eq!(start.target(), TARGET);
         let nonce = start.reason.strip_prefix("zzabbaxterm-").unwrap();
         assert_eq!(nonce.len(), 32);
         assert!(nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert!(
             start
-                .issue_start_command(std::path::Path::new("fixture-cwd"))
-                .is_some()
+                .authorize_with(&cli.0, &scope, async |_| panic!("unexpected command"))
+                .await
+                .unwrap()
+                .is_none()
         );
-        assert!(start.take_start_command().unwrap().is_none());
         reasons.push(start.reason);
     }
     assert_ne!(reasons[0], reasons[1]);
+}
+
+#[tokio::test]
+async fn changing_caller_during_discovery_discards_the_nodes() {
+    let cli = fixture_cli();
+    let mut responses = VecDeque::from([
+        identity(),
+        fixture(
+            json!({"InstanceInformationList": [{"InstanceId": TARGET, "PingStatus": "Online"}]}),
+        ),
+        fixture(json!({"Arn": "arn:aws:sts::123456789012:assumed-role/Sample/Other"})),
+    ]);
+    let result = cli
+        .online_nodes_with(&request().scope, |_| {
+            std::future::ready(Ok(responses.pop_front().unwrap()))
+        })
+        .await;
+    assert_eq!(result.err(), Some(CliError::CallerChanged));
+    assert!(responses.is_empty());
 }
 
 fn fixture(value: Value) -> Captured {
@@ -318,10 +383,11 @@ async fn check_close(
     replies: impl IntoIterator<Item = Exchange>,
 ) -> Result<(), VerificationError> {
     let mut replies: VecDeque<_> = replies.into_iter().collect();
+    let program = request.program.clone();
     let result = request
-        .close_with(scope, async |spec| {
+        .close_with(&program, scope, async |spec| {
             let (args, reply) = replies.pop_front().expect("unexpected command");
-            assert_eq!(spec.program(), "aws");
+            assert_eq!(spec.program(), program.as_ref());
             assert_eq!(
                 spec.args(),
                 args[..2]

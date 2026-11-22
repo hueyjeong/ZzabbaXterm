@@ -1,17 +1,38 @@
 use super::{
     AwsCli, CancellationToken, Captured, CliError, CommandSpec, OnlineNode, Scope, decode,
 };
-use portable_pty::CommandBuilder;
+use portable_pty::{Child, CommandBuilder, PtyPair, PtySize, native_pty_system};
 use serde::Deserialize;
+use std::{io, path::Path, sync::Arc};
 
 // 각 요청을 앱 세션에 보관하고 start-session은 요청당 한 번만 호출한다.
 pub struct StartRequest {
     scope: Scope,
     target: String,
     reason: String,
-    owner: String,
+    owner: Arc<str>,
+    program: Arc<Path>,
     command_issued: bool,
     termination_id: Option<String>,
+}
+
+// CommandBuilder를 노출하면 복제해 같은 인가를 여러 번 실행할 수 있다.
+/// PTY를 시작할 때 소비하는 인가다.
+///
+/// ```compile_fail
+/// use zzabbaxterm_lib::ssm::StartPermit;
+/// fn duplicate(permit: StartPermit) { let _ = permit.clone(); }
+/// ```
+pub struct StartPermit(CommandBuilder);
+
+impl StartPermit {
+    pub fn spawn(self, size: PtySize) -> io::Result<(PtyPair, Box<dyn Child + Send + Sync>)> {
+        let pair = native_pty_system()
+            .openpty(size)
+            .map_err(io::Error::other)?;
+        let child = pair.slave.spawn_command(self.0).map_err(io::Error::other)?;
+        Ok((pair, child))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -47,11 +68,26 @@ impl AwsCli {
         node: &OnlineNode,
         cancel: &CancellationToken,
     ) -> Result<StartRequest, CliError> {
-        prepare_start_with(scope, node, async |spec| {
-            super::require_direct_profile(scope.profile())?;
-            spec.capture(cancel).await
-        })
-        .await
+        require_node_scope(&self.0, scope, node)?;
+        if cancel.is_cancelled() {
+            return Err(CliError::Cancelled);
+        }
+        super::require_direct_profile(scope.profile())?;
+        prepare_start(scope, node)
+    }
+
+    pub async fn authorize_start(
+        &self,
+        request: &mut StartRequest,
+        scope: &Scope,
+        cancel: &CancellationToken,
+    ) -> Result<Option<StartPermit>, CliError> {
+        request
+            .authorize_with(&self.0, scope, async |spec| {
+                super::require_direct_profile(scope.profile())?;
+                spec.capture(cancel).await
+            })
+            .await
     }
 
     pub async fn verify_session(
@@ -62,12 +98,14 @@ impl AwsCli {
         cancel: &CancellationToken,
     ) -> Result<VerifiedSession, VerificationError> {
         use VerificationError::Unconfirmed;
-        request.require_issued_scope(current_scope)?;
+        request.require_issued_scope(&self.0, current_scope)?;
         super::require_direct_profile(current_scope.profile()).map_err(|_| Unconfirmed)?;
-        let caller = caller_arn(current_scope, async |spec| spec.capture(cancel).await)
-            .await
-            .map_err(|_| Unconfirmed)?;
-        if caller != request.owner {
+        let caller = caller_arn(&self.0, current_scope, async |spec| {
+            spec.capture(cancel).await
+        })
+        .await
+        .map_err(|_| Unconfirmed)?;
+        if caller != request.owner.as_ref() {
             return Err(Unconfirmed);
         }
         let result = request.lookup_command(lookup, None).capture(cancel).await;
@@ -80,52 +118,64 @@ impl AwsCli {
         current_scope: &Scope,
         cancel: &CancellationToken,
     ) -> Result<(), VerificationError> {
-        request.require_issued_scope(current_scope)?;
+        request.require_issued_scope(&self.0, current_scope)?;
         super::require_direct_profile(current_scope.profile())
             .map_err(|_| VerificationError::Unconfirmed)?;
         request
-            .close_with(current_scope, async |spec| spec.capture(cancel).await)
+            .close_with(&self.0, current_scope, async |spec| {
+                spec.capture(cancel).await
+            })
             .await
     }
 }
 
 impl StartRequest {
-    // 반환된 명령은 앱 세션을 소유하는 PTY에 한 번만 넘긴다.
-    pub fn take_start_command(&mut self) -> Result<Option<CommandBuilder>, CliError> {
+    async fn authorize_with(
+        &mut self,
+        program: &Path,
+        scope: &Scope,
+        capture: impl AsyncFnMut(CommandSpec) -> Result<Captured, CliError>,
+    ) -> Result<Option<StartPermit>, CliError> {
+        if !self.matches(program, scope) {
+            return Err(CliError::InvalidTarget);
+        }
         if self.command_issued {
             return Ok(None);
         }
-        super::require_direct_profile(self.scope.profile())?;
         let cwd = std::env::current_dir().map_err(|_| CliError::ProcessIo)?;
-        Ok(self.issue_start_command(&cwd))
+        let command = self.start_command(&cwd);
+        // 인가 직전 신원을 확인한다. 외부의 실행 파일·프로필·캐시 변경은 이 경계 밖이다.
+        if caller_arn(&self.program, scope, capture).await? != self.owner.as_ref() {
+            return Err(CliError::CallerChanged);
+        }
+        self.command_issued = true;
+        Ok(Some(StartPermit(command)))
     }
 
-    fn issue_start_command(&mut self, cwd: &std::path::Path) -> Option<CommandBuilder> {
-        if std::mem::replace(&mut self.command_issued, true) {
-            return None;
-        }
+    fn start_command(&self, cwd: &Path) -> CommandBuilder {
         let spec = self.scope.command(
+            &self.program,
             "ssm",
             "start-session",
             &["--target", &self.target, "--reason", &self.reason],
         );
-        let mut command = CommandBuilder::new(if cfg!(windows) {
-            "aws.exe"
-        } else {
-            spec.program()
-        });
+        let mut command = CommandBuilder::new(spec.program());
         command.args(spec.args());
         command.cwd(cwd);
         apply_start_environment(&mut command, &spec, std::env::vars_os());
-        Some(command)
+        command
     }
 
     pub fn target(&self) -> &str {
         &self.target
     }
 
-    fn require_issued_scope(&self, current_scope: &Scope) -> Result<(), VerificationError> {
-        if self.command_issued && *current_scope == self.scope {
+    fn matches(&self, program: &Path, scope: &Scope) -> bool {
+        *scope == self.scope && program == self.program.as_ref()
+    }
+
+    fn require_issued_scope(&self, program: &Path, scope: &Scope) -> Result<(), VerificationError> {
+        if self.command_issued && self.matches(program, scope) {
             Ok(())
         } else {
             Err(VerificationError::Unconfirmed)
@@ -143,6 +193,7 @@ impl StartRequest {
             format!("key=Target,value={}", self.target)
         };
         self.scope.command(
+            &self.program,
             "ssm",
             "describe-sessions",
             &["--state", state, "--filters", &filter],
@@ -151,15 +202,16 @@ impl StartRequest {
 
     async fn close_with(
         &mut self,
+        program: &Path,
         current_scope: &Scope,
         mut capture: impl AsyncFnMut(CommandSpec) -> Result<Captured, CliError>,
     ) -> Result<(), VerificationError> {
         use VerificationError::Unconfirmed;
-        self.require_issued_scope(current_scope)?;
-        if caller_arn(current_scope, &mut capture)
+        self.require_issued_scope(program, current_scope)?;
+        if caller_arn(&self.program, current_scope, &mut capture)
             .await
             .map_err(|_| Unconfirmed)?
-            != self.owner
+            != self.owner.as_ref()
         {
             return Err(Unconfirmed);
         }
@@ -177,10 +229,12 @@ impl StartRequest {
             .ok_or(Unconfirmed)?;
 
         let id = self.termination_id.insert(active.session_id).as_str();
-        let result = capture(
-            self.scope
-                .command("ssm", "terminate-session", &["--session-id", id]),
-        )
+        let result = capture(self.scope.command(
+            &self.program,
+            "ssm",
+            "terminate-session",
+            &["--session-id", id],
+        ))
         .await
         .and_then(Captured::success);
         match result {
@@ -232,7 +286,7 @@ impl StartRequest {
             if record.reason.as_deref() != Some(self.reason.as_str()) {
                 continue;
             }
-            if record.owner.as_deref() != Some(self.owner.as_str())
+            if record.owner.as_deref() != Some(self.owner.as_ref())
                 || record.target.as_deref() != Some(self.target.as_str())
                 || verified.is_some()
             {
@@ -276,8 +330,6 @@ fn apply_start_environment(
     }
     #[cfg(windows)]
     command.env("PATHEXT", ".EXE");
-    // StartSession은 멱등성 토큰을 지원하지 않는다.
-    command.env("AWS_MAX_ATTEMPTS", "1");
     for key in spec.env_remove() {
         command.env_remove(key);
     }
@@ -286,36 +338,41 @@ fn apply_start_environment(
     }
 }
 
-async fn prepare_start_with(
-    scope: &Scope,
-    node: &OnlineNode,
-    capture: impl AsyncFnMut(CommandSpec) -> Result<Captured, CliError>,
-) -> Result<StartRequest, CliError> {
-    if &node.scope != scope {
+fn require_node_scope(program: &Path, scope: &Scope, node: &OnlineNode) -> Result<(), CliError> {
+    if &node.scope != scope || node.program.as_ref() != program {
         return Err(CliError::InvalidTarget);
     }
-    let owner = caller_arn(scope, capture).await?;
+    Ok(())
+}
+
+fn prepare_start(scope: &Scope, node: &OnlineNode) -> Result<StartRequest, CliError> {
     let mut nonce = [0; 16];
     getrandom::fill(&mut nonce).map_err(|_| CliError::RandomUnavailable)?;
     Ok(StartRequest {
         scope: scope.clone(),
         target: node.instance_id.clone(),
         reason: format!("zzabbaxterm-{:032x}", u128::from_be_bytes(nonce)),
-        owner,
+        owner: node.owner.clone(),
+        program: node.program.clone(),
         command_issued: false,
         termination_id: None,
     })
 }
 
-fn identity_command(scope: &Scope) -> CommandSpec {
-    scope.command("sts", "get-caller-identity", &[])
+pub(super) fn identity_command(program: &Arc<Path>, scope: &Scope) -> CommandSpec {
+    scope.command(program, "sts", "get-caller-identity", &[])
 }
 
-async fn caller_arn(
+pub(super) async fn caller_arn(
+    program: &Arc<Path>,
     scope: &Scope,
     mut capture: impl AsyncFnMut(CommandSpec) -> Result<Captured, CliError>,
 ) -> Result<String, CliError> {
-    parse_caller_arn(&capture(identity_command(scope)).await?.success()?)
+    captured_caller_arn(capture(identity_command(program, scope)).await?)
+}
+
+pub(super) fn captured_caller_arn(captured: Captured) -> Result<String, CliError> {
+    parse_caller_arn(&captured.success()?)
 }
 
 fn parse_caller_arn(bytes: &[u8]) -> Result<String, CliError> {
