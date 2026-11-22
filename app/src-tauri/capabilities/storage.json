@@ -9,6 +9,7 @@
     "allow-storage-relogin",
     "allow-storage-list-buckets",
     "allow-storage-list-objects",
+    "allow-storage-count-previous-files",
     "allow-storage-select-local-file",
     "allow-storage-upload",
     "allow-storage-download",

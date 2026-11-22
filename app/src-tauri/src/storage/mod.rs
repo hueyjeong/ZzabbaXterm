@@ -3,6 +3,7 @@ mod download;
 pub(crate) mod ipc;
 #[cfg(test)]
 mod tests;
+mod versions;
 
 use std::{error::Error as StdError, fs::File, time::Duration};
 

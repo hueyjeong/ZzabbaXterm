@@ -1,7 +1,9 @@
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import type { VersionedFilesStatus } from "../files/FileBrowser";
 import { ObjectTable } from "./ObjectTable";
 import type { BucketRow, ObjectRow, S3Actions, S3FileSelection, S3Session } from "./s3";
 import { StorageProblem, TransferStatus, type Problem, type Transfer } from "./StorageStatus";
+import { countPreviousFiles } from "./storageIpc";
 import "./storage.css";
 
 type Location = { bucket: string; prefix: string; region: string };
@@ -23,10 +25,16 @@ type View = {
 };
 const initial: View = { confirmed: false, loading: false, selectedKey: null, uploadKey: "" };
 
-type Props = Readonly<{ session: S3Session; actions: S3Actions; onRelogin?: () => void }>;
+type Props = Readonly<{
+  session: S3Session;
+  actions: S3Actions;
+  onRelogin?: () => void;
+  countHistory?: typeof countPreviousFiles;
+}>;
 
-export function S3StoragePanel({ session, actions, onRelogin }: Props) {
+export function S3StoragePanel({ session, actions, onRelogin, countHistory = countPreviousFiles }: Props) {
   const [views, setViews] = useState(() => new Map<string, View>());
+  const [history, setHistory] = useState<{ request: Parameters<typeof countPreviousFiles>[0]; count: typeof countPreviousFiles; status: VersionedFilesStatus }>();
   const { sessionId } = session;
   const view = views.get(sessionId) ?? initial;
   const input = view.input ?? { bucket: "", prefix: "", region: session.region };
@@ -92,6 +100,35 @@ export function S3StoragePanel({ session, actions, onRelogin }: Props) {
   const canTransfer = view.confirmed && !view.loading && !transferring && !expired;
   const selectedKey = listing?.kind === "objects" && listing.rows.some(row => row.kind === "object" && row.key === view.selectedKey)
     ? view.selectedKey : null;
+  const historyListing = view.confirmed && !view.loading && !view.problem && !expired && listing?.kind === "objects" ? listing : undefined;
+  const historyRequest = useMemo(() => historyListing ? { sessionId, ...historyListing.location } : undefined,
+    [historyListing, sessionId]);
+
+  useEffect(() => {
+    if (!historyRequest) return;
+    let active = true;
+    async function loadHistory(request: NonNullable<typeof historyRequest>) {
+      let status: VersionedFilesStatus = { kind: "unavailable" };
+      try {
+        const result = await countHistory(request);
+        if (result.ok) status = { kind: "count", count: result.value };
+        else if (result.error.failure.kind === "service") {
+          const { status: httpStatus, code } = result.error.failure;
+          if (httpStatus === 403) status = { kind: "denied" };
+          else if (httpStatus === 501 || code === "NotImplemented" || code === "UnsupportedOperation") status = { kind: "unsupported" };
+        }
+      } catch {
+        // IPC 오류도 객체 목록과 별도로 표시한다.
+      }
+      if (active) setHistory({ request, count: countHistory, status });
+    }
+    void loadHistory(historyRequest);
+    return () => { active = false; };
+  }, [countHistory, historyRequest]);
+
+  const versionedFiles: VersionedFilesStatus | undefined = historyRequest
+    ? history?.request === historyRequest && history.count === countHistory ? history.status : { kind: "loading" }
+    : undefined;
 
   async function transfer(direction: S3FileSelection["direction"], key: string | null) {
     if (!canTransfer || !location || key === null || key === "") return;
@@ -151,7 +188,7 @@ export function S3StoragePanel({ session, actions, onRelogin }: Props) {
     </ul>}
     {listing?.kind === "objects" && <>
       <div className="storage-location"><strong>{listing.location.bucket}</strong> / <code>{listing.location.prefix}</code> · {listing.location.region}</div>
-      <ObjectTable rows={listing.rows} selectedKey={selectedKey} onOpenPrefix={prefix => {
+      <ObjectTable rows={listing.rows} selectedKey={selectedKey} versionedFiles={versionedFiles} onOpenPrefix={prefix => {
         if (!view.loading && !transferring) open({ ...listing.location, prefix });
       }} onSelectObject={key => update(() => ({ selectedKey: key }))} />
     </>}

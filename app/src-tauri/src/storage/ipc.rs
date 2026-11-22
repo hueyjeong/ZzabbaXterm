@@ -405,6 +405,35 @@ impl StorageIpc {
         result
     }
 
+    async fn count_previous_files(
+        &self,
+        document: &Document,
+        request: PreviousFilesRequest,
+    ) -> Result<usize, Error> {
+        let stage = Stage::ListObjects;
+        let PreviousFilesRequest { session_id, bucket, region, prefix } = request;
+        let target = Target { session_id, bucket, region, key: prefix };
+        let (client, closed) = {
+            let mut registry = self.0.lock().unwrap();
+            let tab = registry.tab(document, &target.session_id).ok_or_else(|| unavailable(stage))?;
+            if !bucket_verified(tab, &target) { return Err(unavailable(stage)); }
+            (tab.client.clone(), tab.closed.subscribe())
+        };
+        let result = until_closed(&closed, stage, async {
+            client.in_region(&target.region, stage)?
+                .count_previous_files(&target.bucket, &target.key).await
+        }).await;
+        let mut registry = self.0.lock().unwrap();
+        let tab = registry.tab(document, &target.session_id).ok_or_else(|| unavailable(stage))?;
+        if !closed.same_channel(&tab.closed.subscribe()) || !Arc::ptr_eq(&tab.client, &client)
+            || !bucket_verified(tab, &target)
+        {
+            return Err(unavailable(stage));
+        }
+        mark_expired(tab, &result);
+        result
+    }
+
     fn record_expiration<T>(&self, document: &Document, id: &str, result: &Result<T, Error>) {
         if is_login_required(result) && let Some(tab) = self.0.lock().unwrap().tab(document, id) {
             mark_expired(tab, result);
@@ -633,6 +662,15 @@ struct BucketPageRequest {
 struct ObjectPageRequest {
     session_id: String,
     token: Option<String>,
+    bucket: String,
+    region: String,
+    prefix: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PreviousFilesRequest {
+    session_id: String,
     bucket: String,
     region: String,
     prefix: String,
@@ -940,6 +978,15 @@ pub(crate) fn dispatch<R: tauri::Runtime>(invoke: Invoke<R>) -> bool {
                 ))
             }
         ),
+        "storage_count_previous_files" => handle!(
+            "storage_count_previous_files",
+            PreviousFilesRequest,
+            async |webview: tauri::Webview<R>, document, request| {
+                Ok(S3Result::from(
+                    webview.state::<StorageIpc>().count_previous_files(&document, request).await,
+                ))
+            }
+        ),
         "storage_select_local_file" => handle!(
             "storage_select_local_file",
             FileSelection,
@@ -993,6 +1040,10 @@ pub(crate) fn dispatch<R: tauri::Runtime>(invoke: Invoke<R>) -> bool {
     }
     true
 }
+
+#[cfg(test)]
+#[path = "versions_ipc_tests.rs"]
+mod versions_tests;
 
 #[cfg(test)]
 mod tests {

@@ -32,8 +32,3 @@
 .storage-location, .storage-transfer { overflow-wrap: anywhere; }
 .storage-location code, .storage-transfer code { white-space: pre-wrap; }
 .storage-buckets { list-style: none; padding: 0; }
-.storage-objects { width: 100%; border-collapse: collapse; margin-block: 6px 10px; text-align: left; }
-.storage-objects th, .storage-objects td { padding: 4px 6px; border-block-end: 1px solid var(--border, #36454b); }
-.storage-objects :is(th, td):is(:first-child, :last-child) { width: 1%; white-space: nowrap; }
-.storage-objects td:last-child { text-align: right; font-variant-numeric: tabular-nums; }
-.storage-objects button { text-align: left; white-space: pre-wrap; overflow-wrap: anywhere; border-color: transparent; }

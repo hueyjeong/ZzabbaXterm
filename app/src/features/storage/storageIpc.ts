@@ -13,6 +13,10 @@ export function closeStorage(sessionId: string) {
   return invoke<boolean>("storage_close", { request: { sessionId } });
 }
 
+export function countPreviousFiles(request: Readonly<{ sessionId: string; bucket: string; region: string; prefix: string }>) {
+  return invoke<S3Result<number>>("storage_count_previous_files", { request });
+}
+
 async function useApproval<T>(command: string, request: Parameters<S3Actions["upload"]>[0]) {
   try {
     return await invoke<S3Result<T>>(command, { request });

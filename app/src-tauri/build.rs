@@ -23,6 +23,7 @@ fn main() {
         "ai_decisions",
         "ssm_discovery",
         "storage_open", "storage_list_buckets", "storage_list_objects", "storage_select_local_file",
+        "storage_count_previous_files",
         "storage_upload", "storage_download", "storage_cancel_approval", "storage_close",
         "storage_relogin",
         "ai_cli_review",
