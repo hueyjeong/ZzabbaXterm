@@ -146,26 +146,25 @@ export function Workspace() {
       let blocked: typeof closeBlock = openingFile.current ? { kind: "picker", message: "파일 선택 중 · 창 닫기 보류" } :
         cliMounts.current.size ? { kind: "cli", message: "CLI 편집 탭 연결 중 · 창 닫기 보류" } :
         pendingEditorMounts.current.size ? { kind: "mount", message: "편집 탭 여는 중 · 창 닫기 보류" } : undefined;
-      const discard: string[] = [];
-      for (const tab of liveTabs.current) {
-        if (blocked) break;
-        if (tab.kind !== "editor") continue;
-        const state = editorActions.current.get(tab.id)?.closeState();
-        if (tab.attaching || !state || state.pending) {
-          blocked = { kind: "editor", id: tab.id, message: `${tab.label}: 편집 작업 중 · 창 닫기 보류` };
-          break;
-        }
-        if (state.dirty || state.uncertain) discard.push(tab.label);
-      }
-      const element = workspace.current;
+      const element = blocked ? undefined : workspace.current;
       // showModal()로 열린 대화상자는 상위 요소의 inert를 상속하지 않는다.
       const dialog = element?.querySelector<HTMLDialogElement>("dialog[open]:not([inert])");
-      const focusedElement = document.activeElement;
+      const focusedElement = element ? document.activeElement : null;
       const blockCancel = (event: Event) => {
         event.preventDefault();
         event.stopImmediatePropagation();
       };
-      let approved = false;
+      let locked = false;
+      let destroyQueued = false;
+      function unlock() {
+        if (!locked) return;
+        locked = false;
+        closingWindow.current = false;
+        element?.removeAttribute("inert");
+        dialog?.removeAttribute("inert");
+        dialog?.removeEventListener("cancel", blockCancel, { capture: true });
+        if (!disposed && focusedElement instanceof HTMLElement && element?.contains(focusedElement)) focusedElement.focus();
+      }
       try {
         setCloseBlock(blocked);
         approved = !blocked && (!discard.length || window.confirm(
@@ -173,10 +172,10 @@ export function Workspace() {
         ));
         if (approved) {
           closingWindow.current = true;
+          if (focusedElement instanceof HTMLElement && element?.contains(focusedElement)) focusedElement.blur();
           element?.setAttribute("inert", "");
           dialog?.setAttribute("inert", "");
           dialog?.addEventListener("cancel", blockCancel, { capture: true });
-          if (focusedElement instanceof HTMLElement && element?.contains(focusedElement)) focusedElement.blur();
         }
         await invoke("workspace_window", { action: "respondToClose", requestId, approved });
       } catch (error) {
@@ -188,12 +187,17 @@ export function Workspace() {
           if (focusedElement instanceof HTMLElement && element?.contains(focusedElement)) focusedElement.focus();
         }
         if (answeredId === requestId) {
-          answeredId = undefined;
           if (!disposed) setCloseError(`닫기 실패: ${String(error)}`);
         }
+      } finally {
+        if (!destroyQueued) unlock();
       }
     }
-    void registration.catch((error: unknown) => {
+    void registration.then(async () => {
+      if (disposed) return;
+      const requestId = await invoke<string | null>("workspace_window", { action: "pendingClose" });
+      if (typeof requestId === "string" && requestId) void respond(requestId);
+    }).catch((error: unknown) => {
       if (!disposed) setCloseError(`창 닫기 연결 실패: ${String(error)}`);
     });
     return () => {
