@@ -9,6 +9,7 @@ export interface TerminalViewProps {
   readonly active: boolean;
   readonly focusRequested: boolean;
   readonly label: string;
+  readonly targetId?: string;
   readonly onStatus?: (status: TerminalStatus, sessionId?: string) => void;
 }
 
@@ -23,7 +24,7 @@ function text(status: TerminalStatus) {
 }
 
 // Keep the component mounted with a stable tab key; only unmount closes the session.
-export function TerminalView({ active, focusRequested, label, onStatus }: TerminalViewProps) {
+export function TerminalView({ active, focusRequested, label, targetId, onStatus }: TerminalViewProps) {
   const host = useRef<HTMLDivElement>(null);
   const refresh = useRef<((visible: boolean, ready: boolean, requested: boolean) => void) | null>(null);
   const [status, setStatus] = useState<TerminalStatus>({ kind: "opening" });
@@ -52,7 +53,7 @@ export function TerminalView({ active, focusRequested, label, onStatus }: Termin
         session = connectLocalTerminal(dimensions, (bytes, parsed) => term.write(bytes, parsed), (next, id) => {
           setStatus(next);
           statusListener.current?.(next, id);
-        });
+        }, undefined, targetId);
       } else {
         session.resize(dimensions);
       }
@@ -71,7 +72,7 @@ export function TerminalView({ active, focusRequested, label, onStatus }: Termin
       session?.close();
       term.dispose();
     };
-  }, []);
+  }, [targetId]);
 
   useLayoutEffect(() => {
     refresh.current?.(active, status.kind === "running", focusRequested);

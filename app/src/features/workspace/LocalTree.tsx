@@ -1,45 +1,134 @@
-import { useRef, useState, type KeyboardEvent } from "react";
+import { useLayoutEffect, useRef, useState, type KeyboardEvent } from "react";
+import type { SavedConnections } from "../connections/connectionIpc";
 
-export function LocalTree({ onOpen }: { onOpen: () => void }) {
-  const [expanded, setExpanded] = useState(true);
-  const [selected, setSelected] = useState<"group" | "target">("group");
-  const group = useRef<HTMLLIElement>(null);
-  const target = useRef<HTMLLIElement>(null);
+type OpenTarget = (target?: SavedConnections["targets"][number]["profile"]) => void;
 
-  function navigate(event: KeyboardEvent<HTMLLIElement>, item: "group" | "target") {
+export function LocalTree({ profiles, onOpen }: { profiles?: SavedConnections; onOpen: OpenTarget }) {
+  const [query, setQuery] = useState("");
+  const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set());
+  const [selected, setSelected] = useState("local");
+  const [menu, setMenu] = useState<{ x: number; y: number; row: HTMLLIElement; open: () => void }>();
+  const tree = useRef<HTMLUListElement>(null);
+  const menuButton = useRef<HTMLButtonElement>(null);
+  useLayoutEffect(() => { if (menu) menuButton.current?.focus(); }, [menu]);
+
+  const term = query.trim().toLocaleLowerCase();
+  const matches = (name: string) => name.toLocaleLowerCase().includes(term);
+  const groups = [
+    { key: "local", name: "로컬", id: "", targets: [{ key: "pc", name: "내 PC", id: "", open: () => onOpen() }] },
+    ...(profiles?.groups.map(({ profile }) => ({
+      key: `group:${profile.id}`, name: profile.displayName, id: profile.id,
+      targets: profiles.targets.filter(({ profile: target }) => target.groupId === profile.id).map(({ profile: target }) => ({
+        key: `target:${target.id}`, name: target.displayName, id: target.id, open: () => onOpen(target),
+      })),
+    })) ?? []),
+  ].flatMap((group) => {
+    if (matches(group.name)) return [group];
+    const targets = group.targets.filter((target) => matches(target.name));
+    return targets.length ? [{ ...group, targets }] : [];
+  });
+  const expanded = (key: string) => Boolean(term) || !collapsed.has(key);
+  const tabStop = groups.some((group) => group.key === selected ||
+    (expanded(group.key) && group.targets.some((target) => target.key === selected))) ? selected : groups[0]?.key;
+
+  function toggle(key: string) {
+    if (term) return;
+    setCollapsed((previous) => {
+      const next = new Set(previous);
+      if (!next.delete(key)) next.add(key);
+      return next;
+    });
+  }
+
+  function showMenu(row: HTMLLIElement, open: () => void, x: number, y: number) {
+    row.focus();
+    setMenu({ row, open, x: Math.min(x, window.innerWidth - 100), y: Math.min(y, window.innerHeight - 44) });
+  }
+
+  function navigate(event: KeyboardEvent<HTMLLIElement>, groupKey?: string, open?: () => void) {
     event.stopPropagation();
-    const { key } = event;
-    if (item === "group") {
-      if (key === "ArrowRight" && !expanded) setExpanded(true);
-      else if ((key === "ArrowRight" || key === "ArrowDown" || key === "End") && expanded) target.current?.focus();
-      else if (key === "ArrowLeft") setExpanded(false);
-      else if (key === "Enter" || key === " ") setExpanded(!expanded);
-      else return;
-    } else if (key === "ArrowUp" || key === "ArrowLeft" || key === "Home") group.current?.focus();
-    else if (key === "Enter") onOpen();
-    else return;
+    const row = event.currentTarget;
+    switch (event.key) {
+      case "ArrowDown": case "ArrowUp": case "Home": case "End": {
+        const visible = [...(tree.current?.querySelectorAll<HTMLLIElement>('[role="treeitem"]') ?? [])]
+          .filter((element) => !element.closest("[hidden]"));
+        const index = visible.indexOf(row);
+        const next = event.key === "Home" ? 0 : event.key === "End" ? visible.length - 1
+          : index + (event.key === "ArrowDown" ? 1 : -1);
+        visible[next]?.focus();
+        break;
+      }
+      case "ArrowRight":
+        if (groupKey && !expanded(groupKey)) toggle(groupKey);
+        else if (groupKey) row.querySelector<HTMLElement>('[role="treeitem"]')?.focus();
+        break;
+      case "ArrowLeft":
+        if (groupKey && expanded(groupKey)) toggle(groupKey);
+        else if (!groupKey) row.parentElement?.closest<HTMLElement>('[role="treeitem"]')?.focus();
+        break;
+      case "Enter":
+        if (open) open();
+        else if (groupKey) toggle(groupKey);
+        break;
+      case " ":
+        if (groupKey) toggle(groupKey);
+        break;
+      case "ContextMenu": case "F10": {
+        if (!open || (event.key === "F10" && !event.shiftKey)) return;
+        const rect = row.getBoundingClientRect();
+        showMenu(row, open, rect.left, rect.bottom);
+        break;
+      }
+      default: return;
+    }
     event.preventDefault();
   }
 
-  return (
-    <ul className="local-tree" role="tree" aria-label="연결">
-      <li ref={group} role="treeitem" aria-labelledby="local-group" aria-expanded={expanded}
-        aria-selected={selected === "group"} tabIndex={selected === "group" ? 0 : -1}
-        onFocus={(event) => { if (event.target === event.currentTarget) setSelected("group"); }}
-        onKeyDown={(event) => navigate(event, "group")}>
-        <div id="local-group" className="tree-row" onClick={() => {
-          group.current?.focus();
-          setExpanded(!expanded);
-        }}><span aria-hidden="true">{expanded ? "▾" : "▸"}</span> 로컬</div>
-        <ul role="group" hidden={!expanded}>
-          <li ref={target} role="treeitem" aria-selected={selected === "target"}
-            tabIndex={selected === "target" ? 0 : -1} onFocus={() => setSelected("target")}
-            onClick={() => target.current?.focus()} onDoubleClick={onOpen}
-            onKeyDown={(event) => navigate(event, "target")}>
-            <div className="tree-row">내 PC</div>
-          </li>
-        </ul>
-      </li>
+  return <>
+    <input className="connection-search" type="search" aria-label="연결 검색" value={query} onChange={(event) => setQuery(event.target.value)} />
+    {term && !groups.length && <div className="connection-status" role="status">검색 결과 없음</div>}
+    <ul ref={tree} className="local-tree" role="tree" aria-label="연결">
+      {groups.map((group) => (
+        <li key={group.key} role="treeitem" aria-labelledby={group.key} aria-expanded={expanded(group.key)}
+          aria-selected={selected === group.key} tabIndex={tabStop === group.key ? 0 : -1}
+          onFocus={(event) => { if (event.target === event.currentTarget) setSelected(group.key); }}
+          onKeyDown={(event) => navigate(event, group.key)}>
+          <div id={group.key} className="tree-row" onClick={(event) => {
+            event.currentTarget.parentElement?.focus();
+            toggle(group.key);
+          }}><span aria-hidden="true">{expanded(group.key) ? "▾" : "▸"}</span> <span>{group.name}</span>
+            {groups.some((other) => other.key !== group.key && other.name === group.name) &&
+              <small>{group.id || "내 PC"}</small>}
+          </div>
+          <ul role="group" hidden={!expanded(group.key)}>
+            {group.targets.map((target) => (
+              <li key={target.key} role="treeitem" aria-selected={selected === target.key} tabIndex={tabStop === target.key ? 0 : -1}
+                onFocus={() => setSelected(target.key)} onClick={(event) => event.currentTarget.focus()}
+                onDoubleClick={target.open} onKeyDown={(event) => navigate(event, undefined, target.open)}
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  showMenu(event.currentTarget, target.open, event.clientX, event.clientY);
+                }}>
+                <div className="tree-row"><span>{target.name}</span>
+                  {group.targets.some((other) => other.key !== target.key && other.name === target.name) && <small>{target.id}</small>}
+                </div>
+              </li>
+            ))}
+          </ul>
+        </li>
+      ))}
     </ul>
-  );
+    {menu && <div className="connection-menu" role="menu" style={{ left: menu.x, top: menu.y }}
+      onBlur={() => setMenu(undefined)} onKeyDown={(event) => {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          menu.row.focus();
+        }
+      }}>
+      <button ref={menuButton} type="button" role="menuitem" onClick={() => {
+        setMenu(undefined);
+        menu.open();
+      }}>로컬</button>
+    </div>}
+  </>;
 }

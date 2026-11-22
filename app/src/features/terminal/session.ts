@@ -10,7 +10,7 @@ export type Dimensions = { rows: number; cols: number };
 type Message = ArrayBuffer | End;
 
 export interface LocalTerminalIpc {
-  open(size: Dimensions, receive: (message: Message) => void): Promise<string>;
+  open(size: Dimensions, receive: (message: Message) => void, targetId?: string): Promise<string>;
   start(id: string): Promise<void>;
   input(id: string, bytes: Uint8Array): Promise<void>;
   resize(id: string, size: Dimensions): Promise<void>;
@@ -19,7 +19,9 @@ export interface LocalTerminalIpc {
 }
 
 const tauriIpc: LocalTerminalIpc = {
-  open: (size, receive) => invoke("terminal_open", { ...size, output: new Channel(receive) }),
+  open: (size, receive, targetId) => invoke("terminal_open", {
+    ...size, output: new Channel(receive), ...(targetId === undefined ? {} : { targetId }),
+  }),
   start: (id) => invoke("terminal_start", { id }),
   input: (id, bytes) => invoke("terminal_input", { id, bytes: Array.from(bytes) }),
   resize: (id, size) => invoke("terminal_resize", { id, ...size }),
@@ -38,6 +40,7 @@ export function connectLocalTerminal(
   write: (bytes: Uint8Array, parsed: () => void) => void,
   status: (status: TerminalStatus, sessionId?: string) => void,
   ipc = tauriIpc,
+  targetId?: string,
 ): LocalTerminal {
   let id: string | undefined;
   let stopped = false;
@@ -107,7 +110,7 @@ export function connectLocalTerminal(
     // React StrictMode can dispose the first mount before any native session is needed.
     await Promise.resolve();
     if (stopped) return;
-    const opened = await ipc.open(initialSize, receive);
+    const opened = await ipc.open(initialSize, receive, targetId);
     id = opened;
     if (stopped) {
       release();
