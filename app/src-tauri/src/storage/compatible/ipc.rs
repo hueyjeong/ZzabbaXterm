@@ -5,10 +5,10 @@ use tauri::Manager;
 use tokio::sync::watch;
 use uuid::Uuid;
 
-use super::{Document, StorageIpc, confirm_native};
+use super::{Document, Registry, StorageIpc, confirm_native};
 use crate::storage::compatible::{
-    AddressStyle, opaque_id,
-    settings::{ConnectIntent, Settings, SettingsError, SettingsInput, SettingsView},
+    AddressStyle, CompatibleS3, opaque_id,
+    settings::{ConnectIntent, Settings, SettingsError, SettingsInput, SettingsView, StagedSettings},
 };
 
 #[derive(Deserialize)]
@@ -85,6 +85,20 @@ pub(super) struct Pending {
     pub(super) closed: Arc<watch::Sender<bool>>,
 }
 
+struct PreparedOpen {
+    client: CompatibleS3,
+    target: SettingsView,
+    settings: Option<StagedSettings>,
+}
+
+impl Registry {
+    fn compatible_is_pending(&self, document: &Document, id: &str, closed: &Arc<watch::Sender<bool>>) -> bool {
+        self.active(document) && self.pending_compatible.get(id).is_some_and(|pending| {
+            pending.document == *document && Arc::ptr_eq(&pending.closed, closed)
+        })
+    }
+}
+
 impl StorageIpc {
     pub(super) fn reserve_compatible(&self, document: &Document, id: &str) -> Result<Arc<watch::Sender<bool>>, SettingsError> {
         let uuid = Uuid::parse_str(id).map_err(|_| SettingsError::Cancelled)?;
@@ -103,8 +117,29 @@ impl StorageIpc {
         Ok(closed)
     }
 
-    fn compatible_is_pending(&self, id: &str, closed: &Arc<watch::Sender<bool>>) -> bool {
-        self.0.lock().unwrap().pending_compatible.get(id).is_some_and(|pending| Arc::ptr_eq(&pending.closed, closed))
+    fn finish_compatible(
+        &self, document: Document, id: String, closed: &Arc<watch::Sender<bool>>,
+        prepared: Result<PreparedOpen, SettingsError>,
+    ) -> Result<CompatibleSession, SettingsError> {
+        let mut registry = self.0.lock().unwrap();
+        if !registry.compatible_is_pending(&document, &id, closed) {
+            return Err(SettingsError::Cancelled);
+        }
+        registry.pending_compatible.remove(&id);
+        let PreparedOpen { client, target, settings } = prepared?;
+        // 최종 파일 교체와 탭 게시는 같은 예약에 속한다. 임시 파일 쓰기와 동기화는 락 밖에서 끝낸다.
+        let published = match settings.map(StagedSettings::publish).transpose() {
+            Ok(file) => file,
+            Err(error) => {
+                drop(registry);
+                drop(error);
+                return Err(SettingsError::Io);
+            }
+        };
+        Self::insert_compatible_tab(&mut registry, id.clone(), document, client);
+        drop(registry);
+        drop(published);
+        Ok(CompatibleSession { session_id: id, target })
     }
 }
 
@@ -112,8 +147,8 @@ pub(super) async fn open<R: tauri::Runtime>(webview: tauri::Webview<R>, document
     reserved: Result<Arc<watch::Sender<bool>>, SettingsError>,
 ) -> Result<Reply<CompatibleSession>, tauri::ipc::InvokeError> {
     let closed = match reserved { Ok(closed) => closed, Err(error) => return Ok(Err(error).into()) };
-    let state = webview.state::<StorageIpc>();
-    let result = async {
+    let app = webview.app_handle().clone();
+    let approved = async {
         let id = match &request {
             OpenRequest::Saved { expected } => &expected.service_id,
             OpenRequest::Select { settings, .. } => &settings.service_id,
@@ -140,31 +175,29 @@ pub(super) async fn open<R: tauri::Runtime>(webview: tauri::Webview<R>, document
         if !confirm_native(webview.window(), "S3 호환 키링 항목 사용", prompt, closed.subscribe()).await {
             return Err(SettingsError::Cancelled);
         }
-        let app = webview.app_handle().clone();
-        let approved_id = session_id.clone();
-        let approved_signal = closed.clone();
-        let intent = ConnectIntent::Connect { service_id: view.service_id.clone(), endpoint: view.origin.clone() };
-        let client = tauri::async_runtime::spawn_blocking(move || {
-            let state = app.state::<StorageIpc>();
-            let client = settings.connect(intent, |_, _| state.compatible_is_pending(&approved_id, &approved_signal))?;
-            if !state.compatible_is_pending(&approved_id, &approved_signal) { return Err(SettingsError::Cancelled); }
-            if save {
-                std::fs::create_dir_all(path.parent().unwrap()).map_err(|_| SettingsError::Io)?;
-                settings.save(&path)?;
-            }
-            Ok(client)
-        }).await.map_err(|_| SettingsError::Io)??;
-        Ok((client, view))
+        Ok((settings, save.then_some(path), view))
     }.await;
-    let mut registry = state.0.lock().unwrap();
-    if !registry.pending_compatible.get(&session_id).is_some_and(|pending| Arc::ptr_eq(&pending.closed, &closed)) {
-        return Ok(Err(SettingsError::Cancelled).into());
-    }
-    registry.pending_compatible.remove(&session_id);
-    Ok(result.map(|(client, target)| {
-        StorageIpc::insert_compatible_tab(&mut registry, session_id.clone(), document, client);
-        CompatibleSession { session_id, target }
-    }).into())
+    let worker_document = document.clone();
+    let worker_id = session_id.clone();
+    let worker_closed = closed.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<StorageIpc>();
+        let prepared = approved.and_then(|(settings, path, target)| {
+            let intent = ConnectIntent::Connect { service_id: target.service_id.clone(), endpoint: target.origin.clone() };
+            let client = settings.connect(intent, |_, _| {
+                state.0.lock().unwrap().compatible_is_pending(&worker_document, &worker_id, &worker_closed)
+            })?;
+            let settings = path.map(|path| {
+                std::fs::create_dir_all(path.parent().unwrap()).map_err(|_| SettingsError::Io)?;
+                settings.stage_save(path)
+            }).transpose()?;
+            Ok(PreparedOpen { client, target, settings })
+        });
+        state.finish_compatible(worker_document, worker_id, &worker_closed, prepared)
+    }).await.unwrap_or_else(|_| {
+        webview.state::<StorageIpc>().finish_compatible(document, session_id, &closed, Err(SettingsError::Io))
+    });
+    Ok(result.into())
 }
 
 #[cfg(test)]

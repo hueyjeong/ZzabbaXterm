@@ -34,10 +34,12 @@ fn settings_replace_atomically_and_expose_only_the_public_view() {
     assert_eq!(Settings::load(&path).err(), Some(SettingsError::NotFound));
     Settings::new(input(ENDPOINT, "이전"), reference())
         .unwrap()
-        .save(&path)
+        .stage_save(path.clone())
+        .unwrap()
+        .publish()
         .unwrap();
     let settings = Settings::new(input(ENDPOINT, " 새 별칭 "), reference()).unwrap();
-    settings.save(&path).unwrap();
+    settings.stage_save(path.clone()).unwrap().publish().unwrap();
 
     let view = json!({
         "serviceId": "sample", "alias": "새 별칭", "origin": ORIGIN,
@@ -57,7 +59,7 @@ fn settings_replace_atomically_and_expose_only_the_public_view() {
 
     let blocked = dir.path().join("existing-directory");
     std::fs::create_dir(&blocked).unwrap();
-    assert_eq!(settings.save(&blocked), Err(SettingsError::Io));
+    assert!(settings.stage_save(blocked.clone()).unwrap().publish().is_err());
     assert!(blocked.is_dir());
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
 }
@@ -129,7 +131,7 @@ fn load_rejects_unknown_versions_and_inconsistent_bindings() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("compatible.json");
     let settings = Settings::new(input(ENDPOINT, "test"), reference()).unwrap();
-    settings.save(&path).unwrap();
+    settings.stage_save(path.clone()).unwrap().publish().unwrap();
     let original: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     for (pointer, replacement, error) in [
         ("/version", json!(2), SettingsError::UnsupportedVersion),

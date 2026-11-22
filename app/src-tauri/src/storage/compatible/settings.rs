@@ -1,11 +1,11 @@
 use std::{
     fs::File,
     io::{BufWriter, Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize};
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, PersistError};
 
 use super::{
     AddressStyle, CompatibleS3, CompatibleService, ConfigError, KeyAccessError, ServiceKey,
@@ -118,6 +118,17 @@ pub(crate) struct Settings {
     key: ServiceKeyRef,
 }
 
+pub(in crate::storage) struct StagedSettings {
+    file: NamedTempFile,
+    path: PathBuf,
+}
+
+impl StagedSettings {
+    pub(in crate::storage) fn publish(self) -> Result<File, PersistError> {
+        self.file.persist(self.path)
+    }
+}
+
 impl Settings {
     /// 선택 경계에서 만든 원래 참조를 받는다. 변경된 주소에 기존 항목을 다시 묶을 수 없다.
     #[cfg(test)]
@@ -178,7 +189,7 @@ impl Settings {
     }
 
     /// 경로는 설정을 관리하는 Rust 호출자가 지정한다. 웹뷰 입력으로 받지 않는다.
-    pub(crate) fn save(&self, path: &Path) -> Result<(), SettingsError> {
+    pub(in crate::storage) fn stage_save(&self, path: PathBuf) -> Result<StagedSettings, SettingsError> {
         let file = FileV1 {
             version: VERSION,
             service: self.view(),
@@ -198,8 +209,7 @@ impl Settings {
         writer.flush().map_err(|_| SettingsError::Io)?;
         drop(writer);
         temp.as_file().sync_all().map_err(|_| SettingsError::Io)?;
-        temp.persist(path).map_err(|_| SettingsError::Io)?;
-        Ok(())
+        Ok(StagedSettings { file: temp, path })
     }
 
     pub(crate) fn load(path: &Path) -> Result<Self, SettingsError> {
