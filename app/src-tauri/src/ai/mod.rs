@@ -6,6 +6,7 @@ pub(crate) mod ipc;
 mod ollama;
 pub(crate) mod session_selection;
 mod shared;
+mod shared_protocol;
 mod control_wire;
 mod shared_wire;
 
