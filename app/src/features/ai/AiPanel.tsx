@@ -161,14 +161,13 @@ function Chat({ models, model, onModelChange, onSendChat }: Pick<AiPanelProps, "
       </li>)}
     </ol>
     {state.kind === "failed" && <p role="alert">전송 실패: {state.message}</p>}
-    {models.length === 0 && state.kind === "sending" && <p role="status">전송 중</p>}
-    {models.length > 0 && <form className="a01-composer" onSubmit={send}>
+    <form className="a01-composer" onSubmit={send}>
       <textarea ref={input} aria-label="메시지 입력" placeholder="메시지 입력" value={draft}
         readOnly={state.kind === "sending"} onChange={(event) => setDraft(event.target.value)} />
       <button type="submit" disabled={!model || !draft.trim() || state.kind === "sending"}>
         {state.kind === "sending" ? "전송 중" : "전송"}
       </button>
-    </form>}
+    </form>
   </>;
 }
 

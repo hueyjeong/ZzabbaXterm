@@ -77,9 +77,10 @@ it("passes the exact saved generation through selection and keeps decisions sepa
   expect(host.querySelector('[role="alert"]')?.textContent).toContain("설치되어 있지 않습니다");
 });
 
-it("모델 조회 실패 중에는 작성 폼을 숨기고 새로고침 후 초안을 복원한다", async () => {
+it("모델 조회 실패 중에도 작성 폼과 포커스를 유지하고 새로고침 후 전송을 다시 활성화한다", async () => {
+  const failure = Promise.withResolvers<never>();
   const modelRoster = vi.fn().mockResolvedValueOnce(["fixture:latest"])
-    .mockRejectedValueOnce("설치된 로컬 모델 없음").mockResolvedValueOnce(["fixture:latest"]);
+    .mockReturnValueOnce(failure.promise).mockResolvedValueOnce(["fixture:latest"]);
   invoke.mockImplementation(async (command) => {
     if (command === "ai_models") return modelRoster();
     if (command === "ai_policy") return false;
@@ -93,12 +94,20 @@ it("모델 조회 실패 중에는 작성 폼을 숨기고 새로고침 후 초�
     draft.dispatchEvent(new InputEvent("input", { bubbles: true }));
   });
   await act(async () => button("새로고침")!.click());
+  draft.focus();
+  await act(async () => { failure.reject("설치된 로컬 모델 없음"); });
   expect(host.querySelector('[role="alert"]')?.textContent).toBe("설치된 로컬 모델 없음");
-  expect(host.querySelector("select, form")).toBeNull();
+  expect(host.querySelector("select")).toBeNull();
+  expect(host.querySelector("textarea")).toBe(draft);
+  expect(document.activeElement).toBe(draft);
+  expect(draft.value).toBe("보존할 초안");
+  expect(button("전송")?.disabled).toBe(true);
   await act(async () => button("새로고침")!.click());
   expect(host.querySelector('[role="alert"]')).toBeNull();
   expect(selects()[0].value).toBe("fixture:latest");
-  expect(host.querySelector("textarea")?.value).toBe("보존할 초안");
+  expect(host.querySelector("textarea")).toBe(draft);
+  expect(draft.value).toBe("보존할 초안");
+  expect(button("전송")?.disabled).toBe(false);
 });
 
 it("저장된 조회 대상의 세대가 바뀌면 이전 선택을 사용하지 않는다", async () => {
@@ -120,7 +129,9 @@ it("저장된 조회 대상의 세대가 바뀌면 이전 선택을 사용하지
 it("기본 채팅 화면에는 빈 선택기와 대기 문구 없이 조회 설정을 접어 둔다", async () => {
   invoke.mockImplementation(async (command) => command === "ai_policy" ? false : []);
   await render(0, filesTab, []);
-  expect(host.querySelector("select, form, article")).toBeNull();
+  expect(host.querySelector("select, article")).toBeNull();
+  expect(host.querySelector('textarea[aria-label="메시지 입력"]')).not.toBeNull();
+  expect(button("전송")?.disabled).toBe(true);
   expect(host.querySelector('[role="status"]')?.textContent).toBe("선택할 SSM 세션 없음");
   expect(host.textContent).not.toContain("대기");
   expect(button("새로고침")?.getAttribute("aria-label")).toBe("모델 및 대상 새로고침");
