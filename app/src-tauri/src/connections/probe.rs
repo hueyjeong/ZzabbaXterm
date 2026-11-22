@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc, thread};
 use serde::{Deserialize, Serialize};
 
 use crate::terminal::{Sessions, probe::Probe};
-use super::{profile::{Draft, ValidatedDraft}, store::{SaveStatus, Store, StoreError}};
+use super::{profile::{Draft, Method, ValidatedDraft}, store::{SaveStatus, Store, StoreError}};
 
 const UNTESTED: &str = "이 초안의 현재 시험이 없습니다";
 
@@ -38,11 +38,13 @@ struct Run {
     confirmed: bool,
 }
 
+type Retired = (String, u64, RunKey, Arc<Probe>);
+
 #[derive(Default)]
 pub(crate) struct Runs {
     active: HashMap<String, HashMap<String, Run>>,
-    retiring: Vec<(String, RunKey, Arc<Probe>)>,
-    unconfirmed: HashMap<String, (String, RunKey, Arc<Probe>)>,
+    retiring: Vec<Retired>,
+    unconfirmed: HashMap<String, Retired>,
 }
 
 impl Runs {
@@ -55,35 +57,46 @@ impl Runs {
         self.active.get(owner)?.values().find(|run| run.session_id == id).map(|run| run.probe.as_ref())
     }
 
-    fn retire(&mut self, owner: &str, key: RunKey, probe: Arc<Probe>) {
-        let entry = (owner.into(), key, probe);
-        if !entry.2.finished() {
-            entry.2.stop();
+    fn retire(&mut self, owner: &str, document: u64, key: RunKey, probe: Arc<Probe>) {
+        let entry = (owner.into(), document, key, probe);
+        if !entry.3.finished() {
+            entry.3.stop();
             self.retiring.push(entry);
-        } else if entry.2.cleanup_unconfirmed() {
-            self.unconfirmed.insert(entry.1.run_id.clone(), entry);
+        } else if entry.3.cleanup_unconfirmed() {
+            self.unconfirmed.insert(entry.2.run_id.clone(), entry);
         }
     }
 
     pub(crate) fn reap(&mut self, run_id: &str, current_document: bool) {
-        if let Some(index) = self.retiring.iter().position(|(_, key, _)| key.run_id == run_id) {
+        if let Some(index) = self.retiring.iter().position(|(_, _, key, _)| key.run_id == run_id) {
             let entry = self.retiring.swap_remove(index);
-            if current_document && entry.2.cleanup_unconfirmed() { self.unconfirmed.insert(run_id.into(), entry); }
+            if (current_document || entry.3.is_ssh()) && entry.3.cleanup_unconfirmed() {
+                self.unconfirmed.insert(run_id.into(), entry);
+            }
         }
     }
 
-    pub(crate) fn stop_owner(&mut self, owner: &str) {
+    pub(crate) fn stop_owner(&mut self, owner: &str, document: u64) {
         if let Some(runs) = self.active.remove(owner) {
             for run in runs.into_values() {
-                self.retire(owner, run.key, run.probe);
+                self.retire(owner, document, run.key, run.probe);
             }
         }
-        self.unconfirmed.retain(|_, (previous, _, _)| previous != owner);
+        self.unconfirmed.retain(|_, (previous, _, _, probe)| previous != owner || probe.is_ssh());
+    }
+
+    pub(crate) fn closing_ssh(&self, owner: Option<&str>) -> Vec<Arc<Probe>> {
+        self.active.iter().filter(|(label, _)| owner.is_none_or(|owner| owner == *label))
+            .flat_map(|(_, runs)| runs.values().map(|run| &run.probe))
+            .chain(self.retiring.iter().chain(self.unconfirmed.values())
+                .filter(|(label, _, _, _)| owner.is_none_or(|owner| owner == label))
+                .map(|(_, _, _, probe)| probe))
+            .filter(|probe| probe.is_ssh()).cloned().collect()
     }
 
     pub(crate) fn stop_all(&mut self) -> Vec<Arc<Probe>> {
-        self.unconfirmed.clear();
-        let mut probes: Vec<_> = self.retiring.drain(..).map(|(_, _, probe)| probe).collect();
+        let mut probes: Vec<_> = self.unconfirmed.drain().filter_map(|(_, (_, _, _, probe))| probe.is_ssh().then_some(probe)).collect();
+        probes.extend(self.retiring.drain(..).map(|(_, _, _, probe)| probe));
         for run in self.active.drain().flat_map(|(_, runs)| runs.into_values()) {
             run.probe.stop();
             probes.push(run.probe);
@@ -96,14 +109,14 @@ pub(super) fn start(sessions: &Sessions, owner: &str, document: u64, draft_id: S
     if draft_id.is_empty() || draft_version > (1 << 53) - 1 {
         return Err("초안 ID 또는 버전이 올바르지 않습니다".into());
     }
-    sessions.with_probes(owner, document, |runs| {
+    sessions.with_probe_access(owner, document, matches!(draft.target.method, Method::Ssh { .. }), |runs| {
         let active = runs.active.entry(owner.into()).or_default();
         if active.get(&draft_id).is_some_and(|run| run.key.draft_version > draft_version) {
             return Err("이전 초안 버전입니다".into());
         }
         // 재시험이 입력 검증에 실패해도 이전 성공은 폐기한다.
         if let Some(previous) = active.remove(&draft_id) {
-            runs.retire(owner, previous.key, previous.probe);
+            runs.retire(owner, document, previous.key, previous.probe);
         }
         let draft = Arc::new(draft.validate().map_err(|error| format!("초안 검증: {error:?}"))?);
         let key = RunKey { draft_id, draft_version, run_id: sessions.next_id() };
@@ -140,7 +153,7 @@ pub(super) fn wait(sessions: &Sessions, owner: &str, document: u64, key: &RunKey
     let result = probe.wait();
     sessions.with_probes(owner, document, |runs| {
         if let Err(error) = result {
-            remove_run(runs, owner, key)?;
+            remove_run(runs, owner, document, key)?;
             return Err(error);
         }
         runs.get(owner, key)?;
@@ -154,18 +167,18 @@ pub(super) fn cancel(sessions: &Sessions, owner: &str, document: u64, key: &RunK
     let probe = sessions.with_probes(owner, document, |runs| {
         if let Ok(run) = runs.get(owner, key) {
             let probe = Arc::clone(&run.probe);
-            remove_run(runs, owner, key)?;
+            remove_run(runs, owner, document, key)?;
             return Ok(Some((probe, false)));
         }
-        if let Some((previous, old, probe)) = runs.unconfirmed.get(&key.run_id) {
-            if previous != owner || old != key { return Err(UNTESTED.into()); }
+        if let Some((previous, generation, old, probe)) = runs.unconfirmed.get(&key.run_id) {
+            if previous != owner || *generation != document || old != key { return Err(UNTESTED.into()); }
             return Ok(Some((Arc::clone(probe), true)));
         }
-        if let Some((_, _, probe)) = runs.retiring.iter().find(|(previous, old, _)| previous == owner && old == key) {
-            return Ok(Some((Arc::clone(probe), false)));
+        if let Some((_, _, _, probe)) = runs.retiring.iter().find(|(previous, generation, old, _)| previous == owner && *generation == document && old == key) {
+            return Ok(Some((Arc::clone(probe), probe.is_ssh())));
         }
-        let belongs_to_other = runs.retiring.iter().any(|(previous_owner, old, _)| {
-            previous_owner != owner && old.run_id == key.run_id
+        let belongs_to_other = runs.retiring.iter().any(|(previous, generation, old, probe)| {
+            old.run_id == key.run_id && (previous != owner || probe.is_ssh() && *generation != document)
         }) || runs.active.iter().any(|(other, active)| {
             other != owner && active.values().any(|run| run.key.run_id == key.run_id)
         });
@@ -186,10 +199,10 @@ pub(super) fn cancel(sessions: &Sessions, owner: &str, document: u64, key: &RunK
     Ok(())
 }
 
-fn remove_run(runs: &mut Runs, owner: &str, key: &RunKey) -> Result<(), String> {
+fn remove_run(runs: &mut Runs, owner: &str, document: u64, key: &RunKey) -> Result<(), String> {
     runs.get(owner, key)?;
     let run = runs.active.get_mut(owner).unwrap().remove(&key.draft_id).unwrap();
-    runs.retire(owner, run.key, run.probe);
+    runs.retire(owner, document, run.key, run.probe);
     Ok(())
 }
 
@@ -361,6 +374,15 @@ mod tests {
                 terminal(b"fixture-password\r", &reopened, rx, Some("FIXTURE-REOPENED"));
             }
         }
+        let closing = start(&sessions, "main", 0, "closing".into(), 0,
+            serde_json::from_value(input.clone()).unwrap(), dir.path().into()).unwrap();
+        let id = attach(&sessions, "main", 0, &closing, 24, 100, Channel::new(|_| Ok(()))).unwrap();
+        sessions.start("main", &id).unwrap();
+        assert!(sessions.close_ssh_probes(Some("other")));
+        assert!(sessions.ack("main", &id, 0).is_ok());
+        assert!(sessions.close_ssh_probes(Some("main")));
+        assert!(sessions.input("main", &id, b"closed").is_err());
+        sessions.destroy("main");
     }
 
     #[test]

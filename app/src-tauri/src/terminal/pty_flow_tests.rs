@@ -420,3 +420,118 @@ fn c02_close_before_start_retires_only_the_unstarted_pty() {
         assert!(matches!(peer_events.try_recv(), Err(mpsc::TryRecvError::Disconnected)));
     });
 }
+
+#[test]
+fn c02_native_start_outcomes() {
+    bounded(|| {
+        let root = tempfile::tempdir().unwrap();
+        let exe = root.path().join(format!("ssm fixture{}", std::env::consts::EXE_SUFFIX));
+        let compiled = std::process::Command::new(option_env!("RUSTC").unwrap_or("rustc"))
+            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/src/terminal/ssm_fixture.rs"))
+            .arg("-o").arg(&exe).output().unwrap();
+        assert!(compiled.status.success(), "{}", String::from_utf8_lossy(&compiled.stderr));
+
+        for mode in ["not-spawned", "reject", "unknown", "connected"] {
+            let dir = root.path().join(mode);
+            std::fs::create_dir(&dir).unwrap();
+            let program = dir.join(exe.file_name().unwrap());
+            if mode != "not-spawned" { std::fs::copy(&exe, &program).unwrap(); }
+            std::fs::write(dir.join("mode"), mode).unwrap();
+            let sessions = Sessions::default();
+            let mut target = super::remote::Target::new("fixture", "us-west-2", "i-01234567").unwrap();
+            target.fixture = Some(program);
+            let (send, events) = mpsc::channel();
+            let id = sessions.open_document("main", sessions.document("main"), size(24, 120), super::Launch::Ssm(target), move |event| {
+                send.send(event).map_err(|error| error.to_string())
+            }).unwrap();
+            let start = sessions.start("main", &id);
+            if mode == "not-spawned" {
+                assert_eq!(start, Err("SSM PTY: 시작 실패".into()));
+            } else {
+                start.unwrap();
+                let mut pty = Pty { sessions: &sessions, id: id.clone(), events, output: Vec::new() };
+                let deadline = Instant::now() + TIMEOUT;
+                let mut ready = false;
+                #[cfg(windows)]
+                let mut cursor = false;
+                loop {
+                    match pty.next(deadline) {
+                        Event::Bytes(_) => {
+                            pty.ack(pty.output.len());
+                            #[cfg(windows)]
+                            if !cursor && pty.output.windows(4).any(|bytes| bytes == b"\x1b[6n") {
+                                pty.input(b"\x1b[1;1R");
+                                cursor = true;
+                            }
+                        }
+                        Event::Connecting => {}
+                        Event::Ready if mode == "connected" => {
+                            ready = true;
+                            pty.input(b"fixture-input\r");
+                        }
+                        Event::Exited(0) if mode == "connected" => {
+                            assert!(ready);
+                            assert!(pty.output.windows(22).any(|bytes| bytes == b"fixture-input-received"));
+                            break;
+                        }
+                        Event::Disconnected(error) => {
+                            assert!(!ready);
+                            match mode {
+                                "reject" => assert_eq!(error, "SSM: 노드 연결 불가", "{:?}", String::from_utf8_lossy(&pty.output)),
+                                "unknown" => assert!(error.contains("종료 확인 불가: i-01234567"), "{error}"),
+                                _ => panic!("{mode}: {error}"),
+                            }
+                            break;
+                        }
+                        event => panic!("{mode}: {event:?}"),
+                    }
+                }
+            }
+            let closed = sessions.close("main", &id).unwrap();
+            use super::remote::RemoteClose;
+            assert_eq!(closed.remote, match mode {
+                "unknown" => RemoteClose::Unconfirmed,
+                "connected" => RemoteClose::Confirmed,
+                _ => RemoteClose::NotStarted,
+            });
+            assert_eq!(dir.join("start").is_file(), mode != "not-spawned");
+            assert_eq!(dir.join("History").is_file(), matches!(mode, "unknown" | "connected"));
+        }
+    });
+}
+
+#[test]
+fn c02_native_pty_creation_failure_stays_local() {
+    #[cfg(unix)]
+    {
+        const CHILD: &str = "ZZABBA_C02_PTY_LIMIT_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "terminal::pty_flow_tests::c02_native_pty_creation_failure_stays_local", "--nocapture"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(result.status.success(), "{}\n{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+            return;
+        }
+    }
+
+    let program = std::env::current_exe().unwrap();
+    let mut target = super::remote::Target::new("fixture", "us-west-2", "i-01234567").unwrap();
+    target.fixture = Some(program);
+    let cancel = crate::ssm::CancellationToken::new();
+    let mut remote = tauri::async_runtime::block_on(target.prepare(&cancel)).unwrap();
+    #[cfg(windows)]
+    let size = size(0, 0);
+    #[cfg(unix)]
+    let size = {
+        // 리소스 한도는 이 전용 시험 프로세스에만 적용한다.
+        let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }, 0);
+        limit.rlim_cur = 3;
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        size(24, 80)
+    };
+    let Err(error) = portable_pty::native_pty_system().openpty(size) else { panic!("네이티브 PTY 생성 실패가 필요합니다") };
+    println!("PTY 생성 실패: {error}");
+    assert_eq!(remote.spawn(size, &cancel).err().as_deref(), Some("SSM PTY: 시작 실패"));
+    assert_eq!(remote.close(), (super::remote::RemoteClose::NotStarted, None));
+}

@@ -3,10 +3,10 @@ use portable_pty::ChildKiller;
 use std::process::{Child as Process, Command, Stdio};
 
 #[derive(Debug)]
-struct Isolated(Process);
+pub(crate) struct Isolated(pub(crate) Process);
 
 impl Isolated {
-    fn waiting() -> Self {
+    pub(crate) fn waiting() -> Self {
         #[cfg(unix)]
         let mut command = Command::new("/bin/cat");
         #[cfg(windows)]
@@ -63,10 +63,10 @@ fn ssh_child_natural_exit_preserves_status() {
 }
 
 #[derive(Debug)]
-struct Restricted {
-    child: Isolated,
+pub(crate) struct Restricted {
+    pub(crate) child: Isolated,
     #[cfg(windows)]
-    handle: std::os::windows::io::OwnedHandle,
+    pub(crate) handle: std::os::windows::io::OwnedHandle,
 }
 
 impl ChildKiller for Restricted {
@@ -102,7 +102,7 @@ fn ssh_child_failed_kill_is_explicit_and_keeps_child_running() {
 }
 
 #[cfg(windows)]
-fn restricted_handle(child: &Process, access: u32) -> std::os::windows::io::OwnedHandle {
+pub(crate) fn restricted_handle(child: &Process, access: u32) -> std::os::windows::io::OwnedHandle {
     use std::{os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle}, ptr};
     use windows_sys::Win32::{Foundation::DuplicateHandle, System::Threading::GetCurrentProcess};
     let mut handle = ptr::null_mut();

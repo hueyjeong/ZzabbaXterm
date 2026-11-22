@@ -73,6 +73,8 @@ struct Registry {
     destroyed: HashSet<String>,
     documents: HashMap<String, u64>,
     probes: Runs,
+    closing: HashSet<String>,
+    exiting: bool,
     shutdown: bool,
 }
 
@@ -87,14 +89,29 @@ impl Sessions {
     }
 
     pub(crate) fn with_probes<T>(&self, owner: &str, document: u64, use_probes: impl FnOnce(&mut Runs) -> Result<T, String>) -> Result<T, String> {
+        self.with_probe_access(owner, document, false, use_probes)
+    }
+
+    pub(crate) fn with_probe_access<T>(&self, owner: &str, document: u64, starting_ssh: bool,
+        use_probes: impl FnOnce(&mut Runs) -> Result<T, String>) -> Result<T, String> {
         let mut registry = self.registry.lock().unwrap();
-        if registry.shutdown || registry.destroyed.contains(owner) {
+        if registry.shutdown || registry.destroyed.contains(owner)
+            || starting_ssh && (registry.exiting || registry.closing.contains(owner))
+        {
             return Err("창이 닫혔습니다".into());
         }
         if registry.documents.get(owner).copied().unwrap_or(0) != document {
             return Err("문서가 바뀌었습니다".into());
         }
         use_probes(&mut registry.probes)
+    }
+
+    pub(crate) fn release_close_gate(&self, owner: Option<&str>) {
+        let mut registry = self.registry.lock().unwrap();
+        match owner {
+            Some(owner) => { registry.closing.remove(owner); }
+            None => registry.exiting = false,
+        }
     }
 
     pub(crate) fn probe_completion(&self, owner: String, document: u64, run_id: String) -> impl FnOnce() + Send + use<> {
@@ -230,14 +247,32 @@ impl Sessions {
         self.stop_owner(owner, true);
     }
 
+    pub(crate) fn close_ssh_probes(&self, owner: Option<&str>) -> bool {
+        let probes = {
+            let mut registry = self.registry.lock().unwrap();
+            match owner {
+                Some(owner) => { registry.closing.insert(owner.into()); }
+                None => registry.exiting = true,
+            }
+            registry.probes.closing_ssh(owner)
+        };
+        for probe in &probes { probe.stop(); }
+        let confirmed = probes.into_iter().all(|probe| probe.confirm_ssh_close());
+        if !confirmed { self.release_close_gate(owner); }
+        confirmed
+    }
+
     fn stop_owner(&self, owner: &str, destroyed: bool) {
         let mut registry = self.registry.lock().unwrap();
-        *registry.documents.entry(owner.into()).or_default() += 1;
+        let document = registry.documents.entry(owner.into()).or_default();
+        let previous = *document;
+        *document += 1;
         registry.close_results.retain(|_, entry| entry.owner() != owner);
         if destroyed {
+            registry.closing.remove(owner);
             registry.destroyed.insert(owner.into());
         }
-        registry.probes.stop_owner(owner);
+        registry.probes.stop_owner(owner, previous);
         for session in registry.sessions.values().filter(|session| session.owner == owner) {
             session.stop(process::Stop::Closed);
         }
@@ -256,7 +291,10 @@ impl Sessions {
         for session in sessions {
             session.wait_finished();
         }
-        probes.iter().for_each(|probe| probe.wait_finished());
+        for probe in probes {
+            probe.wait_finished();
+            if probe.is_ssh() { let _ = probe.cancel_result(true); }
+        }
     }
 }
 

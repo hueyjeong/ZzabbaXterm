@@ -59,7 +59,7 @@ impl Probe {
         Self::with_timeout(owner, TIMEOUT, false, false)
     }
 
-    fn with_timeout(owner: &str, timeout: Duration, ssm: bool, ssh: bool) -> Self {
+    pub(super) fn with_timeout(owner: &str, timeout: Duration, ssm: bool, ssh: bool) -> Self {
         Self { session: Arc::new(Session::new(owner, ssm)), ssh, deadline: Instant::now() + timeout, state: Mutex::default(), ready: Condvar::new() }
     }
 
@@ -146,7 +146,7 @@ impl Probe {
         combine_cleanup(result, self.session.cleanup_result())
     }
 
-    fn finish(&self, result: Result<(), String>) {
+    pub(super) fn finish(&self, result: Result<(), String>) {
         self.state.lock().unwrap().result = Some(if result.is_ok() && Instant::now() >= self.deadline { Err(TIMED_OUT.into()) } else { result });
         self.ready.notify_all();
     }
@@ -175,18 +175,30 @@ impl Probe {
         drop(self.ready.wait_while(self.state.lock().unwrap(), |state| state.result.is_none()).unwrap());
     }
 
+    pub(crate) fn is_ssh(&self) -> bool {
+        self.ssh
+    }
+
+    pub(super) fn confirm_ssh_close(&self) -> bool {
+        self.cancel_result(true).is_ok()
+    }
+
     pub(crate) fn cleanup_unconfirmed(&self) -> bool {
         self.session.cleanup_result().is_err()
     }
 
     pub(crate) fn cancel_result(&self, retry: bool) -> Result<(), String> {
-        if self.session.is_ssm() {
+        if self.ssh {
+            let (state, _) = self.ready.wait_timeout_while(self.state.lock().unwrap(), Duration::from_secs(5),
+                |state| state.result.is_none()).unwrap();
+            if state.result.is_none() { return Err("SSH 시험 자식 종료 확인 불가".into()); }
+        } else if self.session.is_ssm() {
             self.wait_finished();
-            if retry { return self.session.recheck_cleanup().warning().map_or(Ok(()), Err); }
-            self.session.cleanup_result()?;
+        } else {
+            return Ok(());
         }
-        if self.ssh { self.wait_finished(); self.session.cleanup_result()?; }
-        Ok(())
+        if retry { return self.session.recheck_cleanup().warning().map_or(Ok(()), Err); }
+        self.session.cleanup_result()
     }
 
     fn after_cleanup(&self, result: Result<(), String>) -> Result<(), String> {
@@ -213,13 +225,14 @@ impl Probe {
         let (sender, receiver) = mpsc::sync_channel(1);
         let session = Arc::downgrade(&self.session);
         let output = std::cell::Cell::new((0u64, 0usize));
+        let remote_ready = std::cell::Cell::new(false);
         #[cfg(windows)]
         let cursor_query = std::cell::Cell::new(0usize);
         let launched = self.session.begin_launch(size(24, 80), command, move |event| {
             let (position, mut matched) = output.get();
             match event {
                 Event::Bytes(bytes) => {
-                    scan(marker, &mut matched, &bytes);
+                    if !ssm || remote_ready.get() { scan(marker, &mut matched, &bytes); }
                     let position = position + bytes.len() as u64;
                     output.set((position, matched));
                     let session = session.upgrade().ok_or(super::CLOSED)?;
@@ -237,8 +250,11 @@ impl Probe {
                     Ok(())
                 }
                 Event::Connecting => Ok(()),
-                Event::Ready => session.upgrade().ok_or(super::CLOSED.to_owned())?.input(SSM_CHECK),
-                Event::Exited(0) if matched == marker.len() => sender.send(Ok(())).map_err(|err| err.to_string()),
+                Event::Ready => {
+                    remote_ready.set(true);
+                    session.upgrade().ok_or(super::CLOSED.to_owned())?.input(SSM_CHECK)
+                }
+                Event::Exited(0) if (!ssm || remote_ready.get()) && matched == marker.len() => sender.send(Ok(())).map_err(|err| err.to_string()),
                 Event::Exited(23) if !ssm => sender.send(Err("셸이 요청한 작업 디렉터리에서 시작하지 못했습니다".into()))
                     .map_err(|err| err.to_string()),
                 Event::Exited(code) => sender.send(Err(format!("셸 시험 출력 또는 종료 상태가 올바르지 않습니다 (종료 코드 {code})")))

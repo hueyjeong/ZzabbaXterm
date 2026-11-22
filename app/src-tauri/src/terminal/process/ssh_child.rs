@@ -73,4 +73,4 @@ fn wait_until(child: &mut dyn Child, deadline: Instant) -> Result<ExitStatus, St
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

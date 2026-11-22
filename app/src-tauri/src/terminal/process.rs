@@ -218,13 +218,16 @@ impl Session {
         let send_event = |event| (send.lock().unwrap())(event);
         thread::scope(|scope| {
             let (event_tx, event_rx) = mpsc::sync_channel(1);
+            let (diagnostic_tx, diagnostic_rx) = mpsc::sync_channel(1);
             let drain = thread::Builder::new().name("terminal-output".into()).spawn_scoped(scope, move || {
                 if ssm {
                     drop(self.wake.wait_while(self.flow.lock().unwrap(), |flow| {
                         !flow.attached && flow.stop.is_none()
                     }).unwrap());
                 }
-                let end = self.drain(reader, &send_event);
+                let mut diagnostic = ssm.then(remote::StartDiagnostic::new);
+                let end = self.drain(reader, &send_event, diagnostic.as_mut());
+                let _ = diagnostic_tx.send(if end.is_ok() { diagnostic } else { None });
                 if let Err(error) = end {
                     self.stop(Stop::Disconnected(error));
                 }
@@ -294,11 +297,14 @@ impl Session {
             }
             if !ssm { let _ = ready.send(Ok(())); }
 
+            let mut connected = false;
             let event = thread::scope(|scope| {
                 if let Some(remote) = remote.as_ref() {
+                    let connected = &mut connected;
                     scope.spawn(move || {
                         let cancel = self.cancel.as_ref().unwrap();
                         let result = remote.wait_connected(cancel).and_then(|()| {
+                            *connected = true;
                             if !cancel.is_cancelled() { send_event(Event::Ready)?; }
                             Ok(())
                         });
@@ -329,6 +335,17 @@ impl Session {
             // and drains/discards until the console releases its output pipe.
             drop(master);
             self.writer.lock().unwrap().take();
+            let event = match event {
+                Some(Event::Exited(254)) if ssm && !connected => {
+                    if let Some(error) = diagnostic_rx.recv().ok().flatten().and_then(|output| output.rejection(254)) {
+                        drop(remote.take());
+                        Some(Event::Disconnected(error))
+                    } else {
+                        Some(Event::Exited(254))
+                    }
+                }
+                event => event,
+            };
             self.cleanup(remote.take());
             let _ = event_tx.send(event);
             let _ = drain.join();
@@ -512,7 +529,7 @@ impl Session {
         }
     }
 
-    fn drain(&self, mut reader: Box<dyn Read + Send>, send: &impl Fn(Event) -> Result<(), String>) -> Result<(), String> {
+    fn drain(&self, mut reader: Box<dyn Read + Send>, send: &impl Fn(Event) -> Result<(), String>, mut diagnostic: Option<&mut remote::StartDiagnostic>) -> Result<(), String> {
         let mut buffer = [0; CHUNK];
         loop {
             let mut flow = self.flow.lock().unwrap();
@@ -559,6 +576,7 @@ impl Session {
                     return Err(stage("read", error));
                 }
             };
+            if let Some(output) = &mut diagnostic { output.record(&buffer[..count]); }
             let mut flow = self.flow.lock().unwrap();
             if flow.stop.is_some() { continue; }
             if flow.sent == flow.acked {
@@ -714,4 +732,6 @@ fn kill_foreground(master: &dyn MasterPty, pid: libc::pid_t) {
 mod process_job;
 
 mod ssh_child;
+#[cfg(test)]
+mod probe_cleanup_tests;
 use ssh_child::{poll as poll_ssh, terminate as terminate_ssh};
