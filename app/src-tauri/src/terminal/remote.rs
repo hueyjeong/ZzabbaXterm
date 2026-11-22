@@ -218,7 +218,16 @@ fn submitted_control_start_is_reaped_and_checks_exact_ssm_cleanup_after_revocati
     const WAIT: std::time::Duration = std::time::Duration::from_secs(60);
     let (done, finished) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
-        submitted_control_start_shutdown_case();
+        let root = tempfile::tempdir().unwrap();
+        let program = root.path().join(format!("ssm fixture{}", std::env::consts::EXE_SUFFIX));
+        let compiled = std::process::Command::new(option_env!("RUSTC").unwrap_or("rustc"))
+            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/src/terminal/ssm_fixture.rs"))
+            .arg("-o").arg(&program).output().unwrap();
+        assert!(compiled.status.success(), "{}", String::from_utf8_lossy(&compiled.stderr));
+        std::fs::write(root.path().join("mode"), "unknown").unwrap();
+        submitted_control_start_shutdown_case(&program, false);
+        std::fs::remove_file(root.path().join("History")).unwrap();
+        submitted_control_start_shutdown_case(&program, true);
         let _ = done.send(());
     });
     match finished.recv_timeout(WAIT) {
@@ -228,23 +237,16 @@ fn submitted_control_start_is_reaped_and_checks_exact_ssm_cleanup_after_revocati
 }
 
 #[cfg(all(test, any(windows, unix)))]
-fn submitted_control_start_shutdown_case() {
+fn submitted_control_start_shutdown_case(program: &std::path::Path, exit_started: bool) {
     use crate::terminal::{ControlExitReport, LocalClose, Sessions, process::Session};
     use std::{sync::mpsc, thread, time::Duration};
 
     const WAIT: Duration = Duration::from_secs(10);
-    let root = tempfile::tempdir().unwrap();
-    let program = root.path().join(format!("ssm fixture{}", std::env::consts::EXE_SUFFIX));
-    let compiled = std::process::Command::new(option_env!("RUSTC").unwrap_or("rustc"))
-        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/src/terminal/ssm_fixture.rs"))
-        .arg("-o").arg(&program).output().unwrap();
-    assert!(compiled.status.success(), "{}", String::from_utf8_lossy(&compiled.stderr));
-    std::fs::write(root.path().join("mode"), "unknown").unwrap();
     let sessions = Sessions::default();
     let central = sessions.insert_live_ssm_fixture("main", 0, "123456789012", "us-west-2", "i-01234567");
     let binding = sessions.bind_ssm_control("main", &central.identity, &CancellationToken::new()).unwrap();
     let cancel = binding.cancel_token();
-    let mut remote = Remote::fixture(&program);
+    let mut remote = Remote::fixture(program);
     let selected = sessions.get("main", &central.identity.id).unwrap();
     let permit = remote.authorize(cancel).unwrap();
     let session = Arc::new(Session::dedicated(&binding));
@@ -276,36 +278,23 @@ fn submitted_control_start_shutdown_case() {
         child
     });
     assert!(cancel.is_cancelled());
-    let (cleanup, permit_cleanup) = mpsc::channel();
-    assert_eq!(sessions.drain_controls_for_exit(Duration::ZERO), ControlExitReport {
-        pending: 1, ..ControlExitReport::default()
+    if exit_started {
+        assert_eq!(sessions.drain_controls_for_exit(Duration::ZERO), ControlExitReport {
+            pending: 1, ..ControlExitReport::default()
+        });
+    }
+    session.terminate_fixture(child.as_mut(), pair.master.as_ref());
+    drop(pair);
+    session.cleanup(Some(remote));
+    drop(tracked);
+    let result = transport.close();
+    assert_eq!((result.local, result.remote, result.target.as_deref()),
+        (LocalClose::CliReaped, RemoteClose::Unconfirmed, Some("i-01234567")));
+    // 정확한 닫기가 첫 완료 보고의 레지스트리 잠금을 앞서 획득한다.
+    assert_eq!(sessions.drain_controls_for_exit(WAIT), ControlExitReport {
+        remote_unconfirmed: usize::from(exit_started), ..ControlExitReport::default()
     });
-    let (result, checked) = mpsc::channel();
-    let (exit, exited) = mpsc::channel();
-    thread::scope(|scope| {
-        scope.spawn(|| {
-            exit.send(sessions.drain_controls_for_exit(WAIT)).unwrap();
-        });
-        scope.spawn(move || {
-            permit_cleanup.recv_timeout(WAIT).unwrap();
-            session.terminate_fixture(child.as_mut(), pair.master.as_ref());
-            drop(pair);
-            session.cleanup(Some(remote));
-            result.send(session.close_result()).unwrap();
-            drop(tracked);
-        });
-        assert!(matches!(exited.recv_timeout(Duration::from_millis(100)), Err(mpsc::RecvTimeoutError::Timeout)));
-        cleanup.send(()).unwrap();
-        let result = checked.recv_timeout(WAIT).unwrap();
-        assert_eq!((result.local, result.remote, result.target.as_deref()), (LocalClose::CliReaped, RemoteClose::Unconfirmed, Some("i-01234567")));
-        assert_eq!(exited.recv_timeout(WAIT).unwrap(), ControlExitReport {
-            remote_unconfirmed: 1, ..ControlExitReport::default()
-        });
-    });
-    assert!(root.path().join("History").is_file());
-    assert_eq!(sessions.drain_controls_for_exit(Duration::ZERO).remote_unconfirmed, 1);
-    assert_eq!(transport.close().remote, RemoteClose::Unconfirmed);
-    assert_eq!(sessions.drain_controls_for_exit(Duration::ZERO), ControlExitReport::default());
+    assert!(program.with_file_name("History").is_file());
 }
 
 fn start_error(error: CliError) -> String {

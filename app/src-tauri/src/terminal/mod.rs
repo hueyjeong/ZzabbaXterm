@@ -144,8 +144,11 @@ impl ControlBinding {
     }
 
     pub(crate) fn consume_control_close(&self, id: u64) {
-        // 정확한 결과를 받은 닫기만 집계를 지운다. Drop과 대기 만료는 그대로 둔다.
-        self.registry.lock().unwrap().control_cleanup.remove(&id);
+        let mut registry = self.registry.lock().unwrap();
+        // 앱 종료 중에는 정확한 결과를 받은 호출보다 종료 보고를 우선한다.
+        if !registry.control_exit && !registry.shutdown {
+            registry.control_cleanup.remove(&id);
+        }
     }
 
     // 중앙 세션 확인과 입력 예약만 처리한다. AWS 조회와 PTY 입출력은 잠금 밖에서 처리한다.
