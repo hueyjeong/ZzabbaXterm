@@ -8,8 +8,8 @@ pub(super) const MAIN: &str = "main";
 pub(crate) fn prepare_cli(app: AppHandle, pending: Pending) -> impl Future<Output = ()> + Send + 'static {
     let targeted = (|| {
         let (document, lifetime) = app.state::<LocalEditors>().scope(MAIN).ok()?;
-        let webview = app.get_webview(MAIN)?;
-        let window = webview.window();
+        let webview = app.get_webview_window(MAIN)?;
+        let window = webview.as_ref().window();
         (window.label() == MAIN).then_some((window, document, lifetime))
     })();
     async move {
