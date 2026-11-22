@@ -1,17 +1,22 @@
 use std::{io, process::Stdio, sync::Arc, time::Duration};
 
 use tauri::AppHandle;
-use tokio::{io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt}, process::Command, sync::{mpsc, oneshot}, time::timeout};
+use tokio::{io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt}, process::Command, sync::{mpsc, oneshot}, time::{Instant, sleep_until, timeout}};
 use tokio_util::sync::{CancellationToken, DropGuard};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::editor::{nano_bridge, nano_wire::{CHALLENGE_LEN, Lease, MAX_PAYLOAD, NO_PROOF, PROOF_LEN, PTY_FRAME_LEN, PTY_PREFIX, Ready, Request, STARTUP_LIMIT, decode_len}};
+use crate::editor::{
+    nano_bridge::{self, BridgeRequest, PUBLICATION_IO_LIMIT, PublicationReply, PublicationWork, PublishError},
+    nano_wire::{CHALLENGE_LEN, Lease, MAX_PAYLOAD, NO_PROOF, PROOF_LEN, PTY_FRAME_LEN, PTY_PREFIX, Ready, Response, STARTUP_LIMIT, decode_len,
+        publication::{ActiveOpen, MAX_OPEN_PAYLOAD, OperationKind, Outcome, PeerFrame, decode_peer_prefix}},
+};
 
 use super::ConnectionPlan;
 
 pub(super) const HELPER: &str = "/usr/local/libexec/zzabba-editor-bridge";
 const PREPARE_LIMIT: Duration = Duration::from_secs(3);
 const QUEUE: usize = 8;
+const WORK_QUEUE: usize = 1;
 
 pub(crate) struct Binding {
     pub(super) app: AppHandle,
@@ -70,19 +75,23 @@ impl Running {
             let exchange = exchange(stdin, stdout, binding, ready_tx, proof_rx, session_cancel.clone());
             tokio::pin!(exchange);
             let (reaped, exchange_done) = tokio::select! {
+                biased;
+                _ = &mut exchange => (false, true),
                 status = child.wait() => (status.is_ok(), false),
                 _ = worker_cancel.cancelled() => (false, false),
-                _ = &mut exchange => (false, true),
             };
             session_cancel.cancel();
-            if !reaped {
-                let _ = child.start_kill();
-                while child.wait().await.is_err() {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+            let reap = async {
+                if !reaped {
                     let _ = child.start_kill();
+                    while child.wait().await.is_err() {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        let _ = child.start_kill();
+                    }
                 }
-            }
-            if !exchange_done { let _ = exchange.await; }
+            };
+            let finish = async { if !exchange_done { let _ = exchange.await; } };
+            tokio::join!(finish, reap);
         });
         let running = Self {
             stop: Some(cancel.clone().drop_guard()), worker: Some(worker), startup: Some(Startup::new(proof_tx)),
@@ -224,28 +233,197 @@ async fn exchange(
         }
     }
     let (requests, incoming) = mpsc::channel(QUEUE);
-    let (responses, mut outgoing) = mpsc::channel(QUEUE);
-    let bridge = nano_bridge::run(binding.app, binding.owner, binding.document, parent, cancel.clone(), incoming, responses);
-    tokio::pin!(bridge);
-    let result = tokio::select! {
-        _ = &mut bridge => return Ok(()),
-        _ = cancel.cancelled() => Ok(()),
-        result = async {
-            loop {
-                let message = Request::decode(frame(&mut stdout, &mut buffer).await?)?;
-                if requests.try_send(message).is_err() { return Err(io::ErrorKind::BrokenPipe.into()); }
-            }
-        } => result,
-        result = async {
-            while let Some(response) = outgoing.recv().await {
-                stdin.write_all(&response.encode()?).await?;
-            }
-            Ok(())
-        } => result,
+    let (responses, outgoing) = mpsc::channel(QUEUE);
+    let (work, queued) = mpsc::channel(WORK_QUEUE);
+    let bridge = nano_bridge::run(binding.app, binding.owner, binding.document, parent, cancel.clone(), incoming, responses, work);
+    let relay = async {
+        let result = transport(stdin, stdout, &cancel, requests, outgoing, queued, PUBLICATION_IO_LIMIT).await;
+        // 발행 응답과 큐를 먼저 반환해야 같은 SFTP 슬롯을 정리할 수 있다.
+        cancel.cancel();
+        result
     };
-    cancel.cancel();
-    drop(outgoing);
-    bridge.await;
+    let (result, ()) = tokio::join!(biased; relay, bridge);
+    result
+}
+
+const PEER_PREFIX: usize = 2 + 8;
+
+struct PeerReader<R> {
+    input: R,
+    bytes: [u8; 4 + MAX_OPEN_PAYLOAD],
+    filled: usize,
+}
+
+impl<R: AsyncRead + Unpin> PeerReader<R> {
+    async fn fill(&mut self, end: usize) -> io::Result<()> {
+        while self.filled < end {
+            // read_exact와 달리 select가 중단해도 수신 위치를 유지한다.
+            let read = self.input.read(&mut self.bytes[self.filled..end]).await?;
+            if read == 0 { return Err(io::ErrorKind::UnexpectedEof.into()); }
+            self.filled += read;
+        }
+        Ok(())
+    }
+
+    async fn next(&mut self) -> io::Result<(PeerFrame, &[u8])> {
+        self.fill(4).await?;
+        let header = self.bytes[..4].try_into().expect("four-byte length");
+        if !(PEER_PREFIX..=MAX_OPEN_PAYLOAD).contains(&(u32::from_be_bytes(header) as usize)) {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        self.fill(4 + PEER_PREFIX).await?;
+        let prefix = self.bytes[4..4 + PEER_PREFIX].try_into().expect("peer frame prefix");
+        let (len, kind) = decode_peer_prefix(header, prefix)?;
+        self.fill(4 + len).await?;
+        self.filled = 0;
+        Ok((kind, &self.bytes[4..4 + len]))
+    }
+}
+
+struct Active {
+    id: u64,
+    last_op: u64,
+    cancelled: bool,
+}
+
+impl Active {
+    fn cancel(&mut self, id: u64, requests: &mpsc::Sender<BridgeRequest>) -> io::Result<()> {
+        if self.id == id && !self.cancelled {
+            self.cancelled = true;
+            forward(requests, BridgeRequest::Cancel(id))?;
+        }
+        Ok(())
+    }
+}
+
+fn forward(requests: &mpsc::Sender<BridgeRequest>, request: BridgeRequest) -> io::Result<()> {
+    requests.try_send(request).map_err(|_| io::ErrorKind::BrokenPipe.into())
+}
+
+fn publication_result(outcome: Outcome) -> Result<PublicationReply, PublishError> {
+    match outcome {
+        Outcome::Observation(observation) => Ok(PublicationReply::Observed(observation)),
+        Outcome::Reloaded(snapshot) => Ok(PublicationReply::Reloaded(snapshot)),
+        Outcome::Saved(snapshot) => Ok(PublicationReply::Saved(snapshot)),
+        Outcome::Conflict => Err(PublishError::Conflict),
+        Outcome::Unavailable => Err(PublishError::Unavailable),
+        Outcome::Unknown(recovery) => Err(PublishError::Unknown(recovery)),
+    }
+}
+
+async fn transport(
+    mut output: impl AsyncWrite + Unpin,
+    input: impl AsyncRead + Unpin,
+    cancel: &CancellationToken,
+    requests: mpsc::Sender<BridgeRequest>,
+    mut responses: mpsc::Receiver<Response>,
+    mut queued: mpsc::Receiver<PublicationWork>,
+    limit: Duration,
+) -> io::Result<()> {
+    let mut peer = PeerReader { input, bytes: [0; 4 + MAX_OPEN_PAYLOAD], filled: 0 };
+    let mut latest_id = 0;
+    let mut active = None::<Active>;
+    let result = async {
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Ok(()),
+                _ = requests.closed() => return Ok(()),
+                message = peer.next() => match message? {
+                    (PeerFrame::Open(id), payload) if active.is_none() && id > latest_id => {
+                        forward(&requests, BridgeRequest::Open(ActiveOpen::decode(payload)?))?;
+                        latest_id = id;
+                        active = Some(Active { id, last_op: 0, cancelled: false });
+                    }
+                    (PeerFrame::Cancel(id), _) => {
+                        if let Some(active) = &mut active { active.cancel(id, &requests)?; }
+                    }
+                    _ => return Err(io::ErrorKind::InvalidData.into()),
+                },
+                response = responses.recv() => {
+                    let Some(response) = response else { return Ok(()); };
+                    if !active.as_ref().is_some_and(|active| active.id == response.id()) {
+                        return Err(io::ErrorKind::InvalidData.into());
+                    }
+                    if let Ok(work) = queued.try_recv() { work.respond(Err(PublishError::Unavailable)); }
+                    let frame = response.encode()?;
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return Ok(()),
+                        result = timeout(limit, output.write_all(&frame)) => result.map_err(|_| io::ErrorKind::TimedOut)??,
+                    }
+                    active = None;
+                }
+                work = queued.recv() => {
+                    let Some(work) = work else { return Ok(()); };
+                    let Some(active) = active.as_mut().filter(|active| active.id == work.open_id) else {
+                        work.respond(Err(PublishError::Unavailable));
+                        continue;
+                    };
+                    let kind = work.operation.kind();
+                    let mut written = 0;
+                    let result = async {
+                        let op = active.last_op.checked_add(1).ok_or(io::ErrorKind::InvalidData)?;
+                        let frame = work.operation.encode(active.id, op)?;
+                        let total = frame.header.len() + frame.fragment.len();
+                        let expires = Instant::now() + limit;
+                        let deadline = sleep_until(expires);
+                        tokio::pin!(deadline);
+                        loop {
+                            tokio::select! {
+                                // 이미 도착한 정확한 응답을 연결 종료보다 먼저 처리한다.
+                                biased;
+                                message = peer.next() => match message? {
+                                    (PeerFrame::Cancel(id), _) => {
+                                        active.cancel(id, &requests)?;
+                                        if cancel.is_cancelled() { return Err(io::ErrorKind::Interrupted.into()); }
+                                        if requests.is_closed() { return Err(io::ErrorKind::BrokenPipe.into()); }
+                                        if Instant::now() >= expires { return Err(io::ErrorKind::TimedOut.into()); }
+                                    }
+                                    (PeerFrame::Outcome(id), payload) if written == total && id == active.id => {
+                                        return Outcome::decode(payload, active.id, op, kind);
+                                    }
+                                    _ => return Err(io::ErrorKind::InvalidData.into()),
+                                },
+                                _ = cancel.cancelled() => return Err(io::ErrorKind::Interrupted.into()),
+                                _ = requests.closed() => return Err(io::ErrorKind::BrokenPipe.into()),
+                                _ = &mut deadline => return Err(io::ErrorKind::TimedOut.into()),
+                                result = async {
+                                    if written == 0 && (active.cancelled || cancel.is_cancelled() || work.request.is_cancelled()
+                                        || work.reply.is_closed() || requests.is_closed() || queued.is_closed() || responses.is_closed())
+                                    {
+                                        return Ok(None);
+                                    }
+                                    let part = if written < frame.header.len() {
+                                        &frame.header[written..]
+                                    } else {
+                                        &frame.fragment[written - frame.header.len()..]
+                                    };
+                                    output.write(part).await.map(Some)
+                                }, if written < total => {
+                                    let Some(count) = result? else { return Ok(Outcome::Unavailable); };
+                                    if count == 0 { return Err(io::ErrorKind::WriteZero.into()); }
+                                    active.last_op = op;
+                                    written += count;
+                                },
+                            }
+                        }
+                    }.await;
+                    match result {
+                        Ok(outcome) => work.respond(publication_result(outcome)),
+                        Err(error) => {
+                            let lost = if written != 0 && kind == OperationKind::Save { PublishError::Unknown(None) } else { PublishError::Unavailable };
+                            work.respond(Err(lost));
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+        }
+    }.await;
+    // 아직 보내지 않은 작업은 저장 결과 미확인과 구분한다.
+    queued.close();
+    while let Ok(work) = queued.try_recv() { work.respond(Err(PublishError::Unavailable)); }
     result
 }
 
@@ -286,6 +464,10 @@ async fn frame_rejects_oversize_and_short_payloads() {
     assert_eq!(frame(&mut &oversize[..], &mut buffer).await.unwrap_err().kind(), io::ErrorKind::InvalidData);
     assert_eq!(frame(&mut &[0, 0, 0, 2, 1][..], &mut buffer).await.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
 }
+
+#[cfg(test)]
+#[path = "nano_transport_tests.rs"]
+mod transport_tests;
 
 #[cfg(test)]
 mod startup_tests {
