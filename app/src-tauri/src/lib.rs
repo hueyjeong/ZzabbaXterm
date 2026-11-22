@@ -1,3 +1,4 @@
+pub mod ai;
 mod connections;
 mod terminal;
 mod workspace_window;
