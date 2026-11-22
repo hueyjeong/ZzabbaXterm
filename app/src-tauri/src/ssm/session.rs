@@ -24,6 +24,8 @@ pub struct StartRequest {
     program: Arc<Path>,
     command_issued: bool,
     termination_id: Option<String>,
+    #[cfg(test)]
+    fixture: bool,
 }
 
 // CommandBuilder를 노출하면 복제해 같은 인가를 여러 번 실행할 수 있다.
@@ -56,6 +58,10 @@ impl StartPermit {
                 cwd.as_os_str().as_ref(),
             )
             .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "SSM plugin search changed"))?;
+        self.spawn_in(pair)
+    }
+
+    fn spawn_in(self, pair: PtyPair) -> io::Result<(PtyPair, Box<dyn Child + Send + Sync>)> {
         let child = pair.slave.spawn_command(self.0).map_err(io::Error::other)?;
         Ok((
             pair,
@@ -65,6 +71,34 @@ impl StartPermit {
                 _credentials: self.1,
             }),
         ))
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_start(program: &Path) -> (AwsCli, Scope, StartRequest, StartPermit) {
+    let scope = Scope::new("fixture".into(), "us-west-2".into()).unwrap();
+    let program: Arc<Path> = program.into();
+    let credentials = super::tests::fixture_credentials();
+    let request = StartRequest {
+        scope: scope.clone(),
+        target: "i-01234567".into(),
+        reason: "zzabbaxterm-0123456789abcdef0123456789abcdef".into(),
+        owner: "arn:aws:sts::123456789012:assumed-role/Sample/Sample".into(),
+        credentials: credentials.clone(),
+        program: program.clone(),
+        command_issued: true,
+        termination_id: None,
+        fixture: true,
+    };
+    let plugin = plugin::tests::fixture_plugin();
+    let command = request.start_command(credentials.home().path(), plugin.path());
+    (AwsCli(program), scope, request, StartPermit(command, credentials, plugin))
+}
+
+#[cfg(test)]
+impl StartPermit {
+    pub(crate) fn spawn_fixture(self, size: PtySize) -> io::Result<(PtyPair, Box<dyn Child + Send + Sync>)> {
+        self.spawn_in(native_pty_system().openpty(size).map_err(io::Error::other)?)
     }
 }
 
@@ -187,7 +221,11 @@ impl AwsCli {
         cancel: &CancellationToken,
     ) -> Result<(), VerificationError> {
         request.require_issued_scope(&self.0, scope)?;
-        request.wait_connected_with(cancel, async |spec, timeout| spec.capture_with_timeout(cancel, timeout).await).await
+        request.wait_connected_with(cancel, async |spec, timeout| {
+            #[cfg(test)]
+            if request.fixture { return spec.capture_fixture(cancel, timeout).await; }
+            spec.capture_with_timeout(cancel, timeout).await
+        }).await
     }
 
     pub async fn close_session(
@@ -201,8 +239,12 @@ impl AwsCli {
             .credentials
             .require_current()
             .map_err(|_| VerificationError::Unconfirmed)?;
+        #[cfg(test)]
+        let fixture = request.fixture;
         request
             .close_with(&self.0, current_scope, async |spec| {
+                #[cfg(test)]
+                if fixture { return spec.capture_fixture(cancel, CLOSE_LOOKUP_TIMEOUT).await; }
                 spec.capture_with_timeout(cancel, CLOSE_LOOKUP_TIMEOUT).await
             })
             .await
@@ -212,6 +254,8 @@ impl AwsCli {
         request.require_issued_scope(&self.0, scope)?;
         let cancel = CancellationToken::new();
         request.confirm_terminated(request.termination_id.as_deref(), async |spec| {
+            #[cfg(test)]
+            if request.fixture { return spec.capture_fixture(&cancel, CLOSE_LOOKUP_TIMEOUT).await; }
             spec.capture_with_timeout(&cancel, CLOSE_LOOKUP_TIMEOUT).await
         }).await
     }
@@ -282,6 +326,8 @@ impl StartRequest {
         command.args(spec.args());
         command.cwd(cwd);
         apply_start_environment(&mut command, &spec, std::env::vars_os());
+        // StartSession 작업 이름이 들어 있는 CLI 오류 형식으로 고정한다.
+        command.env("AWS_CLI_ERROR_FORMAT", "legacy");
         command.env("PATH", plugin_path);
         command
     }
@@ -466,6 +512,50 @@ impl StartRequest {
     }
 }
 
+pub(crate) fn start_rejection(output: &[u8]) -> Option<CliError> {
+    #[cfg(windows)]
+    let output = conpty_diagnostic(output)?;
+    let output = std::str::from_utf8(output).ok()?;
+    let mut lines = output.lines().map(str::trim).filter(|line| {
+        !line.is_empty() && line.as_bytes() != super::cli::HISTORY_WARNING
+    });
+    let line = lines.next()?;
+    if lines.next().is_some() { return None; }
+    let line = line.strip_prefix("aws: [ERROR]: ").unwrap_or(line);
+    let (code, _) = line.strip_prefix("An error occurred (")?
+        .split_once(") when calling the StartSession operation:")?;
+    Some(match code {
+        "AccessDenied" | "AccessDeniedException" | "NotAuthorized" | "UnauthorizedOperation" => CliError::AccessDenied,
+        "ExpiredToken" | "ExpiredTokenException" => CliError::CredentialsExpired,
+        "InvalidClientTokenId" | "UnrecognizedClientException" => CliError::CredentialsUnavailable,
+        "InvalidDocument" => CliError::InvalidSessionDocument,
+        "TargetNotConnected" => CliError::TargetNotConnected,
+        _ => return None,
+    })
+}
+
+#[cfg(windows)]
+fn conpty_diagnostic(mut output: &[u8]) -> Option<&[u8]> {
+    // ConPTY는 같은 스트림에 초기 모드·창 제목과 종료 모드 변경을 보낸다.
+    while output.starts_with(b"\x1b") {
+        if let Some(title) = output.strip_prefix(b"\x1b]0;") {
+            output = &title[title.iter().position(|&byte| byte == 7)? + 1..];
+        } else if let Some(rest) = [b"\x1b[6n".as_slice(), b"\x1b[?9001h", b"\x1b[?1004h", b"\x1b[m", b"\x1b[?25h"]
+            .into_iter().find_map(|control| output.strip_prefix(control))
+        {
+            output = rest;
+        } else {
+            return None;
+        }
+    }
+    while let Some(rest) = [b"\x1b[?9001l".as_slice(), b"\x1b[?1004l"]
+        .into_iter().find_map(|control| output.strip_suffix(control))
+    {
+        output = rest;
+    }
+    (!output.contains(&0x1b)).then_some(output)
+}
+
 fn apply_start_environment(
     command: &mut CommandBuilder,
     spec: &CommandSpec,
@@ -508,6 +598,8 @@ fn prepare_start(scope: &Scope, node: &OnlineNode) -> Result<StartRequest, CliEr
         program: node.program.clone(),
         command_issued: false,
         termination_id: None,
+        #[cfg(test)]
+        fixture: false,
     })
 }
 

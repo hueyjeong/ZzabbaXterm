@@ -61,9 +61,7 @@ pub(super) async fn checked_path(
         .capture_in(cwd, cancel)
         .await?
         .success()?;
-    if !supports_environment_response(&output) {
-        return Err(CliError::PluginMissing);
-    }
+    require_supported_version(&output, cfg!(windows))?;
     let path = std::env::join_paths([dir]).map_err(|_| CliError::PluginMissing)?;
     Ok(CheckedPlugin {
         file: plugin.into(),
@@ -128,11 +126,21 @@ fn official_file() -> Result<(PathBuf, File), CliError> {
     Err(CliError::PluginMissing)
 }
 
-fn supports_environment_response(output: &[u8]) -> bool {
-    let Ok(version) = std::str::from_utf8(output) else {
-        return false;
+fn require_supported_version(output: &[u8], windows: bool) -> Result<(), CliError> {
+    // AWS 지원 하한과 Windows 국제 키보드 수정: plugin-version-history.html
+    let (minimum, label) = if windows {
+        ([1, 2, 792, 0], "1.2.792.0")
+    } else {
+        ([1, 2, 764, 0], "1.2.764.0")
     };
-    numeric_version(version.trim()).is_some_and(|parts| parts > [1, 2, 497, 0])
+    let version = std::str::from_utf8(output)
+        .ok()
+        .and_then(|version| numeric_version(version.trim()))
+        .ok_or(CliError::InvalidResponse)?;
+    if version < minimum {
+        return Err(CliError::PluginUpgradeRequired { minimum: label });
+    }
+    Ok(())
 }
 
 pub(super) fn numeric_version(version: &str) -> Option<[u32; 4]> {
@@ -212,14 +220,21 @@ pub(super) mod tests {
 
     #[test]
     fn version_and_shadow_candidates_fail_closed() {
-        assert!(supports_environment_response(b"1.2.497.1\r\n"));
+        for (windows, old, minimum) in [
+            (false, "1.2.763.99", "1.2.764.0"),
+            (true, "1.2.791.99", "1.2.792.0"),
+        ] {
+            assert_eq!(require_supported_version(old.as_bytes(), windows), Err(CliError::PluginUpgradeRequired { minimum }));
+            assert_eq!(require_supported_version(format!("{minimum}\r\n").as_bytes(), windows), Ok(()));
+            assert_eq!(require_supported_version(b"1.2.896.0", windows), Ok(()));
+        }
         for invalid in [
-            b"1.2.497.0".as_slice(),
+            b"".as_slice(),
             b"1.2. 900",
             b"1.2.764.0.1",
             b"\xff",
         ] {
-            assert!(!supports_environment_response(invalid));
+            assert_eq!(require_supported_version(invalid, false), Err(CliError::InvalidResponse));
         }
         let chosen = tempfile::tempdir().unwrap();
         let earlier = tempfile::tempdir().unwrap();

@@ -213,13 +213,14 @@ impl Probe {
         let (sender, receiver) = mpsc::sync_channel(1);
         let session = Arc::downgrade(&self.session);
         let output = std::cell::Cell::new((0u64, 0usize));
+        let remote_ready = std::cell::Cell::new(false);
         #[cfg(windows)]
         let cursor_query = std::cell::Cell::new(0usize);
         let launched = self.session.begin_launch(size(24, 80), command, move |event| {
             let (position, mut matched) = output.get();
             match event {
                 Event::Bytes(bytes) => {
-                    scan(marker, &mut matched, &bytes);
+                    if !ssm || remote_ready.get() { scan(marker, &mut matched, &bytes); }
                     let position = position + bytes.len() as u64;
                     output.set((position, matched));
                     let session = session.upgrade().ok_or(super::CLOSED)?;
@@ -237,8 +238,11 @@ impl Probe {
                     Ok(())
                 }
                 Event::Connecting => Ok(()),
-                Event::Ready => session.upgrade().ok_or(super::CLOSED.to_owned())?.input(SSM_CHECK),
-                Event::Exited(0) if matched == marker.len() => sender.send(Ok(())).map_err(|err| err.to_string()),
+                Event::Ready => {
+                    remote_ready.set(true);
+                    session.upgrade().ok_or(super::CLOSED.to_owned())?.input(SSM_CHECK)
+                }
+                Event::Exited(0) if (!ssm || remote_ready.get()) && matched == marker.len() => sender.send(Ok(())).map_err(|err| err.to_string()),
                 Event::Exited(23) if !ssm => sender.send(Err("셸이 요청한 작업 디렉터리에서 시작하지 못했습니다".into()))
                     .map_err(|err| err.to_string()),
                 Event::Exited(code) => sender.send(Err(format!("셸 시험 출력 또는 종료 상태가 올바르지 않습니다 (종료 코드 {code})")))

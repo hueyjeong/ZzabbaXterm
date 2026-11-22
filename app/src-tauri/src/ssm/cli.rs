@@ -28,6 +28,7 @@ pub enum CliError {
     AwsCliMissing,
     AwsCliNotV2,
     PluginMissing,
+    PluginUpgradeRequired { minimum: &'static str },
     InvalidProfile,
     ProfileNotFound,
     UnsupportedProfile,
@@ -41,6 +42,7 @@ pub enum CliError {
     SsoLoginNotApplicable,
     AccessDenied,
     TargetNotConnected,
+    InvalidSessionDocument,
     EndpointUnavailable,
     InvalidResponse,
     OutputLimit,
@@ -246,6 +248,11 @@ impl CommandSpec {
         if let Some((_, credentials)) = &self.bound {
             credentials.require_current()?;
         }
+        capture(self.command(), self.tool, timeout, cancel).await
+    }
+
+    #[cfg(test)]
+    pub(super) async fn capture_fixture(&self, cancel: &CancellationToken, timeout: Duration) -> Result<Captured, CliError> {
         capture(self.command(), self.tool, timeout, cancel).await
     }
 
