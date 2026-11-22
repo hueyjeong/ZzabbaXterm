@@ -123,7 +123,7 @@ const status = () => find("footer").textContent;
 const tree = () => find('[role="tree"]');
 async function openSecond() {
   const group = find('[role="treeitem"][aria-expanded]');
-  group.focus();
+  await act(async () => { group.focus(); });
   await key(group, "ArrowRight");
   expect(document.activeElement).toBe(find('[role="treeitem"]:not([aria-expanded])'));
   await key(document.activeElement as HTMLElement, "Enter");
@@ -199,6 +199,32 @@ describe("L02", () => {
     });
     await act(async () => { viewportWidth = 1200; observeWorkspace(); });
     expect([left, right].map((part) => part.getAttribute("aria-valuenow"))).toEqual(["211", "211"]);
+  });
+
+  it("좁은 창에서 같은 드래그의 시작점으로 돌아오면 기존 트리 선호 폭을 되찾는다", async () => {
+    const left = find(".splitter-left");
+    left.setPointerCapture = vi.fn();
+    async function pointer(type: string, clientX: number) {
+      await act(async () => {
+        left.dispatchEvent(new PointerEvent(type, { pointerId: 1, clientX, bubbles: true }));
+      });
+    }
+    await pointer("pointerdown", 280);
+    await pointer("pointermove", 340);
+    await pointer("lostpointercapture", 340);
+    expect(left.getAttribute("aria-valuenow")).toBe("340");
+
+    await act(async () => { viewportWidth = 660; observeWorkspace(); });
+    expect(left.getAttribute("aria-valuenow")).toBe("211");
+    await pointer("pointerdown", 211);
+    await pointer("pointermove", 200);
+    expect(left.getAttribute("aria-valuenow")).toBe("200");
+    await pointer("pointermove", 211);
+    expect(left.getAttribute("aria-valuenow")).toBe("211");
+    await pointer("lostpointercapture", 211);
+
+    await act(async () => { viewportWidth = 1200; observeWorkspace(); });
+    expect(left.getAttribute("aria-valuenow")).toBe("340");
   });
 
   it("집중 보기와 탭 왕복은 두 PTY와 패널 선호값, 미제출 입력, 채팅 초안을 유지한다", async () => {

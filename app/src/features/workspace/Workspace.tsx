@@ -127,8 +127,8 @@ export function Workspace() {
             min={20} max={80} units={100 / Math.max(1, area.height)} onChange={setChatHeight} />
         </aside>
         {!focused && <>
-          <Splitter edge="left" label="트리 너비" value={left} min={Math.min(160, sideLimit)} max={sideLimit} units={1} onChange={setTreeWidth} />
-          <Splitter edge="right" label="AI 열 너비" value={right} min={Math.min(200, sideLimit)} max={sideLimit} units={1} onChange={setAiWidth} />
+          <Splitter edge="left" label="트리 너비" value={left} preferred={treeWidth} min={Math.min(160, sideLimit)} max={sideLimit} units={1} onChange={setTreeWidth} />
+          <Splitter edge="right" label="AI 열 너비" value={right} preferred={aiWidth} min={Math.min(200, sideLimit)} max={sideLimit} units={1} onChange={setAiWidth} />
         </>}
       </div>
       <footer className="workspace-status">

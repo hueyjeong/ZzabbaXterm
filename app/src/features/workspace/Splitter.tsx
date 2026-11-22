@@ -1,15 +1,16 @@
 import { useRef } from "react";
 
-export function Splitter({ edge, label, value, min, max, units, onChange }: {
+export function Splitter({ edge, label, value, preferred = value, min, max, units, onChange }: {
   edge: "left" | "right" | "chat";
   label: string;
   value: number;
+  preferred?: number;
   min: number;
   max: number;
   units: number;
   onChange: (value: number) => void;
 }) {
-  const drag = useRef<{ pointer: number; start: number; value: number; last: number } | null>(null);
+  const drag = useRef<{ pointer: number; start: number; value: number; preferred: number; last: number } | null>(null);
   const vertical = edge !== "chat";
   const direction = edge === "right" ? -1 : 1;
   return (
@@ -21,13 +22,15 @@ export function Splitter({ edge, label, value, min, max, units, onChange }: {
         event.preventDefault();
         event.currentTarget.focus();
         event.currentTarget.setPointerCapture(event.pointerId);
-        drag.current = { pointer: event.pointerId, start: vertical ? event.clientX : event.clientY, value, last: value };
+        drag.current = { pointer: event.pointerId, start: vertical ? event.clientX : event.clientY, value, preferred, last: preferred };
       }}
       onPointerMove={(event) => {
         const start = drag.current;
         if (start?.pointer !== event.pointerId) return;
         const delta = ((vertical ? event.clientX : event.clientY) - start.start) * units * direction;
-        const next = Math.round(Math.max(min, Math.min(max, start.value + delta)));
+        const bounded = Math.round(Math.max(min, Math.min(max, start.value + delta)));
+        if (delta !== 0 && bounded === start.value && start.last === start.preferred) return;
+        const next = delta === 0 ? start.preferred : bounded;
         if (next !== start.last) {
           start.last = next;
           onChange(next);
