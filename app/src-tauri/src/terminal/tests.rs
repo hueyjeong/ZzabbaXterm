@@ -119,6 +119,7 @@ fn l01_terminal_calculates_12_and_reports_exit_7_after_output() {
             Event::Bytes(_) => {},
             Event::Exited(code) => { assert_eq!(code, 7); break; }
             Event::Disconnected(reason) => panic!("L01: 자연 종료 대신 단절: {reason}"),
+            other => panic!("예상하지 못한 로컬 이벤트: {other:?}"),
         }
     }
     assert!(sessions.input("main", &peer.id, b"x").is_err());
@@ -164,7 +165,7 @@ fn l01_terminal_navigation_retires_old_document_and_accepts_new_document() {
     let sessions = Sessions::default();
     let old = Peer::open(&sessions);
     let document = sessions.document("main");
-    let delayed_open = || sessions.open_document("main", document, SIZE, shell(), |_| Ok(()));
+    let delayed_open = || sessions.open_document("main", document, SIZE, super::Launch::Local(shell()), |_| Ok(()));
     sessions.navigate("main");
     assert!(sessions.input("main", &old.id, b"x").is_err());
     assert_eq!(delayed_open().unwrap_err(), "open: 문서가 바뀌었습니다");
@@ -218,6 +219,7 @@ fn l01_terminal_stalled_output_ack_disconnects_even_below_the_window() {
                 break;
             }
             Event::Exited(code) => panic!("ACK 단절 대신 종료: {code}"),
+            other => panic!("예상하지 못한 로컬 이벤트: {other:?}"),
         }
     }
     assert!((1..WINDOW).contains(&received));
@@ -236,6 +238,7 @@ fn l01_terminal_exit_259_is_not_a_running_process() {
             Event::Bytes(_) => {},
             Event::Exited(code) => { assert_eq!(code, 259); break; }
             Event::Disconnected(reason) => panic!("종료 259 대신 단절: {reason}"),
+            other => panic!("예상하지 못한 로컬 이벤트: {other:?}"),
         }
     }
 }

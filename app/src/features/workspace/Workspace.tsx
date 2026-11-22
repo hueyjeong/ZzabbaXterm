@@ -5,6 +5,7 @@ import type { ConnectionClose, LocalProfileDraft } from "../connections/profiles
 import { EditorTab, type EditorTabActions } from "../editor/EditorTab";
 import type { ApprovedEditorFile, ConfirmEditorDiscard } from "../editor/contract";
 import { closeLocalFile, localEditorError, localEditorTransport, openLocalFile } from "../editor/localEditorIpc";
+import type { SsmTarget } from "../ssm/ssm";
 import { TerminalView } from "../terminal/TerminalView";
 import type { TerminalStatus } from "../terminal/session";
 import { LocalTree } from "./LocalTree";
@@ -13,7 +14,7 @@ import { macTitleBar, TitleBar } from "./TitleBar";
 import "./workspace.css";
 
 type Tab = { id: number; label: string } & (
-  | { kind: "terminal"; targetId?: string; status: TerminalStatus; sessionId?: string }
+  | { kind: "terminal"; targetId?: string; ssm?: SsmTarget; status: TerminalStatus; sessionId?: string; closeStatus?: "closing" | "unconfirmed" }
   | { kind: "editor"; file: ApprovedEditorFile }
 );
 type ProfileLoad = { kind: "loading" | "ready"; profiles?: SavedConnections }
@@ -26,6 +27,7 @@ const confirmEditorDiscard: ConfirmEditorDiscard = async ({ label, reason }) => 
 function terminalStatus(status: TerminalStatus) {
   switch (status.kind) {
     case "opening": return "여는 중";
+    case "connecting": return "연결 중";
     case "running": return "연결됨";
     case "exited": return `종료 코드 ${status.value}`;
     case "disconnected": return `단절: ${status.value}`;
@@ -43,6 +45,10 @@ export function Workspace() {
   const [filePickerBusy, setFilePickerBusy] = useState(false);
   const [fileError, setFileError] = useState("");
   const [focusTab, setFocusTab] = useState<number | null>(1);
+  const liveTabs = useRef(tabs);
+  const closingTabs = useRef(new Set<number>());
+  const remoteTerminals = useRef(new Map<number, { confirmClose(): Promise<void> }>());
+  useLayoutEffect(() => { liveTabs.current = tabs; }, [tabs]);
   const [focused, setFocused] = useState(false);
   const [draft, setDraft] = useState("");
   const [windowError, setWindowError] = useState("");
@@ -125,7 +131,8 @@ export function Workspace() {
   function openTab(target?: SavedConnections["targets"][number]["profile"]) {
     const id = nextTab.current++;
     setTabs((current) => [...current, {
-      id, label: target?.displayName ?? `로컬 ${id}`, kind: "terminal", targetId: target?.id, status: { kind: "opening" },
+      id, label: target?.displayName ?? `로컬 ${id}`, kind: "terminal", targetId: target?.id,
+      ssm: target?.defaultMethod === "ssm" ? target.ssm : undefined, status: { kind: "opening" },
     }]);
     selectTab(id);
   }
@@ -159,10 +166,27 @@ export function Workspace() {
     setFocusTab(id);
   }
 
-  function closeTab(id: number) {
-    const index = tabs.findIndex((tab) => tab.id === id);
+  async function closeTab(id: number) {
+    const tab = liveTabs.current.find(item => item.id === id);
+    if (!tab || closingTabs.current.has(id)) return;
+    if (tab.kind === "terminal" && tab.ssm) {
+      closingTabs.current.add(id);
+      setTabs(current => current.map(item => item.id === id && item.kind === "terminal" ? { ...item, closeStatus: "closing" } : item));
+      try {
+        const terminal = remoteTerminals.current.get(id);
+        if (!terminal) throw new Error("세션 종료 상태를 확인할 수 없습니다");
+        await terminal.confirmClose();
+      } catch {
+        setTabs(current => current.map(item => item.id === id && item.kind === "terminal" ? { ...item, closeStatus: "unconfirmed" } : item));
+        return;
+      } finally {
+        closingTabs.current.delete(id);
+      }
+    }
+    const current = liveTabs.current;
+    const index = current.findIndex(item => item.id === id);
     if (index < 0) return;
-    if (id === activeId.current) selectTab(tabs[index + 1]?.id ?? tabs[index - 1]?.id ?? 0);
+    if (id === activeId.current) selectTab(current[index + 1]?.id ?? current[index - 1]?.id ?? 0);
     setTabs((current) => current.filter((tab) => tab.id !== id));
   }
 
@@ -179,15 +203,21 @@ export function Workspace() {
     <main className={`workspace${macTitleBar ? " workspace-mac" : ""}${focused ? " workspace-focused" : ""}`} style={layout}
       onFocusCapture={(event) => { if (!event.target.closest(".terminal-screen")) setFocusTab(null); }}>
       <TitleBar focused={focused} onToggle={() => setFocused(!focused)} onWindowError={setWindowError}>
-        {tabs.map(({ id, label, kind }) => (
-          <div className="workspace-tab" key={id}>
+        {tabs.map((tab) => {
+          const { id, label, kind } = tab;
+          const closeStatus = kind === "terminal" ? tab.closeStatus : undefined;
+          return <div className="workspace-tab" key={id}>
             <button ref={id === active ? activeButton : undefined} aria-pressed={id === active} onClick={() => selectTab(id)}>{label}</button>
-            <button aria-label={`${label} 닫기`} onClick={() => {
-              if (kind === "editor") void editorActions.current.get(id)?.requestClose();
-              else closeTab(id);
-            }}>×</button>
+            <button aria-label={`${label} ${closeStatus === "unconfirmed" ? "종료 다시 확인" : "닫기"}`}
+              disabled={closeStatus === "closing"} onClick={() => {
+                if (kind === "editor") void editorActions.current.get(id)?.requestClose();
+                else void closeTab(id);
+              }}>×</button>
+            {closeStatus && <span role={closeStatus === "closing" ? "status" : "alert"}>
+              {closeStatus === "closing" ? "종료 중" : "종료 확인 불가"}
+            </span>}
           </div>
-        ))}
+        })}
       </TitleBar>
       <div className="workspace-body" ref={body}>
         <aside className="workspace-tree" hidden={focused}>
@@ -207,6 +237,10 @@ export function Workspace() {
             <div className="workspace-session" key={tab.id} hidden={tab.id !== active} inert={tab.id !== active}>
               {tab.kind === "terminal" ? (
                 <TerminalView active={tab.id === active} focusRequested={tab.id === focusTab} label={tab.label} targetId={tab.targetId}
+                  remote={!!tab.ssm} closing={!!tab.closeStatus} closeRef={tab.ssm ? (handle) => {
+                    if (handle) remoteTerminals.current.set(tab.id, handle);
+                    else remoteTerminals.current.delete(tab.id);
+                  } : undefined}
                   onStatus={(status, sessionId) => updateStatus(tab.id, status, sessionId)} />
               ) : (
                 <EditorTab file={tab.file} active={tab.id === active} transport={localEditorTransport} confirmDiscard={confirmEditorDiscard}
@@ -216,7 +250,7 @@ export function Workspace() {
                   }}
                   onClose={(handle) => {
                     if (handle !== tab.file.handle) return;
-                    closeTab(tab.id);
+                    void closeTab(tab.id);
                     void closeLocalFile(handle).catch((error) => setFileError(`파일 닫기 실패: ${localEditorError(error).message}`));
                   }} />
               )}
@@ -242,7 +276,9 @@ export function Workspace() {
       </div>
       <footer className="workspace-status">
         <span role="status">{current?.kind === "terminal"
-          ? [current.targetId ? current.label : "내 PC", "로컬", current.sessionId, terminalStatus(current.status)].filter(Boolean).join(" · ")
+          ? [current.targetId ? current.label : "내 PC", current.ssm ?
+            `SSM · ${current.ssm.profile} / ${current.ssm.region} / ${current.ssm.instanceId}` : "로컬", current.sessionId,
+          !current.closeStatus && terminalStatus(current.status)].filter(Boolean).join(" · ")
           : current ? `내 PC · 로컬 파일 · ${current.label}` : "연결 없음"}</span>
         {windowError && <span role="alert">{windowError}</span>}
         {fileError && <span role="alert">{fileError}</span>}

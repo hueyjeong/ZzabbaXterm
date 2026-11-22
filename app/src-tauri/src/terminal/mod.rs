@@ -8,13 +8,55 @@ use std::{
 pub(crate) mod ipc;
 mod process;
 pub(crate) mod probe;
+mod remote;
 mod saved;
 #[cfg(all(test, any(windows, unix)))]
 mod pty_flow_tests;
 #[cfg(test)]
 pub(crate) mod tests;
 
-use process::Session;
+use process::{Launch, Session};
+use remote::RemoteClose;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum LocalClose {
+    #[default]
+    NotStarted,
+    CliReaped,
+    Unconfirmed,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct CloseResult {
+    local: LocalClose,
+    remote: RemoteClose,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
+}
+
+impl CloseResult {
+    fn warning(&self) -> Option<String> {
+        if self.remote == RemoteClose::Unconfirmed {
+            return self.target.as_ref().map(|target| format!("종료 확인 불가: {target}"));
+        }
+        (self.local == LocalClose::Unconfirmed).then(|| "로컬 자식 종료 확인 불가".into())
+    }
+}
+
+enum Retired {
+    Completed { owner: String, result: CloseResult },
+    Unconfirmed(Arc<Session>),
+}
+
+impl Retired {
+    fn owner(&self) -> &str {
+        match self {
+            Self::Completed { owner, .. } => owner,
+            Self::Unconfirmed(session) => &session.owner,
+        }
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct Sessions {
@@ -25,6 +67,7 @@ pub(crate) struct Sessions {
 #[derive(Default)]
 struct Registry {
     sessions: HashMap<String, Arc<Session>>,
+    close_results: HashMap<String, Retired>,
     destroyed: HashSet<String>,
     documents: HashMap<String, u64>,
     probes: Runs,
@@ -34,7 +77,7 @@ struct Registry {
 impl Sessions {
     #[cfg(test)]
     fn open(&self, owner: &str, size: PtySize, command: CommandBuilder, send: impl Fn(Event) -> Result<(), String> + Send + 'static) -> Result<String, String> {
-        self.open_document(owner, self.document(owner), size, command, send)
+        self.open_document(owner, self.document(owner), size, Launch::Local(command), send)
     }
 
     pub(crate) fn document(&self, owner: &str) -> u64 {
@@ -52,11 +95,13 @@ impl Sessions {
         use_probes(&mut registry.probes)
     }
 
-    pub(crate) fn probe_completion(&self, run_id: String) -> impl FnOnce() + Send + use<> {
+    pub(crate) fn probe_completion(&self, owner: String, document: u64, run_id: String) -> impl FnOnce() + Send + use<> {
         let registry = Arc::downgrade(&self.registry);
         move || {
             if let Some(registry) = registry.upgrade() {
-                registry.lock().unwrap().probes.reap(&run_id);
+                let mut registry = registry.lock().unwrap();
+                let current = registry.documents.get(&owner).copied().unwrap_or(0) == document && !registry.shutdown;
+                registry.probes.reap(&run_id, current);
             }
         }
     }
@@ -65,10 +110,10 @@ impl Sessions {
         self.next.fetch_add(1, Ordering::Relaxed).to_string()
     }
 
-    fn open_document(&self, owner: &str, document: u64, size: PtySize, command: CommandBuilder, send: impl Fn(Event) -> Result<(), String> + Send + 'static) -> Result<String, String> {
+    fn open_document(&self, owner: &str, document: u64, size: PtySize, command: Launch, send: impl Fn(Event) -> Result<(), String> + Send + 'static) -> Result<String, String> {
         validate_size(size)?;
         let id = self.next_id();
-        let session = Arc::new(Session::new(owner));
+        let session = Arc::new(Session::new(owner, command.is_ssm()));
         {
             let mut registry = self.registry.lock().unwrap();
             if registry.shutdown || registry.destroyed.contains(owner) {
@@ -81,8 +126,20 @@ impl Sessions {
         }
         let registry = Arc::clone(&self.registry);
         let worker_id = id.clone();
-        let result = session.launch(size, command, send, move || {
-            registry.lock().unwrap().sessions.remove(&worker_id);
+        let result = session.launch(size, command, send, move |session| {
+            let mut registry = registry.lock().unwrap();
+            let result = session.close_result();
+            if session.is_ssm() && !registry.shutdown
+                && registry.documents.get(&session.owner).copied().unwrap_or(0) == document
+            {
+                let retired = if result.warning().is_some() {
+                    Retired::Unconfirmed(Arc::clone(session))
+                } else {
+                    Retired::Completed { owner: session.owner.clone(), result }
+                };
+                registry.close_results.insert(worker_id.clone(), retired);
+            }
+            registry.sessions.remove(&worker_id);
         });
         if let Err(error) = result {
             session.wait_finished();
@@ -118,11 +175,30 @@ impl Sessions {
         self.get(owner, id)?.ack(position)
     }
 
-    fn close(&self, owner: &str, id: &str) -> Result<(), String> {
-        let session = self.get(owner, id)?;
+    fn close(&self, owner: &str, id: &str) -> Result<CloseResult, String> {
+        let (session, retired) = {
+            let mut registry = self.registry.lock().unwrap();
+            match registry.close_results.get(id) {
+                Some(entry) if entry.owner() != owner => return Err("다른 창의 세션입니다".into()),
+                Some(Retired::Completed { .. }) => {
+                    let Some(Retired::Completed { result, .. }) = registry.close_results.remove(id) else { unreachable!() };
+                    return Ok(result);
+                }
+                Some(Retired::Unconfirmed(session)) => (Arc::clone(session), true),
+                None => (registry.sessions.get(id).cloned().ok_or(CLOSED)?, false),
+            }
+        };
+        if session.owner != owner { return Err("다른 창의 세션입니다".into()); }
+        if retired {
+            let result = session.recheck_cleanup();
+            if result.warning().is_none() { self.registry.lock().unwrap().close_results.remove(id); }
+            return Ok(result);
+        }
         session.stop(process::Stop::Closed);
         session.wait_finished();
-        Ok(())
+        let result = session.close_result();
+        if result.warning().is_none() { self.registry.lock().unwrap().close_results.remove(id); }
+        Ok(result)
     }
 
     pub(crate) fn navigate(&self, owner: &str) {
@@ -136,6 +212,7 @@ impl Sessions {
     fn stop_owner(&self, owner: &str, destroyed: bool) {
         let mut registry = self.registry.lock().unwrap();
         *registry.documents.entry(owner.into()).or_default() += 1;
+        registry.close_results.retain(|_, entry| entry.owner() != owner);
         if destroyed {
             registry.destroyed.insert(owner.into());
         }
@@ -149,6 +226,7 @@ impl Sessions {
         let (sessions, probes) = {
             let mut registry = self.registry.lock().unwrap();
             registry.shutdown = true;
+            registry.close_results.clear();
             (registry.sessions.values().cloned().collect::<Vec<_>>(), registry.probes.stop_all())
         };
         for session in &sessions {
@@ -176,8 +254,6 @@ fn size(rows: u16, cols: u16) -> PtySize {
     PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }
 }
 
-type SendEvent = dyn Fn(Event) -> Result<(), String> + Send;
-
 const CHUNK: usize = 16 * 1024;
 const WINDOW: usize = 256 * 1024;
 
@@ -195,6 +271,8 @@ impl Drop for Sessions {
 enum End {
     Exited(u32),
     Disconnected(String),
+    Connecting,
+    Ready,
 }
 
 impl Event {
@@ -204,6 +282,8 @@ impl Event {
             Self::Bytes(bytes) => InvokeResponseBody::Raw(bytes),
             Self::Exited(code) => End::Exited(code).body()?,
             Self::Disconnected(reason) => End::Disconnected(reason).body()?,
+            Self::Connecting => End::Connecting.body()?,
+            Self::Ready => End::Ready.body()?,
         })
     }
 }
@@ -213,6 +293,8 @@ enum Event {
     Bytes(Vec<u8>),
     Exited(u32),
     Disconnected(String),
+    Connecting,
+    Ready,
 }
 
 fn validate_working_directory(directory: &std::path::Path) -> Result<(), String> {

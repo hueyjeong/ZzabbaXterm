@@ -6,6 +6,7 @@ fn main() {
         "connections_load",
         "editor_local_open", "editor_local_save", "editor_local_compare", "editor_local_reload",
         "editor_local_close",
+        "ssm_discovery",
     ]);
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(app))
         .expect("failed to build app permissions");

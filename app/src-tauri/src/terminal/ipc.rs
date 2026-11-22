@@ -1,4 +1,4 @@
-use super::{Sessions, saved, shell, size, stage};
+use super::{Launch, Sessions, saved, shell, size, stage};
 use tauri::{Manager, WebviewWindow, ipc::{Channel, CommandArg, CommandItem, Invoke, InvokeResponseBody}};
 
 async fn blocking<T: Send + 'static>(job: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
@@ -35,9 +35,9 @@ pub(crate) fn terminal_open(invoke: Invoke) {
             let command = match target_id {
                 Some(id) => {
                     let directory = webview.path().app_config_dir().map_err(|error| stage("앱 설정 디렉터리", error))?;
-                    saved::command(&directory, &id)?
+                    saved::launch(&directory, &id)?
                 }
-                None => shell(),
+                None => Launch::Local(shell()),
             };
             webview.state::<Sessions>().open_document(webview.label(), document, size(rows, cols), command, move |event| {
                 event.send(&output).map_err(|error| error.to_string())
@@ -47,8 +47,8 @@ pub(crate) fn terminal_open(invoke: Invoke) {
 }
 
 #[tauri::command]
-pub(crate) fn terminal_start(webview: WebviewWindow, id: String) -> Result<(), String> {
-    webview.state::<Sessions>().start(webview.label(), &id)
+pub(crate) async fn terminal_start(webview: WebviewWindow, id: String) -> Result<(), String> {
+    blocking(move || webview.state::<Sessions>().start(webview.label(), &id)).await
 }
 
 #[tauri::command]
@@ -68,5 +68,5 @@ pub(crate) fn terminal_ack(webview: WebviewWindow, id: String, position: u64) ->
 
 #[tauri::command]
 pub(crate) async fn terminal_close(webview: WebviewWindow, id: String) -> Result<(), String> {
-    blocking(move || webview.state::<Sessions>().close(webview.label(), &id)).await
+    blocking(move || webview.state::<Sessions>().close(webview.label(), &id)?.warning().map_or(Ok(()), Err)).await
 }

@@ -1,5 +1,6 @@
 mod connections;
 mod editor;
+pub mod ssm;
 mod terminal;
 mod workspace_window;
 
@@ -17,6 +18,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(Sessions::default())
         .manage(LocalEditors::default())
+        .plugin(ssm::ipc::lifecycle())
         .on_page_load(|webview, payload| {
             if payload.event() == tauri::webview::PageLoadEvent::Started {
                 webview.state::<Sessions>().navigate(webview.label());
@@ -26,6 +28,9 @@ pub fn run() {
         .invoke_handler(move |invoke| {
             if invoke.message.command() == "terminal_open" {
                 terminal_open(invoke);
+                true
+            } else if invoke.message.command() == ssm::ipc::COMMAND {
+                ssm::ipc::dispatch(invoke);
                 true
             } else {
                 match editor::ipc::dispatch(invoke) {

@@ -64,6 +64,60 @@ fn save(store: &Store, input: Value) -> Result<SaveStatus, StoreError> {
     store.save(draft.validate().unwrap())
 }
 
+fn ssm_draft(dir: &Path) -> Value {
+    let mut value = draft(dir, "work", "ssm-node");
+    let target = value["target"].as_object_mut().unwrap();
+    target.remove("local");
+    target.insert("defaultMethod".into(), json!("ssm"));
+    target.insert("ssm".into(), json!({
+        "profile": "company-sso", "region": "ap-northeast-2", "instanceId": "i-0123456789abcdef0"
+    }));
+    value
+}
+
+#[test]
+fn c02_local_v1_and_ssm_references_round_trip_in_one_file() {
+    let dir = TestDir::new();
+    let local = draft(dir.path(), "work", "local-shell");
+    fs::write(dir.file(), serde_json::to_vec(&json!({
+        "version": 1,
+        "groups": [{"revision": 7, "profile": local["group"]}],
+        "targets": [{"revision": 9, "profile": local["target"]}],
+    })).unwrap()).unwrap();
+    let mut ssm = ssm_draft(dir.path());
+    ssm["groupRevision"] = json!(7);
+    let store = Store::new(dir.path());
+    assert_eq!(save(&store, ssm.clone()).unwrap(), SaveStatus::Saved);
+    let stored = serde_json::to_value(store.load().unwrap()).unwrap();
+    assert_eq!(stored, json!({
+        "version": 1,
+        "groups": [{"revision": 7, "profile": local["group"]}],
+        "targets": [{"revision": 9, "profile": local["target"]}, {"revision": 1, "profile": ssm["target"]}],
+    }));
+    assert!(matches!(store.load().unwrap().targets[1].profile.method(),
+        super::profile::MethodRef::Ssm { profile: "company-sso", region: "ap-northeast-2", instance_id: "i-0123456789abcdef0" }));
+}
+
+#[test]
+fn c02_rejects_mixed_methods_forbidden_fields_and_invalid_references() {
+    let dir = TestDir::new();
+    let valid = ssm_draft(dir.path());
+    for (path, key) in [("target", "local"), ("target", "password"), ("ssm", "accessToken"), ("ssm", "executable"), ("ssm", "args")] {
+        let mut invalid = valid.clone();
+        let object = if path == "target" { &mut invalid["target"] } else { &mut invalid["target"]["ssm"] };
+        object[key] = json!("forbidden");
+        assert!(serde_json::from_value::<Draft>(invalid).is_err(), "{path}.{key}");
+    }
+    let mut local = draft(dir.path(), "work", "local-shell");
+    local["target"]["ssm"] = valid["target"]["ssm"].clone();
+    assert!(serde_json::from_value::<Draft>(local).is_err());
+    for (key, value) in [("profile", "--profile"), ("region", "-bad"), ("instanceId", "display-name")] {
+        let mut invalid = valid.clone();
+        invalid["target"]["ssm"][key] = json!(value);
+        assert!(serde_json::from_value::<Draft>(invalid).unwrap().validate().is_err(), "{key}");
+    }
+}
+
 #[cfg(any(windows, unix))]
 pub(crate) fn with_saved_pty_targets(run: impl FnOnce(&Path, &Path)) {
     let root = TestDir::new();
@@ -101,6 +155,19 @@ mod local_probe {
     }
 
     #[test]
+    fn c02_local_trial_cannot_authorize_an_ssm_profile() {
+        let dir = TestDir::new();
+        let store = Store::new(dir.path());
+        let sessions = Sessions::default();
+        let local_run = start_at(&sessions, dir.path(), 1);
+        assert!(wait(&sessions, "main", 0, &local_run).is_ok());
+        let mut input = ssm_draft(dir.path());
+        input["target"]["id"] = json!("first");
+        assert!(save_at(&sessions, "main", &local_run, input, &store).is_err());
+        assert!(!dir.file().exists());
+    }
+
+    #[test]
     fn c01_probe_normal_exit_authorizes_only_the_tested_draft() {
         let dir = TestDir::new();
         let store = Store::new(&dir.0);
@@ -121,7 +188,7 @@ mod local_probe {
         assert!(save_at(&sessions, "main", &run, modified, &store).is_err());
         assert!(!dir.file().exists());
         save_at(&sessions, "main", &run, input.clone(), &store).unwrap();
-        assert_eq!(store.load().unwrap().targets[0].profile.local.start_directory, dir.0);
+        assert_eq!(serde_json::to_value(&store.load().unwrap().targets[0].profile).unwrap(), input["target"]);
         assert!(save_at(&sessions, "main", &run, input, &store).is_err());
     }
 
@@ -291,7 +358,7 @@ fn c01_simultaneous_saves_preserve_two_same_named_targets() {
         let target = file.targets.iter().find(|entry| entry.profile.id.as_str() == id).unwrap();
         assert_eq!(target.profile.group_id.as_str(), group);
         assert_eq!(target.profile.display_name, "작업 셸");
-        assert_eq!(target.profile.local.start_directory, dir.0);
+        assert_eq!(serde_json::to_value(&target.profile).unwrap(), draft(&dir.0, group, id)["target"]);
     }
 }
 
