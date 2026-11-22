@@ -192,26 +192,47 @@ fn request_cancel_reaches_the_control_child_without_cancelling_the_central_sessi
 
 #[test]
 fn shutdown_completes_control_cancel_before_start_and_rejects_late_launch() {
-    use std::thread;
+    let (done, finished) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        control_shutdown_before_start_case();
+        let _ = done.send(());
+    });
+    match finished.recv_timeout(Duration::from_secs(10)) {
+        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => worker.join().unwrap(),
+        Err(mpsc::RecvTimeoutError::Timeout) => panic!("전용 제어 작업 완료 대기 시간 초과"),
+    }
+}
 
-    const WAIT: Duration = Duration::from_secs(5);
+fn control_shutdown_before_start_case() {
+    {
+        let closing = Sessions::default();
+        let peer = closing.insert_live_ssm_fixture(OWNER, closing.document(OWNER), ACCOUNT, REGION, NODE);
+        let late = closing.bind_ssm_control(OWNER, &peer.identity, &CancellationToken::new()).unwrap();
+        assert!(closing.close_ssh_probes(None));
+        assert!(!late.cancel_token().is_cancelled());
+        assert!(matches!(closing.launch_control(&late, PtySize::default(), Target::new("fixture", REGION, NODE).unwrap(), |_| unreachable!()), Err(error) if error == UNAVAILABLE));
+    }
+
     let sessions = Sessions::default();
     let central = sessions.insert_live_ssm_fixture(OWNER, sessions.document(OWNER), ACCOUNT, REGION, NODE);
     let request = CancellationToken::new();
     let binding = sessions.bind_ssm_control(OWNER, &central.identity, &request).unwrap();
-    let (control, opened) = sessions.launch_control(&binding, PtySize::default(), Target::new("fixture", REGION, NODE).unwrap(), |_| unreachable!()).unwrap();
+    let (events, output) = mpsc::channel();
+    let (control, opened) = sessions.launch_control(
+        &binding,
+        PtySize::default(),
+        Target::new("fixture", REGION, NODE).unwrap(),
+        move |event| events.send(event).map_err(|error| error.to_string()),
+    ).unwrap();
     opened.unwrap();
+    // 중앙 픽스처에는 완료를 통지할 작업자가 없다. 중앙 탭이 닫힌 상태를 만든다.
+    drop(central);
 
-    let (done, finished) = mpsc::channel();
-    thread::scope(|scope| {
-        scope.spawn(|| {
-            sessions.shutdown();
-            done.send(()).unwrap();
-        });
-        finished.recv_timeout(WAIT).unwrap();
-    });
+    sessions.shutdown();
+    assert!(matches!(output.try_recv(), Err(mpsc::TryRecvError::Disconnected)));
     assert!(binding.cancel_token().is_cancelled());
     assert!(control.start_until(None).is_err());
     assert_eq!(control.close_result(), CloseResult::default());
-    assert!(matches!(sessions.launch_control(&binding, PtySize::default(), Target::new("fixture", REGION, NODE).unwrap(), |_| unreachable!()), Err(error) if error == UNAVAILABLE));
+    let target = Target::new("fixture", REGION, NODE).unwrap();
+    assert!(matches!(sessions.launch_control(&binding, PtySize::default(), target, |_| unreachable!()), Err(error) if error == UNAVAILABLE));
 }

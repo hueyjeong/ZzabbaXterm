@@ -215,6 +215,20 @@ impl Remote {
 #[cfg(all(test, any(windows, unix)))]
 #[test]
 fn submitted_control_start_is_reaped_and_checks_exact_ssm_cleanup_after_revocation() {
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+    let (done, finished) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        submitted_control_start_shutdown_case();
+        let _ = done.send(());
+    });
+    match finished.recv_timeout(WAIT) {
+        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => worker.join().unwrap(),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("제어 SSM 종료 확인 대기 시간 초과"),
+    }
+}
+
+#[cfg(all(test, any(windows, unix)))]
+fn submitted_control_start_shutdown_case() {
     use crate::terminal::{LocalClose, Sessions, process::Session};
     use std::{sync::mpsc, thread, time::Duration};
 
