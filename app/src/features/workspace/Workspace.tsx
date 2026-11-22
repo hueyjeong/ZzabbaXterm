@@ -237,14 +237,14 @@ export function Workspace() {
             try {
               const draft = await invoke<WizardRequest | null>("ai_cli_draft", {});
               if (draft) setWizard({ ...draft, received: true });
-              else setWindowError("접수된 CLI 초안이 없습니다");
+              else setWindowError("명령줄에서 보낸 연결 설정이 없습니다");
             } catch (error) {
               setWindowError(String(error));
             } finally {
               draftPending.current = false;
               setReceivingDraft(false);
             }
-          }}>CLI 초안 열기</button>
+          }}>명령줄에서 보낸 연결 설정 열기</button>
           {profileLoad.kind === "loading" && <div className="connection-status" role="status">저장된 연결 불러오는 중</div>}
           {profileLoad.kind === "ready" && profileLoad.profiles?.targets.length === 0 &&
             <div className="connection-status" role="status">저장된 연결 없음</div>}
