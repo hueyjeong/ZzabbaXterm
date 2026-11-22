@@ -35,4 +35,6 @@
 
 마법사의 `verify_ssh_host`는 Rust에서 검증한 초안의 대상·호스트·포트·지문을 대조한다. 네이티브 파일 선택과 별도 확인을 모두 거친 공개 키만 앱 설정 디렉터리의 `ssh-trust`에 등록한다. SSH-over-SSM과 저장 암호는 이 후보에서 사용 불가다.
 
-저장 대상은 `terminal_open` → `terminal::saved::launch` → `ssh::terminal::DirectLaunch`를 거친다. Rust는 각 PTY ID에 독립 계획을 만들고 자식을 회수한 뒤 임시 파일을 해제한다. 연결 시험은 고정 원격 명령의 출력과 종료 코드를 확인한다. 화면 없는 시험에서 사용자 입력이 필요한 인증은 성공할 수 없다.
+저장 대상은 `terminal_open` → `terminal::saved::launch` → `ssh::terminal::DirectLaunch`를 거친다. Rust는 각 PTY ID에 독립 계획을 만들고 자식을 회수한 뒤 임시 파일을 해제한다. SSH 연결 시험은 별도 터미널에서 비밀번호나 키 암호를 입력받는다. Rust는 현재 문서와 초안의 시험 ID에만 입력을 연결하고, 고정 원격 명령의 시도별 출력과 정상 종료가 모두 확인된 뒤 저장을 승인한다.
+
+루프백 검증은 테스트 전용 Paramiko가 설치된 Python을 `ZZABBA_F01_FIXTURE_PYTHON`으로 지정하고 `cargo test --locked --manifest-path app/src-tauri/Cargo.toml --lib f01_interactive_loopback_saves_and_reopens -- --ignored`를 실행한다. 시험이 만든 계정·키·임시 포트로 직접 입력, 암호화 키, 취소, 저장·재로드·재접속을 확인한다.

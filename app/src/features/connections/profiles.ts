@@ -69,7 +69,7 @@ export type ConnectionClose =
 
 export interface LocalConnectionActions {
   verifySshHost?(approval: SshHostApproval, draft: ConnectionProfileDraft): Promise<void>;
-  test(attempt: ConnectionTestDraft): Promise<ConnectionTestRun>;
+  test(attempt: ConnectionTestDraft, interactive?: (run: ConnectionTestRun) => void): Promise<ConnectionTestRun>;
   cancelTest(attempt: ConnectionTestDraft): Promise<void>;
   // Rust의 저장 성공만 이행하고 충돌과 저장 오류는 실제 메시지로 거절한다.
   save(request: ConnectionRequest): Promise<void>;
@@ -79,7 +79,7 @@ export interface LocalConnectionActions {
 type Step = "target" | "method" | "auth" | "verify";
 type Status =
   | { kind: "idle" | "closing" | "closed" }
-  | { kind: "testing"; attempt: ConnectionTestDraft }
+  | { kind: "testing"; attempt: ConnectionTestDraft; sshRun?: ConnectionTestRun }
   | { kind: "passed" | "saving"; request: ConnectionRequest; attempt: ConnectionTestDraft }
   | { kind: "testFailed" | "closeFailed"; error: string }
   | { kind: "saveFailed"; request: ConnectionRequest; attempt: ConnectionTestDraft; error: string };
@@ -113,6 +113,7 @@ export interface LocalConnectionWizardState {
   invalidateSsmSelection(): void;
   selectGroup(group: LocalProfileDraft["group"], revision: number | null): void;
   test(actions: LocalConnectionActions): Promise<void>;
+  cancelSshTest(attempt: ConnectionTestDraft): Promise<void>;
   save(actions: LocalConnectionActions): Promise<void>;
   close(actions: LocalConnectionActions): Promise<void>;
   retryCleanup(): void;
@@ -166,6 +167,10 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Local
       }
     }
     const step = steps[steps.indexOf(state.step) + delta];
+    if (step && state.step === "verify" && draft.target.defaultMethod === "ssh") {
+      update({ status: { kind: "idle" } });
+      void cancelPending();
+    }
     if (step) update({ step, sshPin: state.sshPin.kind === "checking" ? { kind: "idle" } : state.sshPin });
   }
 
@@ -249,6 +254,15 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Local
     void cancelPending();
   }
 
+  async function cancelSshTest(attempt: ConnectionTestDraft) {
+    if (!isTesting(attempt)) return;
+    update({ status: { kind: "idle" } });
+    const [result] = await cancelPending(attempt);
+    if (result?.status === "rejected" && state.status.kind === "idle") {
+      update({ status: { kind: "testFailed", error: errorText(result.reason) } });
+    }
+  }
+
   async function test(actions: LocalConnectionActions) {
     if (locked() || state.step !== "verify" || state.status.kind === "testing" || state.remoteCleanup) return;
     const { draft } = state;
@@ -264,7 +278,9 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Local
     pending.set(attempt, active => actions.cancelTest(active));
     update({ status: testing });
     try {
-      const run = await actions.test(attempt);
+      const run = await actions.test(attempt, sshRun => {
+        if (isTesting(attempt)) update({ status: { kind: "testing", attempt, sshRun } });
+      });
       if (!isTesting(attempt)) return;
       if (run.draftId !== draftId || run.draftVersion !== attempt.draftVersion) {
         throw new Error("시험 응답의 실행 ID 또는 초안 버전이 일치하지 않습니다");
@@ -332,9 +348,10 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Local
     const closing = { kind: "closing" } as const;
     update({ status: closing });
     const hasRemote = [...pending.keys()].some(attempt => attempt.draft.target.defaultMethod === "ssm");
+    const hasSsh = [...pending.keys()].some(attempt => attempt.draft.target.defaultMethod === "ssh");
     const cancellation = cancelPending();
     let results: Awaited<typeof cancellation> | null;
-    if (hasRemote) {
+    if (hasRemote || hasSsh) {
       results = await cancellation;
     } else {
       const timeout = Promise.withResolvers<null>();
@@ -370,6 +387,7 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Local
     invalidateSsmSelection,
     selectGroup,
     test,
+    cancelSshTest,
     save,
     close,
     retryCleanup() {

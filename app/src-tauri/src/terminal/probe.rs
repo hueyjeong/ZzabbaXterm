@@ -9,11 +9,11 @@ use super::{Event, process::{Launch, Session, Stop}, remote, size};
 
 const MARKER: &[u8] = b"ZZABBA-C01:314159";
 const SSM_MARKER: &[u8] = b"ZZABBA-C02:314159";
-const SSH_MARKER: &[u8] = b"ZZABBA-F01:314159";
 // 표식의 완성 문자열은 PTY가 되비추는 입력에 없다.
 const SSM_CHECK: &[u8] = b"[ \"$(uname -s)\" = Linux ] || exit 19; printf 'ZZABBA-C02:%d\\n' \"$((314000+159))\" && exit 0; exit 19\r";
 const TIMEOUT: Duration = Duration::from_secs(8);
 const SSM_TIMEOUT: Duration = Duration::from_secs(60);
+const SSH_TIMEOUT: Duration = Duration::from_secs(120);
 pub(super) const TIMED_OUT: &str = "연결 시험 시간이 초과되었습니다";
 
 fn scan(needle: &[u8], matched: &mut usize, bytes: &[u8]) -> bool {
@@ -30,6 +30,7 @@ fn scan(needle: &[u8], matched: &mut usize, bytes: &[u8]) -> bool {
 
 pub(crate) struct Probe {
     session: Arc<Session>,
+    ssh: bool,
     deadline: Instant,
     state: Mutex<State>,
     ready: Condvar,
@@ -39,30 +40,110 @@ pub(crate) struct Probe {
 struct State {
     result: Option<Result<(), String>>,
     stopped: bool,
+    attachment: Option<(portable_pty::PtySize, tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>)>,
+    attached: bool,
+    opened: bool,
 }
 
 impl Probe {
     pub(crate) fn for_draft(owner: &str, draft: &ValidatedDraft) -> Self {
-        let ssm = matches!(draft.method(), MethodRef::Ssm { .. });
-        Self::with_timeout(owner, if ssm { SSM_TIMEOUT } else { TIMEOUT }, ssm)
+        match draft.method() {
+            MethodRef::Ssh { .. } => Self::with_timeout(owner, SSH_TIMEOUT, false, true),
+            MethodRef::Ssm { .. } => Self::with_timeout(owner, SSM_TIMEOUT, true, false),
+            MethodRef::Local { .. } => Self::with_timeout(owner, TIMEOUT, false, false),
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn new(owner: &str) -> Self {
-        Self::with_timeout(owner, TIMEOUT, false)
+        Self::with_timeout(owner, TIMEOUT, false, false)
     }
 
-    fn with_timeout(owner: &str, timeout: Duration, ssm: bool) -> Self {
-        Self { session: Arc::new(Session::new(owner, ssm)), deadline: Instant::now() + timeout, state: Mutex::default(), ready: Condvar::new() }
+    fn with_timeout(owner: &str, timeout: Duration, ssm: bool, ssh: bool) -> Self {
+        Self { session: Arc::new(Session::new(owner, ssm)), ssh, deadline: Instant::now() + timeout, state: Mutex::default(), ready: Condvar::new() }
     }
+
+    pub(crate) fn attach(&self, size: portable_pty::PtySize, output: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>) -> Result<(), String> {
+        let mut state = self.state.lock().unwrap();
+        if !self.ssh || state.stopped || state.result.is_some() || state.attached || self.remaining().is_zero() {
+            return Err(super::CLOSED.into());
+        }
+        state.attached = true;
+        state.attachment = Some((size, output));
+        self.ready.notify_all();
+        Ok(())
+    }
+
+    pub(super) fn session(&self) -> Arc<Session> {
+        Arc::clone(&self.session)
+    }
+
+    pub(crate) fn wait_open(&self) -> Result<(), String> {
+        let (state, _) = self.ready.wait_timeout_while(self.state.lock().unwrap(), self.remaining(), |state| {
+            !state.opened && state.result.is_none() && !state.stopped
+        }).unwrap();
+        if state.stopped { return Err(super::CLOSED.into()); }
+        if state.opened { return Ok(()); }
+        state.result.clone().unwrap_or_else(|| Err(TIMED_OUT.into()))
+    }
+
+    pub(super) fn attached(&self) -> bool {
+        self.ssh && self.state.lock().unwrap().opened
+    }
+
 
     pub(crate) fn run(&self, draft: &ValidatedDraft, config: &std::path::Path) {
         let launch = match draft.method() {
             MethodRef::Local { shell, start_directory } => command(shell, start_directory).map(Launch::Local),
             MethodRef::Ssm { profile, region, instance_id } => remote::Target::new(profile, region, instance_id).map(Launch::Ssm),
-            MethodRef::Ssh { ssh } => crate::ssh::terminal::saved(config, ssh).map(|launch| Launch::Ssh(launch.for_probe())),
+            MethodRef::Ssh { ssh } => {
+                self.finish(self.run_ssh(config, ssh));
+                return;
+            }
         };
         self.finish(launch.and_then(|launch| self.measure(launch)));
+    }
+
+    fn run_ssh(&self, config: &std::path::Path, ssh: &crate::connections::profile::Ssh) -> Result<(), String> {
+        let (size, output) = {
+            let (mut state, _) = self.ready.wait_timeout_while(self.state.lock().unwrap(), self.remaining(), |state| {
+                !state.stopped && state.attachment.is_none()
+            }).unwrap();
+            if state.stopped { return Err(super::CLOSED.into()); }
+            state.attachment.take().ok_or(TIMED_OUT)?
+        };
+        let launch = crate::ssh::terminal::saved(config, ssh)?;
+        let mut nonce = [0; 16];
+        getrandom::fill(&mut nonce).map_err(|_| "SSH 시험 난수를 생성할 수 없습니다")?;
+        let nonce = u128::from_ne_bytes(nonce);
+        let marker = format!("ZZABBA-F01:{nonce:032x}");
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let matched = std::cell::Cell::new(0);
+        let opened = self.session.begin_launch(size, Launch::Ssh(launch.for_probe(nonce)), move |event| {
+            let result = match &event {
+                Event::Bytes(bytes) => {
+                    let mut count = matched.get();
+                    scan(marker.as_bytes(), &mut count, bytes);
+                    matched.set(count);
+                    None
+                }
+                Event::Exited(0) if matched.get() == marker.len() => Some(Ok(())),
+                Event::Exited(code) => Some(Err(format!("SSH 연결 시험 실패 (종료 코드 {code})"))),
+                Event::Disconnected(error) => Some(Err(error.clone())),
+                _ => None,
+            };
+            event.send(&output).map_err(|error| error.to_string())?;
+            if let Some(result) = result { let _ = sender.send(result); }
+            Ok(())
+        }, |_| {})?;
+        let result = self.receive(&opened).and_then(|value| value).and_then(|_| {
+            self.state.lock().unwrap().opened = true;
+            self.ready.notify_all();
+            self.receive(&receiver)?
+        });
+        if result.is_err() { self.session.stop(Stop::Closed); }
+        self.session.wait_finished();
+        combine_cleanup(result, self.session.cleanup_result())
     }
 
     fn finish(&self, result: Result<(), String>) {
@@ -78,7 +159,7 @@ impl Probe {
         let (state, _) = self.ready.wait_timeout_while(self.state.lock().unwrap(), self.remaining(), |state| {
             state.result.is_none() && !state.stopped
         }).unwrap();
-        if self.session.is_ssm() && (state.stopped || state.result.is_none()) {
+        if (self.session.is_ssm() || self.ssh) && (state.stopped || state.result.is_none()) {
             let reason = if state.stopped { "연결 시험이 취소되었습니다" } else { TIMED_OUT };
             drop(state);
             self.session.stop(Stop::Closed);
@@ -104,6 +185,7 @@ impl Probe {
             if retry { return self.session.recheck_cleanup().warning().map_or(Ok(()), Err); }
             self.session.cleanup_result()?;
         }
+        if self.ssh { self.wait_finished(); self.session.cleanup_result()?; }
         Ok(())
     }
 
@@ -127,8 +209,7 @@ impl Probe {
             return Err(TIMED_OUT.into());
         }
         let ssm = command.is_ssm();
-        let ssh = matches!(command, Launch::Ssh(_));
-        let marker = if ssh { SSH_MARKER } else if ssm { SSM_MARKER } else { MARKER };
+        let marker = if ssm { SSM_MARKER } else { MARKER };
         let (sender, receiver) = mpsc::sync_channel(1);
         let session = Arc::downgrade(&self.session);
         let output = std::cell::Cell::new((0u64, 0usize));
@@ -158,9 +239,7 @@ impl Probe {
                 Event::Connecting => Ok(()),
                 Event::Ready => session.upgrade().ok_or(super::CLOSED.to_owned())?.input(SSM_CHECK),
                 Event::Exited(0) if matched == marker.len() => sender.send(Ok(())).map_err(|err| err.to_string()),
-                Event::Exited(23) if !ssm && !ssh => sender.send(Err("셸이 요청한 작업 디렉터리에서 시작하지 못했습니다".into()))
-                    .map_err(|err| err.to_string()),
-                Event::Exited(code) if ssh => sender.send(Err(format!("SSH 연결 시험 실패 (종료 코드 {code})")))
+                Event::Exited(23) if !ssm => sender.send(Err("셸이 요청한 작업 디렉터리에서 시작하지 못했습니다".into()))
                     .map_err(|err| err.to_string()),
                 Event::Exited(code) => sender.send(Err(format!("셸 시험 출력 또는 종료 상태가 올바르지 않습니다 (종료 코드 {code})")))
                     .map_err(|err| err.to_string()),
@@ -243,13 +322,13 @@ mod tests {
         command.args(["-NonInteractive", "-Command", "[Console]::WriteLine('ZZABBA-C01:314159'); Start-Sleep 60"]);
         #[cfg(unix)]
         command.args(["-c", "builtin printf 'ZZABBA-C01:314159\\n'; read -rt 60"]);
-        let probe = Probe::with_timeout("timeout", Duration::from_secs(1), false);
+        let probe = Probe::with_timeout("timeout", Duration::from_secs(1), false, false);
         assert_eq!(probe.measure(Launch::Local(command)), Err(TIMED_OUT.into()));
     }
 
     #[test]
     fn c01_probe_counts_time_before_the_open_handshake() {
-        let probe = Probe::with_timeout("startup", Duration::from_millis(50), false);
+        let probe = Probe::with_timeout("startup", Duration::from_millis(50), false, false);
         let (ready, opened) = mpsc::sync_channel(1);
         assert_eq!(probe.receive(&opened), Err(TIMED_OUT.into()));
         ready.send(()).unwrap();

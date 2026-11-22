@@ -1,9 +1,11 @@
-import { useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { SavedConnections } from "./connectionIpc";
 import { SsmSelectionView } from "../ssm/SsmSelectionView";
 import { useSsmSelection } from "../ssm/ssm";
 import { createSsmDiscovery } from "../ssm/ssmDiscovery";
 import { SshMethodFields, SshAuthFields, SshReview } from "./SshFields";
+import { TerminalView } from "../terminal/TerminalView";
+import { sshTestIpc } from "../terminal/session";
 import {
   createLocalConnectionWizard,
   type LocalConnectionActions,
@@ -44,6 +46,9 @@ function Wizard(props: LocalConnectionWizardProps) {
     return () => modal?.close();
   }, []);
   useLayoutEffect(() => wizard.abandon, [wizard]);
+  const sshRun = status.kind === "testing" ? status.sshRun : undefined;
+  const sshAttempt = status.kind === "testing" ? status.attempt : undefined;
+  const sshIpc = useMemo(() => sshRun && sshAttempt && sshTestIpc(sshRun, () => wizard.cancelSshTest(sshAttempt)), [sshRun, sshAttempt, wizard]);
 
   if (status.kind === "closed") return null;
   const locked = status.kind === "saving" || status.kind === "closing" || status.kind === "closeFailed";
@@ -116,6 +121,10 @@ function Wizard(props: LocalConnectionWizardProps) {
             <button type="button" disabled={status.kind === "testing" || !!remoteCleanup || (!!ssh && sshPin.kind !== "verified")}
               onClick={() => void wizard.test(props)}>연결 테스트</button>
             <button type="button" disabled={!canSave} onClick={() => void wizard.save(props)}>저장</button>
+            {sshRun && sshAttempt && sshIpc && <div className="ssh-test-terminal">
+              <TerminalView key={sshRun.runId} active focusRequested label="SSH 시험 터미널" ipc={sshIpc} />
+              <button type="button" onClick={() => void wizard.cancelSshTest(sshAttempt)}>SSH 시험 닫기</button>
+            </div>}
           </>
         )}
         {step !== "target" && <button type="button" disabled={sshPin.kind === "checking"} onClick={() => wizard.go(-1)}>이전</button>}

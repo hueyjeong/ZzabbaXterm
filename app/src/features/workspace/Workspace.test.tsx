@@ -813,6 +813,65 @@ describe("F01 직접 SSH", () => {
     expect(connectionCalls("ssm_discovery")).toEqual([]);
   });
 
+  it("시험 PTY만 입력을 받고 닫힌 시험의 늦은 성공은 저장할 수 없다", async () => {
+    const waits = new Map<string, PromiseWithResolvers<unknown>>();
+    let serial = 0;
+    runConnectionCommand = async (command, args) => {
+      if (command === "verify_ssh_host") {
+        const { request } = args as { request: { targetId: string; host: string; port: number } };
+        const { targetId, host, port } = request;
+        return { targetId, host, port, fingerprint };
+      }
+      if (command === "connection_test_start") {
+        const { draftId, draftVersion } = args as ConnectionTestDraft;
+        const runId = `attempt-${++serial}`;
+        waits.set(runId, Promise.withResolvers());
+        return { draftId, draftVersion, runId };
+      }
+      const { run } = args as RunArgs;
+      if (command === "connection_ssh_test_attach") return `trial-${run.runId}`;
+      if (command === "connection_test_wait") return waits.get(run.runId)?.promise;
+      if (command === "connection_test_cancel") return null;
+      throw new Error(command);
+    };
+    const select = async (label: string, value: string) => {
+      const control = [...find("dialog").querySelectorAll("label")]
+        .find(item => item.firstChild?.textContent?.trim() === label)?.querySelector("select");
+      if (!control) throw new Error(label);
+      await act(async () => {
+        control.value = value;
+        control.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+    };
+    await press("연결 추가");
+    await changeInput("그룹", "작업");
+    await changeInput("표시명", "개발 서버");
+    await press("다음");
+    await select("접속 방식", "ssh");
+    await changeInput("서버 호스트", "dev.example.invalid");
+    await changeInput("SSH 계정", "deploy");
+    await changeInput("호스트 키 SHA256 지문", fingerprint);
+    await press("다음");
+    await select("SSH 인증 방식", "manualPassword");
+    await press("다음");
+    await press("호스트 키 선택 및 등록");
+    await press("연결 테스트");
+    const [[, { run: first }]] = connectionCalls("connection_ssh_test_attach");
+    expect(first.runId).toBe("attempt-1");
+    const field = find<HTMLTextAreaElement>('[aria-label="SSH 시험 터미널"] textarea');
+    expect(document.activeElement).toBe(field);
+    await type(field, "fixture");
+    expect(calls("input")).toEqual([{ id: "trial-attempt-1", bytes: Array.from(new TextEncoder().encode("fixture")) }]);
+    expect(button("저장")?.disabled).toBe(true);
+    await press("SSH 시험 닫기");
+    expect(connectionCalls("connection_test_cancel")).toEqual([["connection_test_cancel", { run: first }]]);
+    await press("연결 테스트");
+    await act(async () => waits.get(first.runId)?.resolve({ ...first, sessionId: "trial-attempt-1" }));
+    expect(button("저장")?.disabled).toBe(true);
+    await press("이전");
+    expect(connectionCalls("connection_test_cancel").map(([, args]) => args.run.runId)).toEqual(["attempt-1", "attempt-2"]);
+  });
+
   it("같은 저장 대상을 두 번 열고 닫은 탭의 PTY ID만 회수한다", async () => {
     loadProfiles = async () => ({
       version: 1,

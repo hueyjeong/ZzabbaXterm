@@ -118,7 +118,7 @@ fn c02_rejects_mixed_methods_forbidden_fields_and_invalid_references() {
     }
 }
 
-fn ssh_draft(dir: &Path) -> Value {
+pub(super) fn ssh_draft(dir: &Path) -> Value {
     let mut value = draft(dir, "work", "ssh-server");
     value["target"] = json!({
         "id": "ssh-server", "groupId": "work", "displayName": "개발 서버", "defaultMethod": "ssh",
