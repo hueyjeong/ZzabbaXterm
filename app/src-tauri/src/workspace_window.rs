@@ -223,7 +223,9 @@ fn modal_open(window: &Window) -> bool {
 fn modal_open(_: &Window) -> bool { false }
 
 fn close_webview(window: &Window, key: WindowKey) -> Option<Webview> {
-    window.app_handle().get_webview(MAIN).filter(|webview| window_key(&webview.window()) == Some(key))
+    let webview = window.app_handle().get_webview_window(MAIN)?;
+    let webview = webview.as_ref();
+    (window_key(&webview.window()) == Some(key)).then(|| webview.clone())
 }
 
 fn valid_close(window: &Window, key: WindowKey, id: &str, require_trusted_url: bool) -> Result<Option<Url>, &'static str> {
