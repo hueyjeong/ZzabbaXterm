@@ -5,6 +5,7 @@
 mod os;
 pub(crate) mod ipc;
 pub(crate) mod registry;
+pub(crate) mod storage_files;
 #[cfg(test)]
 mod tests;
 
@@ -138,7 +139,7 @@ impl LocalFile {
 
         check_parent(&self.selected_parent, &self.parent).map_err(save_read_error)?;
         let access = os::Access::read(&self.original).map_err(at(PreservePermissions))?;
-        let mut temp = self.parent.stage(&access).map_err(at(CreateTemporary))?;
+        let mut temp = self.parent.stage(Some(&access)).map_err(at(CreateTemporary))?;
         let bytes = buffer.as_bytes();
         temp.file().write_all(bytes).map_err(at(WriteTemporary))?;
         access

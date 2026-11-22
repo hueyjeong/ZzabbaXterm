@@ -1,6 +1,5 @@
 use std::{
     error::Error as _,
-    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -28,7 +27,8 @@ use aws_smithy_runtime_api::{
     },
 };
 use aws_smithy_types::{checksum_config::ResponseChecksumValidation, config_bag::ConfigBag};
-use tempfile::NamedTempFile;
+use sha2::{Digest, Sha256};
+use crate::editor::storage_files::DownloadTarget;
 use tokio::{fs::File, io::AsyncWriteExt, sync::watch};
 
 use super::{DownloadIntegrity, Downloaded, Error, Failure, Stage, sdk_error, single_attempt};
@@ -37,7 +37,7 @@ pub(super) async fn download(
     client: &Client,
     bucket: &str,
     key: &str,
-    target: &Path,
+    target: &DownloadTarget,
     closed: &watch::Sender<bool>,
 ) -> Result<Downloaded, Error> {
     let checksum = ChecksumStatus::default();
@@ -76,16 +76,12 @@ pub(super) async fn download(
         return Err(Error::at(Stage::DownloadBody, Failure::Checksum));
     }
 
-    let parent = target
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let (file, temp) = NamedTempFile::new_in(parent)
-        .map_err(|err| local_error(Stage::DownloadWrite, err, 0))?
-        .into_parts();
-    let mut file = File::from_std(file);
+    let mut staged = target.stage().map_err(|err| local_error(Stage::DownloadWrite, err, 0))?;
+    let mut file = File::from_std(staged.writer().map_err(|err| local_error(Stage::DownloadWrite, err, 0))?);
+    let mut digest = Sha256::new();
     let mut body = output.body;
     let mut bytes = 0;
+    let result = async {
     loop {
         let next = tokio::select! {
             biased;
@@ -99,11 +95,7 @@ pub(super) async fn download(
         let chunk = match next {
             Ok(Some(chunk)) => chunk,
             Ok(None) => break,
-            Err(error) => {
-                let _ = file.flush().await;
-                drop(file);
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         let chunk = chunk.map_err(|err| {
             let mut cause = err.source();
@@ -132,6 +124,7 @@ pub(super) async fn download(
         file.write_all(&chunk)
             .await
             .map_err(|err| local_error(Stage::DownloadWrite, err, bytes))?;
+        digest.update(&chunk);
         bytes += chunk.len() as u64;
     }
     if bytes != expected {
@@ -139,23 +132,17 @@ pub(super) async fn download(
     }
     file.flush()
         .await
-        .map_err(|err| local_error(Stage::DownloadWrite, err, bytes))?;
-    file.sync_all()
-        .await
-        .map_err(|err| local_error(Stage::DownloadWrite, err, bytes))?;
-    drop(file);
-    // 닫기와 파일 교체 중 먼저 이 잠금을 얻은 동작이 확정된다.
-    let live = closed.borrow();
-    if *live {
-        return Err(Error {
-            stage: Stage::DownloadCommit,
-            failure: Failure::Request,
-            bytes,
-        });
-    }
-    temp.persist(target)
-        .map_err(|err| local_error(Stage::DownloadCommit, err.error, bytes))?;
-    drop(live);
+        .map_err(|err| local_error(Stage::DownloadWrite, err, bytes))
+    }.await;
+    // Wait for the Tokio worker to release its file handle, including on body errors.
+    drop(file.into_std().await);
+    result?;
+    staged.commit(closed, digest.finalize().into())
+        .map_err(|err| if err.kind() == std::io::ErrorKind::Interrupted {
+            Error { stage: Stage::DownloadCommit, failure: Failure::Request, bytes }
+        } else {
+            local_error(Stage::DownloadCommit, err, bytes)
+        })?;
     Ok(Downloaded {
         bytes,
         integrity: if checksum.matched.load(Ordering::Relaxed) {

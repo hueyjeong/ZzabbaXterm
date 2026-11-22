@@ -4,7 +4,8 @@ pub(crate) mod ipc;
 #[cfg(test)]
 mod tests;
 
-use std::{error::Error as StdError, path::Path};
+use std::{error::Error as StdError, fs::File};
+use crate::editor::storage_files::DownloadTarget;
 
 use aws_credential_types::provider::{SharedCredentialsProvider, error::CredentialsError};
 use aws_sdk_s3::{
@@ -249,10 +250,10 @@ impl AwsS3 {
         &self,
         bucket: &str,
         key: &str,
-        source: &Path,
+        source: File,
     ) -> Result<u64, Error> {
         check_bucket(bucket, Stage::PutObject)?;
-        let body = ByteStream::from_path(source)
+        let body = ByteStream::read_from().file(tokio::fs::File::from_std(source)).build()
             .await
             .map_err(|_| Error::at(Stage::UploadSource, Failure::Request))?;
         let bytes = body.size_hint().0;
@@ -273,7 +274,7 @@ impl AwsS3 {
         &self,
         bucket: &str,
         key: &str,
-        target: &Path,
+        target: &DownloadTarget,
         closed: &tokio::sync::watch::Sender<bool>,
     ) -> Result<Downloaded, Error> {
         check_bucket(bucket, Stage::GetObject)?;

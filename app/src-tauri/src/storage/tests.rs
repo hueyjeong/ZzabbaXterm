@@ -48,6 +48,32 @@ pub(super) fn client(replay: &StaticReplayClient) -> AwsS3 {
 }
 
 #[tokio::test]
+async fn storage_upload_stream_uses_the_held_file() {
+    use aws_smithy_http_client::test_util::infallible_client_fn;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("chosen.bin");
+    std::fs::write(&path, b"original").unwrap();
+    let file = crate::editor::storage_files::open_upload(&path).unwrap();
+    std::fs::rename(&path, dir.path().join("previous.bin")).unwrap();
+    std::fs::write(&path, b"replacement").unwrap();
+    let (send, receive) = std::sync::mpsc::channel();
+    let client = AwsS3 {
+        client: Client::from_conf(s3_config("eu-west-1")
+            .credentials_provider(Credentials::new("fixture", "fixture", None, None, "fixture"))
+            .request_checksum_calculation(aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired)
+            .http_client(infallible_client_fn(move |request| {
+                send.send(request.into_body()).unwrap();
+                http::Response::new(SdkBody::empty())
+            })).build()),
+        endpoint: String::new(),
+    };
+    assert_eq!(client.upload("selected-bucket", "chosen.bin", file).await.unwrap(), 8);
+    let body = ByteStream::new(receive.recv().unwrap()).collect().await.unwrap().into_bytes();
+    assert_eq!(body.as_ref(), b"original");
+    assert_eq!(std::fs::read(path).unwrap(), b"replacement");
+}
+
+#[tokio::test]
 async fn s01_지정_버킷의_다음_페이지와_선택한_키를_그대로_요청한다() {
     let replay = replay([
         response(403, "<Error><Code>AccessDenied</Code></Error>"),
@@ -103,7 +129,7 @@ async fn s01_지정_버킷의_다음_페이지와_선택한_키를_그대로_요
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("chosen.txt");
     assert_eq!(
-        s3.download("selected-bucket", key, &target, &tokio::sync::watch::Sender::new(false)).await,
+        s3.download("selected-bucket", key, &DownloadTarget::open(&target).unwrap(), &tokio::sync::watch::Sender::new(false)).await,
         Ok(Downloaded {
             bytes: 3,
             integrity: DownloadIntegrity::LengthOnly
@@ -234,7 +260,7 @@ async fn s01_다운로드에_실패하면_기존_파일을_보존하고_완료�
         ),
     ] {
         let error = s3
-            .download("selected-bucket", "%2F/../other.txt", &target, &tokio::sync::watch::Sender::new(false))
+            .download("selected-bucket", "%2F/../other.txt", &DownloadTarget::open(&target).unwrap(), &tokio::sync::watch::Sender::new(false))
             .await
             .unwrap_err();
         assert_eq!(
@@ -249,7 +275,7 @@ async fn s01_다운로드에_실패하면_기존_파일을_보존하고_완료�
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
     assert_eq!(
-        s3.download("selected-bucket", "%2F/../other.txt", &target, &tokio::sync::watch::Sender::new(false))
+        s3.download("selected-bucket", "%2F/../other.txt", &DownloadTarget::open(&target).unwrap(), &tokio::sync::watch::Sender::new(false))
             .await,
         Ok(Downloaded {
             bytes: 3,
@@ -394,7 +420,7 @@ async fn s01_get_object_권한만으로_받고_미검증_체크섬을_구분한�
         ]);
         assert_eq!(
             client(&replay)
-                .download("selected-bucket", "object", &target, &tokio::sync::watch::Sender::new(false))
+                .download("selected-bucket", "object", &DownloadTarget::open(&target).unwrap(), &tokio::sync::watch::Sender::new(false))
                 .await,
             Ok(Downloaded {
                 bytes: 5,

@@ -12,6 +12,7 @@ use tauri::{
 use tokio::sync::watch;
 use uuid::Uuid;
 
+use crate::editor::storage_files::{DownloadTarget, open_upload};
 use crate::{
     connections::{profile::MethodRef, with_saved_method},
     ssm::{CliError, Scope},
@@ -47,7 +48,21 @@ struct Selection {
     id: String,
     target: Target,
     direction: Direction,
-    path: Option<PathBuf>,
+    file: Option<ApprovedFile>,
+}
+
+enum ApprovedFile {
+    Upload(std::fs::File),
+    Download(DownloadTarget),
+}
+
+impl ApprovedFile {
+    fn open(path: &std::path::Path, direction: Direction) -> std::io::Result<Self> {
+        match direction {
+            Direction::Upload => open_upload(path).map(Self::Upload),
+            Direction::Download => DownloadTarget::open(path).map(Self::Download),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -194,7 +209,7 @@ impl StorageIpc {
             id: id.clone(),
             target,
             direction,
-            path: None,
+            file: None,
         });
         Some(id)
     }
@@ -204,7 +219,7 @@ impl StorageIpc {
         document: &Document,
         session_id: &str,
         id: String,
-        selected: Option<PathBuf>,
+        selected: Option<Result<ApprovedFile, std::io::Error>>,
     ) -> LocalFileApproval {
         let mut registry = self.0.lock().unwrap();
         let Some(tab) = registry.tab(document, session_id) else {
@@ -218,8 +233,8 @@ impl StorageIpc {
             return LocalFileApproval::Denied;
         };
         match selected {
-            Some(path) if path.is_absolute() => {
-                selection.path = Some(path);
+            Some(Ok(file)) => {
+                selection.file = Some(file);
                 LocalFileApproval::Approved { approval_id: id }
             }
             Some(_) => {
@@ -239,7 +254,7 @@ impl StorageIpc {
             return false;
         };
         if !tab.selection.as_ref().is_some_and(|selection| {
-            selection.id == request.approval_id && selection.path.is_some()
+            selection.id == request.approval_id && selection.file.is_some()
         }) {
             return false;
         }
@@ -259,7 +274,7 @@ impl StorageIpc {
         if selection.id != request.approval_id
             || selection.direction != direction
             || selection.target != request.target
-            || selection.path.is_none()
+            || selection.file.is_none()
         {
             return None;
         }
@@ -268,7 +283,7 @@ impl StorageIpc {
             client: tab.client.clone(),
             closed: tab.closed.clone(),
             target: selection.target,
-            path: selection.path?,
+            file: selection.file?,
         })
     }
 
@@ -317,13 +332,14 @@ impl StorageIpc {
         let transfer = self
             .consume(document, request, Direction::Upload)
             .ok_or_else(|| unavailable(Stage::UploadSource))?;
+        let ApprovedFile::Upload(file) = transfer.file else { return Err(unavailable(Stage::UploadSource)); };
         until_closed(
             &transfer.closed.subscribe(),
             Stage::PutObject,
             transfer.client.upload(
                 &transfer.target.bucket,
                 &transfer.target.key,
-                &transfer.path,
+                file,
             ),
         )
         .await
@@ -337,12 +353,13 @@ impl StorageIpc {
         let transfer = self
             .consume(document, request, Direction::Download)
             .ok_or_else(|| unavailable(Stage::GetObject))?;
+        let ApprovedFile::Download(file) = transfer.file else { return Err(unavailable(Stage::GetObject)); };
         transfer
             .client
             .download(
                 &transfer.target.bucket,
                 &transfer.target.key,
-                &transfer.path,
+                &file,
                 &transfer.closed,
             )
             .await
@@ -353,7 +370,7 @@ struct Transfer {
     client: Arc<AwsS3>,
     closed: Arc<watch::Sender<bool>>,
     target: Target,
-    path: PathBuf,
+    file: ApprovedFile,
 }
 
 async fn until_closed<T>(
@@ -509,7 +526,31 @@ async fn select_file(
     let Ok((_, closed)) = state.client(document, &session_id, Stage::Profile) else {
         return LocalFileApproval::Denied;
     };
-    let selected = pick_local_file(webview.window(), title, direction, closed).await;
+    let window = webview.window();
+    let replace = if direction == Direction::Download {
+        match choose_replace(window.clone(), closed.clone()).await {
+            Some(replace) => replace,
+            None => return state.finish_selection(document, &session_id, id, None),
+        }
+    } else { false };
+    let picker_direction = if replace { Direction::Upload } else { direction };
+    let selected = match pick_local_file(window.clone(), title.clone(), picker_direction, closed.clone()).await {
+        Some(path) => {
+            let display = format!("{path:?}");
+            let selected = tokio::task::spawn_blocking(move || {
+                let file = ApprovedFile::open(&path, direction)?;
+                if let ApprovedFile::Download(target) = &file && target.replaces_existing() != replace {
+                    return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "download destination changed"));
+                }
+                Ok(file)
+            }).await.unwrap_or_else(|error| Err(std::io::Error::other(error)));
+            if matches!(&selected, Ok(ApprovedFile::Download(target)) if target.replaces_existing()) {
+                let prompt = format!("{title}\n\n기존 파일을 교체하시겠습니까?\n{display}");
+                if confirm_replace(window, prompt, closed).await { Some(selected) } else { None }
+            } else { Some(selected) }
+        }
+        None => None,
+    };
     state.finish_selection(document, &session_id, id, selected)
 }
 
@@ -552,7 +593,7 @@ async fn pick_local_file<R: tauri::Runtime>(window: tauri::Window<R>, title: Str
             picker.set_modal(true);
             picker.set_destroy_with_parent(true);
             picker.set_local_only(true);
-            if direction == Direction::Download { picker.set_do_overwrite_confirmation(true); }
+            picker.set_do_overwrite_confirmation(false);
             let path = tokio::select! {
                 biased;
                 _ = closed.wait_for(|closed| *closed) => None,
@@ -563,6 +604,78 @@ async fn pick_local_file<R: tauri::Runtime>(window: tauri::Window<R>, title: Str
         });
     }).ok()?;
     selected.await.ok().flatten()
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn choose_replace<R: tauri::Runtime>(window: tauri::Window<R>, mut closed: watch::Receiver<bool>) -> Option<bool> {
+    let dialog = rfd::AsyncMessageDialog::new().set_parent(&window).set_title("다운로드 위치")
+        .set_description("기존 파일을 교체하시겠습니까?\n예: 기존 파일 선택 / 아니요: 새 파일 저장")
+        .set_buttons(rfd::MessageButtons::YesNoCancel);
+    tokio::select! {
+        biased;
+        _ = closed.wait_for(|value| *value) => None,
+        answer = dialog.show() => match answer {
+            rfd::MessageDialogResult::Yes => Some(true),
+            rfd::MessageDialogResult::No => Some(false),
+            _ => None,
+        },
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn choose_replace<R: tauri::Runtime>(window: tauri::Window<R>, closed: watch::Receiver<bool>) -> Option<bool> {
+    use gtk::ResponseType;
+    match download_dialog(window, "다운로드 위치", "다운로드 위치".into(), true, closed).await? {
+        ResponseType::Yes => Some(true),
+        ResponseType::No => Some(false),
+        _ => None,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn confirm_replace<R: tauri::Runtime>(window: tauri::Window<R>, prompt: String, mut closed: watch::Receiver<bool>) -> bool {
+    let dialog = rfd::AsyncMessageDialog::new().set_parent(&window).set_title("다운로드 파일 교체")
+        .set_description(prompt).set_buttons(rfd::MessageButtons::OkCancel);
+    tokio::select! {
+        biased;
+        _ = closed.wait_for(|value| *value) => false,
+        answer = dialog.show() => answer == rfd::MessageDialogResult::Ok,
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn confirm_replace<R: tauri::Runtime>(window: tauri::Window<R>, prompt: String, closed: watch::Receiver<bool>) -> bool {
+    download_dialog(window, "다운로드 파일 교체", prompt, false, closed).await == Some(gtk::ResponseType::Ok)
+}
+
+#[cfg(target_os = "linux")]
+async fn download_dialog<R: tauri::Runtime>(window: tauri::Window<R>, title: &'static str, prompt: String, choose_mode: bool,
+    mut closed: watch::Receiver<bool>) -> Option<gtk::ResponseType> {
+    use gtk::{ButtonsType, DialogFlags, MessageDialog, MessageType, ResponseType, prelude::*};
+    let (answer, result) = tokio::sync::oneshot::channel();
+    let owner = window.clone();
+    if window.run_on_main_thread(move || {
+        let Ok(parent) = owner.gtk_window() else { return; };
+        gtk::glib::MainContext::default().spawn_local(async move {
+            let dialog = MessageDialog::new(Some(&parent), DialogFlags::MODAL | DialogFlags::DESTROY_WITH_PARENT,
+                MessageType::Question, if choose_mode { ButtonsType::None } else { ButtonsType::OkCancel }, &prompt);
+            dialog.set_title(title);
+            if choose_mode {
+                dialog.add_button("취소", ResponseType::Cancel);
+                dialog.add_button("새 파일 저장", ResponseType::No);
+                dialog.add_button("기존 파일 교체", ResponseType::Yes);
+            }
+            dialog.set_default_response(ResponseType::Cancel);
+            let confirmed = tokio::select! {
+                biased;
+                _ = closed.wait_for(|value| *value) => ResponseType::Cancel,
+                result = dialog.run_future() => result,
+            };
+            dialog.close();
+            let _ = answer.send(confirmed);
+        });
+    }).is_err() { return None; }
+    result.await.ok()
 }
 
 pub(crate) fn dispatch<R: tauri::Runtime>(invoke: Invoke<R>) -> bool {
@@ -770,7 +883,7 @@ mod tests {
         let path = dir.path().join(name);
         std::fs::write(&path, b"original").unwrap();
         let approval = state.begin_selection(&document, target(&session), Direction::Download).unwrap();
-        state.finish_selection(&document, &session.session_id, approval.clone(), Some(path.clone()));
+        state.finish_selection(&document, &session.session_id, approval.clone(), Some(ApprovedFile::open(&path, Direction::Download)));
         let (send, received) = std::sync::mpsc::channel();
         let webview: &tauri::Webview<test::MockRuntime> = window.as_ref();
         webview.clone().on_message(request("storage_download", json!({
@@ -934,7 +1047,7 @@ mod tests {
             .begin_selection(&doc, target(&first), Direction::Upload)
             .unwrap();
         assert!(matches!(
-            state.finish_selection(&doc, &first.session_id, id.clone(), Some(file.clone())),
+            state.finish_selection(&doc, &first.session_id, id.clone(), Some(ApprovedFile::open(&file, Direction::Upload))),
             LocalFileApproval::Approved { .. }
         ));
         let request = |target| ApprovedTransfer {
@@ -1016,7 +1129,7 @@ mod tests {
         let id = state
             .begin_selection(&doc, target(&first), Direction::Download)
             .unwrap();
-        state.finish_selection(&doc, &first.session_id, id.clone(), Some(file.clone()));
+        state.finish_selection(&doc, &first.session_id, id.clone(), Some(ApprovedFile::open(&file, Direction::Download)));
         assert!(state.cancel_approval(
             &doc,
             &ApprovalId {
@@ -1045,7 +1158,7 @@ mod tests {
         assert!(state.close(&doc, &first.session_id));
         assert!(*closed.borrow());
         assert!(matches!(
-            state.finish_selection(&doc, &first.session_id, pending, Some(file)),
+            state.finish_selection(&doc, &first.session_id, pending, Some(ApprovedFile::open(&file, Direction::Download))),
             LocalFileApproval::Denied
         ));
         let request = || BucketPageRequest {
