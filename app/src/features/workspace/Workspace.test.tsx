@@ -24,6 +24,7 @@ vi.mock("@xterm/xterm", () => ({
     private field!: HTMLTextAreaElement;
     private screen!: HTMLElement;
     loadAddon() { }
+    attachCustomKeyEventHandler() { }
     open(screen: HTMLElement) {
       this.screen = screen;
       this.field = screen.appendChild(document.createElement("textarea"));

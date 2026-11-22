@@ -56,7 +56,15 @@ export function TerminalView({ active, focusRequested, label, targetId, ipc, rem
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(element);
-    let acceptsUserInput = !remote;
+    let acceptsUserInput = false;
+    term.attachCustomKeyEventHandler((event) => {
+      if (event.type !== "keydown" || event.key !== "Enter" || !event.shiftKey ||
+          event.ctrlKey || event.altKey || event.metaKey || event.keyCode === 229) return true;
+      if (event.isComposing) return false;
+      event.preventDefault();
+      if (acceptsUserInput && !stopRequested.current) term.input("\x1b[13;2u", true);
+      return false;
+    });
     const inputEvents = ["keydown", "keypress", "keyup", "beforeinput", "input", "paste", "compositionstart", "compositionupdate",
       "compositionend", "drop", "mousedown", "mouseup", "mousemove", "wheel", "auxclick", "contextmenu"];
     function blockUserInput(event: Event) {
@@ -84,7 +92,7 @@ export function TerminalView({ active, focusRequested, label, targetId, ipc, rem
     const observer = new ResizeObserver(layout);
     observer.observe(element);
     refresh.current = (visible, ready, requested) => {
-      if (remote) acceptsUserInput = visible && ready;
+      acceptsUserInput = visible && ready;
       if (visible) layout();
       if (!visible || !ready) term.blur();
       else if (requested) term.focus();
