@@ -27,6 +27,26 @@ pub(crate) fn with_saved_method<T>(directory: &Path, id: &str, use_method: impl 
     use_method(target.method())
 }
 
+pub(crate) fn with_saved_ssh<T>(
+    directory: &Path,
+    id: &str,
+    read: impl FnOnce(Option<(std::num::NonZeroU64, profile::Ssh)>) -> T,
+) -> Result<T, String> {
+    store::Store::new(directory).with_loaded(|file| {
+        let saved = file.targets.into_iter().find(|entry| entry.profile.id.as_str() == id)
+            .and_then(|entry| match entry.profile.method {
+                profile::Method::Ssh { ssh } => Some((entry.revision, ssh)),
+                _ => None,
+            });
+        read(saved)
+    }).map_err(|error| format!("프로필 읽기: {error:?}"))
+}
+
+#[cfg(test)]
+pub(crate) fn save_test_profile(directory: &Path, draft: profile::ValidatedDraft) {
+    assert_eq!(store::Store::new(directory).save(draft).unwrap(), store::SaveStatus::Saved);
+}
+
 pub(crate) fn with_ai_targets<T>(
     directory: &Path,
     read: impl FnOnce(Vec<crate::ai::SelectedTarget>) -> T,

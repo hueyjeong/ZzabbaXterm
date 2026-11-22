@@ -14,7 +14,7 @@ use tokio::{
 };
 
 use crate::{
-    connections::{self, profile::{Draft, ValidatedDraft, valid_id}},
+    connections::{self, profile::{Draft, MethodRef, SshAuth, SshTransport, ValidatedDraft, valid_id}},
     local_ipc::{self, DEADLINE, Endpoint, Listener, MAX_FRAME, SERVICE, encode_frame, read_frame, write_frame},
 };
 use tauri::{AppHandle, Manager};
@@ -40,6 +40,13 @@ pub(crate) enum Error {
     GroupConflict,
     #[serde(skip)]
     TargetConflict,
+    #[serde(skip)]
+    SshOverSsmUnavailable,
+    #[serde(skip)]
+    StoredSshPasswordUnavailable,
+    #[cfg(windows)]
+    #[serde(skip)]
+    UnsupportedWindowsStartDirectory,
 }
 
 impl fmt::Display for Error {
@@ -53,6 +60,10 @@ impl fmt::Display for Error {
             Self::StoreUnavailable => "저장된 연결 설정에 접근할 수 없습니다.",
             Self::GroupConflict => "저장된 연결 그룹이 입력과 일치하지 않습니다.",
             Self::TargetConflict => "새 대상 ID와 비어 있는 대상 개정이 필요합니다.",
+            Self::SshOverSsmUnavailable => "SSH-over-SSM을 사용할 수 없습니다",
+            Self::StoredSshPasswordUnavailable => "저장된 SSH 암호를 사용할 수 없습니다",
+            #[cfg(windows)]
+            Self::UnsupportedWindowsStartDirectory => "작업 디렉터리: Windows 드라이브의 일반 절대 경로만 지원합니다",
         })
     }
 }
@@ -264,7 +275,26 @@ fn parse(command: &str, input: impl Read) -> Result<Command> {
     }
     if command == "register" {
         let draft: Draft = decode(&bytes)?;
-        Ok(Command::Register(draft.validate().map_err(|_| Error::InvalidRequest)?))
+        let draft = draft.validate().map_err(|_| Error::InvalidRequest)?;
+        match draft.method() {
+            MethodRef::Ssh { ssh } => {
+                if matches!(ssh.transport, SshTransport::Ssm(_)) {
+                    return Err(Error::SshOverSsmUnavailable);
+                }
+                if matches!(ssh.auth, SshAuth::StoredPassword { .. }) {
+                    return Err(Error::StoredSshPasswordUnavailable);
+                }
+            }
+            #[cfg(windows)]
+            MethodRef::Local { start_directory, .. } => {
+                use std::path::{Component, Prefix};
+                if !matches!(start_directory.components().next(), Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_))) {
+                    return Err(Error::UnsupportedWindowsStartDirectory);
+                }
+            }
+            _ => {}
+        }
+        Ok(Command::Register(draft))
     } else {
         let proposal: Proposal = decode(&bytes)?;
         proposal.validate()?;

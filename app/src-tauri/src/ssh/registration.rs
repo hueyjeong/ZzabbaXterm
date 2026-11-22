@@ -4,7 +4,7 @@ use std::{path::{Path, PathBuf}, sync::Mutex};
 
 use serde::{Deserialize, Serialize};
 use ssh_key::{Fingerprint, HashAlg};
-use tauri::{Manager, ipc::{CommandArg, CommandItem, Invoke}};
+use tauri::{Manager, Webview, ipc::{CommandArg, CommandItem, Invoke}};
 use crate::{connections::profile::Draft, terminal::Sessions};
 
 use super::{ApprovedHost, Endpoint, Error, TrustStore, trust::plain_public_key};
@@ -52,6 +52,23 @@ enum Rejection {
     StoreUnavailable,
 }
 
+impl Rejection {
+    fn saved_message(self) -> &'static str {
+        match self {
+            Self::InvalidTarget => "저장된 SSH 연결 대상을 찾을 수 없습니다",
+            Self::InvalidEndpoint => "SSH 접속 주소가 올바르지 않습니다",
+            Self::EndpointMismatch => "저장된 SSH 연결 대상이 바뀌었습니다",
+            Self::InvalidFingerprint => "SSH 호스트 키 지문이 올바르지 않습니다",
+            Self::InvalidPublicKey => "SSH 서버 공개 키가 올바르지 않습니다",
+            Self::FingerprintMismatch => "선택한 SSH 호스트 키의 지문이 다릅니다",
+            Self::ExistingPinConflict => "다른 SSH 호스트 키가 이미 등록되어 있습니다",
+            Self::Cancelled | Self::StaleDocument => "SSH 호스트 키 등록이 취소되었습니다",
+            Self::Busy => "열려 있는 SSH 호스트 키 창을 먼저 닫으세요",
+            Self::StoreUnavailable => "SSH 신뢰 저장소를 사용할 수 없습니다",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct VerifiedHost {
@@ -70,7 +87,7 @@ struct Confirmation {
 
 struct Reservation {
     document: u64,
-    attempt: Attempt,
+    attempt: Option<Attempt>,
     ticket: String,
     cancelled: bool,
     ready: Option<Prepared>,
@@ -102,7 +119,7 @@ impl Registration {
         }
     }
 
-    fn begin(&self, document: u64, attempt: Attempt) -> Result<String, Rejection> {
+    fn begin(&self, document: u64, attempt: Option<Attempt>) -> Result<String, Rejection> {
         let mut pending = self.pending.lock().map_err(|_| Rejection::StoreUnavailable)?;
         if pending.is_some() {
             return Err(Rejection::Busy);
@@ -116,7 +133,7 @@ impl Registration {
 
     fn cancel(&self, document: u64, attempt: &Attempt) -> Result<(), Rejection> {
         let mut pending = self.pending.lock().map_err(|_| Rejection::StoreUnavailable)?;
-        if pending.as_ref().is_some_and(|slot| slot.document == document && &slot.attempt == attempt) {
+        if pending.as_ref().is_some_and(|slot| slot.document == document && slot.attempt.as_ref() == Some(attempt)) {
             Self::invalidate(&mut pending);
         }
         Ok(())
@@ -125,7 +142,7 @@ impl Registration {
     fn commit(&self, document: u64, attempt: &Attempt, ticket: &str, sessions: &Sessions) -> Result<VerifiedHost, Rejection> {
         let mut pending = self.pending.lock().map_err(|_| Rejection::StoreUnavailable)?;
         let slot = pending.as_ref().filter(|slot| {
-            !slot.cancelled && slot.document == document && &slot.attempt == attempt && slot.ticket == ticket && slot.ready.is_some()
+            !slot.cancelled && slot.document == document && slot.attempt.as_ref() == Some(attempt) && slot.ticket == ticket && slot.ready.is_some()
         }).ok_or(Rejection::Cancelled)?;
         // 문서 세대와 예약을 모두 잠근 채 일회 예약을 소비하고 핀을 저장한다.
         sessions.with_probes("main", slot.document, |_| {
@@ -133,6 +150,52 @@ impl Registration {
             Ok(prepared.commit(&self.store))
         }).map_err(|_| Rejection::StaleDocument)?
     }
+
+    fn register_saved(
+        &self,
+        directory: &Path,
+        target_id: String,
+        sessions: &Sessions,
+        document: u64,
+        pick: impl FnOnce() -> Result<Option<PathBuf>, Rejection>,
+        confirm: impl FnOnce(&Endpoint, &Fingerprint) -> Result<bool, Rejection>,
+    ) -> Result<(), Rejection> {
+        let ticket = self.begin(document, None)?;
+        let reservation = Pending { state: self, ticket: &ticket };
+        sessions.with_probes("main", document, |_| Ok(())).map_err(|_| Rejection::StaleDocument)?;
+        let saved = crate::connections::with_saved_ssh(directory, &target_id, |saved| saved)
+            .map_err(|_| Rejection::StoreUnavailable)?.ok_or(Rejection::InvalidTarget)?;
+        let ssh = &saved.1;
+        let prepared = reservation.verify(Request {
+            target_id, host: ssh.host.clone(), port: ssh.port,
+            expected_fingerprint: ssh.host_key_fingerprint.clone(),
+        }, |_| Endpoint::new(&ssh.host, ssh.port).ok(), pick, confirm)?;
+
+        // 프로필 → 예약 → 문서 순으로 잠그고 핀 기록까지 유지한다.
+        let target_id = prepared.host.target_id.clone();
+        crate::connections::with_saved_ssh(directory, &target_id, |current| {
+            if current.as_ref() != Some(&saved) {
+                return Err(Rejection::EndpointMismatch);
+            }
+            let _pending = reservation.lock_current()?;
+            sessions.with_probes("main", document, |_| Ok(prepared.commit(&self.store).map(drop)))
+                .map_err(|_| Rejection::StaleDocument)?
+        }).map_err(|_| Rejection::StoreUnavailable)?
+    }
+}
+
+pub(crate) fn register_saved(caller: &Webview, document: u64, target_id: String) -> Result<(), String> {
+    let config = caller.path().app_config_dir().map_err(|error| format!("앱 설정 디렉터리: {error}"))?;
+    let state = caller.try_state::<Registration>().ok_or(Rejection::StoreUnavailable.saved_message())?;
+    let window = caller.window();
+    state.register_saved(&config, target_id, &caller.state::<Sessions>(), document,
+        || dialogs::pick(&window),
+        |endpoint, fingerprint| dialogs::confirm(&window, confirmation_message(endpoint, fingerprint)),
+    ).map_err(|error| error.saved_message().into())
+}
+
+fn confirmation_message(endpoint: &Endpoint, fingerprint: &Fingerprint) -> String {
+    format!("서버: {}\n포트: {}\nSHA256 지문: {fingerprint}", endpoint.host, endpoint.port)
 }
 
 pub(crate) fn dispatch(invoke: Invoke) {
@@ -197,7 +260,7 @@ pub(crate) fn dispatch(invoke: Invoke) {
         },
         Err(error) => { resolver.invoke_error(error); return; }
     };
-    let ticket = match state.begin(document, attempt) {
+    let ticket = match state.begin(document, Some(attempt)) {
         Ok(ticket) => ticket,
         Err(error) => { resolver.invoke_error(error.into()); return; }
     };
@@ -213,9 +276,7 @@ pub(crate) fn dispatch(invoke: Invoke) {
                 request,
                 |id| draft.ssh_pin_endpoint(id, &expected_fingerprint),
                 || dialogs::pick(&window),
-                |endpoint, fingerprint| dialogs::confirm(&window, format!(
-                    "서버: {}\n포트: {}\nSHA256 지문: {fingerprint}", endpoint.host, endpoint.port,
-                )),
+                |endpoint, fingerprint| dialogs::confirm(&window, confirmation_message(endpoint, fingerprint)),
             )?;
             let host = prepared.host.clone();
             reservation.ready(prepared)?;

@@ -40,7 +40,7 @@ fn verify(
     pick: impl FnOnce() -> Option<PathBuf>,
     confirm: impl FnOnce(&Endpoint, &Fingerprint) -> bool,
 ) -> Result<String, Rejection> {
-    let ticket = state.begin(0, attempt(0))?;
+    let ticket = state.begin(0, Some(attempt(0)))?;
     let pending = Pending { state, ticket: &ticket };
     let prepared = pending.verify(request, resolve, || Ok(pick()), |endpoint, sha| Ok(confirm(endpoint, sha)))?;
     pending.ready(prepared)?;
@@ -117,7 +117,7 @@ fn cancellation_navigation_and_changed_selection_cannot_commit_a_pin() {
     assert_eq!(verify(&state, request(), target, pick, |_, _| false), Err(Rejection::Cancelled));
     assert_eq!(verify(&state, request(), target, || {
         state.document_changed(OWNER);
-        assert_eq!(state.begin(1, attempt(0)), Err(Rejection::Busy));
+        assert_eq!(state.begin(1, Some(attempt(0))), Err(Rejection::Busy));
         pick()
     }, |_, _| panic!("confirm")), Err(Rejection::Cancelled));
     assert_eq!(verify(&state, request(), target, pick, |_, _| {
@@ -176,4 +176,61 @@ fn commit_rechecks_cancellation_draft_ticket_and_document_before_writing() {
     sessions.navigate(OWNER);
     assert_eq!(state.commit(0, &attempt(0), &ticket, &sessions), Err(Rejection::StaleDocument));
     assert_no_pin(&state);
+}
+
+#[test]
+fn saved_registration_rejects_a_profile_revision_changed_during_confirmation() {
+    use crate::connections::{self, profile::Draft, tests::ssh_draft};
+    use serde_json::json;
+
+    let (root, state) = setup();
+    let config = root.path().join("config");
+    let mut input = ssh_draft(&config);
+    input["target"]["ssh"]["host"] = json!("dev.example.invalid");
+    input["target"]["ssh"]["hostKeyFingerprint"] = json!(SHA);
+    let draft = |input| serde_json::from_value::<Draft>(input).unwrap().validate().unwrap();
+    assert_eq!(connections::register(&config, draft(input.clone())).unwrap(), ("ssh-server".into(), "1".into()));
+    let path = root.path().join("host.pub");
+    fs::write(&path, KEY).unwrap();
+    let sessions = Sessions::default();
+    assert_eq!(state.register_saved(&config, "SSH-server".into(), &sessions, 0,
+        || panic!("picker"), |_, _| panic!("confirm")), Err(Rejection::InvalidTarget));
+    input["groupRevision"] = json!(1);
+    input["targetRevision"] = json!(1);
+    input["target"]["displayName"] = json!("새 이름");
+    assert_eq!(state.register_saved(&config, "ssh-server".into(), &sessions, 0,
+        || Ok(Some(path.clone())), |endpoint, fingerprint| {
+            assert_eq!(endpoint.port, 2222);
+            assert_eq!(fingerprint.to_string(), SHA);
+            connections::save_test_profile(&config, draft(input));
+            Ok(true)
+        }), Err(Rejection::EndpointMismatch));
+    assert_no_pin(&state);
+    assert_eq!(state.register_saved(&config, "ssh-server".into(), &sessions, 0,
+        || Ok(Some(path.clone())), |_, _| {
+            sessions.navigate(OWNER);
+            Ok(true)
+        }), Err(Rejection::StaleDocument));
+    assert_no_pin(&state);
+    let profile = config.join("connections.json");
+    let before = fs::read(&profile).unwrap();
+    state.register_saved(&config, "ssh-server".into(), &sessions, sessions.document(OWNER),
+        || Ok(Some(path.clone())), |_, _| Ok(true)).unwrap();
+    assert_eq!(fs::read(profile).unwrap(), before);
+    let endpoint = endpoint();
+    let approved = ApprovedHost::confirm(&endpoint, &endpoint, SHA).unwrap();
+    assert_eq!(state.store.pin(&approved).unwrap().0, format!("[dev.example.invalid]:2222 {KEY}\n"));
+}
+
+#[test]
+fn saved_registration_acl_allows_only_the_local_main_webview() {
+    use tauri::ipc::Origin;
+
+    let mut context: tauri::Context<tauri::Wry> = tauri::generate_context!();
+    let acl = context.runtime_authority_mut();
+    let command = "register_saved_ssh_host";
+    assert!(acl.resolve_access(command, "main", "main", &Origin::Local).is_some());
+    assert!(acl.resolve_access(command, "main", "secondary", &Origin::Local).is_none());
+    let remote = Origin::Remote { url: "https://remote.example.invalid".parse().unwrap() };
+    assert!(acl.resolve_access(command, "main", "main", &remote).is_none());
 }

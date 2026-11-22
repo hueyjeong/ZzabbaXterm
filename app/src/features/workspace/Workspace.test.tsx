@@ -98,7 +98,7 @@ beforeEach(async () => {
   native.invoke.mockImplementation(async (command, args) => {
     if (command === "connections_load") return loadProfiles();
     if (command === "ai_models" || command === "ai_targets" || command === "ai_decisions") return [];
-    if (command.startsWith("connection_") || ["verify_ssh_host", "commit_ssh_host", "cancel_ssh_host"].includes(command)) return runConnectionCommand(command, args);
+    if (command.startsWith("connection_") || ["verify_ssh_host", "commit_ssh_host", "cancel_ssh_host", "register_saved_ssh_host"].includes(command)) return runConnectionCommand(command, args);
     if (command === "ssm_discovery") return runDiscovery(args);
     if (command === "editor_local_open") return openFile();
     if (command === "editor_local_save") return saveFile();
@@ -944,6 +944,49 @@ describe("F01 직접 SSH", () => {
     expect(button("저장")?.disabled).toBe(true);
     await press("이전");
     expect(connectionCalls("connection_test_cancel").map(([, args]) => args.run.runId)).toEqual(["attempt-1", "attempt-2"]);
+  });
+
+  it("같은 창에서 새로고침한 SSH 행의 키를 등록하고 더블클릭으로만 연결한다", async () => {
+    const registration = Promise.withResolvers<null>();
+    runConnectionCommand = vi.fn().mockRejectedValueOnce("SSH 호스트 키 등록이 취소되었습니다").mockReturnValueOnce(registration.promise);
+    loadProfiles = async () => ({
+      version: 1,
+      groups: [{ revision: 1, profile: { id: "work", displayName: "작업" } }],
+      targets: [{ revision: 1, profile: {
+        id: "server", groupId: "work", displayName: "개발 서버", defaultMethod: "ssh",
+        ssh: {
+          host: "dev.example.invalid", port: 2222, account: "deploy", hostKeyFingerprint: fingerprint,
+          transport: { kind: "direct" }, auth: { kind: "manualPassword" },
+        },
+      } }],
+    });
+    expect(tree().textContent).not.toContain("개발 서버");
+    await press("새로고침");
+    const target = [...tree().querySelectorAll<HTMLElement>('[role="treeitem"]')].find(item => item.textContent === "개발 서버")!;
+    expect(target).toBeDefined();
+
+    await key(target, "ContextMenu");
+    await key(find('[role="menuitem"]'), "Escape");
+    expect(host.querySelector('[role="menu"]')).toBeNull();
+    expect(connectionCalls("register_saved_ssh_host")).toEqual([]);
+
+    await key(target, "ContextMenu");
+    expect([...find('[role="menu"]').querySelectorAll('[role="menuitem"]')].map(item => item.textContent)).toEqual(["SSH", "호스트 키 등록"]);
+    await press("호스트 키 등록");
+    expect(host.querySelector('[role="menu"]')).toBeNull();
+    expect(find('footer [role="alert"]').textContent).toContain("SSH 호스트 키 등록이 취소되었습니다");
+
+    await key(target, "ContextMenu");
+    await press("호스트 키 등록");
+    expect(connectionCalls("register_saved_ssh_host")).toEqual([
+      ["register_saved_ssh_host", { targetId: "server" }],
+      ["register_saved_ssh_host", { targetId: "server" }],
+    ]);
+    await act(async () => { registration.resolve(null); });
+    expect(status()).toContain("SSH 호스트 키 등록 완료");
+    expect(calls("open").filter(args => args.targetId)).toEqual([]);
+    await act(async () => { target.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); });
+    expect(calls("open").slice(-1)[0]).toMatchObject({ targetId: "server" });
   });
 
   it("SSH 종료가 미확인이면 탭을 남기고 같은 PTY ID로만 다시 확인한다", async () => {

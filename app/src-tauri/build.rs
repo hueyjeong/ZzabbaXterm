@@ -15,6 +15,7 @@ fn main() {
         "connection_ssh_test_attach",
         "connections_load",
         "verify_ssh_host", "commit_ssh_host", "cancel_ssh_host",
+        "register_saved_ssh_host",
         "editor_local_open", "editor_local_save", "editor_local_compare", "editor_local_reload",
         "editor_local_close",
         "ai_targets", "ai_models", "ai_select", "ai_chat", "ai_propose", "ai_decide",

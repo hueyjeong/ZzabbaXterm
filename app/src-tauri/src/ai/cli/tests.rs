@@ -66,7 +66,7 @@ async fn restricted_methods_and_exact_fields() {
 fn register_adds_to_the_app_store_without_overwriting_existing_profiles() {
     let root = connections::tests::TestDir::new();
     let directory = root.path().join("config");
-    let mut input = connections::tests::draft(root.path(), "work", "dev-a");
+    let mut input = connections::tests::draft(&root.path().join("missing"), "work", "dev-a");
     let parse_registration = |value: &serde_json::Value| {
         let Command::Register(draft) = parse("register", value.to_string().as_bytes()).unwrap() else {
             panic!("등록 명령이 필요합니다");
@@ -82,6 +82,59 @@ fn register_adds_to_the_app_store_without_overwriting_existing_profiles() {
     assert_eq!(saved, [Alias {
         id: "dev-a".into(), display_name: "작업 셸".into(), method: "local".into(), generation: "1".into(),
     }]);
+}
+
+#[test]
+fn register_saves_supported_remote_settings_without_keys_or_host_trust() {
+    use serde_json::json;
+
+    let root = connections::tests::TestDir::new();
+    let missing_key = root.path().join("missing-key");
+    let ssh = connections::tests::ssh_draft(root.path());
+    let mut ssm = ssh.clone();
+    ssm["target"] = json!({
+        "id": "ssm-node", "groupId": "work", "displayName": "개발 노드", "defaultMethod": "ssm",
+        "ssm": {"profile": "missing-profile", "region": "ap-northeast-2", "instanceId": "i-0123456789abcdef0"}
+    });
+    for (index, input) in [
+        json!({"kind": "manualPassword"}),
+        json!({"kind": "keyFile", "privateKeyPath": missing_key}),
+        json!({"kind": "agent", "publicKeyPath": missing_key}),
+    ].into_iter().map(|auth| {
+        let mut input = ssh.clone();
+        input["target"]["ssh"]["auth"] = auth;
+        input
+    }).chain([ssm]).enumerate() {
+        let Command::Register(draft) = parse("register", input.to_string().as_bytes()).unwrap() else {
+            panic!("등록 명령이 필요합니다");
+        };
+        let output = register(&root.path().join(index.to_string()), draft).unwrap();
+        assert_eq!(serde_json::to_value(output).unwrap(), json!({"id": input["target"]["id"], "generation": "1"}));
+    }
+}
+
+#[test]
+fn register_rejects_unsupported_ssh_settings_before_save() {
+    use serde_json::json;
+
+    let root = connections::tests::TestDir::new();
+    for (field, value, error) in [
+        ("transport", json!({"kind": "ssm", "profile": "dev", "region": "ap-northeast-2", "instanceId": "i-0123456789abcdef0"}), Error::SshOverSsmUnavailable),
+        ("auth", json!({"kind": "storedPassword", "itemId": "vault-item"}), Error::StoredSshPasswordUnavailable),
+    ] {
+        let mut input = connections::tests::ssh_draft(root.path());
+        input["target"]["ssh"][field] = value;
+        assert_eq!(parse("register", input.to_string().as_bytes()).err(), Some(error));
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn register_rejects_nonstandard_windows_start_directories() {
+    for path in [r"\\server\share\folder", r"\\?\C:\folder", r"\\.\C:\folder"] {
+        let input = connections::tests::draft(Path::new(path), "work", "dev-a");
+        assert_eq!(parse("register", input.to_string().as_bytes()).err(), Some(Error::UnsupportedWindowsStartDirectory), "{path}");
+    }
 }
 
 #[tokio::test]

@@ -55,6 +55,7 @@ export function Workspace() {
   const [windowError, setWindowError] = useState("");
   const [loadVersion, setLoadVersion] = useState(0);
   const [profileLoad, setProfileLoad] = useState<ProfileLoad>({ kind: "loading" });
+  const [hostRegistration, setHostRegistration] = useState<{ kind: "status" | "alert"; message: string }>();
   const [wizard, setWizard] = useState<WizardRequest>();
   const [treeWidth, setTreeWidth] = useState(280);
   const [aiWidth, setAiWidth] = useState(360);
@@ -79,6 +80,16 @@ export function Workspace() {
   function reloadProfiles() {
     setProfileLoad(({ profiles }) => ({ kind: "loading", profiles }));
     setLoadVersion((version) => version + 1);
+  }
+
+  async function registerSavedSshHost(targetId: string) {
+    setHostRegistration({ kind: "status", message: "SSH 호스트 키 등록 중" });
+    try {
+      await connections.registerSavedSshHost(targetId);
+      setHostRegistration({ kind: "status", message: "SSH 호스트 키 등록 완료" });
+    } catch (error) {
+      setHostRegistration({ kind: "alert", message: `SSH 호스트 키 등록 실패: ${error instanceof Error ? error.message : String(error)}` });
+    }
   }
 
   useEffect(() => {
@@ -231,6 +242,7 @@ export function Workspace() {
         <aside className="workspace-tree" hidden={focused}>
           <button className="connection-add" type="button" aria-label="연결 추가" onClick={openWizard}>+</button>
           <button className="local-file-open" type="button" disabled={filePickerBusy} onClick={() => void openEditor()}>파일 열기</button>
+          {profileLoad.kind === "ready" && <button className="local-file-open" type="button" onClick={reloadProfiles}>새로고침</button>}
           {profileLoad.kind === "loading" && <div className="connection-status" role="status">저장된 연결 불러오는 중</div>}
           {profileLoad.kind === "ready" && profileLoad.profiles?.targets.length === 0 &&
             <div className="connection-status" role="status">저장된 연결 없음</div>}
@@ -238,7 +250,7 @@ export function Workspace() {
             <div role="alert">연결 불러오기 실패: {profileLoad.error}</div>
             <button onClick={reloadProfiles}>다시 불러오기</button>
           </div>}
-          <LocalTree profiles={profileLoad.profiles} onOpen={openTab} />
+          <LocalTree profiles={profileLoad.profiles} onOpen={openTab} onRegisterSshHost={(targetId) => void registerSavedSshHost(targetId)} />
         </aside>
         <div className="workspace-center">
           {tabs.map((tab) => (
@@ -284,6 +296,7 @@ export function Workspace() {
           : current ? `내 PC · 로컬 파일 · ${current.label}` : "연결 없음"}</span>
         {windowError && <span role="alert">{windowError}</span>}
         {fileError && <span role="alert">{fileError}</span>}
+        {hostRegistration && <span role={hostRegistration.kind}>{hostRegistration.message}</span>}
         <span>AI 전용 셸 · 대기</span>
       </footer>
       {wizard && <LocalConnectionWizard {...wizard} groups={profileLoad.profiles?.groups ?? []}
