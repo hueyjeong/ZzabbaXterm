@@ -45,6 +45,7 @@ export function S3StoragePanel({ session, actions, onRelogin, refresh = 0, editE
   const editListener = useRef(onEditFile);
   useLayoutEffect(() => { editListener.current = onEditFile; }, [onEditFile]);
   const { sessionId } = session;
+  const compatible = session.compatible;
   const view = views.get(sessionId) ?? initial;
   const input = view.input ?? session.location ?? { bucket: "", prefix: "", region: session.region };
 
@@ -126,12 +127,12 @@ export function S3StoragePanel({ session, actions, onRelogin, refresh = 0, editE
   const listing = view.listing;
   const location = listing?.kind === "objects" ? listing.location : null;
   const transferring = view.transfer?.state === "selecting" || view.transfer?.state === "running";
-  const expired = view.expired || (view.transfer?.state === "failed" && view.transfer.problem !== "unavailable" && view.transfer.problem.failure.kind === "ssoLoginRequired");
-  const detectedRegion = view.problem && view.problem !== "unavailable" && view.problem.failure.kind === "bucketRegionMismatch" ? view.problem.failure.region : null;
+  const expired = !compatible && (view.expired || (view.transfer?.state === "failed" && view.transfer.problem !== "unavailable" && view.transfer.problem.failure.kind === "ssoLoginRequired"));
+  const detectedRegion = !compatible && view.problem && view.problem !== "unavailable" && view.problem.failure.kind === "bucketRegionMismatch" ? view.problem.failure.region : null;
   const canTransfer = view.confirmed && !view.loading && !transferring && !expired;
   const selectedKey = listing?.kind === "objects" && listing.rows.some(row => row.kind === "object" && row.key === view.selectedKey)
     ? view.selectedKey : null;
-  const canEdit = editEnabled && !!onEditFile && view.confirmed && !view.loading && !expired;
+  const canEdit = !compatible && editEnabled && !!onEditFile && view.confirmed && !view.loading && !expired;
   useLayoutEffect(() => () => { editAttempt.current = null; }, [sessionId, canEdit]);
 
   function approvedRowId(key: string | undefined) {
@@ -167,7 +168,7 @@ export function S3StoragePanel({ session, actions, onRelogin, refresh = 0, editE
       if (editAttempt.current === current) editAttempt.current = null;
     }
   }
-  const historyListing = view.confirmed && !view.loading && !view.problem && !expired && listing?.kind === "objects" ? listing : undefined;
+  const historyListing = !compatible && view.confirmed && !view.loading && !view.problem && !expired && listing?.kind === "objects" ? listing : undefined;
   const historyRequest = useMemo(() => historyListing ? { sessionId, ...historyListing.location } : undefined,
     [historyListing, sessionId]);
 
@@ -236,13 +237,16 @@ export function S3StoragePanel({ session, actions, onRelogin, refresh = 0, editE
     }
   }
 
-  return <section className="s3-storage" aria-label="AWS S3">
+  const title = compatible ? "S3 호환 HTTPS" : "AWS S3";
+  return <section className="s3-storage" aria-label={title}>
     <header className="storage-heading">
-      <h2>AWS S3</h2><span>{session.profile} · {session.region}</span>
+      <h2>{title}</h2><span>{session.profile} · {session.region}{compatible &&
+        ` · ${compatible.serviceId} · ${session.endpoint} · ${compatible.addressing === "path" ? "경로" : "가상 호스트"}`}</span>
     </header>
     <form className="storage-controls" onSubmit={event => { event.preventDefault(); if (input.bucket && input.region && !view.loading && !transferring) open(input); }}>
       {([["버킷", "bucket"], ["접두어", "prefix"], ["리전", "region"]] as const).map(([label, field]) =>
-        <label key={field}>{label}<input value={input[field]} disabled={view.loading || transferring} onChange={event => {
+        <label key={field}>{field === "region" && compatible ? "서명 리전" : label}<input value={input[field]} readOnly={field === "region" && !!compatible} disabled={view.loading || transferring} onChange={event => {
+          if (field === "region" && compatible) return;
           const value = event.target.value;
           editAttempt.current = null;
           update(() => ({ input: { ...input, [field]: value }, confirmed: false }));
@@ -259,7 +263,7 @@ export function S3StoragePanel({ session, actions, onRelogin, refresh = 0, editE
     {view.loading && <p role="status">목록 요청 중</p>}
     {listing?.kind === "buckets" && <ul className="storage-buckets" aria-label="버킷 목록">
       {listing.rows.map(({ name, region }) => <li key={name}>
-        <button type="button" disabled={view.loading || transferring} onClick={() => open({ bucket: name, prefix: "", region })}>{name}</button> <span>{region}</span>
+        <button type="button" disabled={view.loading || transferring} onClick={() => open({ bucket: name, prefix: "", region: compatible ? session.region : region })}>{name}</button> <span>{region}</span>
       </li>)}
     </ul>}
     {listing?.kind === "objects" && <>
