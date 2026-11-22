@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use tauri::{Manager, Webview, WebviewWindow, ipc::{Channel, CommandArg, CommandItem, Invoke, InvokeError}};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
-use super::{Change, Error, Event, Input, ResizeResult, Size, Tab, approved::Draft, lifetime::Lifetime, output::{Mailbox, Output}, presentation::{CHUNK, Image, Surface}};
+use crate::tunnels::ipc::TunnelTabs;
+
+use super::{Change, Error, Event, Input, ResizeResult, Size, Tab, approved::{Draft, route_lost}, lifetime::Lifetime, output::{Mailbox, Output}, presentation::{CHUNK, Image, Surface}};
 
 pub(crate) const COMMANDS: [&str; 5] = ["vnc_create", "vnc_connect", "vnc_input", "vnc_ack", "vnc_close"];
 const CLOSED: &str = "VNC 세션이 닫혔습니다";
@@ -16,7 +18,7 @@ pub(crate) struct Sessions(Mutex<Registry>);
 #[derive(Default)]
 struct Registry {
     document: u64,
-    document_proof: Option<(String, String)>,
+    document_proof: Option<(String, String, u64)>,
     closed: bool,
     tabs: HashMap<String, Slot>,
     approving: Option<Arc<()>>,
@@ -82,8 +84,9 @@ impl Action {
 }
 
 impl Registry {
-    fn document_is(&self, proof: &str) -> bool {
-        !self.closed && self.document_proof.as_ref().is_some_and(|(expected, _)| expected == proof)
+    fn document_for(&self, proof: &str) -> Option<(u64, u64)> {
+        let (expected, _, tunnel_epoch) = self.document_proof.as_ref()?;
+        (!self.closed && expected == proof).then_some((self.document, *tunnel_epoch))
     }
 
     fn slot(&mut self, owner: &Owner, document: u64) -> Result<&mut Slot, &'static str> {
@@ -105,7 +108,7 @@ impl Sessions {
 
     pub(super) fn packet<T>(&self, proof: &str, origin: &str, ticket: &str, deliver: impl FnOnce(bool, Vec<u8>) -> T) -> Option<T> {
         let state = self.0.lock().unwrap();
-        if !state.document_is(proof) || state.document_proof.as_ref()?.1 != origin { return None; }
+        if state.document_for(proof).is_none() || state.document_proof.as_ref()?.1 != origin { return None; }
         let (raw, bytes) = state.tabs.values().filter_map(|slot| slot.current.as_ref())
             .find_map(|active| active.life.live(|| active.mailbox.take(ticket)).flatten())?;
         Some(deliver(raw, bytes))
@@ -130,12 +133,13 @@ pub(crate) fn issue_document(webview: &Webview, url: &tauri::Url) {
     let sessions = webview.state::<Sessions>();
     let mut state = sessions.0.lock().unwrap();
     if state.closed || state.document_proof.is_some() { return; }
+    let tunnel_epoch = webview.state::<TunnelTabs>().epoch();
     let Ok(proof) = opaque_id() else { return; };
     let generation = state.document;
     let origin = if bundled && !cfg!(windows) { "tauri://localhost".to_owned() } else { url.origin().ascii_serialization() };
     let url = serde_json::to_string(url.as_str()).unwrap();
     let script = format!("if (window === top && location.href === {url} && (window.__ZZABBA_VNC_DOCUMENT__?.generation ?? -1) < {generation}) {{ window.__ZZABBA_VNC_DOCUMENT__ = Object.freeze({{ generation: {generation}, proof: '{proof}' }}); }}");
-    if webview.eval(script).is_ok() { state.document_proof = Some((proof, origin)); }
+    if webview.eval(script).is_ok() { state.document_proof = Some((proof, origin, tunnel_epoch)); }
 }
 
 pub(crate) fn dispatch(invoke: Invoke) {
@@ -149,14 +153,14 @@ pub(crate) fn dispatch(invoke: Invoke) {
         return;
     };
     let sessions = caller.state::<Sessions>();
-    let document = {
+    let (document, tunnel_epoch) = {
         let state = sessions.0.lock().unwrap();
         let proof = invoke.message.headers().get("x-zzabba-vnc-document").and_then(|header| header.to_str().ok());
-        if !proof.is_some_and(|proof| state.document_is(proof)) {
+        let Some(epochs) = proof.and_then(|proof| state.document_for(proof)) else {
             invoke.resolver.reject(CLOSED);
             return;
-        }
-        state.document
+        };
+        epochs
     };
     let arg = |key| CommandItem { name: command, key, plugin: None, message: &invoke.message, acl: &invoke.acl };
     macro_rules! read {
@@ -190,7 +194,7 @@ pub(crate) fn dispatch(invoke: Invoke) {
         let result = prepare(&sessions, &owner, document);
         match result {
             Ok(work) => invoke.resolver.respond_async(async move {
-                connect(&window, owner, draft, output, work).await.map_err(InvokeError::from)
+                connect(&window, owner, draft, output, work, tunnel_epoch).await.map_err(InvokeError::from)
             }),
             Err(error) => invoke.resolver.reject(error),
         }
@@ -255,13 +259,14 @@ fn prepare(sessions: &Sessions, owner: &Owner, document: u64) -> Result<Work, &'
     Ok(work)
 }
 
-async fn connect(window: &WebviewWindow, owner: Owner, draft: Draft, notify: Channel<String>, work: Work) -> Result<(), String> {
+async fn connect(window: &WebviewWindow, owner: Owner, draft: Draft, notify: Channel<String>, work: Work,
+                 tunnel_epoch: u64) -> Result<(), String> {
     let Work { gate, generation, life, approval, inputs, mailbox } = work;
     let output = Output { life: life.clone(), mailbox, notify };
     let sessions = window.state::<Sessions>();
     let guard = gate.lock_owned().await;
     let mut tab = Tab::default();
-    let approved = if life.revoked() { Err(CLOSED) } else { draft.approve(window, life.clone()).await };
+    let approved = if life.revoked() { Err(CLOSED.into()) } else { draft.approve(window, life.clone(), tunnel_epoch).await };
     let finish = |failure| {
         let mut state = sessions.0.lock().unwrap();
         if let Ok(slot) = state.slot(&owner, owner.document) {
@@ -270,26 +275,34 @@ async fn connect(window: &WebviewWindow, owner: Owner, draft: Draft, notify: Cha
         failure
     };
     let opened = match approved {
-        Err(error) => Err(error.into()),
-        Ok(approved) => tokio::select! {
-            biased;
-            _ = life.cancelled() => Err(CLOSED.into()),
-            result = approved.open(&mut tab) => result.map_err(|error| message(&error)),
+        Err(error) => Err(error),
+        Ok(mut approved) => {
+            let loss = approved.loss();
+            let result = tokio::select! {
+                biased;
+                _ = life.cancelled() => Err(CLOSED.into()),
+                _ = route_lost(loss.as_ref()) => Err(message(&Error::Disconnected)),
+                result = approved.open(&mut tab) => result.map_err(|error| message(&error)),
+            };
+            result.map(|id| (id, approved.into_lease()))
         },
     };
     {
         let mut state = sessions.0.lock().unwrap();
         if state.approving.as_ref().is_some_and(|current| Arc::ptr_eq(current, &approval)) { state.approving = None; }
     }
-    let id = opened.map_err(finish)?;
+    let (id, lease) = opened.map_err(finish)?;
+    let loss = lease.as_ref().map(|lease| lease.loss());
     let identity = Identity { session_id: id.get().to_string(), generation };
     let started = control(&output, &identity, "started", serde_json::Value::Null, 0);
     let result = tokio::select! {
         biased;
         _ = life.cancelled() => None,
+        _ = route_lost(loss.as_ref()) => Some(Err(Error::Disconnected)),
         result = async { started.await?; drive(&mut tab, id, &identity, &output, inputs).await } => Some(result),
     };
     tab.stop().await;
+    drop(lease);
     if let Some(Err(error)) = result {
         if !life.revoked() {
             output.mailbox.clear();
@@ -407,6 +420,18 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn vnc_proof_binds_the_issued_tunnel_epoch() {
+        let sessions = Sessions::default();
+        sessions.0.lock().unwrap().document_proof = Some(("old".into(), "tauri://localhost".into(), 41));
+        assert_eq!(sessions.0.lock().unwrap().document_for("old"), Some((0, 41)));
+        sessions.retire(false);
+        sessions.0.lock().unwrap().document_proof = Some(("new".into(), "tauri://localhost".into(), 42));
+        let state = sessions.0.lock().unwrap();
+        assert_eq!(state.document_for("old"), None);
+        assert_eq!(state.document_for("new"), Some((1, 42)));
+    }
+
+    #[test]
     fn vnc_replacement_discards_old_document_and_running_input() {
         let sessions = Sessions::default();
         let owner = Owner { tab: "viewer".into(), document: 0 };
@@ -475,7 +500,7 @@ mod tests {
         let owner = Owner { tab: "viewer".into(), document: 0 };
         {
             let mut state = sessions.0.lock().unwrap();
-            state.document_proof = Some(("old".into(), "tauri://localhost".into()));
+            state.document_proof = Some(("old".into(), "tauri://localhost".into(), 0));
             state.tabs.insert(owner.tab.clone(), Slot::default());
         }
         let work = prepare(&sessions, &owner, 0).unwrap();

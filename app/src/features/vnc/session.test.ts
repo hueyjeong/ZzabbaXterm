@@ -137,3 +137,15 @@ it("Canvas에 그린 뒤에만 마지막 화면 조각을 ACK한다", async () =
     vi.unstubAllGlobals();
   }
 });
+
+it("터널 요청은 원격 목적지만 전달하고 실패 후 직접 TLS를 시도하지 않는다", async () => {
+  invoke.mockReset().mockRejectedValue("터널 종료");
+  const owner = { tab: "viewer", document: 1 };
+  const source = { tabHandle: "a".repeat(32), tunnelId: "7", targetId: "server", destination: { host: "::1", port: 5900 } };
+  const failed = vi.fn();
+  connect(owner, { source, password: true }, vi.fn(), vi.fn(), failed);
+  await Promise.resolve();
+  expect(invoke).toHaveBeenCalledTimes(1);
+  expect(invoke).toHaveBeenCalledWith("vnc_connect", { owner, draft: { source, password: true }, output: expect.anything() });
+  expect(failed).toHaveBeenCalledWith("터널 종료");
+});

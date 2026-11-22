@@ -1,8 +1,9 @@
 import { useLayoutEffect, useRef, useState, type FormEvent } from "react";
 import { RemoteDesktopView } from "../remoteDesktop/RemoteDesktopView";
+import type { DesktopTunnelSource } from "../tunnels/tunnelIpc";
 import { closeOwner, connect, createOwner, type Connection, type Owner } from "./session";
 
-export function VncView({ active }: { readonly active: boolean }) {
+export function VncView({ active, source }: { readonly active: boolean; readonly source?: DesktopTunnelSource }) {
   const owner = useRef<Promise<Owner> | null>(null);
   const cancel = useRef<(() => void) | null>(null);
   const busy = useRef(false);
@@ -38,7 +39,10 @@ export function VncView({ active }: { readonly active: boolean }) {
     event.preventDefault();
     if (!active || !event.nativeEvent.isTrusted || busy.current) return;
     const fields = new FormData(event.currentTarget);
-    const draft = { host: String(fields.get("host") ?? "").trim(), port: Number(fields.get("port")), password: fields.get("auth") === "password" };
+    const password = fields.get("auth") === "password";
+    const draft = source ? { source, password } : {
+      host: String(fields.get("host") ?? "").trim(), port: Number(fields.get("port")), password,
+    };
     busy.current = true;
     cancel.current?.();
     setSession(undefined);
@@ -69,13 +73,15 @@ export function VncView({ active }: { readonly active: boolean }) {
 
   return <section className="remote-desktop-view" aria-label="VNC" hidden={!active} inert={!active}>
     <form className="remote-desktop-toolbar" onSubmit={(event) => void open(event)}>
-      <label>호스트 <input name="host" maxLength={253} required autoComplete="off" disabled={connecting} /></label>
-      <label>포트 <input name="port" type="number" min={1} max={65535} defaultValue={5900} required disabled={connecting} /></label>
+      {source ? <span>SSH 터널 · [{source.destination.host}]:{source.destination.port}</span> : <>
+        <label>TLS 호스트 <input name="host" maxLength={253} required autoComplete="off" disabled={connecting} /></label>
+        <label>TLS 포트 <input name="port" type="number" min={1} max={65535} defaultValue={5900} required disabled={connecting} /></label>
+      </>}
       <label>서비스 인증 <select name="auth" defaultValue="password" disabled={connecting}>
         <option value="password">VNC 비밀번호</option>
         <option value="none">없음</option>
       </select></label>
-      <button type="submit" disabled={connecting}>{session ? "다시 연결" : "TLS 연결"}</button>
+      <button type="submit" disabled={connecting}>{source ? "SSH 터널로 연결" : session ? "직접 TLS 다시 연결" : "직접 TLS 연결"}</button>
     </form>
     {connecting && <span role="status">VNC 연결 대기 중</span>}
     {notice && <span role="status">{notice}</span>}

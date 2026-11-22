@@ -1,10 +1,15 @@
+import type { DesktopTunnelSource } from "../tunnels/tunnelIpc";
 import { Channel } from "@tauri-apps/api/core";
 import { documentProof, invokeVnc, readPacket } from "./document";
 import type { RemoteDesktopEvent, RemoteDesktopIdentity, RemoteDesktopSession } from "../remoteDesktop/session";
 import { keysym } from "./keys";
 
 export interface Owner { readonly tab: string; readonly document: number }
-export interface Draft { readonly host: string; readonly port: number; readonly password: boolean }
+export type Draft = Readonly<{ password: boolean } & (
+  | { host: string; port: number; source?: never }
+  | { source: DesktopTunnelSource; host?: never; port?: never }
+)>;
+
 type Frame = Extract<RemoteDesktopEvent, { kind: "full" | "patch" }>;
 const HEADER = 33;
 const CHUNK = 256 * 1024;
