@@ -31,7 +31,7 @@ class Terminal:
             os.setgid(uid)
             os.setuid(uid)
             os.chdir('/tmp')
-            os.execve(argv[0], argv, {'PATH': '/usr/bin:/bin', 'TERM': 'xterm', 'HOME': '/tmp', 'PS1': 'zzabba$ ', 'LANG': 'C.UTF-8'})
+            os.execve(argv[0], argv, {'PATH': '/usr/bin:/bin', 'TERM': 'xterm', 'HOME': '/tmp', 'PS1': 'zzabba$ ', 'LANG': 'C.UTF-8', 'INPUTRC': '/dev/null'})
         self.buffer = b''
         self.transcript = b''
 
@@ -123,7 +123,9 @@ class Control(Terminal):
 def bash(stack, uid=UID):
     term = stack.enter_context(Terminal(['/usr/bin/bash', '--noprofile', '--norc', '-i'], uid))
     term.read(rb'zzabba\$ ')
-    term.send(f'source {HOOK}\n'.encode())
+    term.send(f'set -o emacs; source {HOOK} && bind -X\n'.encode())
+    term.read(rb'\r\n"\\C-xp": "__zzabba_shared_key pair"\r\n')
+    term.read(rb'"\\C-xu": "__zzabba_shared_key claim"\r\n')
     term.read(rb'zzabba\$ ')
     return term
 
