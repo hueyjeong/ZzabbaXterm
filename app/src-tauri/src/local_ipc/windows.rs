@@ -14,7 +14,7 @@ use windows_sys::Win32::{
             GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
         },
         GetTokenInformation, OWNER_SECURITY_INFORMATION, SECURITY_ATTRIBUTES, TOKEN_QUERY,
-        TOKEN_USER, TokenUser,
+        TOKEN_ELEVATION, TOKEN_USER, TokenElevation, TokenUser,
     },
     Storage::FileSystem::{
         CreateFileW, FILE_FLAG_OVERLAPPED, FILE_READ_DATA, FILE_WRITE_DATA, OPEN_EXISTING,
@@ -124,6 +124,30 @@ impl Listener {
         })
     }
 
+    pub(crate) fn current_process_is_elevated() -> io::Result<bool> {
+        let token = current_process_token()?;
+        let mut elevation = TOKEN_ELEVATION::default();
+        let size = std::mem::size_of::<TOKEN_ELEVATION>() as u32;
+        let mut written = 0;
+        // SAFETY: 토큰은 열려 있고 두 출력 버퍼의 크기와 정렬은 API 요구사항을 충족한다.
+        if unsafe {
+            GetTokenInformation(
+                token.as_raw_handle(),
+                TokenElevation,
+                (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+                size,
+                &mut written,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if written != size {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        Ok(elevation.TokenIsElevated != 0)
+    }
+
     pub async fn accept(&mut self) -> io::Result<NamedPipeServer> {
         self.next.connect().await?;
         let next = create(&self.name, &self.descriptor, false)?;
@@ -162,14 +186,18 @@ impl Drop for LocalAllocation {
     }
 }
 
-fn current_user_sid() -> io::Result<String> {
+fn current_process_token() -> io::Result<OwnedHandle> {
     let mut token = null_mut();
     // SAFETY: The process pseudo-handle is valid and the output location is writable.
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: OpenProcessToken returned an owned handle.
-    let token = unsafe { OwnedHandle::from_raw_handle(token) };
+    Ok(unsafe { OwnedHandle::from_raw_handle(token) })
+}
+
+fn current_user_sid() -> io::Result<String> {
+    let token = current_process_token()?;
     let mut size = 0;
     // SAFETY: A zero-sized query supplies only a writable output length.
     unsafe { GetTokenInformation(token.as_raw_handle(), TokenUser, null_mut(), 0, &mut size) };
@@ -222,6 +250,11 @@ fn wide(text: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_token_reports_elevation() {
+        Listener::current_process_is_elevated().unwrap();
+    }
 
     #[tokio::test]
     async fn client_rejects_unexpected_pipe_owner() {

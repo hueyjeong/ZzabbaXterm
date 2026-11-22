@@ -250,6 +250,11 @@ async fn serve_connection(
                     edit::send_edit(stream, edit::Response::InvalidRequest, deadline).await?;
                     return Ok(None);
                 }
+                #[cfg(windows)]
+                if !matches!(Listener::current_process_is_elevated(), Ok(false)) {
+                    edit::send_edit(stream, edit::Response::OpenFailed, deadline).await?;
+                    return Ok(None);
+                }
                 let Ok(permit) = Arc::clone(edits).try_acquire_owned() else {
                     edit::send_edit(stream, edit::Response::OpenFailed, deadline).await?;
                     return Ok(None);
