@@ -239,7 +239,9 @@ describe("중앙 원격 화면", () => {
     Reflect.get(target, impl)._dispatch(state);
   }
 
-  it.each(["rdp", "vnc"] as const)("%s 엔진의 프레임·입력·종료가 탭 수명을 따른다", async (protocol) => {
+  it.each([
+    ["rdp", true], ["rdp", false], ["vnc", true], ["vnc", false],
+  ] as const)("%s 엔진의 프레임·입력·탭 종료가 수명을 따른다 (첫 종료 확인: %s)", async (protocol, confirmed) => {
     const label = `${protocol.toUpperCase()} 3`;
     const identity = { sessionId: "b".repeat(32), generation: 1 };
     const owner = { tab: identity.sessionId, document: 1 };
@@ -255,6 +257,7 @@ describe("중앙 원격 화면", () => {
     const pendingRdp = Promise.withResolvers<void>();
     const invoke = native.invoke.getMockImplementation()!;
     let output: { onmessage(ticket: string): void } | undefined;
+    let closeAttempts = 0;
     native.invoke.mockImplementation((command, args) => {
       if (command === "rdp_prepare") return Promise.resolve(identity);
       if (command === "vnc_create") return Promise.resolve(owner);
@@ -262,7 +265,12 @@ describe("중앙 원격 화면", () => {
         output = args.output;
         return protocol === "rdp" ? pendingRdp.promise : Promise.resolve();
       }
-      if (command === `${protocol}_close`) pendingRdp.resolve();
+      if (command === `${protocol}_close`) {
+        const closed = ++closeAttempts > 1 || confirmed;
+        if (protocol === "vnc") return Promise.resolve(closed);
+        if (!closed) return Promise.reject(new Error("RDP 종료 확인 불가"));
+        pendingRdp.resolve();
+      }
       return invoke(command, args);
     });
     let ticketSequence = 0;
@@ -371,12 +379,26 @@ describe("중앙 원격 화면", () => {
     });
     expect(keyCalls()).toHaveLength(2);
 
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const closeArgs = protocol === "rdp" ? { id: identity } : { owner, generation: null };
+    const closeOptions = { headers: { [`x-zzabba-${protocol}-document`]: proof } };
+    if (!confirmed) await press("로컬 2");
     await press(`${label} 닫기`);
+    expect(connectionCalls(`${protocol}_close`)).toEqual([[`${protocol}_close`, closeArgs, closeOptions]]);
+    if (!confirmed) {
+      expect(find(".workspace-session.workspace-desktop")).toBe(pane);
+      expect(pane.hidden).toBe(false);
+      const tab = button(label)!;
+      expect(tab.getAttribute("aria-pressed")).toBe("true");
+      expect(tab.parentElement?.querySelector('[role="alert"]')?.textContent).toBe("종료 확인 불가");
+      await press(`${label} 종료 다시 확인`);
+      expect(connectionCalls(`${protocol}_close`)).toEqual([
+        [`${protocol}_close`, closeArgs, closeOptions],
+        [`${protocol}_close`, protocol === "rdp" ? closeArgs : { ...closeArgs, retry: true }, closeOptions],
+      ]);
+    }
+    expect(confirm).not.toHaveBeenCalled();
     expect(pane.isConnected).toBe(false);
-    expect(connectionCalls(`${protocol}_close`)).toEqual([[
-      `${protocol}_close`, protocol === "rdp" ? { id: identity } : { owner, generation: null },
-      { headers: { [`x-zzabba-${protocol}-document`]: proof } },
-    ]]);
     expect(document.activeElement).toBe(terminal);
     expect(terminal.closest('[data-pane="left"]')).not.toBeNull();
     expect(find(".splitter-center")).toBe(boundary);
