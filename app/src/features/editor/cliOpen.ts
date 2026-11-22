@@ -59,14 +59,23 @@ export function subscribeLocalCliOpen(
     }
   }
 
+  function receive(requestId: unknown) {
+    if (!signal.aborted && isEditorId(requestId) && !requests.has(requestId)) void claim(requestId);
+  }
+
   const registration = (async () => {
     if (!isTauri() || getCurrentWebview().label !== "main") return;
     return listen<unknown>("editor-local-cli-open", ({ payload }) => {
       if (signal.aborted || typeof payload !== "object" || !payload || Reflect.ownKeys(payload).length !== 1) return;
-      const requestId: unknown = Object.getOwnPropertyDescriptor(payload, "requestId")?.value;
-      if (isEditorId(requestId) && !requests.has(requestId)) void claim(requestId);
+      receive(Object.getOwnPropertyDescriptor(payload, "requestId")?.value);
     }, { target: { kind: "Webview", label: "main" } });
-  })().catch((error: unknown) => {
+  })();
+  void registration.then(async (unlisten) => {
+    if (!unlisten || signal.aborted) return;
+    // 구독이 설치되기 전에 발행된 요청도 같은 경로로 전달한다.
+    const pending = await invoke<unknown>("editor_local_cli_pending");
+    if (Array.isArray(pending)) pending.forEach(receive);
+  }).catch((error: unknown) => {
     if (!signal.aborted) onListenError?.(error);
   });
 

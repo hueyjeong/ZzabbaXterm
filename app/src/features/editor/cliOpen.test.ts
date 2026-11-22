@@ -9,10 +9,12 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 vi.mock("@tauri-apps/api/webview", () => ({ getCurrentWebview: vi.fn() }));
 
 const event = "editor-local-cli-open";
+const pendingCommand = "editor_local_cli_pending";
 const requestId = "1".repeat(32);
 const handle = "2".repeat(32);
 const opened = { status: "opened", handle, name: "한글.txt", text: "본문" };
-const ipc = vi.mocked(invoke);
+const getPending = vi.fn<() => Promise<unknown>>();
+const ipc = vi.fn<(command: string, ...args: unknown[]) => Promise<unknown>>();
 const register = vi.mocked(listen);
 const unlisten = vi.fn();
 let unsubscribe: (() => void) | undefined;
@@ -29,6 +31,9 @@ function deliver(payload: unknown = { requestId }) {
 beforeEach(() => {
   vi.resetAllMocks();
   ipc.mockResolvedValue(undefined);
+  getPending.mockResolvedValue([]);
+  vi.mocked(invoke).mockImplementation((command: string, ...args: unknown[]) =>
+    command === pendingCommand ? getPending() : ipc(command, ...args));
   vi.mocked(isTauri).mockReturnValue(true);
   vi.mocked(getCurrentWebview).mockReturnValue({ label: "main" } as Webview);
   register.mockResolvedValue(unlisten);
@@ -65,6 +70,36 @@ it("현재 메인 웹뷰만 구독하고 실제 부착 응답 전에는 승인�
   ]);
 });
 
+it("구독 이전 요청을 회수하고 이벤트와 겹친 요청은 한 번만 클레임한다", async () => {
+  const overlappingId = "3".repeat(32);
+  const registration = Promise.withResolvers<UnlistenFn>();
+  const snapshot = Promise.withResolvers<unknown>();
+  const firstClaim = Promise.withResolvers<unknown>();
+  register.mockReturnValueOnce(registration.promise);
+  getPending.mockReturnValueOnce(snapshot.promise);
+  ipc.mockReturnValueOnce(firstClaim.promise).mockResolvedValueOnce(opened);
+  const attach = vi.fn<Parameters<typeof subscribeLocalCliOpen>[0]>(async (_file, respond) => {
+    await respond({ attached: true });
+  });
+  subscribe(attach);
+  expect(invoke).not.toHaveBeenCalled();
+
+  registration.resolve(unlisten);
+  await vi.waitFor(() => expect(invoke).toHaveBeenCalledWith(pendingCommand));
+  deliver({ requestId: overlappingId });
+  snapshot.resolve([requestId, overlappingId]);
+  await vi.waitFor(() => expect(attach).toHaveBeenCalledTimes(1));
+  firstClaim.resolve({ ...opened, handle: "4".repeat(32) });
+  await vi.waitFor(() => expect(attach).toHaveBeenCalledTimes(2));
+  deliver();
+
+  expect(ipc.mock.calls.filter(([command]) => command === "editor_local_cli_claim")).toEqual([
+    ["editor_local_cli_claim", { requestId: overlappingId }],
+    ["editor_local_cli_claim", { requestId }],
+  ]);
+  expect(getPending).toHaveBeenCalledTimes(1);
+});
+
 it("동시 요청의 응답은 각각 클레임한 핸들과 연결된다", async () => {
   const otherId = "3".repeat(32);
   const otherHandle = "4".repeat(32);
@@ -94,7 +129,7 @@ it("브라우저와 다른 웹뷰에서는 구독하지 않는다", () => {
   subscribeLocalCliOpen(attach)();
   expect(getCurrentWebview).toHaveBeenCalledTimes(1);
   expect(register).not.toHaveBeenCalled();
-  expect(ipc).not.toHaveBeenCalled();
+  expect(invoke).not.toHaveBeenCalled();
 });
 
 it("정확한 단일 요청 ID 필드만 받는다", () => {
@@ -128,6 +163,7 @@ it("거부된 claim에서 탭을 열거나 다른 IPC를 호출하지 않는다"
   subscribe(attach);
   deliver();
   await rejected.catch(() => {});
+  deliver();
   expect(attach).not.toHaveBeenCalled();
   expect(ipc.mock.calls).toEqual([["editor_local_cli_claim", { requestId }]]);
 });
@@ -162,7 +198,22 @@ it("구독 등록 전 해제하면 늦게 등록된 리스너도 한 번만 해�
   deliver();
   registration.resolve(unlisten);
   await vi.waitFor(() => expect(unlisten).toHaveBeenCalledTimes(1));
+  expect(invoke).not.toHaveBeenCalled();
+});
+
+it("구독이 끝난 뒤 도착한 미처리 ID는 클레임하지 않는다", async () => {
+  const snapshot = Promise.withResolvers<unknown>();
+  getPending.mockReturnValueOnce(snapshot.promise);
+  const attach = vi.fn();
+  const stop = subscribe(attach);
+  await vi.waitFor(() => expect(getPending).toHaveBeenCalledTimes(1));
+  stop();
+  await vi.waitFor(() => expect(unlisten).toHaveBeenCalledTimes(1));
+
+  snapshot.resolve([requestId]);
+  await snapshot.promise;
   expect(ipc).not.toHaveBeenCalled();
+  expect(attach).not.toHaveBeenCalled();
 });
 
 it("해제 뒤 도착한 claim은 탭을 열지 않고 정확한 핸들을 거절한다", async () => {
@@ -209,5 +260,5 @@ it("구독 등록 오류는 활성 구독의 호출자에게 전달한다", asyn
   const received = Promise.withResolvers<unknown>();
   subscribe(vi.fn(), received.resolve);
   await expect(received.promise).resolves.toBe(error);
-  expect(ipc).not.toHaveBeenCalled();
+  expect(invoke).not.toHaveBeenCalled();
 });

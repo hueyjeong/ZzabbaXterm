@@ -23,6 +23,7 @@ pub(crate) fn dispatch(invoke: Invoke) -> Result<(), Invoke> {
     const COMPARE: &str = "editor_local_compare";
     const RELOAD: &str = "editor_local_reload";
     const CLOSE: &str = "editor_local_close";
+    const PENDING: &str = "editor_local_cli_pending";
     const CLAIM: &str = "editor_local_cli_claim";
     const RESPOND: &str = "editor_local_cli_respond";
 
@@ -32,6 +33,7 @@ pub(crate) fn dispatch(invoke: Invoke) -> Result<(), Invoke> {
         COMPARE => COMPARE,
         RELOAD => RELOAD,
         CLOSE => CLOSE,
+        PENDING => PENDING,
         CLAIM => CLAIM,
         RESPOND => RESPOND,
         _ => return Err(invoke),
@@ -42,7 +44,7 @@ pub(crate) fn dispatch(invoke: Invoke) -> Result<(), Invoke> {
         acl,
     } = invoke;
     let webview = message.webview_ref();
-    if matches!(command, CLAIM | RESPOND)
+    if matches!(command, PENDING | CLAIM | RESPOND)
         && (webview.label() != super::cli_open::MAIN || webview.window().label() != super::cli_open::MAIN)
     {
         resolver.reject(EditorError::DocumentClosed);
@@ -57,6 +59,11 @@ pub(crate) fn dispatch(invoke: Invoke) -> Result<(), Invoke> {
             return Ok(());
         }
     };
+
+    if command == PENDING {
+        resolver.respond(editors.pending_offers(webview.label(), document).map_err(InvokeError::from));
+        return Ok(());
+    }
 
     if command == OPEN {
         let InvokeBody::Json(body) = message.payload() else {

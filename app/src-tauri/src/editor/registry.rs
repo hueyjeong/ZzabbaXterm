@@ -171,6 +171,15 @@ impl LocalEditors {
         Ok((id, completed))
     }
 
+    pub(super) fn pending_offers(&self, label: &str, document: Document) -> Result<Vec<String>, EditorError> {
+        let registry = self.0.lock().unwrap();
+        registry.check_document(label, document)?;
+        Ok(registry.offers.iter()
+            .filter(|(_, offer)| offer.document == document && offer.text.is_some() && !offer.pending.is_inactive())
+            .map(|(id, _)| id.clone())
+            .collect())
+    }
+
     pub(super) fn claim(&self, label: &str, document: Document, id: &str) -> Result<Selected, EditorError> {
         let mut registry = self.0.lock().unwrap();
         registry.check_document(label, document)?;

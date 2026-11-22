@@ -132,6 +132,7 @@ beforeEach(async () => {
     if (command.startsWith("storage_")) return runStorage(command, args);
     if (command.startsWith("editor_sftp_")) return runSftp(command, args);
     if (command.startsWith("tunnel_")) return runTunnel(command, args);
+    if (command === "editor_local_cli_pending") return [];
     if (command.startsWith("editor_local_cli_")) return runCliEditor(command, args);
     if (command === "editor_local_open") return openFile();
     if (command === "editor_local_save") return saveFile();

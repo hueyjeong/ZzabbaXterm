@@ -630,9 +630,12 @@ fn cli_wait_belongs_to_the_claimed_tab_in_the_approving_document() {
         (id, response, mounted, opening)
     };
     let (id, mut response, mut mounted, _) = offer();
+    assert_eq!(editors.pending_offers("main", document).unwrap(), [id.clone()]);
     let (other_id, mut other_response, mut other_mounted, _) = offer();
+    assert!(editors.pending_offers("other", other).unwrap().is_empty());
     assert!(matches!(editors.claim("other", other, &id), Err(EditorError::InvalidHandle)));
     let Selected::Opened { handle, text, .. } = editors.claim("main", document, &id).unwrap() else { panic!("CLI 탭 누락"); };
+    assert_eq!(editors.pending_offers("main", document).unwrap(), [other_id.clone()]);
     let Selected::Opened { handle: other_handle, .. } = editors.claim("main", document, &other_id).unwrap() else { panic!("CLI 탭 누락"); };
     assert_eq!(text, "원본");
     assert_ne!(handle, other_handle);
@@ -659,11 +662,14 @@ fn cli_wait_belongs_to_the_claimed_tab_in_the_approving_document() {
     assert_eq!(cancelled_mounted.try_recv(), Err(oneshot::error::TryRecvError::Closed));
 
     let (pending_id, mut pending_response, mut pending_mounted, _) = offer();
+    assert_eq!(editors.pending_offers("main", document).unwrap(), [pending_id.clone()]);
     editors.navigate("main");
+    assert!(matches!(editors.pending_offers("main", document), Err(EditorError::DocumentClosed)));
     assert_eq!(other_response.try_recv(), Err(oneshot::error::TryRecvError::Closed));
     assert_eq!(pending_response.try_recv(), Err(oneshot::error::TryRecvError::Closed));
     assert_eq!(pending_mounted.try_recv(), Err(oneshot::error::TryRecvError::Closed));
     let next = editors.document("main").unwrap();
+    assert!(editors.pending_offers("main", next).unwrap().is_empty());
     assert!(matches!(editors.claim("main", next, &pending_id), Err(EditorError::InvalidHandle)));
     assert!(matches!(editors.close("main", next, &other_handle), Err(EditorError::InvalidHandle)));
 }
