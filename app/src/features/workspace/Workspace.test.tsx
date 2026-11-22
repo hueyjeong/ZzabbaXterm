@@ -61,6 +61,7 @@ let runConnectionCommand: (command: string, args: unknown) => Promise<unknown>;
 let closeTerminal: (id: string) => Promise<unknown>;
 let runDiscovery: (args: unknown) => Promise<unknown>;
 let runStorage: (command: string, args: unknown) => Promise<unknown>;
+let runSftp: (command: string, args: unknown) => Promise<unknown>;
 let openFile: () => Promise<unknown>;
 let saveFile: () => Promise<unknown>;
 
@@ -102,6 +103,7 @@ beforeEach(async () => {
   closeTerminal = async () => null;
   runDiscovery = async () => { throw new Error("예상하지 않은 SSM 검색"); };
   runStorage = async command => { throw new Error(`예상하지 않은 스토리지 명령: ${command}`); };
+  runSftp = async command => { throw new Error(`예상하지 않은 SFTP 명령: ${command}`); };
   openFile = async () => ({ status: "cancelled" });
   saveFile = async () => null;
   native.invoke.mockImplementation(async (command, args) => {
@@ -110,6 +112,7 @@ beforeEach(async () => {
     if (command.startsWith("connection_") || ["verify_ssh_host", "commit_ssh_host", "cancel_ssh_host", "register_saved_ssh_host"].includes(command)) return runConnectionCommand(command, args);
     if (command === "ssm_discovery") return runDiscovery(args);
     if (command.startsWith("storage_")) return runStorage(command, args);
+    if (command.startsWith("editor_sftp_")) return runSftp(command, args);
     if (command === "editor_local_open") return openFile();
     if (command === "editor_local_save") return saveFile();
     if (command === "terminal_start") return starts.get(args.id);
@@ -148,6 +151,14 @@ async function press(name: string) {
   const control = button(name);
   expect(control, name).toBeDefined();
   await act(async () => { control!.click(); });
+}
+
+async function chooseFileConnection(targetId: string) {
+  const select = find<HTMLSelectElement>('select[aria-label="파일 연결"]');
+  await act(async () => {
+    select.value = targetId;
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+  });
 }
 
 async function key(element: HTMLElement, value: string) {
@@ -308,14 +319,13 @@ describe("L02", () => {
       treeSplitter.dispatchEvent(new PointerEvent("pointermove", { pointerId: 1, clientX: 340, bubbles: true }));
       treeSplitter.dispatchEvent(new PointerEvent("lostpointercapture", { pointerId: 1, bubbles: true }));
     });
-    for (const [label, arrow] of [["AI 열 너비", "ArrowLeft"], ["AI 채팅 높이", "ArrowDown"]]) {
-      await key(find(`[role="separator"][aria-label="${label}"]`), arrow);
-    }
-    const values = () => ["트리 너비", "AI 열 너비", "AI 채팅 높이"].map((label) =>
+    await key(find('[role="separator"][aria-label="AI 열 너비"]'), "ArrowLeft");
+    expect(host.querySelector('[role="separator"][aria-label="AI 채팅 높이"]')).toBeNull();
+    const values = () => ["트리 너비", "AI 열 너비"].map((label) =>
       find(`[role="separator"][aria-label="${label}"]`).getAttribute("aria-valuenow"));
-    expect(values()).toEqual(["340", "380", "55"]);
+    expect(values()).toEqual(["340", "380"]);
     await act(async () => { viewportWidth = 660; observeWorkspace(); });
-    expect(values()).toEqual(["211", "211", "55"]);
+    expect(values()).toEqual(["211", "211"]);
     const footer = find("footer");
     await press("집중 보기");
     expect(tree().closest("[hidden]")).not.toBeNull();
@@ -326,9 +336,9 @@ describe("L02", () => {
     expect(panel.closest("[inert][hidden]")).not.toBeNull();
     await press("로컬 2");
     await press("기본 보기");
-    expect(values()).toEqual(["211", "211", "55"]);
+    expect(values()).toEqual(["211", "211"]);
     await act(async () => { viewportWidth = 1200; observeWorkspace(); });
-    expect(values()).toEqual(["340", "380", "55"]);
+    expect(values()).toEqual(["340", "380"]);
     expect(tree().closest("[hidden]")).toBeNull();
     expect(panel.querySelector("textarea")).toBe(input);
     expect(input.value).toBe("echo B_READY");
@@ -337,6 +347,81 @@ describe("L02", () => {
     expect(calls("close")).toHaveLength(0);
     expect(calls("input")).toEqual([{ id: "pty-11", bytes: Array.from(new TextEncoder().encode("echo B_READY")) }]);
     expect(native.invoke).not.toHaveBeenCalledWith("workspace_window", expect.anything());
+  });
+
+  it("연 터미널만 좌우로 표시하고, 사람 포커스와 AI 조회 대상은 따로 유지한다", async () => {
+    const target = { targetId: "local-a", generation: "7" };
+    const invoke = native.invoke.getMockImplementation()!;
+    native.invoke.mockImplementation((command: string, args: unknown) => {
+      if (command === "ai_targets") return Promise.resolve([{ ...target, label: "조회 A" }]);
+      if (command === "ai_select") return Promise.resolve(true);
+      return invoke(command, args);
+    });
+    await press("모델 및 대상 새로고침");
+    const aiTarget = find<HTMLSelectElement>(".a01-proposals select");
+    await act(async () => {
+      aiTarget.selectedIndex = 1;
+      aiTarget.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    const aiValue = aiTarget.value;
+    expect(aiValue).not.toBe("");
+
+    await openSecond();
+    await press("로컬 1");
+    const left = find<HTMLTextAreaElement>('section[aria-label="로컬 1"] textarea');
+    const right = find<HTMLTextAreaElement>('section[aria-label="로컬 2"] textarea');
+    await type(left, "echo ");
+    const choice = find<HTMLSelectElement>(".workspace-center-actions select");
+    expect([...choice.options].map((option) => option.text)).toEqual(["선택", "로컬 2"]);
+    await act(async () => {
+      choice.selectedIndex = 1;
+      choice.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(left.closest('[data-pane="left"]')).not.toBeNull();
+    expect(right.closest('[data-pane="right"]')).not.toBeNull();
+    expect(right.closest("[hidden], [inert]")).toBeNull();
+    expect(document.activeElement).toBe(left);
+    const boundary = find('[role="separator"][aria-label="중앙 터미널 분할"]');
+    expect(boundary.getAttribute("aria-orientation")).toBe("vertical");
+    await act(async () => boundary.focus());
+    await key(boundary, "ArrowRight");
+    expect(boundary.getAttribute("aria-valuenow")).toBe("55");
+    expect(document.activeElement).toBe(boundary);
+    vi.spyOn(boundary.parentElement!, "clientWidth", "get").mockReturnValue(508);
+    vi.spyOn(boundary, "offsetWidth", "get").mockReturnValue(8);
+    boundary.setPointerCapture = vi.fn();
+    await act(async () => {
+      boundary.dispatchEvent(new PointerEvent("pointerdown", { pointerId: 1, clientX: 250, bubbles: true }));
+      boundary.dispatchEvent(new PointerEvent("pointermove", { pointerId: 1, clientX: 300, bubbles: true }));
+      boundary.dispatchEvent(new PointerEvent("lostpointercapture", { pointerId: 1, bubbles: true }));
+    });
+    expect(boundary.getAttribute("aria-valuenow")).toBe("65");
+
+    await act(async () => right.focus());
+    await type(right, "RIGHT");
+    expect(document.activeElement).toBe(right);
+    expect(button("로컬 2")?.getAttribute("aria-pressed")).toBe("true");
+    expect(status()).toContain("pty-11");
+    await press("집중 보기");
+    await press("기본 보기");
+    expect(find(".splitter-center")).toBe(boundary);
+    expect(boundary.getAttribute("aria-valuenow")).toBe("65");
+    await press("로컬 1");
+    expect(document.activeElement).toBe(left);
+    await press("분할 닫기");
+    expect(right.closest("[hidden][inert]")).not.toBeNull();
+    await press("로컬 2");
+    expect(document.activeElement).toBe(right);
+    expect(left.value).toBe("echo ");
+    expect(calls("open")).toHaveLength(2);
+    expect(calls("close")).toEqual([]);
+    expect(calls("input")).toEqual([
+      { id: "pty-10", bytes: Array.from(new TextEncoder().encode("echo ")) },
+      { id: "pty-11", bytes: Array.from(new TextEncoder().encode("RIGHT")) },
+    ]);
+    expect(aiTarget.value).toBe(aiValue);
+    expect(connectionCalls("ai_select")).toEqual([["ai_select", { target }]]);
+    expect(connectionCalls("ai_set_policy")).toEqual([]);
   });
 
   it("숨은 탭의 출력과 종료는 활성 탭의 입력, 포커스, 상태를 바꾸지 않는다", async () => {
@@ -365,7 +450,7 @@ describe("L02", () => {
     await press("로컬 1 닫기");
     expect(status()).toContain("pty-11");
     await press("로컬 2 닫기");
-    expect(status()).toBe("연결 없음AI 전용 셸 · 대기");
+    expect(status()).toBe("연결 없음");
     expect(calls("close")).toEqual([{ id: "pty-11" }]);
   });
 
@@ -727,13 +812,8 @@ describe("C02 SSM 연결", () => {
     });
     runStorage = async () => ({ ok: false, error: { stage: "profile", failure: { kind: "retestRequired" }, bytes: 0 } });
     await restartWorkspace();
-    await press("스토리지 탭 추가");
-    const select = find<HTMLSelectElement>('section[aria-label="AWS S3"] select');
-    await act(async () => {
-      select.value = "legacy";
-      select.dispatchEvent(new Event("change", { bubbles: true }));
-    });
-    await press("스토리지 연결");
+    await press("파일");
+    await chooseFileConnection("legacy");
     expect(find('section[aria-label="AWS S3"] [role="alert"]').textContent).toContain("다시 시험하고 저장");
     await press("연결 재시험");
     expect(find<HTMLInputElement>('dialog input').value).toBe("관리 노드");
@@ -749,19 +829,14 @@ describe("C02 SSM 연결", () => {
     const opening = Promise.withResolvers<unknown>();
     runStorage = async command => command === "storage_open" ? opening.promise : true;
     await restartWorkspace();
-    await press("스토리지 탭 추가");
-    const select = find<HTMLSelectElement>('section[aria-label="AWS S3"] select');
-    await act(async () => {
-      select.value = "saved-ssm";
-      select.dispatchEvent(new Event("change", { bubbles: true }));
-    });
-    await press("스토리지 연결");
+    await press("파일");
+    await chooseFileConnection("saved-ssm");
     const id = storageOpenId();
-    await press("S3 2 닫기");
-    expect(button("S3 2")).toBeUndefined();
+    await press("관리 노드 닫기");
+    expect(host.querySelector(".workspace-storage")).toBeNull();
     expect(connectionCalls("storage_close")).toEqual([["storage_close", { request: { sessionId: id } }]]);
     await act(async () => opening.resolve({ ok: true, value: { sessionId: id, profile: node.profile, region: node.region, endpoint: "https://s3.example.invalid" } }));
-    expect(button("S3 2")).toBeUndefined();
+    expect(host.querySelector(".workspace-storage")).toBeNull();
     expect(connectionCalls("storage_list_objects")).toHaveLength(0);
   });
 
@@ -777,17 +852,12 @@ describe("C02 SSM 연결", () => {
       throw new Error(command);
     };
     await restartWorkspace();
-    await press("스토리지 탭 추가");
-    const select = find<HTMLSelectElement>('section[aria-label="AWS S3"] select');
-    await act(async () => {
-      select.value = "saved-ssm";
-      select.dispatchEvent(new Event("change", { bubbles: true }));
-    });
-    await press("스토리지 연결");
+    await press("파일");
+    await chooseFileConnection("saved-ssm");
     expect(connectionCalls("storage_relogin")).toHaveLength(0);
     await press("SSO 재로그인");
     expect(connectionCalls("storage_relogin")).toEqual([["storage_relogin", { request: { id: storageOpenId() } }]]);
-    expect(select.value).toBe("saved-ssm");
+    expect(find<HTMLSelectElement>('select[aria-label="파일 연결"]').value).toBe("saved-ssm");
     expect(connectionCalls("storage_open")).toHaveLength(1);
     expect(connectionCalls("storage_upload")).toHaveLength(0);
     expect(connectionCalls("storage_download")).toHaveLength(0);
@@ -826,13 +896,8 @@ describe("C02 SSM 연결", () => {
         default: throw new Error(command);
       }
     };
-    await press("스토리지 탭 추가");
-    const select = find<HTMLSelectElement>('section[aria-label="AWS S3"] select');
-    await act(async () => {
-      select.value = "saved-ssm";
-      select.dispatchEvent(new Event("change", { bubbles: true }));
-    });
-    await press("스토리지 연결");
+    await press("파일");
+    await chooseFileConnection("saved-ssm");
     expect(connectionCalls("storage_open")).toEqual([["storage_open", { request: { targetId: "saved-ssm", id: session.sessionId } }]]);
     await changeInput("버킷", "test-bucket");
     await press("버킷 열기");
@@ -843,6 +908,7 @@ describe("C02 SSM 연결", () => {
     const model = editor.getModels().find(item => item.uri.query === "local-fixture")!;
     await act(async () => model.setValue("미저장 편집"));
     expect(button("격리.txt")?.getAttribute("aria-pressed")).toBe("true");
+    await press("AI 채팅");
     await act(async () => picker.resolve({ kind: "approved", approvalId: "approved-id" }));
     expect(connectionCalls("storage_download")).toEqual([["storage_download", {
       request: {
@@ -851,13 +917,15 @@ describe("C02 SSM 연결", () => {
     }]]);
     expect(connectionCalls("storage_close")).toHaveLength(0);
     await press("로컬 1");
-    expect(find('section[aria-label="로컬 1"] textarea')).toBe(document.activeElement);
+    const terminal = find('section[aria-label="로컬 1"] textarea');
+    expect(terminal).toBe(document.activeElement);
     await act(async () => downloaded.resolve({ ok: true, value: { bytes: 7, integrity: "sdkChecksumVerified" } }));
-    await press("S3 2");
+    await press("파일");
     expect(find('section[aria-label="AWS S3"]').textContent).toContain("다운로드 완료: 7 바이트 · SDK 체크섬 검증됨");
-    await press("S3 2 닫기");
+    await press("격리.txt");
+    await press("관리 노드 닫기");
     expect(connectionCalls("storage_close")).toEqual([["storage_close", { request: { sessionId: session.sessionId } }]]);
-    expect(button("S3 2")).toBeUndefined();
+    expect(host.querySelector(".workspace-storage")).toBeNull();
     expect(button("격리.txt")?.getAttribute("aria-pressed")).toBe("true");
     expect(model.getValue()).toBe("미저장 편집");
     expect(connectionCalls("editor_local_close")).toHaveLength(0);
@@ -896,6 +964,10 @@ describe("C02 SSM 연결", () => {
     expect(status()).toContain("연결됨");
     expect(screen.hasAttribute("inert")).toBe(false);
     expect(document.activeElement).toBe(field);
+    await press("파일");
+    expect(find(".workspace-file-status").textContent).toBe("활성 SSH 연결 없음");
+    expect(connectionCalls("editor_sftp_attach")).toHaveLength(0);
+    await act(async () => field.focus());
     await key(field, "a");
     await act(async () => field.dispatchEvent(new Event("paste", { bubbles: true, cancelable: true })));
     expect(calls("input")).toEqual(["keydown", "paste"].map(text => ({ id: sessionId, bytes: [...new TextEncoder().encode(text)] })));
@@ -1168,5 +1240,319 @@ describe("F01 직접 SSH", () => {
     expect(calls("close")).toEqual([{ id: first }, { id: first }]);
     expect(document.querySelector(".workspace-tab [role=alert]")).toBeNull();
     expect(status()).toContain(`SSH · ${second}`);
+  });
+});
+
+describe("현재 SSH 세션의 SFTP", () => {
+  beforeEach(async () => {
+    loadProfiles = async () => ({
+      version: 1,
+      groups: [{ revision: 1, profile: { id: "work", displayName: "작업" } }],
+      targets: [
+        ...["서버 A", "서버 B"].map<SavedConnections["targets"][number]>((displayName, index) => ({
+          revision: 1,
+          profile: {
+            id: `ssh-${index}`, groupId: "work", displayName, defaultMethod: "ssh",
+            ssh: {
+              host: "dev.example.invalid", port: 2222, account: "deploy", hostKeyFingerprint: `SHA256:${"A".repeat(43)}`,
+              transport: { kind: "direct" }, auth: { kind: "manualPassword" },
+            },
+          },
+        })),
+        ...["개발 버킷", "격리 버킷"].map<SavedConnections["targets"][number]>((displayName, index) => ({
+          revision: 1,
+          profile: {
+            id: `s3-${index}`, groupId: "work", displayName, defaultMethod: "s3",
+            s3: { profile: "dev", region: "ap-northeast-2", bucket: `bucket-${index}`, prefix: `saved-${index}/` },
+          },
+        })),
+      ],
+    });
+    await restartWorkspace();
+  });
+
+  async function openTarget(label: string) {
+    const row = [...tree().querySelectorAll<HTMLElement>('[role="treeitem"]:not([aria-expanded])')]
+      .find(item => item.querySelector(":scope > .tree-row > span")?.textContent === label);
+    expect(row, label).toBeDefined();
+    await key(row!, "Enter");
+  }
+
+  async function openSsh(label: string) {
+    await openTarget(label);
+    const started = calls("start");
+    const { id } = started[started.length - 1];
+    return { id, receive: channels.get(id)! };
+  }
+
+  it("채팅과 중앙 탭을 전환해도 SSH별 목록과 초안을 유지하고 종료된 세션만 분리한다", async () => {
+    runSftp = async (command, args) => {
+      const { sessionId } = args as { sessionId: string };
+      if (command === "editor_sftp_attach") return {
+        entries: [{ entryId: "file", name: `${sessionId}.txt`, isDirectory: false }], parentEntryId: null,
+      };
+      if (command === "editor_sftp_detach") return;
+      throw new Error(command);
+    };
+    const draft = find<HTMLTextAreaElement>('textarea[aria-label="메시지 입력"]');
+    await type(draft, "유지할 채팅 초안");
+    expect(connectionCalls("editor_sftp_attach")).toEqual([]);
+    const starting = Promise.withResolvers<void>();
+    starts.set(`pty-${channels.size + 10}`, starting.promise);
+    const first = await openSsh("서버 A");
+    expect(status()).toContain("여는 중");
+    expect(connectionCalls("editor_sftp_attach")).toEqual([]);
+    await act(async () => starting.resolve());
+    expect(connectionCalls("editor_sftp_attach")).toEqual([]);
+    await press("파일");
+    const sftp = find<HTMLButtonElement>('[role="tab"][aria-selected="true"]');
+    expect(sftp.textContent).toBe("파일");
+    expect(document.activeElement).toBe(sftp);
+    expect(find('section[aria-label="서버 A"]').closest("[hidden]")).toBeNull();
+    expect(draft.closest("[hidden][inert]")).not.toBeNull();
+    const firstFile = button(`${first.id}.txt`)!;
+    await press(`${first.id}.txt`);
+    expect(firstFile.getAttribute("aria-pressed")).toBe("true");
+    await press("AI 채팅");
+    expect(firstFile.closest("[hidden][inert]")).not.toBeNull();
+    expect(draft.value).toBe("유지할 채팅 초안");
+    expect(connectionCalls("editor_sftp_detach")).toEqual([]);
+    await press("파일");
+    expect(button(`${first.id}.txt`)).toBe(firstFile);
+    expect(firstFile.getAttribute("aria-pressed")).toBe("true");
+
+    const second = await openSsh("서버 B");
+    expect(firstFile.closest("[hidden][inert]")).not.toBeNull();
+    const secondFile = button(`${second.id}.txt`)!;
+    expect(secondFile.closest("[hidden]")).toBeNull();
+    expect(firstFile.closest("[hidden][inert]")).not.toBeNull();
+    await press("서버 A");
+    expect(button(`${first.id}.txt`)).toBe(firstFile);
+    expect(firstFile.closest("[hidden]")).toBeNull();
+    expect(secondFile.closest("[hidden][inert]")).not.toBeNull();
+    expect(connectionCalls("editor_sftp_attach")).toEqual([
+      ["editor_sftp_attach", { sessionId: first.id }], ["editor_sftp_attach", { sessionId: second.id }],
+    ]);
+
+    await act(async () => second.receive({ kind: "exited", value: 0 }));
+    expect(button(`${second.id}.txt`)).toBeUndefined();
+    expect(firstFile.closest("[hidden]")).toBeNull();
+    expect(connectionCalls("editor_sftp_detach")).toEqual([["editor_sftp_detach", { sessionId: second.id }]]);
+    expect(calls("close").some(args => args.id === second.id)).toBe(false);
+    await press("서버 B");
+    expect(find(".workspace-file-status").textContent).toBe("활성 SSH 연결 없음");
+    expect(find('textarea[aria-label="메시지 입력"]')).toBe(draft);
+    expect(draft.value).toBe("유지할 채팅 초안");
+  });
+
+  it("A에서 S3를 고정하고 B를 따라간 뒤 같은 S3의 경로와 선택으로 돌아온다", async () => {
+    runSftp = async (command, args) => {
+      const { sessionId } = args as { sessionId: string };
+      if (command === "editor_sftp_attach") return {
+        entries: [{ entryId: "dir", name: `폴더 ${sessionId}`, isDirectory: true }], parentEntryId: null,
+      };
+      if (command === "editor_sftp_list") return {
+        entries: [{ entryId: "file", name: `${sessionId}.txt`, isDirectory: false }], parentEntryId: null,
+      };
+      if (command === "editor_sftp_detach") return;
+      throw new Error(command);
+    };
+    let failClose = true;
+    runStorage = async (command, args) => {
+      const { request } = args as { request: { id: string; targetId: string; prefix: string } };
+      if (command === "storage_open") {
+        const index = request.targetId === "s3-0" ? 0 : 1;
+        const location = { bucket: `bucket-${index}`, prefix: `saved-${index}/`, region: "ap-northeast-2" };
+        return { ok: true, value: { sessionId: request.id, profile: "dev", endpoint: "https://s3.example.invalid", region: location.region, location } };
+      }
+      if (command === "storage_list_objects") return {
+        ok: true, value: { rows: [{ kind: "object", key: `${request.prefix}notes.txt`, bytes: 7 }], nextToken: null },
+      };
+      if (command === "storage_count_previous_files") return { ok: true, value: 0 };
+      if (command === "storage_close") {
+        if (failClose) throw new Error("종료 실패");
+        return true;
+      }
+      throw new Error(command);
+    };
+    const second = await openSsh("서버 B");
+    const first = await openSsh("서버 A");
+    const choice = find<HTMLSelectElement>(".workspace-center-actions select");
+    await act(async () => {
+      choice.value = [...choice.options].find(option => option.text === "서버 B")!.value;
+      choice.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    const right = find<HTMLTextAreaElement>('section[aria-label="서버 B"] textarea');
+    const split = find(".splitter-center");
+    const openedTerminals = calls("open").length;
+    const visible = (element: HTMLElement) => element.closest("[hidden], [inert]") === null;
+    await press("파일");
+    await press(`폴더 ${first.id}`);
+    const firstPath = find(".sftp-location span");
+    expect(visible(firstPath)).toBe(true);
+
+    await openTarget("개발 버킷");
+    const pinned = find(".workspace-storage");
+    const object = button("saved-0/notes.txt")!;
+    await press("saved-0/notes.txt");
+    expect(visible(pinned)).toBe(true);
+    expect(visible(firstPath)).toBe(false);
+    expect(button("서버 A")?.getAttribute("aria-pressed")).toBe("true");
+    await act(async () => right.focus());
+    expect(visible(pinned)).toBe(true);
+    expect(status()).toContain(second.id);
+    expect(connectionCalls("editor_sftp_attach")).toEqual([["editor_sftp_attach", { sessionId: first.id }]]);
+    await press("AI 채팅");
+    expect(visible(pinned)).toBe(false);
+    expect(pinned.isConnected).toBe(true);
+    await press("파일");
+    expect(visible(pinned)).toBe(true);
+
+    await chooseFileConnection("");
+    await press(`폴더 ${second.id}`);
+    const secondPath = find('.workspace-sftp:not([hidden]) .sftp-location span');
+    expect(visible(secondPath)).toBe(true);
+    expect(visible(firstPath)).toBe(false);
+    expect(visible(pinned)).toBe(false);
+    await chooseFileConnection("s3-0");
+    await openTarget("개발 버킷");
+    expect(find(".workspace-storage")).toBe(pinned);
+    expect(button("saved-0/notes.txt")).toBe(object);
+    expect(object.getAttribute("aria-pressed")).toBe("true");
+    expect(find(".storage-location").textContent).toContain("saved-0/");
+    expect(visible(firstPath)).toBe(false);
+    expect(visible(secondPath)).toBe(false);
+    expect(connectionCalls("storage_open")).toHaveLength(1);
+    expect(connectionCalls("storage_list_objects")).toHaveLength(1);
+
+    await openTarget("격리 버킷");
+    const other = find(".workspace-storage:not([hidden])");
+    expect(other).not.toBe(pinned);
+    expect(visible(pinned)).toBe(false);
+    expect(connectionCalls("storage_open")).toHaveLength(2);
+    await press("격리 버킷 닫기");
+    expect(find(".workspace-storage:not([hidden])")).toBe(other);
+    expect(find(".workspace-storage [role=alert]").textContent?.trim()).toBe("종료 확인 불가");
+    failClose = false;
+    await press("격리 버킷 종료 다시 확인");
+    const secondOpen = connectionCalls("storage_open")[1]?.[1]?.request as { id: string };
+    const closeRequest = ["storage_close", { request: { sessionId: secondOpen.id } }];
+    expect(connectionCalls("storage_close")).toEqual([closeRequest, closeRequest]);
+    expect(other.isConnected).toBe(false);
+    await chooseFileConnection("s3-0");
+    expect(find(".workspace-storage:not([hidden])")).toBe(pinned);
+    expect(connectionCalls("editor_sftp_attach")).toHaveLength(2);
+    expect(connectionCalls("editor_sftp_detach")).toHaveLength(0);
+    expect(calls("open")).toHaveLength(openedTerminals);
+    expect(find(".splitter-center")).toBe(split);
+    expect(button("서버 B")?.getAttribute("aria-pressed")).toBe("true");
+    await press("개발 버킷 닫기");
+  });
+
+  it("분할된 SSH의 SFTP 분리와 SSH 종료 확인이 실패해도 상대 터미널을 계속 쓴다", async () => {
+    let failDetach = true;
+    runSftp = async (command) => {
+      if (command === "editor_sftp_attach") return { entries: [], parentEntryId: null };
+      if (command === "editor_sftp_detach") {
+        if (failDetach) throw new Error("분리 실패");
+        return;
+      }
+      throw new Error(command);
+    };
+    const openBaseline = calls("open").length;
+    const first = await openSsh("서버 A");
+    const second = await openSsh("서버 B");
+    await press("서버 A");
+    await press("파일");
+    const choice = find<HTMLSelectElement>(".workspace-center-actions select");
+    await act(async () => {
+      choice.value = [...choice.options].find((option) => option.text === "서버 B")!.value;
+      choice.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(connectionCalls("editor_sftp_attach")).toEqual([["editor_sftp_attach", { sessionId: first.id }]]);
+    const closeBaseline = calls("close").length;
+    closeTerminal = async (id) => {
+      if (id === first.id) throw new Error("종료 실패");
+      return null;
+    };
+    await press("서버 A 닫기");
+    expect(button("서버 A 종료 다시 확인")).toBeDefined();
+    expect(calls("close").slice(closeBaseline)).toEqual([{ id: first.id }]);
+    const right = find<HTMLTextAreaElement>('section[aria-label="서버 B"] textarea');
+    await act(async () => right.focus());
+    expect(connectionCalls("editor_sftp_attach")).toEqual([
+      ["editor_sftp_attach", { sessionId: first.id }], ["editor_sftp_attach", { sessionId: second.id }],
+    ]);
+    await type(right, "READY");
+    failDetach = false;
+    closeTerminal = async () => null;
+    await press("서버 A 종료 다시 확인");
+    expect(button("서버 A")).toBeUndefined();
+    expect(host.querySelector(".splitter-center")).toBeNull();
+    expect(find('section[aria-label="서버 B"] textarea')).toBe(right);
+    expect(right.closest("[hidden], [inert]")).toBeNull();
+    expect(status()).toContain(second.id);
+    expect(calls("open").slice(openBaseline)).toHaveLength(2);
+    expect(calls("close").slice(closeBaseline)).toEqual([{ id: first.id }, { id: first.id }]);
+    expect(calls("input")).toEqual([{ id: second.id, bytes: Array.from(new TextEncoder().encode("READY")) }]);
+  });
+
+  it("SFTP 종료 확인 뒤 해당 SSH만 닫고 원격 편집 버퍼와 파일별 닫기 흐름을 유지한다", async () => {
+    const detached = Promise.withResolvers<void>();
+    runSftp = async (command, args) => {
+      switch (command) {
+        case "editor_sftp_attach": {
+          const { sessionId } = args as { sessionId: string };
+          const name = sessionId === ssh.id ? "원격.txt" : "다른 서버.txt";
+          return { entries: [{ entryId: "file", name, isDirectory: false }], parentEntryId: null };
+        }
+        case "editor_sftp_open": return { handle: "remote-file", name: "원격.txt", text: "원본" };
+        case "editor_sftp_save": return { status: "saved" };
+        case "editor_sftp_close": return;
+        case "editor_sftp_detach": return detached.promise;
+        default: throw new Error(command);
+      }
+    };
+    const ssh = await openSsh("서버 A");
+    await press("파일");
+    await key(button("원격.txt")!, "ContextMenu");
+    await press("편집");
+    expect(connectionCalls("editor_sftp_open")).toEqual([["editor_sftp_open", { sessionId: ssh.id, entryId: "file" }]]);
+    expect(status()).toContain("SFTP · 원격.txt");
+    const model = editor.getModels().find(item => item.uri.query === "remote-file")!;
+    await act(async () => model.setValue("원격 저장"));
+    await press("저장");
+    expect(connectionCalls("editor_sftp_save")).toEqual([["editor_sftp_save", { sessionId: ssh.id, handle: "remote-file", text: "원격 저장" }]]);
+    expect(connectionCalls("editor_local_save")).toEqual([]);
+    await act(async () => model.setValue("미저장 편집"));
+    const other = await openSsh("서버 B");
+    const otherFile = button("다른 서버.txt");
+    expect(otherFile).toBeDefined();
+    await press("원격.txt");
+    await press("서버 A 닫기");
+    expect(button("서버 A 닫기")?.disabled).toBe(true);
+    expect(connectionCalls("editor_sftp_detach")).toEqual([["editor_sftp_detach", { sessionId: ssh.id }]]);
+    expect(calls("close").filter(args => args.id === ssh.id || args.id === other.id)).toEqual([]);
+    await act(async () => detached.resolve());
+    expect(button("서버 A")).toBeUndefined();
+    expect(button("서버 B")).toBeDefined();
+    expect(calls("close").filter(args => args.id === ssh.id || args.id === other.id)).toEqual([{ id: ssh.id }]);
+    expect(connectionCalls("editor_sftp_detach")).toHaveLength(1);
+    expect(button("원격.txt")?.getAttribute("aria-pressed")).toBe("true");
+    expect(model.getValue()).toBe("미저장 편집");
+    await press("서버 B");
+    expect(button("다른 서버.txt")).toBe(otherFile);
+    expect(otherFile?.closest("[hidden]")).toBeNull();
+    await press("원격.txt");
+
+    const confirm = vi.spyOn(window, "confirm").mockReturnValueOnce(false).mockReturnValueOnce(true);
+    await press("원격.txt 닫기");
+    expect(button("원격.txt")).toBeDefined();
+    expect(connectionCalls("editor_sftp_close")).toEqual([]);
+    await press("원격.txt 닫기");
+    expect(confirm).toHaveBeenCalledWith("원격.txt: 미저장 편집 내용을 버리고 닫을까요?");
+    expect(connectionCalls("editor_sftp_close")).toEqual([["editor_sftp_close", { sessionId: ssh.id, handle: "remote-file" }]]);
+    expect(connectionCalls("editor_local_close")).toEqual([]);
+    expect(button("원격.txt")).toBeUndefined();
   });
 });
