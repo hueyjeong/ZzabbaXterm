@@ -114,6 +114,8 @@
 .local-tree [role="treeitem"]:focus-visible > .tree-row { outline: 2px solid var(--accent); outline-offset: -2px; }
 
 .connection-add { width: 36px; height: 36px; margin: 4px; }
+.local-file-open { min-height: 36px; padding-inline: 8px; }
+.local-file-open:disabled { opacity: .5; cursor: default; }
 .connection-search { width: calc(100% - 24px); margin: 0 12px; }
 .connection-search, .connection-wizard :is(input, select) {
   box-sizing: border-box; padding: 6px; color: inherit; background: #12171b; border: 1px solid var(--border);
