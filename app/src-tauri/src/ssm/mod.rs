@@ -9,6 +9,7 @@ mod session;
 mod windows_acl;
 
 pub use cli::{CliError, CommandSpec};
+pub(crate) use profile::DirectSsoConfig;
 pub use session::{SessionLookup, StartPermit, StartRequest, VerificationError, VerifiedSession};
 pub use tokio_util::sync::CancellationToken;
 
@@ -44,6 +45,10 @@ impl Scope {
 
     pub fn region(&self) -> &str {
         &self.region
+    }
+
+    pub(crate) fn direct_sso_config(&self) -> Result<DirectSsoConfig, CliError> {
+        Profiles::load()?.take_export_config(self.profile())
     }
 
     fn command(
@@ -119,8 +124,8 @@ impl AwsCli {
         let profiles = Profiles::load()?;
         let config = profiles.export_config(scope.profile())?;
         let home = home::CliHome::new()?;
-        home.import_sso_token(&home::user_home()?, &config.cache_key)?;
-        self.online_nodes_with(scope, &config.ini, Arc::new(home), |spec| async move {
+        home.import_sso_token(&home::user_home()?, config.cache_key())?;
+        self.online_nodes_with(scope, &config.cli_ini(), Arc::new(home), |spec| async move {
             spec.capture(cancel).await
         })
         .await

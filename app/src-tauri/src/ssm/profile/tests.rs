@@ -13,15 +13,15 @@ fn profile_fixture() {
         ["direct team", "default"]
     );
     assert_eq!(
-        profiles.export_config("direct team").unwrap().ini,
+        profiles.export_config("direct team").unwrap().cli_ini(),
         "[default]\nsso_account_id = 123456789012\nsso_role_name = Fixture\nsso_session = corp\n[sso-session \"corp\"]\nsso_region = us-east-1\nsso_start_url = https://example.invalid/start\n"
     );
     assert_eq!(
-        profiles.export_config("direct team").unwrap().cache_key,
+        profiles.export_config("direct team").unwrap().cache_key(),
         "corp"
     );
     assert_eq!(
-        profiles.export_config("default").unwrap().cache_key,
+        profiles.export_config("default").unwrap().cache_key(),
         "https://example.invalid/start"
     );
     for name in [

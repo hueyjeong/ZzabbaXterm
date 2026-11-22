@@ -58,6 +58,7 @@ let loadProfiles: () => Promise<SavedConnections>;
 let runConnectionCommand: (command: string, args: unknown) => Promise<unknown>;
 let closeTerminal: (id: string) => Promise<unknown>;
 let runDiscovery: (args: unknown) => Promise<unknown>;
+let runStorage: (command: string, args: unknown) => Promise<unknown>;
 
 beforeEach(async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
@@ -90,10 +91,12 @@ beforeEach(async () => {
   runConnectionCommand = async (command) => { throw new Error(`예상하지 않은 연결 명령: ${command}`); };
   closeTerminal = async () => null;
   runDiscovery = async () => { throw new Error("예상하지 않은 SSM 검색"); };
+  runStorage = async command => { throw new Error(`예상하지 않은 스토리지 명령: ${command}`); };
   native.invoke.mockImplementation(async (command, args) => {
     if (command === "connections_load") return loadProfiles();
     if (command.startsWith("connection_")) return runConnectionCommand(command, args);
     if (command === "ssm_discovery") return runDiscovery(args);
+    if (command.startsWith("storage_")) return runStorage(command, args);
     if (command === "terminal_start") return starts.get(args.id);
     if (command === "terminal_close") return closeTerminal(args.id);
     if (command !== "terminal_open") return;
@@ -699,6 +702,56 @@ describe("C02 SSM 연결", () => {
     await press("종료 다시 확인");
     expect(connectionCalls("connection_test_cancel")).toEqual(Array(2).fill(["connection_test_cancel", { run }]));
     expect(host.querySelector("dialog")).toBeNull();
+  });
+
+  it("S3 탭은 저장된 SSO 대상만 열고 탭 이동 중 다운로드를 계속한다", async () => {
+    loadProfiles = async () => ({
+      version: 1,
+      groups: [{ revision: 1, profile: { id: "dev", displayName: "개발" } }],
+      targets: [{ revision: 1, profile: { id: "saved-ssm", groupId: "dev", displayName: "관리 노드", defaultMethod: "ssm", ssm: node } }],
+    });
+    await restartWorkspace();
+    const session = { sessionId: "storage-id", profile: node.profile, region: node.region, endpoint: "https://s3.example.invalid" };
+    const key = "실험//한글 +%2F.txt";
+    const picker = Promise.withResolvers<{ kind: "approved"; approvalId: string }>();
+    const downloaded = Promise.withResolvers<unknown>();
+    runStorage = async command => {
+      switch (command) {
+        case "storage_open": return { ok: true, value: session };
+        case "storage_list_objects": return { ok: true, value: { rows: [{ kind: "object", key, bytes: 9 }], nextToken: null } };
+        case "storage_select_local_file": return picker.promise;
+        case "storage_download": return downloaded.promise;
+        case "storage_close": return true;
+        default: throw new Error(command);
+      }
+    };
+    await press("스토리지 탭 추가");
+    const select = find<HTMLSelectElement>('section[aria-label="AWS S3"] select');
+    await act(async () => {
+      select.value = "saved-ssm";
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await press("스토리지 연결");
+    expect(connectionCalls("storage_open")).toEqual([["storage_open", { request: { targetId: "saved-ssm" } }]]);
+    await changeInput("버킷", "test-bucket");
+    await press("버킷 열기");
+    await press(key);
+    await press("다운로드");
+    await press("로컬 1");
+    await act(async () => picker.resolve({ kind: "approved", approvalId: "approved-id" }));
+    expect(connectionCalls("storage_download")).toEqual([["storage_download", {
+      request: {
+        sessionId: session.sessionId, bucket: "test-bucket", key, approvalId: "approved-id",
+      }
+    }]]);
+    expect(connectionCalls("storage_close")).toHaveLength(0);
+    await act(async () => downloaded.resolve({ ok: true, value: { bytes: 7, integrity: "sdkChecksumVerified" } }));
+    await press("S3 2");
+    expect(find('section[aria-label="AWS S3"]').textContent).toContain("다운로드 완료: 7 바이트 · SDK 체크섬 검증됨");
+    await press("S3 2 닫기");
+    expect(connectionCalls("storage_close")).toEqual([["storage_close", { request: { sessionId: session.sessionId } }]]);
+    expect(button("S3 2")).toBeUndefined();
+    expect(status()).toContain("로컬");
   });
 
   it("SSM 탭은 종료 확인 전 남고 같은 앱 세션 ID로만 다시 확인한다", async () => {

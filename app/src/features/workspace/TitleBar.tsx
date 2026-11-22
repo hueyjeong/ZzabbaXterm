@@ -37,7 +37,7 @@ export function TitleBar({ focused, onToggle, onWindowError, children }: {
       <div className="workspace-handle" onMouseDown={moveWindow}>
         {!focused && "ZzabbaXterm"}
       </div>
-      <nav className="workspace-tabs" aria-label="로컬 터미널">{children}</nav>
+      <nav className="workspace-tabs" aria-label="작업 탭">{children}</nav>
       <div className="workspace-drag-gap" onMouseDown={moveWindow} />
       <button className="workspace-mode" aria-label={focused ? "기본 보기" : "집중 보기"}
         onMouseDown={(event) => {

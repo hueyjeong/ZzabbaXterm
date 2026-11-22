@@ -21,14 +21,34 @@ tauri = { version = "2", features = [] }
 portable-pty = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+aws-config = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "sso"] }
+aws-credential-types = "1"
+aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-sso = { version = "1", default-features = false }
+aws-smithy-checksums = "0.65"
+aws-smithy-http-client = { version = "1", features = ["rustls-aws-lc"] }
+aws-smithy-runtime = "1"
+aws-smithy-runtime-api = { version = "1", features = ["client"] }
+aws-smithy-types = "1"
+http = "1"
+percent-encoding = "2"
+rfd = "0.17"
 getrandom = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 sha1 = "0.10"
 shlex = "2"
 tempfile = "3"
-tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt", "sync", "time"] }
 tokio-util = "0.7"
 zeroize = "1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+aws-config = { version = "1", default-features = false, features = ["test-util"] }
+aws-runtime = "1"
+aws-smithy-http-client = { version = "1", features = ["test-util"] }
+aws-types = "1"
+http-body = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

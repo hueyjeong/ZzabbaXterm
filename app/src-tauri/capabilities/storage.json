@@ -1,0 +1,17 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "local-storage",
+  "description": "번들된 기본 WebView의 스토리지 명령",
+  "local": true,
+  "webviews": ["main"],
+  "permissions": [
+    "allow-storage-open",
+    "allow-storage-list-buckets",
+    "allow-storage-list-objects",
+    "allow-storage-select-local-file",
+    "allow-storage-upload",
+    "allow-storage-download",
+    "allow-storage-cancel-approval",
+    "allow-storage-close"
+  ]
+}

@@ -3,6 +3,7 @@ import { createLocalConnectionIpc, type SavedConnections } from "../connections/
 import { LocalConnectionWizard } from "../connections/LocalConnectionWizard";
 import type { ConnectionClose, LocalProfileDraft } from "../connections/profiles";
 import type { SsmTarget } from "../ssm/ssm";
+import { StorageTab } from "../storage/StorageTab";
 import { TerminalView } from "../terminal/TerminalView";
 import type { TerminalStatus } from "../terminal/session";
 import { LocalTree } from "./LocalTree";
@@ -10,10 +11,12 @@ import { Splitter } from "./Splitter";
 import { macTitleBar, TitleBar } from "./TitleBar";
 import "./workspace.css";
 
-type Tab = {
-  id: number; label: string; targetId?: string; ssm?: SsmTarget; status: TerminalStatus; sessionId?: string;
-  closeStatus?: "closing" | "unconfirmed"
+type TerminalTab = {
+  kind: "terminal"; id: number; label: string; targetId?: string; ssm?: SsmTarget;
+  status: TerminalStatus; sessionId?: string; closeStatus?: "closing" | "unconfirmed";
 };
+type StorageWorkspaceTab = { kind: "storage"; id: number; label: string; closeStatus?: "closing" | "unconfirmed" };
+type Tab = TerminalTab | StorageWorkspaceTab;
 type ProfileLoad = { kind: "loading" | "ready"; profiles?: SavedConnections }
   | { kind: "error"; profiles?: SavedConnections; error: string };
 const connections = createLocalConnectionIpc();
@@ -31,13 +34,13 @@ function terminalStatus(status: TerminalStatus) {
 
 export function Workspace() {
   const nextTab = useRef(2);
-  const [tabs, setTabs] = useState<Tab[]>([{ id: 1, label: "로컬 1", status: { kind: "opening" } }]);
+  const [tabs, setTabs] = useState<Tab[]>([{ kind: "terminal", id: 1, label: "로컬 1", status: { kind: "opening" } }]);
   const [active, setActive] = useState(1);
   const [focusTab, setFocusTab] = useState<number | null>(1);
   const liveTabs = useRef(tabs);
   const activeTab = useRef(active);
   const closingTabs = useRef(new Set<number>());
-  const remoteTerminals = useRef(new Map<number, { confirmClose(): Promise<void> }>());
+  const sessionClosers = useRef(new Map<number, { confirmClose(): Promise<void> }>());
   useLayoutEffect(() => { liveTabs.current = tabs; }, [tabs]);
   const [focused, setFocused] = useState(false);
   const [draft, setDraft] = useState("");
@@ -122,8 +125,15 @@ export function Workspace() {
     const id = nextTab.current++;
     setTabs((current) => [...current, {
       id, label: target?.displayName ?? `로컬 ${id}`, targetId: target?.id,
+      kind: "terminal",
       ssm: target?.defaultMethod === "ssm" ? target.ssm : undefined, status: { kind: "opening" },
     }]);
+    selectTab(id);
+  }
+
+  function openStorageTab() {
+    const id = nextTab.current++;
+    setTabs(current => [...current, { kind: "storage", id, label: `S3 ${id}` }]);
     selectTab(id);
   }
 
@@ -136,13 +146,13 @@ export function Workspace() {
   async function closeTab(id: number) {
     const tab = liveTabs.current.find(item => item.id === id);
     if (!tab || closingTabs.current.has(id)) return;
-    if (tab.ssm) {
+    if (tab.kind === "storage" || tab.ssm) {
       closingTabs.current.add(id);
       setTabs(current => current.map(item => item.id === id ? { ...item, closeStatus: "closing" } : item));
       try {
-        const terminal = remoteTerminals.current.get(id);
-        if (!terminal) throw new Error("세션 종료 상태를 확인할 수 없습니다");
-        await terminal.confirmClose();
+        const session = sessionClosers.current.get(id);
+        if (!session) throw new Error("세션 종료 상태를 확인할 수 없습니다");
+        await session.confirmClose();
       } catch {
         setTabs(current => current.map(item => item.id === id ? { ...item, closeStatus: "unconfirmed" } : item));
         return;
@@ -157,9 +167,9 @@ export function Workspace() {
   }
 
   function updateStatus(id: number, status: TerminalStatus, sessionId?: string) {
-    setTabs((current) => current.some((tab) => tab.id === id) ? current.map((tab) => tab.id === id
+    setTabs(current => current.map(tab => tab.id === id && tab.kind === "terminal"
       ? { ...tab, status, sessionId: sessionId ?? tab.sessionId }
-      : tab) : current);
+      : tab));
   }
 
   const current = tabs.find((tab) => tab.id === active);
@@ -179,6 +189,7 @@ export function Workspace() {
             </span>}
           </div>
         ))}
+        <button type="button" className="storage-add" onClick={openStorageTab}>스토리지 탭 추가</button>
       </TitleBar>
       <div className="workspace-body" ref={body}>
         <aside className="workspace-tree" hidden={focused}>
@@ -193,16 +204,19 @@ export function Workspace() {
           <LocalTree profiles={profileLoad.profiles} onOpen={openTab} />
         </aside>
         <div className="workspace-center">
-          {tabs.map(({ id, label, targetId, ssm, closeStatus }) => (
-            <div className="workspace-session" key={id} hidden={id !== active} inert={id !== active}>
-              <TerminalView active={id === active} focusRequested={id === focusTab} label={label} targetId={targetId}
-                remote={!!ssm} closing={!!closeStatus} closeRef={ssm ? (handle) => {
-                  if (handle) remoteTerminals.current.set(id, handle);
-                  else remoteTerminals.current.delete(id);
-                } : undefined}
-                onStatus={(status, sessionId) => updateStatus(id, status, sessionId)} />
-            </div>
-          ))}
+          {tabs.map(tab => {
+            const { id, label, closeStatus } = tab;
+            const bindClose = (handle: { confirmClose(): Promise<void> } | null) => {
+              if (handle) sessionClosers.current.set(id, handle);
+              else sessionClosers.current.delete(id);
+            };
+            return <div className="workspace-session" key={id} hidden={id !== active} inert={id !== active || (tab.kind === "storage" && !!closeStatus)}>
+              {tab.kind === "storage" ? <StorageTab profiles={profileLoad.profiles} closing={!!closeStatus} closeRef={bindClose} /> :
+                <TerminalView active={id === active} focusRequested={id === focusTab} label={label} targetId={tab.targetId}
+                  remote={!!tab.ssm} closing={!!closeStatus} closeRef={tab.ssm ? bindClose : undefined}
+                  onStatus={(status, sessionId) => updateStatus(id, status, sessionId)} />}
+            </div>;
+          })}
         </div>
         <aside className="workspace-ai" hidden={focused} aria-label="AI">
           <section className="workspace-chat">
@@ -222,7 +236,7 @@ export function Workspace() {
         </>}
       </div>
       <footer className="workspace-status">
-        <span role="status">{current ? [current.targetId ? current.label : "내 PC", current.ssm ?
+        <span role="status">{current?.kind === "storage" ? `${current.label} · 스토리지` : current ? [current.targetId ? current.label : "내 PC", current.ssm ?
           `SSM · ${current.ssm.profile} / ${current.ssm.region} / ${current.ssm.instanceId}` : "로컬", current.sessionId,
         !current.closeStatus && terminalStatus(current.status)].filter(Boolean).join(" · ") : "연결 없음"}</span>
         {windowError && <span role="alert">{windowError}</span>}

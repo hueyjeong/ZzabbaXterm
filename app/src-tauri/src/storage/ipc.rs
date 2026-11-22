@@ -1,0 +1,871 @@
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
+
+use serde::{Deserialize, Serialize};
+use tauri::{
+    Manager,
+    ipc::{CommandArg, CommandItem, Invoke},
+};
+use tokio::sync::watch;
+use uuid::Uuid;
+
+use crate::{
+    connections::{profile::MethodRef, with_saved_method},
+    ssm::{CliError, Scope},
+};
+
+use super::{
+    AwsS3, Downloaded, Error, Failure, ObjectRow, Page, Stage, VerifiedSsoSelection, check_bucket,
+};
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct Document {
+    owner: String,
+    generation: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Session {
+    session_id: String,
+    profile: String,
+    region: String,
+    endpoint: String,
+}
+
+struct Tab {
+    document: Document,
+    client: Arc<AwsS3>,
+    closed: Arc<watch::Sender<bool>>,
+    selection: Option<Selection>,
+}
+
+struct Selection {
+    id: String,
+    target: Target,
+    direction: Direction,
+    path: Option<PathBuf>,
+}
+
+#[derive(Default)]
+struct Registry {
+    documents: HashMap<String, u64>,
+    tabs: HashMap<String, Tab>,
+    shutdown: bool,
+}
+
+impl Registry {
+    fn active(&self, document: &Document) -> bool {
+        !self.shutdown
+            && self.documents.get(&document.owner).copied().unwrap_or(0) == document.generation
+    }
+
+    fn tab(&mut self, document: &Document, id: &str) -> Option<&mut Tab> {
+        self.active(document).then_some(())?;
+        self.tabs
+            .get_mut(id)
+            .filter(|tab| tab.document == *document)
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct StorageIpc(Mutex<Registry>);
+
+impl StorageIpc {
+    pub(crate) fn document(&self, owner: &str) -> Document {
+        let registry = self.0.lock().unwrap();
+        Document {
+            owner: owner.into(),
+            generation: registry.documents.get(owner).copied().unwrap_or(0),
+        }
+    }
+
+    async fn open(
+        &self,
+        document: Document,
+        request: OpenRequest,
+        directory: PathBuf,
+    ) -> Result<Session, Error> {
+        if !self.0.lock().unwrap().active(&document) {
+            return Err(unavailable(Stage::Profile));
+        }
+        let selection = tauri::async_runtime::spawn_blocking(move || {
+            verified_selection(&directory, &request.target_id)
+        })
+        .await
+        .map_err(|_| unavailable(Stage::Profile))??;
+        let VerifiedSsoSelection { profile, region, config } = selection;
+        let client = AwsS3::for_sso_profile(&region, config);
+        self.insert(document, profile, region, client)
+            .ok_or_else(|| unavailable(Stage::Profile))
+    }
+
+    fn insert(
+        &self,
+        document: Document,
+        profile: String,
+        region: String,
+        client: AwsS3,
+    ) -> Option<Session> {
+        let mut registry = self.0.lock().unwrap();
+        if !registry.active(&document) {
+            return None;
+        }
+        let session_id = Uuid::new_v4().to_string();
+        let endpoint = client.endpoint().into();
+        registry.tabs.insert(
+            session_id.clone(),
+            Tab {
+                document,
+                client: Arc::new(client),
+                closed: Arc::new(watch::Sender::new(false)),
+                selection: None,
+            },
+        );
+        Some(Session {
+            session_id,
+            profile,
+            region,
+            endpoint,
+        })
+    }
+
+    fn close(&self, document: &Document, session_id: &str) -> bool {
+        let mut registry = self.0.lock().unwrap();
+        let Some(tab) = registry.tab(document, session_id) else {
+            return false;
+        };
+        tab.closed.send_replace(true);
+        registry.tabs.remove(session_id);
+        true
+    }
+
+    pub(crate) fn navigate(&self, owner: &str) {
+        let mut registry = self.0.lock().unwrap();
+        *registry.documents.entry(owner.into()).or_default() += 1;
+        registry.tabs.retain(|_, tab| {
+            if tab.document.owner != owner {
+                return true;
+            }
+            tab.closed.send_replace(true);
+            false
+        });
+    }
+
+    pub(crate) fn shutdown(&self) {
+        let mut registry = self.0.lock().unwrap();
+        registry.shutdown = true;
+        for (_, tab) in registry.tabs.drain() {
+            tab.closed.send_replace(true);
+        }
+    }
+
+    fn begin_selection(
+        &self,
+        document: &Document,
+        target: Target,
+        direction: Direction,
+    ) -> Option<String> {
+        if target.key.is_empty()
+            || target.key.len() > 1024
+            || check_bucket(&target.bucket, Stage::ListObjects).is_err()
+        {
+            return None;
+        }
+        let mut registry = self.0.lock().unwrap();
+        let tab = registry.tab(document, &target.session_id)?;
+        if tab.selection.is_some() {
+            return None;
+        }
+        let id = Uuid::new_v4().to_string();
+        tab.selection = Some(Selection {
+            id: id.clone(),
+            target,
+            direction,
+            path: None,
+        });
+        Some(id)
+    }
+
+    fn finish_selection(
+        &self,
+        document: &Document,
+        session_id: &str,
+        id: String,
+        selected: Option<PathBuf>,
+    ) -> LocalFileApproval {
+        let mut registry = self.0.lock().unwrap();
+        let Some(tab) = registry.tab(document, session_id) else {
+            return LocalFileApproval::Denied;
+        };
+        let Some(selection) = tab
+            .selection
+            .as_mut()
+            .filter(|selection| selection.id == id)
+        else {
+            return LocalFileApproval::Denied;
+        };
+        match selected {
+            Some(path) if path.is_absolute() => {
+                selection.path = Some(path);
+                LocalFileApproval::Approved { approval_id: id }
+            }
+            Some(_) => {
+                tab.selection = None;
+                LocalFileApproval::Denied
+            }
+            None => {
+                tab.selection = None;
+                LocalFileApproval::Cancelled
+            }
+        }
+    }
+
+    fn cancel_approval(&self, document: &Document, request: &ApprovalId) -> bool {
+        let mut registry = self.0.lock().unwrap();
+        let Some(tab) = registry.tab(document, &request.session_id) else {
+            return false;
+        };
+        if !tab.selection.as_ref().is_some_and(|selection| {
+            selection.id == request.approval_id && selection.path.is_some()
+        }) {
+            return false;
+        }
+        tab.selection = None;
+        true
+    }
+
+    fn consume(
+        &self,
+        document: &Document,
+        request: ApprovedTransfer,
+        direction: Direction,
+    ) -> Option<Transfer> {
+        let mut registry = self.0.lock().unwrap();
+        let tab = registry.tab(document, &request.target.session_id)?;
+        let selection = tab.selection.as_ref()?;
+        if selection.id != request.approval_id
+            || selection.direction != direction
+            || selection.target != request.target
+            || selection.path.is_none()
+        {
+            return None;
+        }
+        let selection = tab.selection.take()?;
+        Some(Transfer {
+            client: tab.client.clone(),
+            closed: tab.closed.clone(),
+            target: selection.target,
+            path: selection.path?,
+        })
+    }
+
+    async fn list_buckets(
+        &self,
+        document: &Document,
+        request: BucketPageRequest,
+    ) -> Result<Page<String>, Error> {
+        let (client, closed) = self.client(document, &request.session_id, Stage::ListBuckets)?;
+        until_closed(
+            &closed,
+            Stage::ListBuckets,
+            client.list_buckets(request.token.as_deref()),
+        )
+        .await
+    }
+
+    async fn list_objects(
+        &self,
+        document: &Document,
+        request: ObjectPageRequest,
+    ) -> Result<Page<ObjectRow>, Error> {
+        let (client, closed) = self.client(document, &request.session_id, Stage::ListObjects)?;
+        until_closed(
+            &closed,
+            Stage::ListObjects,
+            client.list_objects(&request.bucket, &request.prefix, request.token.as_deref()),
+        )
+        .await
+    }
+
+    fn client(
+        &self,
+        document: &Document,
+        session_id: &str,
+        stage: Stage,
+    ) -> Result<(Arc<AwsS3>, watch::Receiver<bool>), Error> {
+        let mut registry = self.0.lock().unwrap();
+        let tab = registry
+            .tab(document, session_id)
+            .ok_or_else(|| unavailable(stage))?;
+        Ok((tab.client.clone(), tab.closed.subscribe()))
+    }
+
+    async fn upload(&self, document: &Document, request: ApprovedTransfer) -> Result<u64, Error> {
+        let transfer = self
+            .consume(document, request, Direction::Upload)
+            .ok_or_else(|| unavailable(Stage::UploadSource))?;
+        until_closed(
+            &transfer.closed.subscribe(),
+            Stage::PutObject,
+            transfer.client.upload(
+                &transfer.target.bucket,
+                &transfer.target.key,
+                &transfer.path,
+            ),
+        )
+        .await
+    }
+
+    async fn download(
+        &self,
+        document: &Document,
+        request: ApprovedTransfer,
+    ) -> Result<Downloaded, Error> {
+        let transfer = self
+            .consume(document, request, Direction::Download)
+            .ok_or_else(|| unavailable(Stage::GetObject))?;
+        transfer
+            .client
+            .download(
+                &transfer.target.bucket,
+                &transfer.target.key,
+                &transfer.path,
+                &transfer.closed,
+            )
+            .await
+    }
+}
+
+struct Transfer {
+    client: Arc<AwsS3>,
+    closed: Arc<watch::Sender<bool>>,
+    target: Target,
+    path: PathBuf,
+}
+
+async fn until_closed<T>(
+    closed: &watch::Receiver<bool>,
+    stage: Stage,
+    operation: impl Future<Output = Result<T, Error>>,
+) -> Result<T, Error> {
+    let mut closed = closed.clone();
+    tokio::select! {
+        biased;
+        _ = closed.wait_for(|closed| *closed) => Err(unavailable(stage)),
+        result = operation => result,
+    }
+}
+
+fn unavailable(stage: Stage) -> Error {
+    Error::at(stage, Failure::Request)
+}
+
+fn verified_selection(directory: &std::path::Path, target_id: &str) -> Result<VerifiedSsoSelection, Error> {
+    let scope = with_saved_method(directory, target_id, |method| match method {
+        MethodRef::Ssm { profile, region, .. } => Ok(Scope::new(profile.to_owned(), region.to_owned())),
+        MethodRef::Local { .. } => Err("SSO 연결이 아닙니다".into()),
+    })
+    .map_err(|_| Error::at(Stage::Profile, Failure::InvalidSsoProfile))?
+    .map_err(|error| Error::at(Stage::Profile, match error {
+        CliError::InvalidRegion => Failure::InvalidRegion,
+        _ => Failure::InvalidSsoProfile,
+    }))?;
+    let config = scope.direct_sso_config()
+        .map_err(|_| Error::at(Stage::Profile, Failure::InvalidSsoProfile))?;
+    Ok(VerifiedSsoSelection {
+        profile: scope.profile().to_owned(),
+        region: scope.region().to_owned(),
+        config,
+    })
+}
+
+#[derive(Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct Target {
+    session_id: String,
+    bucket: String,
+    key: String,
+}
+
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum Direction {
+    Upload,
+    Download,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FileSelection {
+    #[serde(flatten)]
+    target: Target,
+    direction: Direction,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApprovedTransfer {
+    #[serde(flatten)]
+    target: Target,
+    approval_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ApprovalId {
+    session_id: String,
+    approval_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OpenRequest {
+    target_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TabId {
+    session_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BucketPageRequest {
+    session_id: String,
+    token: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ObjectPageRequest {
+    session_id: String,
+    token: Option<String>,
+    bucket: String,
+    prefix: String,
+}
+
+#[derive(Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+enum LocalFileApproval {
+    Approved { approval_id: String },
+    Cancelled,
+    Denied,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum S3Result<T> {
+    Success { ok: bool, value: T },
+    Failure { ok: bool, error: Error },
+}
+
+impl<T> From<Result<T, Error>> for S3Result<T> {
+    fn from(result: Result<T, Error>) -> Self {
+        match result {
+            Ok(value) => Self::Success { ok: true, value },
+            Err(error) => Self::Failure { ok: false, error },
+        }
+    }
+}
+
+async fn select_file(
+    webview: tauri::Webview,
+    document: &Document,
+    request: FileSelection,
+) -> LocalFileApproval {
+    let state = webview.state::<StorageIpc>();
+    let FileSelection { target, direction } = request;
+    let session_id = target.session_id.clone();
+    let action = match direction {
+        Direction::Upload => "업로드",
+        Direction::Download => "다운로드",
+    };
+    let title = format!("S3 {action} · {} / {:?}", target.bucket, target.key);
+    let Some(id) = state.begin_selection(document, target, direction) else {
+        return LocalFileApproval::Denied;
+    };
+    let dialog = rfd::AsyncFileDialog::new()
+        .set_parent(&webview.window())
+        .set_title(title);
+    let selected = match direction {
+        Direction::Upload => dialog.pick_file().await,
+        Direction::Download => dialog.save_file().await,
+    };
+    state.finish_selection(
+        document,
+        &session_id,
+        id,
+        selected.map(|file| file.path().to_owned()),
+    )
+}
+
+pub(crate) fn dispatch(invoke: Invoke) -> bool {
+    let Invoke {
+        message,
+        resolver,
+        acl,
+    } = invoke;
+    let name = message.command();
+    let webview = message.webview_ref().clone();
+    if acl.is_none() || webview.label() != "main" || webview.window_ref().label() != "main" {
+        return false;
+    }
+    // 비동기 처리를 예약하기 전에 실제 IPC 발신자의 문서 세대를 읽는다.
+    let document = webview.state::<StorageIpc>().document(webview.label());
+    macro_rules! handle {
+        ($command:literal, $request:ty, $run:expr) => {{
+            let item = CommandItem {
+                name: $command,
+                key: "request",
+                plugin: None,
+                message: &message,
+                acl: &acl,
+            };
+            let request = match <$request>::from_command(item) {
+                Ok(request) => request,
+                Err(error) => {
+                    resolver.invoke_error(error);
+                    return true;
+                }
+            };
+            resolver.respond_async($run(webview, document, request));
+        }};
+    }
+    match name {
+        "storage_open" => handle!(
+            "storage_open",
+            OpenRequest,
+            async |webview: tauri::Webview, document, request| {
+                let result = match webview.path().app_config_dir() {
+                    Ok(directory) => webview.state::<StorageIpc>().open(document, request, directory).await,
+                    Err(_) => Err(unavailable(Stage::Profile)),
+                };
+                Ok(S3Result::from(result))
+            }
+        ),
+        "storage_list_buckets" => handle!(
+            "storage_list_buckets",
+            BucketPageRequest,
+            async |webview: tauri::Webview, document, request| {
+                Ok(S3Result::from(
+                    webview
+                        .state::<StorageIpc>()
+                        .list_buckets(&document, request)
+                        .await,
+                ))
+            }
+        ),
+        "storage_list_objects" => handle!(
+            "storage_list_objects",
+            ObjectPageRequest,
+            async |webview: tauri::Webview, document, request| {
+                Ok(S3Result::from(
+                    webview
+                        .state::<StorageIpc>()
+                        .list_objects(&document, request)
+                        .await,
+                ))
+            }
+        ),
+        "storage_select_local_file" => handle!(
+            "storage_select_local_file",
+            FileSelection,
+            async |webview, document, request| {
+                Ok(select_file(webview, &document, request).await)
+            }
+        ),
+        "storage_upload" => handle!(
+            "storage_upload",
+            ApprovedTransfer,
+            async |webview: tauri::Webview, document, request| {
+                Ok(S3Result::from(
+                    webview
+                        .state::<StorageIpc>()
+                        .upload(&document, request)
+                        .await,
+                ))
+            }
+        ),
+        "storage_download" => handle!(
+            "storage_download",
+            ApprovedTransfer,
+            async |webview: tauri::Webview, document, request| {
+                Ok(S3Result::from(
+                    webview
+                        .state::<StorageIpc>()
+                        .download(&document, request)
+                        .await,
+                ))
+            }
+        ),
+        "storage_close" => handle!(
+            "storage_close",
+            TabId,
+            async |webview: tauri::Webview, document, request: TabId| {
+                Ok(webview
+                    .state::<StorageIpc>()
+                    .close(&document, &request.session_id))
+            }
+        ),
+        "storage_cancel_approval" => handle!(
+            "storage_cancel_approval",
+            ApprovalId,
+            async |webview: tauri::Webview, document, request: ApprovalId| {
+                Ok(webview
+                    .state::<StorageIpc>()
+                    .cancel_approval(&document, &request))
+            }
+        ),
+        _ => return false,
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        super::tests::{client, replay, response},
+        *,
+    };
+    use aws_sdk_s3::primitives::SdkBody;
+
+    const KEY: &str = "실험//../한글 +%2F.txt";
+
+    fn target(session: &Session) -> Target {
+        Target {
+            session_id: session.session_id.clone(),
+            bucket: "selected-bucket".into(),
+            key: KEY.into(),
+        }
+    }
+
+    #[test]
+    fn storage_open_uses_only_current_saved_direct_sso() {
+        const CHILD: &str = "ZZABBA_S01_OPEN_FIXTURE";
+        let Some(root) = std::env::var_os(CHILD).map(PathBuf::from) else {
+            let root = tempfile::tempdir().unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "storage::ipc::tests::storage_open_uses_only_current_saved_direct_sso"])
+                .env(CHILD, root.path())
+                .env("AWS_CONFIG_FILE", root.path().join("config"))
+                .env("AWS_SHARED_CREDENTIALS_FILE", root.path().join("credentials"))
+                .output().unwrap();
+            assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stdout));
+            assert!(String::from_utf8_lossy(&result.stdout).contains("1 passed"));
+            return;
+        };
+        use serde_json::json;
+        let directory = root.join("app");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("connections.json"), serde_json::to_vec(&json!({
+            "version": 1,
+            "groups": [{"revision": 1, "profile": {"id": "team", "displayName": "Team"}}],
+            "targets": [{"revision": 1, "profile": {
+                "id": "saved-sso", "groupId": "team", "displayName": "SSO", "defaultMethod": "ssm",
+                "ssm": {"profile": "chosen team", "region": "eu-west-1", "instanceId": "i-01234567"}
+            }}]
+        })).unwrap()).unwrap();
+        std::fs::write(root.join("config"), concat!(
+            "[profile \"chosen team\"]\nsso_session = fixture\nsso_account_id = 123456789012\nsso_role_name = ReadOnly\n",
+            "[sso-session fixture]\nsso_region = us-east-1\nsso_start_url = https://fixture.invalid/start\n",
+        )).unwrap();
+
+        tauri::async_runtime::block_on(async {
+            let state = StorageIpc::default();
+            let document = state.document("main");
+            let request = |id: &str| OpenRequest { target_id: id.to_owned() };
+            let session = state.open(document.clone(), request("saved-sso"), directory.clone()).await.unwrap();
+            assert!(Uuid::parse_str(&session.session_id).is_ok());
+            assert_eq!(serde_json::to_value(&session).unwrap(), json!({
+                "sessionId": session.session_id, "profile": "chosen team", "region": "eu-west-1",
+                "endpoint": "https://s3.eu-west-1.amazonaws.com"
+            }));
+            let missing = state.open(document.clone(), request("chosen team"), directory.clone()).await.err().unwrap();
+            assert_eq!(missing.failure, Failure::InvalidSsoProfile);
+
+            std::fs::write(root.join("credentials"), "[chosen team]\naws_access_key_id=fixture\n").unwrap();
+            let changed = state.open(document.clone(), request("saved-sso"), directory.clone()).await.err().unwrap();
+            assert_eq!(changed.failure, Failure::InvalidSsoProfile);
+            state.navigate("main");
+            assert!(!state.close(&state.document("main"), &session.session_id));
+            assert!(state.open(document, request("saved-sso"), directory).await.is_err());
+        });
+    }
+
+    #[tokio::test]
+    async fn 다른_탭과_문서의_전송_및_실패한_전송의_재사용을_거부한다() {
+        let reply = replay([
+            response(500, "<Error><Code>InternalError</Code></Error>"),
+            response(200, SdkBody::empty()),
+        ]);
+        let state = StorageIpc::default();
+        let doc = state.document("main");
+        let first = state
+            .insert(
+                doc.clone(),
+                "first".into(),
+                "eu-west-1".into(),
+                client(&reply),
+            )
+            .unwrap();
+        let second = state
+            .insert(
+                doc.clone(),
+                "second".into(),
+                "eu-west-1".into(),
+                client(&reply),
+            )
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("그대로.txt");
+        std::fs::write(&file, b"payload").unwrap();
+        let id = state
+            .begin_selection(&doc, target(&first), Direction::Upload)
+            .unwrap();
+        assert!(matches!(
+            state.finish_selection(&doc, &first.session_id, id.clone(), Some(file.clone())),
+            LocalFileApproval::Approved { .. }
+        ));
+        let request = |target| ApprovedTransfer {
+            target,
+            approval_id: id.clone(),
+        };
+        assert!(
+            state
+                .upload(&state.document("other"), request(target(&first)))
+                .await
+                .is_err()
+        );
+        assert!(state.upload(&doc, request(target(&second))).await.is_err());
+        for changed in [
+            Target {
+                bucket: "other-bucket".into(),
+                ..target(&first)
+            },
+            Target {
+                key: KEY.replace("//", "/"),
+                ..target(&first)
+            },
+        ] {
+            assert!(state.upload(&doc, request(changed)).await.is_err());
+        }
+        assert!(state.download(&doc, request(target(&first))).await.is_err());
+        assert_eq!(reply.actual_requests().count(), 0);
+        assert_eq!(
+            state
+                .upload(&doc, request(target(&first)))
+                .await
+                .unwrap_err()
+                .stage,
+            Stage::PutObject
+        );
+        assert!(state.upload(&doc, request(target(&first))).await.is_err());
+        let requests: Vec<_> = reply.actual_requests().collect();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].uri(),
+            "https://s3.eu-west-1.amazonaws.com/selected-bucket/%EC%8B%A4%ED%97%98//../%ED%95%9C%EA%B8%80%20%2B%252F.txt?x-id=PutObject"
+        );
+        assert_eq!(std::fs::read(file).unwrap(), b"payload");
+    }
+
+    #[tokio::test]
+    async fn 취소와_닫기는_승인을_폐기하고_다른_탭의_목록을_살려둔다() {
+        let reply = replay([response(
+            200,
+            "<ListAllMyBucketsResult><Buckets/></ListAllMyBucketsResult>",
+        )]);
+        let state = StorageIpc::default();
+        let doc = state.document("main");
+        let first = state
+            .insert(
+                doc.clone(),
+                "test".into(),
+                "eu-west-1".into(),
+                client(&reply),
+            )
+            .unwrap();
+        let second = state
+            .insert(
+                doc.clone(),
+                "test".into(),
+                "eu-west-1".into(),
+                client(&reply),
+            )
+            .unwrap();
+        let cancelled = state
+            .begin_selection(&doc, target(&first), Direction::Download)
+            .unwrap();
+        assert!(matches!(
+            state.finish_selection(&doc, &first.session_id, cancelled, None),
+            LocalFileApproval::Cancelled
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("selected.txt");
+        let id = state
+            .begin_selection(&doc, target(&first), Direction::Download)
+            .unwrap();
+        state.finish_selection(&doc, &first.session_id, id.clone(), Some(file.clone()));
+        assert!(state.cancel_approval(
+            &doc,
+            &ApprovalId {
+                session_id: first.session_id.clone(),
+                approval_id: id.clone()
+            }
+        ));
+        assert!(
+            state
+                .download(
+                    &doc,
+                    ApprovedTransfer {
+                        target: target(&first),
+                        approval_id: id
+                    }
+                )
+                .await
+                .is_err()
+        );
+        let pending = state
+            .begin_selection(&doc, target(&first), Direction::Download)
+            .unwrap();
+        let (_, closed) = state
+            .client(&doc, &first.session_id, Stage::ListBuckets)
+            .unwrap();
+        assert!(state.close(&doc, &first.session_id));
+        assert!(*closed.borrow());
+        assert!(matches!(
+            state.finish_selection(&doc, &first.session_id, pending, Some(file)),
+            LocalFileApproval::Denied
+        ));
+        let request = || BucketPageRequest {
+            session_id: second.session_id.clone(),
+            token: None,
+        };
+        assert!(
+            state
+                .list_buckets(&doc, request())
+                .await
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+        state.navigate("main");
+        assert!(state.list_buckets(&doc, request()).await.is_err());
+        assert!(
+            state
+                .list_buckets(&state.document("main"), request())
+                .await
+                .is_err()
+        );
+        assert_eq!(reply.actual_requests().count(), 1);
+    }
+}
