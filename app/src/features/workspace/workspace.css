@@ -63,6 +63,8 @@
 .workspace-tab button { padding-inline: 12px; }
 .workspace-tab button:last-child { width: 28px; padding: 0; }
 .workspace-drag-gap { flex: 1 0 48px; }
+.workspace-desktop-actions { display: flex; flex: none; }
+.workspace-desktop-actions button { padding-inline: 8px; }
 .workspace-mode { flex: none; width: 86px; border-inline-start: 1px solid var(--border) !important; }
 .window-control { flex: none; width: 44px; font-size: 17px !important; }
 .window-control.close:hover { background: #a6303e; }
@@ -87,6 +89,13 @@
 .workspace-center-actions :is(button, select) { min-height: 28px; padding-inline: 8px; }
 .workspace-session { grid-area: 2 / 1; display: flex; min-width: 0; min-height: 0; }
 .workspace-session[data-pane="right"] { grid-column: 3; }
+.workspace-desktop { overflow: auto; }
+.workspace-desktop > section { flex: 1; min-width: 0; }
+.workspace-desktop .remote-desktop-toolbar :is(input, select) {
+  box-sizing: border-box; max-width: 100%; padding: 6px; font: inherit; color: inherit;
+  background: #12171b; border: 1px solid var(--border); color-scheme: dark;
+}
+.workspace-desktop button:disabled { opacity: .55; cursor: default; }
 .workspace-ai {
   grid-column: 3;
   min-width: 0;

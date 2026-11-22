@@ -1,4 +1,4 @@
-import { useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties, type MouseEvent, type SyntheticEvent } from "react";
 import { LocalAiPanel } from "../ai/LocalAiPanel";
 import { createLocalConnectionIpc, type SavedConnections } from "../connections/connectionIpc";
 import { LocalConnectionWizard } from "../connections/LocalConnectionWizard";
@@ -7,6 +7,7 @@ import { subscribeLocalCliOpen } from "../editor/cliOpen";
 import { EditorTab, type EditorTabActions } from "../editor/EditorTab";
 import type { ApprovedEditorFile, ConfirmEditorDiscard, EditorTransport } from "../editor/contract";
 import { closeLocalFile, localEditorError, localEditorTransport, openLocalFile } from "../editor/localEditorIpc";
+import { RdpTab } from "../rdp/RdpTab";
 import { SftpPanel, type SftpPanelActions } from "../sftp/SftpPanel";
 import { sftpError } from "../sftp/sftpIpc";
 import type { SsmTarget } from "../ssm/ssm";
@@ -15,6 +16,7 @@ import { TerminalView } from "../terminal/TerminalView";
 import type { TerminalStatus } from "../terminal/session";
 import { TunnelTab } from "../tunnels/TunnelTab";
 import { tunnelIpc } from "../tunnels/tunnelIpc";
+import { VncView } from "../vnc/VncView";
 import { LocalTree } from "./LocalTree";
 import { Splitter } from "./Splitter";
 import { macTitleBar, TitleBar } from "./TitleBar";
@@ -22,10 +24,13 @@ import "./workspace.css";
 
 type CloseStatus = "closing" | "unconfirmed";
 type Split = { left: number; right: number };
+type DesktopKind = "rdp" | "vnc";
 type Tab = { id: number; label: string } & (
   | { kind: "terminal"; targetId?: string; ssm?: SsmTarget; ssh?: SshTransport["kind"]; status: TerminalStatus; sessionId?: string; sftpSessionId?: string; closeStatus?: CloseStatus }
   | { kind: "editor"; file: ApprovedEditorFile; transport: EditorTransport; close: () => Promise<void>; source: EditorSource; attaching?: true }
   | { kind: "tunnel"; handle: string; targetId: string; name: string; method: "ssh" | "ssm"; closeStatus?: CloseStatus; closeError?: string }
+  | { kind: "rdp" }
+  | { kind: "vnc" }
 );
 type StorageTarget = { targetId: string; label: string; closeStatus?: CloseStatus };
 type ProfileLoad = { kind: "loading" | "ready"; profiles?: SavedConnections }
@@ -243,6 +248,12 @@ export function Workspace() {
     selectTab(id);
   }
 
+  function openDesktop(kind: DesktopKind) {
+    const id = nextTab.current++;
+    setTabs(current => [...current, { id, label: `${kind.toUpperCase()} ${id}`, kind }]);
+    selectTab(id);
+  }
+
   async function openTunnel(targetId: string, name: string, method: "ssh" | "ssm", share?: { tab: string; id: string }) {
     const id = nextTab.current++;
     const label = `${name} · 터널 ${id}`;
@@ -333,7 +344,8 @@ export function Workspace() {
     if (!tab || closingTabs.current.has(id)) return;
     if (tab.kind === "tunnel" || (tab.kind === "terminal" && (tab.ssm || tab.ssh))) {
       closingTabs.current.add(id);
-      setTabs(current => current.map(item => item.id === id && item.kind !== "editor" ? { ...item, closeStatus: "closing" } : item));
+      setTabs(current => current.map(item => item.id === id && (item.kind === "terminal" || item.kind === "tunnel")
+        ? { ...item, closeStatus: "closing" } : item));
       try {
         if (tab.kind === "tunnel") {
           await tunnelIpc.close(tab.handle);
@@ -354,7 +366,7 @@ export function Workspace() {
         }
       } catch (error) {
         setTabs(current => current.map(item => {
-          if (item.id !== id || item.kind === "editor") return item;
+          if (item.id !== id || (item.kind !== "terminal" && item.kind !== "tunnel")) return item;
           return item.kind === "tunnel" ? { ...item, closeStatus: "unconfirmed", closeError: String(error) }
             : { ...item, closeStatus: "unconfirmed" };
         }));
@@ -416,10 +428,11 @@ export function Workspace() {
   return (
     <main className={`workspace${macTitleBar ? " workspace-mac" : ""}${focused ? " workspace-focused" : ""}`} style={layout}
       onFocusCapture={(event) => { if (!event.target.closest(".terminal-screen, .monaco-editor")) setFocusTab(null); }}>
-      <TitleBar focused={focused} onToggle={() => setFocused(!focused)} onWindowError={setWindowError}>
+      <TitleBar focused={focused} onToggle={() => setFocused(!focused)} onWindowError={setWindowError}
+        onOpenRdp={() => openDesktop("rdp")} onOpenVnc={() => openDesktop("vnc")}>
         {tabs.map((tab) => {
           const { id, label, kind } = tab;
-          const closeStatus = kind === "editor" ? undefined : tab.closeStatus;
+          const closeStatus = kind === "terminal" || kind === "tunnel" ? tab.closeStatus : undefined;
           return <div className="workspace-tab" key={id}>
             <button ref={id === active ? activeButton : undefined} aria-pressed={id === active}
               disabled={kind === "editor" && tab.attaching} onClick={() => selectTab(id)}>{label}</button>
@@ -477,8 +490,30 @@ export function Workspace() {
             };
             const pane = id === visibleSplit?.left ? "left" : id === visibleSplit?.right ? "right" : undefined;
             const visible = id === active || pane !== undefined;
-            return <div className="workspace-session" key={id} id={pane && `${paneId}-${pane}`} data-pane={pane}
-              hidden={!visible} inert={!visible}
+            const desktop = tab.kind === "rdp" || tab.kind === "vnc";
+            // 분할 상태에서 화면 출력은 유지하되, 사용자 입력은 포커스된 터미널에만 전달한다.
+            const terminalHasFocus = (element: HTMLElement) =>
+              id === activeId.current && element.contains(element.ownerDocument.activeElement?.closest(".terminal-screen") ?? null);
+            const blockTerminalInput = (event: SyntheticEvent<HTMLDivElement>) => {
+              if (terminalHasFocus(event.currentTarget)) return;
+              event.preventDefault();
+              event.stopPropagation();
+            };
+            const terminalInput = tab.kind === "terminal" ? {
+              onKeyDownCapture: blockTerminalInput, onKeyPressCapture: blockTerminalInput, onKeyUpCapture: blockTerminalInput,
+              onBeforeInputCapture: blockTerminalInput, onInputCapture: blockTerminalInput,
+              onCompositionStartCapture: blockTerminalInput, onCompositionUpdateCapture: blockTerminalInput,
+              onCompositionEndCapture: blockTerminalInput, onPasteCapture: blockTerminalInput, onDropCapture: blockTerminalInput,
+              onMouseDownCapture: (event: MouseEvent<HTMLDivElement>) => {
+                if (terminalHasFocus(event.currentTarget)) return;
+                blockTerminalInput(event);
+                if (visible && event.button === 0) selectTab(id);
+              },
+              onMouseUpCapture: blockTerminalInput, onMouseMoveCapture: blockTerminalInput,
+              onWheelCapture: blockTerminalInput, onAuxClickCapture: blockTerminalInput, onContextMenuCapture: blockTerminalInput,
+            } : undefined;
+            return <div className={`workspace-session${desktop ? " workspace-desktop" : ""}`} key={id}
+              id={pane && `${paneId}-${pane}`} data-pane={pane} hidden={!visible} inert={!visible} {...terminalInput}
               onFocusCapture={(event) => {
                 if (pane && id !== activeId.current && event.target.closest(".terminal-screen")) selectTab(id, false);
               }}>
@@ -491,6 +526,10 @@ export function Workspace() {
                   closeState={tab.closeStatus === "closing" ? { kind: "closing" } : tab.closeStatus === "unconfirmed"
                     ? { kind: "unconfirmed", error: tab.closeError ?? "종료 확인 불가" } : undefined}
                   onShare={(targetId, tabHandle, tunnelId) => openTunnel(targetId, tab.name, tab.method, { tab: tabHandle, id: tunnelId })} />
+              ) : tab.kind === "rdp" ? (
+                <RdpTab active={id === active} label={label} />
+              ) : tab.kind === "vnc" ? (
+                <VncView active={id === active} />
               ) : (
                 <EditorTab file={tab.file} active={id === active && !tab.attaching} transport={tab.transport}
                   confirmDiscard={(request) => confirmEditorDiscard(tab.source, request)}
@@ -586,7 +625,9 @@ export function Workspace() {
             `SSM · ${current.ssm.profile} / ${current.ssm.region} / ${current.ssm.instanceId}` : current.ssh ? "SSH" : "로컬", current.sessionId,
           !current.closeStatus && terminalStatus(current.status)].filter(Boolean).join(" · ")
           : current?.kind === "tunnel" ? current.label
-            : current ? `${current.source === "local" ? "내 PC · 로컬 파일" : current.source === "sftp" ? "SFTP" : "S3"} · ${current.label}` : "연결 없음"}</span>
+            : current?.kind === "rdp" || current?.kind === "vnc"
+              ? `${current.label} · 직접 · ${current.kind === "rdp" ? "NLA" : "TLS"}`
+              : current ? (current.source === "local" ? "내 PC · 로컬 파일" : current.source === "sftp" ? "SFTP" : "S3") : "연결 없음"}</span>
         {windowError && <span role="alert">{windowError}</span>}
         {fileError && <span role="alert">{fileError}</span>}
         {hostRegistration && <span role={hostRegistration.kind}>{hostRegistration.message}</span>}
