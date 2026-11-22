@@ -23,7 +23,8 @@ const unknown = { ok: false, error: "Unknown" } as const;
 
 function failure(error: unknown, allowsRelogin: boolean): SsmResult<never> {
   const code = error && typeof error === "object" && "code" in error ? error.code : null;
-  if (code === "AccessDenied" || code === "PluginMissing" || (allowsRelogin && code === "SsoLoginRequired")) {
+  if (code === "AccessDenied" || code === "PluginMissing" || code === "InvalidConfiguration" ||
+    (allowsRelogin && code === "SsoLoginRequired")) {
     return { ok: false, error: code };
   }
   return unknown;

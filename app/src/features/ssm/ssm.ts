@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from "react";
 export type SsmScope = Readonly<{ profile: string; region: string }>;
 export type SsmTarget = SsmScope & Readonly<{ instanceId: string }>;
 export type SsmOnlineNode = Readonly<{ instanceId: string; name?: string }>;
-type Failure = "SsoLoginRequired" | "AccessDenied" | "PluginMissing" | "Unknown";
+type Failure = "SsoLoginRequired" | "AccessDenied" | "PluginMissing" | "InvalidConfiguration" | "Unknown";
 export type SsmResult<T> = { readonly ok: true; readonly value: T }
   | { readonly ok: false; readonly error: Failure };
 
