@@ -1,0 +1,217 @@
+// @vitest-environment jsdom
+import { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import App from "../../App";
+
+const native = vi.hoisted(() => ({
+  invoke: vi.fn(),
+  minimize: vi.fn(),
+  toggleMaximize: vi.fn(),
+  close: vi.fn(),
+  fit: vi.fn(),
+}));
+vi.mock("@tauri-apps/api/core", () => ({
+  isTauri: () => true,
+  invoke: native.invoke,
+  Channel: class { constructor(readonly receive: (message: unknown) => void) { } },
+}));
+vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => native }));
+vi.mock("@xterm/addon-fit", () => ({ FitAddon: class { fit = native.fit; } }));
+vi.mock("@xterm/xterm", () => ({
+  Terminal: class {
+    cols = 80;
+    rows = 24;
+    private field!: HTMLTextAreaElement;
+    private screen!: HTMLElement;
+    loadAddon() { }
+    open(screen: HTMLElement) {
+      this.screen = screen;
+      this.field = screen.appendChild(document.createElement("textarea"));
+    }
+    focus() { this.field.focus(); }
+    onData(input: (data: string) => void) {
+      this.field.addEventListener("input", () => input(this.field.value));
+      return { dispose() { } };
+    }
+    write(bytes: Uint8Array, parsed: () => void) {
+      this.screen.append(new TextDecoder().decode(bytes));
+      parsed();
+    }
+    dispose() { this.field.remove(); }
+  },
+}));
+
+let host: HTMLDivElement;
+let root: Root;
+let viewportWidth: number;
+let observeWorkspace: () => void;
+const channels = new Map<string, (message: unknown) => void>();
+
+beforeEach(async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  viewportWidth = 1200;
+  vi.stubGlobal("ResizeObserver", class {
+    constructor(private readonly callback: () => void) { }
+    observe(element: HTMLElement) {
+      if (element.classList.contains("workspace-body")) observeWorkspace = this.callback;
+    }
+    disconnect() { }
+  });
+  vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockImplementation(function(this: HTMLElement) {
+    return this.closest("[hidden]") ? 0 : viewportWidth;
+  });
+  vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(function(this: HTMLElement) {
+    return this.closest("[hidden]") ? 0 : 400;
+  });
+  channels.clear();
+  native.invoke.mockImplementation(async (command, args) => {
+    if (command !== "terminal_open") return;
+    const id = `pty-${channels.size + 10}`;
+    channels.set(id, args.output.receive);
+    return id;
+  });
+  host = document.body.appendChild(document.createElement("div"));
+  root = createRoot(host);
+  await act(async () => { root.render(<App />); });
+});
+
+afterEach(async () => {
+  await act(async () => { root.unmount(); });
+  host.remove();
+  vi.restoreAllMocks();
+  vi.resetAllMocks();
+  vi.unstubAllGlobals();
+});
+
+function find<T extends HTMLElement>(selector: string): T {
+  const element = host.querySelector<T>(selector);
+  expect(element, selector).not.toBeNull();
+  return element!;
+}
+
+function button(name: string) {
+  return [...host.querySelectorAll("button")].find((item) => (item.getAttribute("aria-label") ?? item.textContent) === name);
+}
+
+async function press(name: string) {
+  const control = button(name);
+  expect(control, name).toBeDefined();
+  await act(async () => { control!.click(); });
+}
+
+async function key(element: HTMLElement, value: string) {
+  await act(async () => { element.dispatchEvent(new KeyboardEvent("keydown", { key: value, bubbles: true })); });
+}
+
+async function type(field: HTMLTextAreaElement, value: string) {
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(field, value);
+    field.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+}
+
+function calls(operation: string) {
+  return native.invoke.mock.calls.flatMap(([command, args]) => command === `terminal_${operation}` ? [args] : []);
+}
+
+const status = () => find("footer").textContent;
+const tree = () => find('[role="tree"]');
+async function openSecond() {
+  const group = find('[role="treeitem"][aria-expanded]');
+  group.focus();
+  await key(group, "ArrowRight");
+  expect(document.activeElement).toBe(find('[role="treeitem"]:not([aria-expanded])'));
+  await key(document.activeElement as HTMLElement, "Enter");
+}
+
+describe("L02", () => {
+  it("집중 보기와 탭 왕복은 두 PTY와 패널 선호값, 미제출 입력, 채팅 초안을 유지한다", async () => {
+    expect(status()).toContain("pty-10");
+    await openSecond();
+    expect(status()).toContain("pty-11");
+    const panel = find<HTMLElement>('[aria-label="로컬 2"]:is(section)');
+    const input = panel.querySelector("textarea")!;
+    await type(input, "echo B_READY");
+    const draft = find<HTMLTextAreaElement>('textarea[aria-label="메시지 입력"]');
+    await type(draft, "CHAT_ONLY");
+    const treeSplitter = find('[role="separator"][aria-label="트리 너비"]');
+    treeSplitter.setPointerCapture = vi.fn();
+    await act(async () => {
+      treeSplitter.dispatchEvent(new PointerEvent("pointerdown", { pointerId: 1, clientX: 280, bubbles: true }));
+      treeSplitter.dispatchEvent(new PointerEvent("pointermove", { pointerId: 1, clientX: 340, bubbles: true }));
+      treeSplitter.dispatchEvent(new PointerEvent("lostpointercapture", { pointerId: 1, bubbles: true }));
+    });
+    for (const [label, arrow] of [["AI 열 너비", "ArrowLeft"], ["AI 채팅 높이", "ArrowDown"]]) {
+      await key(find(`[role="separator"][aria-label="${label}"]`), arrow);
+    }
+    const values = () => ["트리 너비", "AI 열 너비", "AI 채팅 높이"].map((label) =>
+      find(`[role="separator"][aria-label="${label}"]`).getAttribute("aria-valuenow"));
+    expect(values()).toEqual(["340", "380", "55"]);
+    await act(async () => { viewportWidth = 660; observeWorkspace(); });
+    expect(values()).toEqual(["211", "211", "55"]);
+    const footer = find("footer");
+    await press("집중 보기");
+    expect(tree().closest("[hidden]")).not.toBeNull();
+    expect(find("footer")).toBe(footer);
+    expect(status()).toContain("pty-11");
+    await press("로컬 1");
+    expect(status()).toContain("pty-10");
+    expect(panel.closest("[inert][hidden]")).not.toBeNull();
+    await press("로컬 2");
+    await press("기본 보기");
+    expect(values()).toEqual(["211", "211", "55"]);
+    await act(async () => { viewportWidth = 1200; observeWorkspace(); });
+    expect(values()).toEqual(["340", "380", "55"]);
+    expect(tree().closest("[hidden]")).toBeNull();
+    expect(panel.querySelector("textarea")).toBe(input);
+    expect(input.value).toBe("echo B_READY");
+    expect(draft.value).toBe("CHAT_ONLY");
+    expect(calls("open")).toHaveLength(2);
+    expect(calls("close")).toHaveLength(0);
+    expect(calls("input")).toEqual([{ id: "pty-11", bytes: Array.from(new TextEncoder().encode("echo B_READY")) }]);
+    expect(native.toggleMaximize).not.toHaveBeenCalled();
+  });
+
+  it("숨은 탭의 출력과 종료는 활성 탭의 입력, 포커스, 상태를 바꾸지 않는다", async () => {
+    await openSecond();
+    const active = document.activeElement;
+    native.fit.mockClear();
+    await act(async () => {
+      const bytes = new Uint8Array(new ArrayBuffer(6));
+      bytes.set(new TextEncoder().encode("A_DONE"));
+      channels.get("pty-10")!(bytes.buffer);
+      channels.get("pty-10")!({ kind: "exited", value: 7 });
+    });
+    expect(document.activeElement).toBe(active);
+    expect(native.fit).not.toHaveBeenCalled();
+    await type(active as HTMLTextAreaElement, "B_READY");
+    expect(calls("input").map(({ id }) => id)).toEqual(["pty-11"]);
+    expect(status()).toContain("pty-11");
+    await press("로컬 1");
+    expect(find('section[aria-label="로컬 1"]').textContent).toContain("A_DONE");
+    expect(status()).toContain("pty-10 · 종료 코드 7");
+    await press("로컬 1 닫기");
+    expect(status()).toContain("pty-11");
+    await press("로컬 2 닫기");
+    expect(status()).toBe("연결 없음AI 전용 셸 · 대기");
+    expect(calls("close")).toEqual([{ id: "pty-11" }]);
+  });
+
+  it("창 버튼은 키보드로 도달할 수 있고 닫기 오류가 나면 탭을 그대로 둔다", async () => {
+    native.close.mockRejectedValueOnce("거부됨");
+    const controls = [...find("header").querySelectorAll("button")].slice(-4);
+    expect(controls.map((item) => item.getAttribute("aria-label"))).toEqual(["집중 보기", "최소화", "최대화/복원", "닫기"]);
+    expect(controls.map((item) => item.tabIndex)).toEqual([0, 0, 0, 0]);
+    for (const name of ["최소화", "최대화/복원", "닫기"]) await press(name);
+    expect(native.minimize).toHaveBeenCalledOnce();
+    expect(native.toggleMaximize).toHaveBeenCalledOnce();
+    expect(native.close).toHaveBeenCalledOnce();
+    expect(status()).toContain("닫기 실패: 거부됨");
+    expect(status()).toContain("pty-10");
+    expect(calls("close")).toHaveLength(0);
+    const drag = [...host.querySelectorAll("[data-tauri-drag-region]")];
+    expect(drag).toHaveLength(2);
+    expect(drag.every((region) => !region.querySelector("button"))).toBe(true);
+  });
+});

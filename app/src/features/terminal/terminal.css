@@ -7,40 +7,6 @@
 
 body { margin: 0; }
 
-.terminal-workspace {
-  display: flex;
-  flex-direction: column;
-  height: 100vh;
-}
-
-.terminal-tabs {
-  display: flex;
-  gap: 1px;
-  flex-wrap: wrap;
-  background: #263238;
-  border-bottom: 1px solid #41514f;
-}
-
-.terminal-tab {
-  display: flex;
-  background: #1b2328;
-  border-bottom: 2px solid transparent;
-}
-
-.terminal-tab:has([aria-pressed="true"]) { border-bottom-color: #9cd9bf; }
-
-.terminal-tabs button {
-  border: 0;
-  padding: 8px 12px;
-  color: inherit;
-  background: transparent;
-  font: inherit;
-  cursor: pointer;
-}
-
-.terminal-tabs button:hover { background: #34413f; }
-.terminal-tabs button:focus-visible { outline: 2px solid #9cd9bf; outline-offset: -2px; }
-
 .terminal-view:not([hidden]) {
   flex: 1;
   min-height: 0;
