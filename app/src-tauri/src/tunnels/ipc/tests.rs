@@ -256,3 +256,72 @@ fn desktop_status_serializes_only_ready_approved_loopback() {
     assert!(encode(&local, &State::Ready, None).get("desktop").is_none());
     assert!(encode(&other, &State::Ready, Some(Protocol::Rdp)).get("desktop").is_none());
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "격리 Ubuntu OpenSSH 서버와 ZZABBA_R01_LOOPBACK_FIXTURE 필요"]
+fn isolated_openssh_desktop_lease_outlives_source_tab() {
+    use crate::tunnels::tests::loopback::{Fixture, SERVER};
+    use std::{io::{ErrorKind, Read, Write}, net::TcpListener, time::Instant};
+
+    let fixture = Fixture::new();
+    let directory = fixture.directory.path();
+    let timeout = Duration::from_secs(4);
+    let service = TcpListener::bind("127.0.0.1:0").unwrap();
+    service.set_nonblocking(true).unwrap();
+    let destination = Destination { host: "127.0.0.1".into(), port: service.local_addr().unwrap().port() };
+    let listen = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let tabs = TunnelTabs::default();
+    let epoch = tabs.epoch();
+    let source = tabs.open(epoch, directory, SERVER.into(), "시험 터널".into()).unwrap();
+    let id = tabs.start(epoch, directory, &source, PortRequest::Local {
+        listen: listen.port(), host: destination.host.clone(), port: destination.port, protocol: Some(Protocol::Rdp),
+    }, |description| {
+        let ssh = &fixture.ssh.1;
+        assert_eq!(description, format!("{}@{}:{}\n{}\n-L {listen} → {}:{}\n서비스: RDP",
+            ssh.account, ssh.host, ssh.port, ssh.host_key_fingerprint, destination.host, destination.port));
+        Ok(true)
+    }).unwrap().unwrap();
+    let deadline = Instant::now() + timeout;
+    loop {
+        let snapshot = tabs.snapshot(epoch, &source).unwrap();
+        let status = &snapshot[0];
+        if status.state == "ready" { break; }
+        assert!(status.state == "starting" && Instant::now() < deadline, "SSH 수신 준비 실패: {:?}", status.error);
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    let (revision, ssh) = &fixture.ssh;
+    let mut lease = tabs.open_desktop(epoch, directory, (&source, &id), SERVER, &destination,
+        Protocol::Rdp, (*revision, ssh)).unwrap();
+    let loss = lease.loss();
+    let mut client = lease.take_stream().unwrap();
+    client.set_read_timeout(Some(timeout)).unwrap();
+    let deadline = Instant::now() + timeout;
+    let mut peer = loop {
+        match service.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error) if error.kind() == ErrorKind::WouldBlock && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("SSH 전달 서비스 연결: {error}"),
+        }
+    };
+    peer.set_write_timeout(Some(timeout)).unwrap();
+    let mut marker = [0; 4];
+    peer.write_all(b"RDP1").unwrap();
+    client.read_exact(&mut marker).unwrap();
+    assert_eq!(&marker, b"RDP1");
+
+    tabs.close(epoch, &source).unwrap();
+    assert!(!loss.is_cancelled());
+    peer.write_all(b"RDP2").unwrap();
+    client.read_exact(&mut marker).unwrap();
+    assert_eq!(&marker, b"RDP2");
+    assert!(!loss.is_cancelled());
+
+    drop(lease);
+    assert!(loss.is_cancelled());
+    let error = TcpStream::connect_timeout(&listen, timeout).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::ConnectionRefused, "마지막 소유자가 닫힌 뒤 SSH 수신 포트");
+}
