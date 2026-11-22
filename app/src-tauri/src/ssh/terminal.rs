@@ -1,12 +1,13 @@
 use portable_pty::CommandBuilder;
 use std::path::Path;
+use std::sync::Arc;
 use crate::connections::profile::{Ssh, SshAuth, SshTransport};
 
 use super::{ApprovedHost, Authentication, Client, ConnectionPlan, Error, Invocation, Transport, TrustStore};
 
 pub(crate) struct DirectLaunch {
     command: CommandBuilder,
-    plan: ConnectionPlan,
+    plan: Arc<ConnectionPlan>,
 }
 
 impl DirectLaunch {
@@ -20,13 +21,13 @@ impl DirectLaunch {
         if account != approved_account {
             return Err(Error::ApprovedAccountMismatch);
         }
-        let plan = ConnectionPlan::prepare(store, approved_host, account, Transport::Direct, auth)?;
+        let plan = Arc::new(ConnectionPlan::prepare(store, approved_host, account, Transport::Direct, auth)?);
         let command = command(plan.invocation(Client::Ssh));
         Ok(Self { command, plan })
     }
 
-    /// PTY 감독자는 자식 회수 뒤 세션을 제거하기 전에 계획을 해제한다.
-    pub(crate) fn into_parts(self) -> (CommandBuilder, ConnectionPlan) {
+    /// 터미널 감독자와 SFTP 작업자가 같은 계획을 공유한다.
+    pub(crate) fn into_parts(self) -> (CommandBuilder, Arc<ConnectionPlan>) {
         (self.command, self.plan)
     }
 

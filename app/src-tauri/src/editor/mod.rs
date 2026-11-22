@@ -5,6 +5,7 @@
 mod os;
 pub(crate) mod ipc;
 pub(crate) mod registry;
+pub(crate) mod sftp;
 pub(crate) mod storage_files;
 #[cfg(test)]
 mod tests;
