@@ -2,10 +2,11 @@ import { useLayoutEffect, useRef, useState, type KeyboardEvent } from "react";
 import type { SavedConnections } from "../connections/connectionIpc";
 
 type OpenTarget = (target?: SavedConnections["targets"][number]["profile"]) => void;
-type MenuTarget = { method: string; open: () => void; sshTargetId?: string };
+type MenuTarget = { method: string; open: () => void; sshTargetId?: string; s3TargetId?: string };
 
-export function LocalTree({ profiles, onOpen, onRegisterSshHost }: {
+export function LocalTree({ profiles, onOpen, onRegisterSshHost, onRetestS3 }: {
   profiles?: SavedConnections; onOpen: OpenTarget; onRegisterSshHost: (targetId: string) => void;
+  onRetestS3?: (targetId: string) => void;
 }) {
   const [query, setQuery] = useState("");
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set());
@@ -23,8 +24,10 @@ export function LocalTree({ profiles, onOpen, onRegisterSshHost }: {
       key: `group:${profile.id}`, name: profile.displayName, id: profile.id,
       targets: profiles.targets.filter(({ profile: target }) => target.groupId === profile.id).map(({ profile: target }) => ({
         key: `target:${target.id}`, name: target.displayName, id: target.id, open: () => onOpen(target),
-        method: target.defaultMethod === "ssm" ? "AWS Systems Manager" : target.defaultMethod === "ssh" ? "SSH" : "로컬",
+        method: target.defaultMethod === "ssm" ? "AWS Systems Manager" : target.defaultMethod === "ssh" ? "SSH"
+          : target.defaultMethod === "s3" ? "S3" : "로컬",
         sshTargetId: target.defaultMethod === "ssh" ? target.id : undefined,
+        s3TargetId: target.defaultMethod === "s3" && onRetestS3 ? target.id : undefined,
       })),
     })) ?? []),
   ].flatMap((group) => {
@@ -47,7 +50,8 @@ export function LocalTree({ profiles, onOpen, onRegisterSshHost }: {
 
   function showMenu(row: HTMLLIElement, target: MenuTarget, x: number, y: number) {
     row.focus();
-    setMenu({ row, target, x: Math.min(x, window.innerWidth - 170), y: Math.min(y, window.innerHeight - (target.sshTargetId === undefined ? 44 : 80)) });
+    const menuHeight = target.sshTargetId !== undefined || target.s3TargetId !== undefined ? 80 : 44;
+    setMenu({ row, target, x: Math.min(x, window.innerWidth - 170), y: Math.min(y, window.innerHeight - menuHeight) });
   }
 
   function navigate(event: KeyboardEvent<HTMLLIElement>, groupKey?: string, target?: MenuTarget) {
@@ -90,6 +94,7 @@ export function LocalTree({ profiles, onOpen, onRegisterSshHost }: {
   }
 
   const sshTargetId = menu?.target.sshTargetId;
+  const s3TargetId = menu?.target.s3TargetId;
 
   return <>
     <input className="connection-search" type="search" aria-label="연결 검색" value={query} onChange={(event) => setQuery(event.target.value)} />
@@ -117,6 +122,7 @@ export function LocalTree({ profiles, onOpen, onRegisterSshHost }: {
                   showMenu(event.currentTarget, target, event.clientX, event.clientY);
                 }}>
                 <div className="tree-row"><span>{target.name}</span>
+                  {target.method === "S3" && <small>S3</small>}
                   {group.targets.some((other) => other.key !== target.key && other.name === target.name) && <small>{target.id}</small>}
                 </div>
               </li>
@@ -141,6 +147,11 @@ export function LocalTree({ profiles, onOpen, onRegisterSshHost }: {
         setMenu(undefined);
         onRegisterSshHost(sshTargetId);
       }}>호스트 키 등록</button>}
+      {s3TargetId !== undefined && <button type="button" role="menuitem" onClick={() => {
+        menu.row.focus();
+        setMenu(undefined);
+        onRetestS3?.(s3TargetId);
+      }}>연결 재시험</button>}
     </div>}
   </>;
 }
