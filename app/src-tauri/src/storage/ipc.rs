@@ -13,6 +13,7 @@ use tauri::{
 use tokio::sync::watch;
 use uuid::Uuid;
 
+use crate::editor::storage_files::{DownloadTarget, open_upload};
 use crate::{
     connections::{profile::MethodRef, with_saved_method},
     ssm::{AwsCli, CancellationToken, CliError, Scope},
@@ -56,7 +57,7 @@ struct LoginBinding {
 
 struct Opening {
     document: Document,
-    cancel: CancellationToken,
+    cancel: Arc<CancellationToken>,
     expired: Option<LoginBinding>,
 }
 
@@ -64,7 +65,21 @@ struct Selection {
     id: String,
     target: Target,
     direction: Direction,
-    path: Option<PathBuf>,
+    file: Option<ApprovedFile>,
+}
+
+enum ApprovedFile {
+    Upload(std::fs::File),
+    Download(DownloadTarget),
+}
+
+impl ApprovedFile {
+    fn open(path: &std::path::Path, direction: Direction) -> std::io::Result<Self> {
+        match direction {
+            Direction::Upload => open_upload(path).map(Self::Upload),
+            Direction::Download => DownloadTarget::open(path).map(Self::Download),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -101,18 +116,18 @@ impl StorageIpc {
         }
     }
 
-    fn reserve_open(&self, document: &Document, id: Uuid) -> Result<CancellationToken, Error> {
+    fn reserve_open(&self, document: &Document, id: Uuid) -> Result<Arc<CancellationToken>, Error> {
         let mut registry = self.0.lock().unwrap();
         if !registry.active(document) || registry.tabs.contains_key(&id.to_string()) || registry.openings.contains_key(&id) {
             return Err(unavailable(Stage::Profile));
         }
-        let cancel = CancellationToken::new();
+        let cancel = Arc::new(CancellationToken::new());
         registry.openings.insert(id, Opening { document: document.clone(), cancel: cancel.clone(), expired: None });
         Ok(cancel)
     }
 
     async fn open_with<F: Future<Output = Result<AwsS3, Error>>>(
-        &self, document: Document, request: OpenRequest, directory: PathBuf, cancel: CancellationToken,
+        &self, document: Document, request: OpenRequest, directory: PathBuf, cancel: Arc<CancellationToken>,
         verify: impl FnOnce(String, crate::ssm::DirectSsoConfig) -> F,
     ) -> Result<Session, Error> {
         let OpenRequest { id, target_id } = request;
@@ -131,7 +146,9 @@ impl StorageIpc {
         };
         let mut registry = self.0.lock().unwrap();
         // 취소 뒤 같은 ID가 다시 예약돼도 이전 작업은 새 예약을 회수할 수 없다.
-        if cancel.is_cancelled() || !registry.active(&document) { return Err(unavailable(Stage::Profile)); }
+        if !registry.active(&document) || !registry.openings.get(&id).is_some_and(|entry| Arc::ptr_eq(&entry.cancel, &cancel)) {
+            return Err(unavailable(Stage::Profile));
+        }
         let opening = registry.openings.remove(&id).ok_or_else(|| unavailable(Stage::Profile))?;
         let (selection, result) = result?;
         let binding = LoginBinding { target_id, selection: Arc::new(selection) };
@@ -196,42 +213,48 @@ impl StorageIpc {
     }
 
     fn close(&self, document: &Document, session_id: &str) -> bool {
-        let mut registry = self.0.lock().unwrap();
-        if let Ok(id) = Uuid::parse_str(session_id)
-            && registry.openings.get(&id).is_some_and(|opening| opening.document == *document) {
-            registry.openings.remove(&id).unwrap().cancel.cancel();
+        let (opening, tab) = {
+            let mut registry = self.0.lock().unwrap();
+            let opening = Uuid::parse_str(session_id).ok().and_then(|id| {
+                if registry.openings.get(&id)?.document != *document { return None; }
+                registry.openings.remove(&id)
+            });
+            let tab = if opening.is_none() && registry.tab(document, session_id).is_some() {
+                registry.tabs.remove(session_id)
+            } else {
+                None
+            };
+            (opening, tab)
+        };
+        if let Some(opening) = opening {
+            opening.cancel.cancel();
             return true;
         }
-        let Some(tab) = registry.tab(document, session_id) else {
-            return false;
-        };
+        let Some(tab) = tab else { return false; };
         tab.closed.send_replace(true);
-        registry.tabs.remove(session_id);
         true
     }
 
     pub(crate) fn navigate(&self, owner: &str) {
-        let mut registry = self.0.lock().unwrap();
-        *registry.documents.entry(owner.into()).or_default() += 1;
-        registry.openings.retain(|_, opening| {
-            if opening.document.owner != owner { return true; }
-            opening.cancel.cancel();
-            false
-        });
-        registry.tabs.retain(|_, tab| {
-            if tab.document.owner != owner {
-                return true;
-            }
-            tab.closed.send_replace(true);
-            false
-        });
+        let (openings, tabs) = {
+            let mut registry = self.0.lock().unwrap();
+            *registry.documents.entry(owner.into()).or_default() += 1;
+            let openings = registry.openings.extract_if(|_, opening| opening.document.owner == owner).map(|(_, opening)| opening).collect::<Vec<_>>();
+            let tabs = registry.tabs.extract_if(|_, tab| tab.document.owner == owner).map(|(_, tab)| tab).collect::<Vec<_>>();
+            (openings, tabs)
+        };
+        for opening in openings { opening.cancel.cancel(); }
+        for tab in tabs { tab.closed.send_replace(true); }
     }
 
     pub(crate) fn shutdown(&self) {
-        let mut registry = self.0.lock().unwrap();
-        registry.shutdown = true;
-        for (_, opening) in registry.openings.drain() { opening.cancel.cancel(); }
-        for (_, tab) in registry.tabs.drain() {
+        let (openings, tabs) = {
+            let mut registry = self.0.lock().unwrap();
+            registry.shutdown = true;
+            (std::mem::take(&mut registry.openings), std::mem::take(&mut registry.tabs))
+        };
+        for (_, opening) in openings { opening.cancel.cancel(); }
+        for (_, tab) in tabs {
             tab.closed.send_replace(true);
         }
     }
@@ -258,7 +281,7 @@ impl StorageIpc {
             id: id.clone(),
             target,
             direction,
-            path: None,
+            file: None,
         });
         Some(id)
     }
@@ -268,7 +291,7 @@ impl StorageIpc {
         document: &Document,
         session_id: &str,
         id: String,
-        selected: Option<PathBuf>,
+        selected: Option<Result<ApprovedFile, std::io::Error>>,
     ) -> LocalFileApproval {
         let mut registry = self.0.lock().unwrap();
         let Some(tab) = registry.tab(document, session_id) else {
@@ -282,8 +305,8 @@ impl StorageIpc {
             return LocalFileApproval::Denied;
         };
         match selected {
-            Some(path) if path.is_absolute() => {
-                selection.path = Some(path);
+            Some(Ok(file)) => {
+                selection.file = Some(file);
                 LocalFileApproval::Approved { approval_id: id }
             }
             Some(_) => {
@@ -303,7 +326,7 @@ impl StorageIpc {
             return false;
         };
         if !tab.selection.as_ref().is_some_and(|selection| {
-            selection.id == request.approval_id && selection.path.is_some()
+            selection.id == request.approval_id && selection.file.is_some()
         }) {
             return false;
         }
@@ -324,7 +347,7 @@ impl StorageIpc {
         if selection.id != request.approval_id
             || selection.direction != direction
             || selection.target != request.target
-            || selection.path.is_none()
+            || selection.file.is_none()
         {
             return None;
         }
@@ -333,7 +356,7 @@ impl StorageIpc {
             client: tab.client.clone(),
             closed: tab.closed.clone(),
             target: selection.target,
-            path: selection.path?,
+            file: selection.file?,
         })
     }
 
@@ -410,21 +433,21 @@ impl StorageIpc {
                 let binding = tab.binding.as_ref().filter(|_| tab.expired && !tab.listing).ok_or_else(|| unavailable(Stage::Profile))?.clone();
                 tab.expired = false;
                 tab.verified_bucket = None;
-                (binding, CancellationToken::new(), Some(tab.closed.subscribe()))
+                (binding, Arc::new(CancellationToken::new()), Some(tab.closed.subscribe()))
             }
         };
         let operation = async {
             let current = tauri::async_runtime::spawn_blocking(move || verified_selection(&directory, &binding.target_id))
                 .await.map_err(|_| unavailable(Stage::Profile))??;
             if current != *binding.selection { return Err(Error::at(Stage::Profile, Failure::AccountMismatch)); }
-            login(current, cancel.clone()).await.map_err(|error| Error::at(Stage::Profile, match error {
+            login(current, (*cancel).clone()).await.map_err(|error| Error::at(Stage::Profile, match error {
                 CliError::CallerChanged => Failure::AccountMismatch,
                 CliError::TimedOut => Failure::TimedOut,
                 _ => Failure::LoginFailed,
             }))
         };
         if let Some(closed) = closed {
-            let _cancel_on_drop = cancel.clone().drop_guard();
+            let _cancel_on_drop = (*cancel).clone().drop_guard();
             until_closed(&closed, Stage::Profile, operation).await
         } else {
             let result = tokio::select! {
@@ -433,7 +456,9 @@ impl StorageIpc {
                 result = operation => result,
             };
             let mut registry = self.0.lock().unwrap();
-            if cancel.is_cancelled() || !registry.active(document) { return Err(unavailable(Stage::Profile)); }
+            if !registry.active(document) || !registry.openings.get(&id).is_some_and(|entry| Arc::ptr_eq(&entry.cancel, &cancel)) {
+                return Err(unavailable(Stage::Profile));
+            }
             registry.openings.remove(&id);
             result
         }
@@ -456,9 +481,10 @@ impl StorageIpc {
         let transfer = self
             .consume(document, request, Direction::Upload)
             .ok_or_else(|| unavailable(Stage::UploadSource))?;
+        let ApprovedFile::Upload(file) = transfer.file else { return Err(unavailable(Stage::UploadSource)); };
         let target = transfer.target;
         let regional = transfer.client.in_region(&target.region, Stage::PutObject)?;
-        let result = until_closed(&transfer.closed.subscribe(), Stage::PutObject, regional.upload(&target.bucket, &target.key, &transfer.path)).await;
+        let result = until_closed(&transfer.closed.subscribe(), Stage::PutObject, regional.upload(&target.bucket, &target.key, file)).await;
         self.record_expiration(document, &target.session_id, &result);
         result
     }
@@ -471,9 +497,10 @@ impl StorageIpc {
         let transfer = self
             .consume(document, request, Direction::Download)
             .ok_or_else(|| unavailable(Stage::GetObject))?;
+        let ApprovedFile::Download(file) = transfer.file else { return Err(unavailable(Stage::GetObject)); };
         let target = transfer.target;
         let regional = transfer.client.in_region(&target.region, Stage::GetObject)?;
-        let result = regional.download(&target.bucket, &target.key, &transfer.path, &transfer.closed).await;
+        let result = regional.download(&target.bucket, &target.key, &file, &transfer.closed).await;
         self.record_expiration(document, &target.session_id, &result);
         result
     }
@@ -499,7 +526,7 @@ struct Transfer {
     client: Arc<AwsS3>,
     closed: Arc<watch::Sender<bool>>,
     target: Target,
-    path: PathBuf,
+    file: ApprovedFile,
 }
 
 async fn until_closed<T>(
@@ -658,7 +685,31 @@ async fn select_file(
     let Ok((_, closed)) = state.client(document, &session_id, Stage::Profile) else {
         return LocalFileApproval::Denied;
     };
-    let selected = pick_local_file(webview.window(), title, direction, closed).await;
+    let window = webview.window();
+    let replace = if direction == Direction::Download {
+        match choose_replace(window.clone(), closed.clone()).await {
+            Some(replace) => replace,
+            None => return state.finish_selection(document, &session_id, id, None),
+        }
+    } else { false };
+    let picker_direction = if replace { Direction::Upload } else { direction };
+    let selected = match pick_local_file(window.clone(), title.clone(), picker_direction, closed.clone()).await {
+        Some(path) => {
+            let display = format!("{path:?}");
+            let selected = tokio::task::spawn_blocking(move || {
+                let file = ApprovedFile::open(&path, direction)?;
+                if let ApprovedFile::Download(target) = &file && target.replaces_existing() != replace {
+                    return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "download destination changed"));
+                }
+                Ok(file)
+            }).await.unwrap_or_else(|error| Err(std::io::Error::other(error)));
+            if matches!(&selected, Ok(ApprovedFile::Download(target)) if target.replaces_existing()) {
+                let prompt = format!("{title}\n\n기존 파일을 교체하시겠습니까?\n{display}");
+                if confirm_replace(window, prompt, closed).await { Some(selected) } else { None }
+            } else { Some(selected) }
+        }
+        None => None,
+    };
     state.finish_selection(document, &session_id, id, selected)
 }
 
@@ -666,7 +717,7 @@ async fn select_file(
 #[path = "dialogs_windows.rs"]
 mod dialogs_windows;
 #[cfg(windows)]
-use dialogs_windows::pick as pick_local_file;
+use dialogs_windows::{choose_replace, confirm_replace, pick as pick_local_file};
 
 #[cfg(not(any(windows, target_os = "linux")))]
 async fn pick_local_file<R: tauri::Runtime>(window: tauri::Window<R>, title: String, direction: Direction, mut closed: watch::Receiver<bool>) -> Option<PathBuf> {
@@ -719,7 +770,7 @@ async fn pick_local_file<R: tauri::Runtime>(window: tauri::Window<R>, title: Str
             picker.set_modal(true);
             picker.set_destroy_with_parent(true);
             picker.set_local_only(true);
-            if direction == Direction::Download { picker.set_do_overwrite_confirmation(true); }
+            picker.set_do_overwrite_confirmation(false);
             let path = tokio::select! {
                 biased;
                 _ = closed.wait_for(|closed| *closed) => None,
@@ -730,6 +781,78 @@ async fn pick_local_file<R: tauri::Runtime>(window: tauri::Window<R>, title: Str
         });
     }).ok()?;
     selected.await.ok().flatten()
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+async fn choose_replace<R: tauri::Runtime>(window: tauri::Window<R>, mut closed: watch::Receiver<bool>) -> Option<bool> {
+    let dialog = rfd::AsyncMessageDialog::new().set_parent(&window).set_title("다운로드 위치")
+        .set_description("기존 파일을 교체하시겠습니까?\n예: 기존 파일 선택 / 아니요: 새 파일 저장")
+        .set_buttons(rfd::MessageButtons::YesNoCancel);
+    tokio::select! {
+        biased;
+        _ = closed.wait_for(|value| *value) => None,
+        answer = dialog.show() => match answer {
+            rfd::MessageDialogResult::Yes => Some(true),
+            rfd::MessageDialogResult::No => Some(false),
+            _ => None,
+        },
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn choose_replace<R: tauri::Runtime>(window: tauri::Window<R>, closed: watch::Receiver<bool>) -> Option<bool> {
+    use gtk::ResponseType;
+    match download_dialog(window, "다운로드 위치", "다운로드 위치".into(), true, closed).await? {
+        ResponseType::Yes => Some(true),
+        ResponseType::No => Some(false),
+        _ => None,
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+async fn confirm_replace<R: tauri::Runtime>(window: tauri::Window<R>, prompt: String, mut closed: watch::Receiver<bool>) -> bool {
+    let dialog = rfd::AsyncMessageDialog::new().set_parent(&window).set_title("다운로드 파일 교체")
+        .set_description(prompt).set_buttons(rfd::MessageButtons::OkCancel);
+    tokio::select! {
+        biased;
+        _ = closed.wait_for(|value| *value) => false,
+        answer = dialog.show() => answer == rfd::MessageDialogResult::Ok,
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn confirm_replace<R: tauri::Runtime>(window: tauri::Window<R>, prompt: String, closed: watch::Receiver<bool>) -> bool {
+    download_dialog(window, "다운로드 파일 교체", prompt, false, closed).await == Some(gtk::ResponseType::Ok)
+}
+
+#[cfg(target_os = "linux")]
+async fn download_dialog<R: tauri::Runtime>(window: tauri::Window<R>, title: &'static str, prompt: String, choose_mode: bool,
+    mut closed: watch::Receiver<bool>) -> Option<gtk::ResponseType> {
+    use gtk::{ButtonsType, DialogFlags, MessageDialog, MessageType, ResponseType, prelude::*};
+    let (answer, result) = tokio::sync::oneshot::channel();
+    let owner = window.clone();
+    if window.run_on_main_thread(move || {
+        let Ok(parent) = owner.gtk_window() else { return; };
+        gtk::glib::MainContext::default().spawn_local(async move {
+            let dialog = MessageDialog::new(Some(&parent), DialogFlags::MODAL | DialogFlags::DESTROY_WITH_PARENT,
+                MessageType::Question, if choose_mode { ButtonsType::None } else { ButtonsType::OkCancel }, &prompt);
+            dialog.set_title(title);
+            if choose_mode {
+                dialog.add_button("취소", ResponseType::Cancel);
+                dialog.add_button("새 파일 저장", ResponseType::No);
+                dialog.add_button("기존 파일 교체", ResponseType::Yes);
+            }
+            dialog.set_default_response(ResponseType::Cancel);
+            let confirmed = tokio::select! {
+                biased;
+                _ = closed.wait_for(|value| *value) => ResponseType::Cancel,
+                result = dialog.run_future() => result,
+            };
+            dialog.close();
+            let _ = answer.send(confirmed);
+        });
+    }).is_err() { return None; }
+    result.await.ok()
 }
 
 pub(crate) fn dispatch<R: tauri::Runtime>(invoke: Invoke<R>) -> bool {
@@ -891,6 +1014,43 @@ mod tests {
     }
 
     #[test]
+    fn storage_revocation_does_not_hold_registry_while_signaling() {
+        for navigate in [false, true] {
+            let state = StorageIpc::default();
+            let replay = replay([response(200, "<ListAllMyBucketsResult><Buckets/></ListAllMyBucketsResult>")]);
+            let doc = state.document("target");
+            let peer_doc = state.document("peer");
+            let first = state.insert(doc.clone(), "test".into(), "eu-west-1".into(), client(&replay)).unwrap();
+            let peer = state.insert(peer_doc.clone(), "test".into(), "eu-west-1".into(), client(&replay)).unwrap();
+            let (_, closed) = state.client(&doc, &first.session_id, Stage::ListBuckets).unwrap();
+            let guard = closed.borrow();
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| {
+                    if navigate { state.navigate("target"); }
+                    else { assert!(state.close(&doc, &first.session_id)); }
+                });
+                let observed = (|| {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                    while std::time::Instant::now() < deadline {
+                        if let Ok(registry) = state.0.try_lock() && !registry.tabs.contains_key(&first.session_id) {
+                            drop(registry);
+                            return tauri::async_runtime::block_on(state.list_buckets(&peer_doc, BucketPageRequest {
+                                session_id: peer.session_id.clone(), token: None,
+                            })).is_ok();
+                        }
+                        std::thread::yield_now();
+                    }
+                    false
+                })();
+                drop(guard);
+                worker.join().unwrap();
+                assert!(observed, "peer blocked during revocation: navigate={navigate}");
+            });
+            assert!(*closed.borrow());
+        }
+    }
+
+    #[test]
     fn storage_close_ipc_stops_inflight_download_without_replacing_file() {
         use serde_json::json;
         use tauri::{ipc::{CallbackFn, InvokeBody, InvokeResponse}, test, utils::acl::ExecutionContext, webview::InvokeRequest};
@@ -918,7 +1078,7 @@ mod tests {
         let path = dir.path().join(name);
         std::fs::write(&path, b"original").unwrap();
         let approval = state.begin_selection(&document, target(&session), Direction::Download).unwrap();
-        state.finish_selection(&document, &session.session_id, approval.clone(), Some(path.clone()));
+        state.finish_selection(&document, &session.session_id, approval.clone(), Some(ApprovedFile::open(&path, Direction::Download)));
         let (send, received) = std::sync::mpsc::channel();
         let webview: &tauri::Webview<test::MockRuntime> = window.as_ref();
         webview.clone().on_message(request("storage_download", json!({
@@ -1005,9 +1165,11 @@ mod tests {
                 super::super::tests::caller_identity("123456789012"),
                 response(200, "<ListAllMyBucketsResult><Buckets><Bucket><Name>selected-bucket</Name><BucketRegion>us-west-2</BucketRegion></Bucket></Buckets></ListAllMyBucketsResult>"),
                 head(301, "us-west-2"),
-                head(200, "us-west-2"),
+                response(403, SdkBody::empty()),
+                head(403, "us-west-2"),
                 response(200, "<ListBucketResult><EncodingType>url</EncodingType><IsTruncated>false</IsTruncated></ListBucketResult>"),
                 head(403, "us-west-2"),
+                response(403, "<Error><Code>AccessDenied</Code></Error>"),
                 super::super::tests::role_credentials("SECOND", &clock, 120),
                 response(200, "<ListAllMyBucketsResult><Buckets/></ListAllMyBucketsResult>"),
             ]);
@@ -1031,16 +1193,22 @@ mod tests {
             assert_eq!(objects("eu-west-1").await.unwrap_err().failure, Failure::BucketRegionMismatch { region: "us-west-2".into() });
             let regional = || Target { region: "us-west-2".into(), ..self::target(&session) };
             assert!(state.begin_selection(&document, regional(), Direction::Upload).is_none());
+            let missing_region = objects("us-west-2").await.unwrap_err();
+            assert_eq!(missing_region.stage, Stage::HeadBucket);
+            assert!(matches!(missing_region.failure, Failure::Service { status: 403, .. }));
+            assert!(state.begin_selection(&document, regional(), Direction::Upload).is_none());
             assert!(objects("us-west-2").await.unwrap().rows.is_empty());
             let approval = state.begin_selection(&document, regional(), Direction::Upload).unwrap();
             assert!(matches!(state.finish_selection(&document, &session.session_id, approval, None), LocalFileApproval::Cancelled));
-            assert!(matches!(objects("us-west-2").await.unwrap_err().failure, Failure::Service { status: 403, .. }));
+            let denied = objects("us-west-2").await.unwrap_err();
+            assert_eq!(denied.stage, Stage::ListObjects);
+            assert_eq!(denied.failure, Failure::Service { status: 403, code: Some("AccessDenied".into()) });
             assert!(state.begin_selection(&document, regional(), Direction::Upload).is_none());
             clock.advance(61);
             assert!(list().await.unwrap().rows.is_empty());
             let requests: Vec<_> = replay.actual_requests().collect();
-            assert_eq!(requests.len(), 11);
-            for index in [0, 2, 9] {
+            assert_eq!(requests.len(), 13);
+            for index in [0, 2, 11] {
                 let uri: http::Uri = requests[index].uri().parse().unwrap();
                 assert_eq!(uri.host(), Some("portal.sso.us-east-1.amazonaws.com"));
                 assert_eq!(uri.path(), "/federation/credentials");
@@ -1052,15 +1220,23 @@ mod tests {
             for (index, scheme, region, key) in [(1, "sts", "eu-west-1", "WRONG"), (3, "sts", "eu-west-1", "FIRST"),
                 (4, "s3", "eu-west-1", "FIRST"), (5, "s3", "eu-west-1", "FIRST"),
                 (6, "s3", "us-west-2", "FIRST"), (7, "s3", "us-west-2", "FIRST"),
-                (8, "s3", "us-west-2", "FIRST"), (10, "s3", "eu-west-1", "SECOND")] {
+                (8, "s3", "us-west-2", "FIRST"), (9, "s3", "us-west-2", "FIRST"),
+                (10, "s3", "us-west-2", "FIRST"), (12, "s3", "eu-west-1", "SECOND")] {
                 assert!(requests[index].uri().starts_with(&format!("https://{scheme}.{region}.amazonaws.com/")));
                 let authorization = requests[index].headers().get("authorization").unwrap();
                 assert!(authorization.contains(&format!("Credential={key}/")));
                 assert!(authorization.contains(&format!("/{region}/{scheme}/aws4_request")));
             }
-            assert_eq!(requests[5].method(), "HEAD");
-            assert_eq!(requests[6].method(), "HEAD");
-            assert!(requests[7].uri().contains("list-type=2"));
+            for (index, method) in [(5, "HEAD"), (6, "HEAD"), (7, "HEAD"), (8, "GET"), (9, "HEAD"), (10, "GET")] {
+                assert_eq!(requests[index].method(), method);
+                let uri: http::Uri = requests[index].uri().parse().unwrap();
+                assert!(uri.path().starts_with("/selected-bucket"));
+                if method == "GET" {
+                    let query = uri.query().unwrap();
+                    assert!(query.contains("list-type=2"));
+                    assert!(query.contains("prefix=%EC%8B%A4%ED%97%98%2F"));
+                }
+            }
             assert_eq!(std::fs::read_to_string(&token).unwrap(), r#"{"accessToken":"fixture-token","expiresAt":"2099-01-01T00:00:00Z"}"#);
             assert!(Uuid::parse_str(&session.session_id).is_ok());
             assert_eq!(serde_json::to_value(&session).unwrap(), json!({
@@ -1080,6 +1256,20 @@ mod tests {
             });
             assert!(result.is_err());
             assert!(!state.close(&document, &id.to_string()));
+
+            // 레지스트리에서 분리됐지만 잠금 밖 취소 신호가 아직 전달되지 않은 순서다.
+            let opening = OpenRequest { id, target_id: "saved-sso".into() };
+            let previous = state.reserve_open(&document, id).unwrap();
+            let detached = state.0.lock().unwrap().openings.remove(&id).unwrap();
+            let successor = state.reserve_open(&document, id).unwrap();
+            let stale = state.open_with(document.clone(), opening, directory.clone(), previous, |_, _| async {
+                Err(Error::at(Stage::Identity, Failure::SsoLoginRequired))
+            }).await.err().unwrap();
+            assert_eq!(stale.failure, Failure::Request);
+            assert!(Arc::ptr_eq(&state.0.lock().unwrap().openings[&id].cancel, &successor));
+            detached.cancel.cancel();
+            assert!(!successor.is_cancelled());
+            assert!(state.close(&document, &id.to_string()));
 
             clock.advance(120);
             std::fs::remove_file(&token).unwrap();
@@ -1102,7 +1292,7 @@ mod tests {
             assert_eq!(state.relogin_with(&document, expired_id, directory.clone(), unexpected).await.unwrap_err().failure, Failure::AccountMismatch);
             write_config("123456789012");
             assert!(state.relogin_with(&document, expired_id, directory.clone(), unexpected).await.is_err());
-            assert_eq!(replay.actual_requests().count(), 11);
+            assert_eq!(replay.actual_requests().count(), 13);
 
             std::fs::write(root.join("credentials"), "[chosen team]\naws_access_key_id=fixture\n").unwrap();
             let changed = open(request("saved-sso")).await.err().unwrap();
@@ -1144,7 +1334,7 @@ mod tests {
             .begin_selection(&doc, target(&first), Direction::Upload)
             .unwrap();
         assert!(matches!(
-            state.finish_selection(&doc, &first.session_id, id.clone(), Some(file.clone())),
+            state.finish_selection(&doc, &first.session_id, id.clone(), Some(ApprovedFile::open(&file, Direction::Upload))),
             LocalFileApproval::Approved { .. }
         ));
         let request = |target| ApprovedTransfer {
@@ -1226,7 +1416,7 @@ mod tests {
         let id = state
             .begin_selection(&doc, target(&first), Direction::Download)
             .unwrap();
-        state.finish_selection(&doc, &first.session_id, id.clone(), Some(file.clone()));
+        state.finish_selection(&doc, &first.session_id, id.clone(), Some(ApprovedFile::open(&file, Direction::Download)));
         assert!(state.cancel_approval(
             &doc,
             &ApprovalId {
@@ -1255,7 +1445,7 @@ mod tests {
         assert!(state.close(&doc, &first.session_id));
         assert!(*closed.borrow());
         assert!(matches!(
-            state.finish_selection(&doc, &first.session_id, pending, Some(file)),
+            state.finish_selection(&doc, &first.session_id, pending, Some(ApprovedFile::open(&file, Direction::Download))),
             LocalFileApproval::Denied
         ));
         let request = || BucketPageRequest {

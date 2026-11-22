@@ -138,14 +138,14 @@ impl Directory {
         )
     }
 
-    pub(super) fn stage(&self, access: &Access) -> io::Result<Temporary<'_>> {
+    pub(super) fn stage(&self, access: Option<&Access>) -> io::Result<Temporary<'_>> {
         let name = temporary_name()?;
         let file = self
             .open_at(
                 &name,
                 FILE_CREATE,
                 GENERIC_READ | GENERIC_WRITE | DELETE,
-                access.descriptor.cast(),
+                access.map_or(null(), |access| access.descriptor.cast()),
             )
             .map_err(nt_error)?;
         let temp = Temporary {
@@ -153,7 +153,7 @@ impl Directory {
             file: Some(file),
         };
         // Verify the inherited descriptor before exposing any buffer bytes in the directory.
-        if !access.matches(temp.file.as_ref().expect("temporary file is open"))? {
+        if let Some(access) = access && !access.matches(temp.file.as_ref().expect("temporary file is open"))? {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "temporary file access differs",
@@ -375,9 +375,17 @@ impl Temporary<'_> {
         self.file.as_mut().expect("temporary file is open")
     }
 
-    pub(super) fn replace(mut self, name: &OsStr) -> io::Result<File> {
+    pub(super) fn install(self, name: &OsStr, replace: bool) -> io::Result<()> {
+        self.rename(name, replace).map(drop)
+    }
+
+    pub(super) fn replace(self, name: &OsStr) -> io::Result<File> {
+        self.rename(name, true)
+    }
+
+    fn rename(mut self, name: &OsStr, replace: bool) -> io::Result<File> {
         let mut request = Rename {
-            flags: FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS,
+            flags: if replace { FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS } else { 0 },
             root: self.directory.file.as_raw_handle(),
             length: 0,
             name: [0; 255],
