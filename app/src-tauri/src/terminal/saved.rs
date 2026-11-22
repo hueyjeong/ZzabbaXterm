@@ -114,7 +114,8 @@ fn nano_approval_admits_only_the_confirmed_saved_ssh_and_document() {
             Ok(true)
         }, |launch| {
             let command = Launch::Ssh(launch);
-            sessions.register_document("main", document, &command, true)?;
+            let (_, session) = sessions.register_document("main", document, &command, true)?;
+            session.finish();
             launch_admissions.set(launch_admissions.get() + 1);
             let Launch::Ssh(launch) = command else { unreachable!() };
             let (_, plan) = launch.into_parts();
