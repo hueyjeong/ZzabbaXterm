@@ -11,7 +11,7 @@ mod tests;
 use std::{
     ffi::OsStr,
     fs,
-    io::{self, Write as _},
+    io::{self, Write},
     path::{Path, PathBuf},
 };
 

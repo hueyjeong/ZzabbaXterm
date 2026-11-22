@@ -1,6 +1,4 @@
 pub mod ai;
-#[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
-mod auth;
 mod connections;
 mod editor;
 mod local_ipc;
@@ -18,8 +16,11 @@ pub mod editor_cli {
 }
 
 #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+#[path = "auth"]
 pub mod local_auth {
-    pub use crate::auth::run_askpass;
+    #[path = "mod.rs"]
+    mod implementation;
+    pub use self::implementation::run_askpass;
 }
 
 use editor::registry::LocalEditors;
