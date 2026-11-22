@@ -52,6 +52,7 @@ afterEach(async () => {
   host.remove();
   vi.unstubAllGlobals();
   ipc.mockReset();
+  vi.useRealTimers();
 });
 
 async function fillSettings() {
@@ -102,6 +103,66 @@ it("등록 중 종료하면 같은 ID로 취소하고 늦은 등록 결과를 �
   expect(ipc).toHaveBeenNthCalledWith(2, "storage_close", { request: { sessionId } });
   expect(ipc).toHaveBeenCalledTimes(2);
   expect(fields()[4].value).toBe("");
+});
+
+it.each([
+  { reply: { ok: true, value: { itemId: "saved-key" } }, itemId: "saved-key", message: undefined, replyFirst: false },
+  { reply: { ok: false, error: { outcomeUnknown: { itemId: "uncertain-key" } } }, itemId: "uncertain-key", message: "키링 등록 결과 확인 불가", replyFirst: true },
+])("취소할 수 없는 등록은 $itemId 결과가 도착할 때까지 닫기를 보류한다", async ({ reply, itemId, message, replyFirst }) => {
+  const registration = Promise.withResolvers<typeof reply>();
+  const cancellation = Promise.withResolvers<boolean>();
+  ipc.mockReturnValueOnce(registration.promise).mockReturnValueOnce(cancellation.promise);
+  await fillSettings();
+  await click("키 등록");
+
+  let close: Promise<void> | undefined;
+  let settled = false;
+  await act(async () => {
+    close = expect(closeRef.current!.confirmClose()).rejects.toThrow("키링 등록 결과 확인 필요").then(() => { settled = true; });
+    if (replyFirst) registration.resolve(reply);
+    else cancellation.resolve(false);
+  });
+  expect(settled).toBe(false);
+  expect(fields()[4].value).toBe("");
+
+  await act(async () => {
+    if (replyFirst) cancellation.resolve(false);
+    else registration.resolve(reply);
+    await close;
+  });
+  expect(fields()[4].value).toBe(itemId);
+  expect(host.querySelector('[role="alert"]')?.textContent).toBe(message);
+  await act(async () => closeRef.current!.confirmClose());
+  expect(ipc).toHaveBeenCalledTimes(2);
+});
+
+it.each(["만료", "응답 유실"])("취소할 수 없는 등록의 %s 후 결과 확인 불가를 표시하고 재등록하지 않는다", async failure => {
+  vi.useFakeTimers();
+  const registration = Promise.withResolvers<unknown>();
+  ipc.mockReturnValueOnce(registration.promise).mockResolvedValueOnce(false);
+  await fillSettings();
+  await click("키 등록");
+
+  await act(async () => {
+    const close = expect(closeRef.current!.confirmClose()).rejects.toThrow("키링 등록 결과 확인 필요");
+    if (failure === "만료") {
+      await vi.advanceTimersByTimeAsync(35_000);
+      registration.resolve({ ok: true, value: { itemId: "expired-key" } });
+    } else registration.reject(new Error("등록 응답 유실"));
+    await close;
+  });
+  expect(fields()[4].value).toBe("");
+  expect(host.querySelector('[role="alert"]')?.textContent).toBe("키링 등록 결과 확인 불가");
+  await act(async () => closeRef.current!.confirmClose());
+  expect(ipc).toHaveBeenCalledTimes(2);
+});
+
+it("등록 IPC가 거부되면 자동 재등록 없이 등록 결과 확인 불가를 표시한다", async () => {
+  ipc.mockRejectedValueOnce(new Error("등록 응답 유실"));
+  await fillSettings();
+  await click("키 등록");
+  expect(host.querySelector('[role="alert"]')?.textContent).toBe("키링 등록 결과 확인 불가");
+  expect(ipc).toHaveBeenCalledTimes(1);
 });
 
 it("동일 출처의 설정 수정은 저장된 전체 스냅샷을 보내고 실제 접속 실패를 표시한다", async () => {

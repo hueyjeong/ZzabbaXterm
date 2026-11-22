@@ -21,7 +21,12 @@ const errors = {
   key_already_exists: "키링 항목이 이미 있습니다", key_outcome_unknown: "키링 등록 결과 확인 불가",
 } satisfies Record<CompatibleSettingsError, string>;
 
-type Attempt = { id: string; closing: boolean; close?: Promise<void> };
+type EnrollReply = Result<{ itemId: string }, CompatibleSettingsError | { outcomeUnknown: { itemId: string } }>;
+type Attempt = { id: string; closing: boolean; close?: Promise<void> } & (
+  { kind: "open" } | { kind: "enroll"; reply: Promise<EnrollReply | undefined> }
+);
+// Linux 금고 쓰기 제한 30초와 IPC 응답 전달 여유.
+const enrollmentCloseWaitMs = 35_000;
 
 function origin(endpoint: string) {
   // 기존 참조 표시용 비교만 수행하며 출처 검증은 Rust에서 다시 한다.
@@ -47,10 +52,21 @@ export function CompatibleStorageTab({ closing, closeRef }: {
 
   function close(current: Attempt) {
     current.closing = true;
-    return current.close ??= closeStorage(current.id).then(() => {
+    return current.close ??= closeStorage(current.id).then(async cancelled => {
+      if (current.kind === "enroll") {
+        if (cancelled === false) {
+          const expiry = Promise.withResolvers<undefined>();
+          const timer = window.setTimeout(() => expiry.resolve(undefined), enrollmentCloseWaitMs);
+          const reply = await Promise.race([current.reply, expiry.promise]).finally(() => window.clearTimeout(timer));
+          finishEnrollment(current, reply);
+          throw new Error("키링 등록 결과 확인 필요");
+        }
+        setBusy(false);
+      }
       if (attempt.current === current) attempt.current = null;
     }, error => {
       current.close = undefined;
+      if (current.kind === "enroll") setError(errors.key_outcome_unknown);
       throw error;
     });
   }
@@ -101,29 +117,36 @@ export function CompatibleStorageTab({ closing, closeRef }: {
     }
   }
 
+  function finishEnrollment(current: Attempt, reply: EnrollReply | undefined) {
+    if (attempt.current !== current) return;
+    attempt.current = null;
+    setBusy(false);
+    if (!reply) setError(errors.key_outcome_unknown);
+    else if (reply.ok) {
+      setItemId(reply.value.itemId);
+      setError("");
+    } else if (typeof reply.error === "string") setError(errors[reply.error]);
+    else {
+      setItemId(reply.error.outcomeUnknown.itemId);
+      setError(errors.key_outcome_unknown);
+    }
+  }
+
   async function enroll() {
     if (closing || busy || attempt.current) return;
-    const current: Attempt = { id: crypto.randomUUID(), closing: false };
+    const id = crypto.randomUUID();
+    const current: Attempt = {
+      id, kind: "enroll", closing: false,
+      reply: invoke<EnrollReply>("storage_compatible_enroll", { request: { sessionId: id, settings: input } })
+        .catch(() => undefined),
+    };
     attempt.current = current;
     setBusy(true);
     setError("");
-    try {
-      const result = await invoke<Result<{ itemId: string }, CompatibleSettingsError | { outcomeUnknown: { itemId: string } }>>(
-        "storage_compatible_enroll", { request: { sessionId: current.id, settings: input } },
-      );
-      if (current.closing) return;
-      if (attempt.current === current) attempt.current = null;
-      if (result.ok) setItemId(result.value.itemId);
-      else if (typeof result.error === "string") setError(errors[result.error]);
-      else {
-        setItemId(result.error.outcomeUnknown.itemId);
-        setError(errors.key_outcome_unknown);
-      }
-    } catch {
-      if (!current.closing) await recover(current);
-    } finally {
-      setBusy(false);
-    }
+    const reply = await current.reply;
+    // 닫기 응답이 먼저 취소 여부를 결정하며, 같은 등록 응답만 결과로 사용한다.
+    if (current.close) await current.close.catch(() => undefined);
+    finishEnrollment(current, reply);
   }
 
   async function open() {
@@ -132,7 +155,7 @@ export function CompatibleStorageTab({ closing, closeRef }: {
       input.alias === reusable.alias && input.endpoint === reusable.origin && input.region === reusable.region && input.addressing === reusable.addressing
         ? { kind: "saved", expected: reusable }
         : { kind: "revise", expected: reusable, settings: input };
-    const current: Attempt = { id: crypto.randomUUID(), closing: false };
+    const current: Attempt = { id: crypto.randomUUID(), kind: "open", closing: false };
     attempt.current = current;
     setBusy(true);
     setError("");
