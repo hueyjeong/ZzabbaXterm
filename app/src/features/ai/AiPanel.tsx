@@ -49,7 +49,7 @@ export function AiPanel(props: AiPanelProps) {
         </select>
       </label>
       {target && props.onOpenCliReview && <button type="button" onClick={props.onOpenCliReview}>CLI 제안 열기</button>}
-      <ProposalReview key={JSON.stringify([selected, target && props.policyVersion])} model={model} target={target}
+      <ProposalReview key={JSON.stringify([selected, !!target, target && props.policyVersion])} model={model} target={target}
         proposals={props.proposals} history={props.history} attempted={attempted.current}
         onRequestProposal={props.onRequestProposal} onDecideProposal={props.onDecideProposal} onReadDecision={props.onReadDecision} />
     </section>

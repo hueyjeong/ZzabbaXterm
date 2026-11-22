@@ -142,7 +142,7 @@ describe("일반 대화", () => {
 });
 
 describe("제안 검토", () => {
-  it.each(["target", "generation", "cancel"])("대상 전환 또는 취소(%s) 후 이전 응답을 버린다", async (change) => {
+  it.each(["target", "generation", "removed", "cancel"])("대상 전환·삭제 또는 취소(%s) 후 이전 응답을 버린다", async (change) => {
     const props = setup();
     const pending = Promise.withResolvers<Proposal>();
     props.onRequestProposal.mockReturnValueOnce(pending.promise);
@@ -154,16 +154,23 @@ describe("제안 검토", () => {
     expect(props.onRequestProposal.mock.calls[0][0]).toEqual({
       model: "local:latest", target: { targetId: "a", generation: "1" }, operation: "uptime",
     });
+    await render({ ...props, targets: [{ ...alpha }, beta] });
+    expect(props.onRequestProposal.mock.calls[0][1].aborted).toBe(false);
+    expect(host.querySelector(".a01-proposals [role=status]")?.textContent).toBe("제안 요청 중");
     if (change === "target") {
       await select("조회 대상", "개발 (b)");
       await select("조회 대상", "개발 (a)");
     } else if (change === "generation") {
       await render({ ...props, targets: [{ ...alpha, generation: "2" }, beta] });
       await select("조회 대상", "개발 (a)");
+    } else if (change === "removed") {
+      await render({ ...props, targets: [beta] });
     } else {
       await click("요청 취소");
     }
     expect(props.onRequestProposal.mock.calls[0][1].aborted).toBe(true);
+    expect(host.querySelector(".a01-proposals [role=status]")?.textContent).toBe("대기");
+    if (change === "removed") await render(props);
     await act(async () => { pending.resolve(card); });
     expect(host.querySelector("article")).toBeNull();
     expect(host.querySelector(".a01-proposals [role=status]")?.textContent).toBe("대기");
