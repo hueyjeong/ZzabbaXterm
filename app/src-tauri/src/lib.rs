@@ -1,3 +1,6 @@
+// 로컬 명령을 등록하기 전까지 프로필과 파일 저장 경계만 컴파일한다.
+#[allow(dead_code)]
+mod connections;
 mod terminal;
 mod workspace_window;
 
