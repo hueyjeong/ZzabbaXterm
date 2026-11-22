@@ -547,7 +547,7 @@ pub(super) fn request_failure<E: ProvideErrorMetadata + StdError + 'static>(
 pub(super) mod settings;
 
 #[path = "compatible/keyring/mod.rs"]
-mod keyring;
+pub(super) mod keyring;
 
 #[cfg(test)]
 #[path = "compatible/tests.rs"]
