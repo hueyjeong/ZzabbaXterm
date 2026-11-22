@@ -147,7 +147,7 @@ fn nodes_command(scope: &Scope) -> CommandSpec {
     scope.command("ssm", "describe-instance-information", &[])
 }
 
-fn validate_profile(profile: &str) -> Result<(), CliError> {
+pub(crate) fn validate_profile(profile: &str) -> Result<(), CliError> {
     if profile.is_empty()
         || profile.trim() != profile
         || profile.starts_with('-')
@@ -158,7 +158,7 @@ fn validate_profile(profile: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-fn valid_region(region: &str) -> bool {
+pub(crate) fn valid_region(region: &str) -> bool {
     let (Some(first), Some(last)) = (region.as_bytes().first(), region.as_bytes().last()) else {
         return false;
     };
@@ -242,7 +242,7 @@ fn parse_online_nodes(scope: &Scope, captured: Captured) -> Result<Vec<OnlineNod
     Ok(nodes)
 }
 
-fn valid_instance_id(id: &str) -> bool {
+pub(crate) fn valid_instance_id(id: &str) -> bool {
     let suffix = if let Some(suffix) = id.strip_prefix("mi-") {
         (suffix.len() == 17).then_some(suffix)
     } else {

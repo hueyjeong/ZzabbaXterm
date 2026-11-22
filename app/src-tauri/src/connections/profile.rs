@@ -33,19 +33,25 @@ pub(super) struct Group {
 }
 
 #[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct Target {
     pub(super) id: TargetId,
     pub(super) group_id: GroupId,
     pub(super) display_name: String,
-    pub(super) default_method: MethodId,
-    pub(super) local: Local,
+    #[serde(flatten)]
+    pub(super) method: Method,
 }
 
 #[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) enum MethodId {
-    Local,
+#[serde(tag = "defaultMethod", rename_all = "camelCase", deny_unknown_fields)]
+pub(super) enum Method {
+    Local { local: Local },
+    Ssm { ssm: Ssm },
+}
+
+pub(crate) enum MethodRef<'a> {
+    Local { shell: Shell, start_directory: &'a Path },
+    Ssm { profile: &'a str, region: &'a str, instance_id: &'a str },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -60,6 +66,28 @@ pub(crate) enum Shell {
 pub(super) struct Local {
     pub(super) shell: Shell,
     pub(super) start_directory: PathBuf,
+}
+
+#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct Ssm {
+    profile: String,
+    region: String,
+    instance_id: String,
+}
+
+impl Ssm {
+    fn validate(&self) -> Result<(), ValidationError> {
+        use crate::ssm::{valid_instance_id, valid_region, validate_profile};
+        validate_profile(&self.profile).map_err(|_| ValidationError::SsmProfile)?;
+        if !valid_region(&self.region) {
+            return Err(ValidationError::SsmRegion);
+        }
+        if !valid_instance_id(&self.instance_id) {
+            return Err(ValidationError::SsmInstanceId);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Deserialize)]
@@ -81,14 +109,22 @@ pub(crate) enum ValidationError {
     GroupMismatch,
     UnsupportedShell,
     StartDirectory,
+    SsmProfile,
+    SsmRegion,
+    SsmInstanceId,
 }
 
-// 구조 검증 결과이며, 실제 셸 시험 결과는 상위 로컬 명령에서 관리한다.
+// 구조 검증과 실제 연결 시험은 별개다.
 pub(crate) struct ValidatedDraft(Draft);
 
 impl ValidatedDraft {
     pub(super) fn matches(&self, other: &Self) -> bool {
-        self.0 == other.0 && self.start_directory().as_os_str() == other.start_directory().as_os_str()
+        self.0 == other.0 && match (self.method(), other.method()) {
+            (MethodRef::Local { start_directory: left, .. }, MethodRef::Local { start_directory: right, .. }) => {
+                left.as_os_str() == right.as_os_str()
+            }
+            _ => true,
+        }
     }
 }
 
@@ -107,12 +143,18 @@ impl Draft {
 }
 
 impl ValidatedDraft {
+    pub(crate) fn method(&self) -> MethodRef<'_> {
+        self.0.target.method()
+    }
+
     pub(crate) fn shell(&self) -> Shell {
-        self.0.target.local.shell
+        let MethodRef::Local { shell, .. } = self.method() else { unreachable!("로컬 시험에서만 호출") };
+        shell
     }
 
     pub(crate) fn start_directory(&self) -> &Path {
-        &self.0.target.local.start_directory
+        let MethodRef::Local { start_directory, .. } = self.method() else { unreachable!("로컬 시험에서만 호출") };
+        start_directory
     }
 
     pub(super) fn into_parts(self) -> (Group, Option<Revision>, Target, Option<Revision>) {
@@ -131,6 +173,13 @@ impl Group {
 }
 
 impl Target {
+    pub(crate) fn method(&self) -> MethodRef<'_> {
+        match &self.method {
+            Method::Local { local } => MethodRef::Local { shell: local.shell, start_directory: &local.start_directory },
+            Method::Ssm { ssm } => MethodRef::Ssm { profile: &ssm.profile, region: &ssm.region, instance_id: &ssm.instance_id },
+        }
+    }
+
     pub(super) fn validate(&self) -> Result<(), ValidationError> {
         if !valid_id(self.id.as_str()) {
             return Err(ValidationError::TargetId);
@@ -139,18 +188,19 @@ impl Target {
             return Err(ValidationError::GroupId);
         }
         validate_name(&self.display_name)?;
-        self.validate_local()
-    }
-
-    fn validate_local(&self) -> Result<(), ValidationError> {
-        if !matches!((cfg!(windows), self.local.shell), (true, Shell::PowerShell) | (false, Shell::Bash)) {
-            return Err(ValidationError::UnsupportedShell);
+        match &self.method {
+            Method::Local { local } => {
+                if !matches!((cfg!(windows), local.shell), (true, Shell::PowerShell) | (false, Shell::Bash)) {
+                    return Err(ValidationError::UnsupportedShell);
+                }
+                let path = &local.start_directory;
+                if !path.is_absolute() || path.as_os_str().as_encoded_bytes().contains(&0) {
+                    return Err(ValidationError::StartDirectory);
+                }
+                Ok(())
+            }
+            Method::Ssm { ssm } => ssm.validate(),
         }
-        let path = &self.local.start_directory;
-        if !path.is_absolute() || path.as_os_str().as_encoded_bytes().contains(&0) {
-            return Err(ValidationError::StartDirectory);
-        }
-        Ok(())
     }
 }
 

@@ -1,11 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ConnectionRequest, ConnectionTestDraft, ConnectionTestRun, LocalConnectionActions, LocalProfileDraft } from "./profiles";
+import type { ConnectionProfileDraft, ConnectionRequest, ConnectionTestDraft, ConnectionTestRun, LocalConnectionActions } from "./profiles";
 
 type SavedEntry<T> = Readonly<{ revision: number; profile: T }>;
 export type SavedConnections = Readonly<{
   version: 1;
-  groups: readonly SavedEntry<LocalProfileDraft["group"]>[];
-  targets: readonly SavedEntry<LocalProfileDraft["target"]>[];
+  groups: readonly SavedEntry<ConnectionProfileDraft["group"]>[];
+  targets: readonly SavedEntry<ConnectionProfileDraft["target"]>[];
 }>;
 
 type WaitReply = ConnectionTestRun & Readonly<{ sessionId: string }>;

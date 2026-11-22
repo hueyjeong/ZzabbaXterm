@@ -7,7 +7,7 @@ export function LocalTree({ profiles, onOpen }: { profiles?: SavedConnections; o
   const [query, setQuery] = useState("");
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set());
   const [selected, setSelected] = useState("local");
-  const [menu, setMenu] = useState<{ x: number; y: number; row: HTMLLIElement; open: () => void }>();
+  const [menu, setMenu] = useState<{ x: number; y: number; row: HTMLLIElement; open: () => void; method: string }>();
   const tree = useRef<HTMLUListElement>(null);
   const menuButton = useRef<HTMLButtonElement>(null);
   useLayoutEffect(() => { if (menu) menuButton.current?.focus(); }, [menu]);
@@ -15,11 +15,12 @@ export function LocalTree({ profiles, onOpen }: { profiles?: SavedConnections; o
   const term = query.trim().toLocaleLowerCase();
   const matches = (name: string) => name.toLocaleLowerCase().includes(term);
   const groups = [
-    { key: "local", name: "로컬", id: "", targets: [{ key: "pc", name: "내 PC", id: "", open: () => onOpen() }] },
+    { key: "local", name: "로컬", id: "", targets: [{ key: "pc", name: "내 PC", id: "", method: "로컬", open: () => onOpen() }] },
     ...(profiles?.groups.map(({ profile }) => ({
       key: `group:${profile.id}`, name: profile.displayName, id: profile.id,
       targets: profiles.targets.filter(({ profile: target }) => target.groupId === profile.id).map(({ profile: target }) => ({
         key: `target:${target.id}`, name: target.displayName, id: target.id, open: () => onOpen(target),
+        method: target.defaultMethod === "ssm" ? "AWS Systems Manager" : "로컬",
       })),
     })) ?? []),
   ].flatMap((group) => {
@@ -40,12 +41,12 @@ export function LocalTree({ profiles, onOpen }: { profiles?: SavedConnections; o
     });
   }
 
-  function showMenu(row: HTMLLIElement, open: () => void, x: number, y: number) {
+  function showMenu(row: HTMLLIElement, open: () => void, x: number, y: number, method: string) {
     row.focus();
-    setMenu({ row, open, x: Math.min(x, window.innerWidth - 100), y: Math.min(y, window.innerHeight - 44) });
+    setMenu({ row, open, x: Math.min(x, window.innerWidth - 170), y: Math.min(y, window.innerHeight - 44), method });
   }
 
-  function navigate(event: KeyboardEvent<HTMLLIElement>, groupKey?: string, open?: () => void) {
+  function navigate(event: KeyboardEvent<HTMLLIElement>, groupKey?: string, target?: { method: string; open: () => void }) {
     event.stopPropagation();
     const row = event.currentTarget;
     switch (event.key) {
@@ -67,16 +68,16 @@ export function LocalTree({ profiles, onOpen }: { profiles?: SavedConnections; o
         else if (!groupKey) row.parentElement?.closest<HTMLElement>('[role="treeitem"]')?.focus();
         break;
       case "Enter":
-        if (open) open();
+        if (target) target.open();
         else if (groupKey) toggle(groupKey);
         break;
       case " ":
         if (groupKey) toggle(groupKey);
         break;
       case "ContextMenu": case "F10": {
-        if (!open || (event.key === "F10" && !event.shiftKey)) return;
+        if (!target || (event.key === "F10" && !event.shiftKey)) return;
         const rect = row.getBoundingClientRect();
-        showMenu(row, open, rect.left, rect.bottom);
+        showMenu(row, target.open, rect.left, rect.bottom, target.method);
         break;
       }
       default: return;
@@ -104,10 +105,10 @@ export function LocalTree({ profiles, onOpen }: { profiles?: SavedConnections; o
             {group.targets.map((target) => (
               <li key={target.key} role="treeitem" aria-selected={selected === target.key} tabIndex={tabStop === target.key ? 0 : -1}
                 onFocus={() => setSelected(target.key)} onClick={(event) => event.currentTarget.focus()}
-                onDoubleClick={target.open} onKeyDown={(event) => navigate(event, undefined, target.open)}
+                onDoubleClick={target.open} onKeyDown={(event) => navigate(event, undefined, target)}
                 onContextMenu={(event) => {
                   event.preventDefault();
-                  showMenu(event.currentTarget, target.open, event.clientX, event.clientY);
+                  showMenu(event.currentTarget, target.open, event.clientX, event.clientY, target.method);
                 }}>
                 <div className="tree-row"><span>{target.name}</span>
                   {group.targets.some((other) => other.key !== target.key && other.name === target.name) && <small>{target.id}</small>}
@@ -128,7 +129,7 @@ export function LocalTree({ profiles, onOpen }: { profiles?: SavedConnections; o
       <button ref={menuButton} type="button" role="menuitem" onClick={() => {
         setMenu(undefined);
         menu.open();
-      }}>로컬</button>
+      }}>{menu.method}</button>
     </div>}
   </>;
 }
