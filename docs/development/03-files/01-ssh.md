@@ -40,5 +40,8 @@ Agent 공개 키는 열린 파일의 핸들로 링크 여부, 정규 파일 여�
 저장 대상은 `terminal_open` → `terminal::saved::launch` → `ssh::terminal::DirectLaunch`를 거친다. Rust는 각 PTY ID에 독립 계획을 만들고 직접 실행한 자식의 종료를 확인한 뒤 임시 파일을 해제한다. 닫기에서 종료 요청이나 상태 확인이 실패하면 같은 탭에 `종료 확인 불가`가 표시되며 다시 확인할 수 있다. Windows의 확인 범위는 소유한 프로세스 핸들 하나다.
 
 SSH 연결 시험은 별도 터미널에서 비밀번호나 키 암호를 입력받는다. Rust는 현재 문서와 초안의 시험 ID에만 입력을 연결하고, 고정 원격 명령의 시도별 출력과 정상 종료가 모두 확인된 뒤 저장을 승인한다.
+시험 자식의 종료가 미확인이면 취소 또는 창 닫기를 다시 요청할 수 있다. 재확인은 같은 OS 소유 자식만 대상으로 하며, 미확인 상태에서는 창 닫기 요청을 보류하고 자식과 접속 계획을 유지한다.
+
+`exec`를 거부하거나 POSIX `printf`가 없는 계정은 직접 셸을 열 수 있어도 현재 연결 시험을 통과할 수 없다. 이 제약을 없애려면 같은 OpenSSH 자식이 호스트 키와 사용자 인증을 통과한 뒤 받은 `shell` 채널 수락을 원격 출력과 분리된 로컬 경로로 전달해야 한다. Windows OpenSSH 9.5p2의 `-E` 파일은 자식이 실행 중일 때 읽기 공유를 거부하고, 일반 ConPTY 출력은 서버 출력과 섞인다. 두 OS에서 사용할 수 있는 독립 이벤트가 확보될 때까지 현재 시험 계약을 유지한다.
 
 루프백 검증은 테스트 전용 Paramiko가 설치된 Python을 `ZZABBA_F01_FIXTURE_PYTHON`으로 지정하고 `cargo test --locked --manifest-path app/src-tauri/Cargo.toml --lib f01_interactive_loopback_saves_and_reopens -- --ignored`를 실행한다. 시험이 만든 계정·키·임시 포트로 직접 입력, 암호화 키, 취소, 저장·재로드·재접속 및 활성 셸 닫기를 확인한다.
