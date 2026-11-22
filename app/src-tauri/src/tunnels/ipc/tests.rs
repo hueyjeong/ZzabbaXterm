@@ -175,3 +175,60 @@ fn desktop_route_survives_source_close_and_cleans_up_on_last_owner() {
         assert_eq!(closes.get(), 1);
     }
 }
+
+#[test]
+fn desktop_live_gate_rejects_removed_owner_and_retired_document() {
+    let tabs = TunnelTabs::default();
+    let dir = tempfile::tempdir().unwrap();
+    let target = "ssh-server";
+    let profile = crate::connections::tests::ssh_draft(dir.path());
+    let draft = serde_json::from_value::<crate::connections::profile::Draft>(profile).unwrap().validate().unwrap();
+    crate::connections::save_test_profile(dir.path(), draft);
+    let handle = tabs.open(0, dir.path(), target.into(), "시험 터널".into()).unwrap();
+    let destination = Destination { host: "127.0.0.1".into(), port: 5900 };
+    let lease = {
+        let mut doc = tabs.document(0).unwrap();
+        let source = doc.tabs[&handle].owner.clone();
+        let ssh = doc.tabs[&handle].ssh.clone().unwrap();
+        let id = doc.tunnels.begin(source.clone(), Route::SshLocal {
+            server: target.into(), listen: ([127, 0, 0, 1], 5901).into(), destination: destination.clone(),
+        }).unwrap();
+        let tunnel = doc.tunnels.entries.get_mut(&id).unwrap();
+        tunnel.state = State::Ready;
+        let loss = tunnel.desktop_loss.get_or_insert_with(CancellationToken::new).child_token();
+        let owner = doc.tunnels.retain_desktop(id, &source).unwrap();
+        DesktopLease { document: Arc::downgrade(&tabs.0), epoch: 0, id, owner, target: target.into(), ssh,
+            destination, protocol: Protocol::Vnc, stream: None, loss }
+    };
+    assert_eq!(lease.while_live(|| 7), Some(7));
+    {
+        let mut doc = tabs.document(0).unwrap();
+        let tunnel = doc.tunnels.entries.get_mut(&lease.id).unwrap();
+        assert!(tunnel.owners.remove(&lease.owner));
+    }
+    assert!(!lease.loss.is_cancelled());
+    assert_eq!(lease.while_live(|| panic!("소유권 해제 후 쓰기")), None::<()>);
+    tabs.navigate(false);
+    assert_eq!(lease.while_live(|| panic!("문서 이동 후 쓰기")), None::<()>);
+}
+
+#[test]
+fn desktop_status_serializes_only_ready_approved_loopback() {
+    let owners = Default::default();
+    let listen = ([127, 0, 0, 1], 3390).into();
+    let route = |host: &str| Route::SshLocal {
+        server: "ssh-server".into(), listen, destination: Destination { host: host.into(), port: 3389 },
+    };
+    let encode = |route: &Route, state: &State, protocol| serde_json::to_value(status(
+        View { id: TunnelId(1), route, owners: &owners, state }, Vec::new(),
+        &Entry { endpoint: String::new(), protocol }, "ssh-server",
+    )).unwrap();
+    let local = route("::1");
+    let other = route("localhost");
+    assert_eq!(encode(&local, &State::Ready, Some(Protocol::Rdp))["desktop"], json!({
+        "protocol": "rdp", "targetId": "ssh-server", "destination": {"host": "::1", "port": 3389}
+    }));
+    assert!(encode(&local, &State::Starting, Some(Protocol::Rdp)).get("desktop").is_none());
+    assert!(encode(&local, &State::Ready, None).get("desktop").is_none());
+    assert!(encode(&other, &State::Ready, Some(Protocol::Rdp)).get("desktop").is_none());
+}

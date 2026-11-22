@@ -47,7 +47,7 @@ struct Entry {
     protocol: Option<Protocol>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum Protocol { Rdp, Vnc }
 
@@ -92,6 +92,22 @@ struct Status {
     owners: Vec<String>,
     state: &'static str,
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    desktop: Option<DesktopStatus>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopStatus {
+    protocol: Protocol,
+    target_id: String,
+    destination: DesktopDestination,
+}
+
+#[derive(Serialize)]
+struct DesktopDestination {
+    host: String,
+    port: u16,
 }
 
 fn route_label(route: &Route) -> String {
@@ -109,14 +125,21 @@ fn route_label(route: &Route) -> String {
     }
 }
 
-fn status(view: View<'_>, owners: Vec<String>, entry: &Entry) -> Status {
+fn status(view: View<'_>, owners: Vec<String>, entry: &Entry, target: &str) -> Status {
     let (state, end) = match view.state {
         State::Starting => ("starting", None),
         State::Ready => ("ready", None),
         State::Failed(end) => ("failed", Some(end)),
         State::Disconnected(end) => ("disconnected", Some(end)),
     };
-    Status { id: view.id.0.to_string(), endpoint: entry.endpoint.clone(), route: route_label(view.route), owners, state,
+    let desktop = match (view.state, view.route, entry.protocol) {
+        (State::Ready, Route::SshLocal { server, destination, .. }, Some(protocol))
+            if desktop_listener(view.route, target, destination).is_ok() => Some(DesktopStatus {
+                protocol, target_id: server.clone(), destination: DesktopDestination { host: destination.host.clone(), port: destination.port },
+            }),
+        _ => None,
+    };
+    Status { id: view.id.0.to_string(), endpoint: entry.endpoint.clone(), route: route_label(view.route), owners, state, desktop,
         error: end.map(|end| match &end.cleanup_error {
             Some(error) => format!("{} · 종료 확인 불가: {error}", end.reason),
             None => end.reason.clone(),
@@ -145,6 +168,22 @@ impl DesktopLease {
     pub(crate) fn destination(&self) -> &Destination { &self.destination }
     pub(crate) fn protocol(&self) -> Protocol { self.protocol }
     pub(crate) fn loss(&self) -> CancellationToken { self.loss.child_token() }
+
+    /// 철회와 직렬화할 비차단 I/O 한 번만 실행한다. 콜백은 임대나 터널 등록부에 재진입할 수 없다.
+    pub(crate) fn while_live<T>(&self, f: impl FnOnce() -> T) -> Option<T> {
+        let document = self.document.upgrade()?;
+        let doc = document.lock().ok()?;
+        if doc.destroyed || doc.epoch != self.epoch || self.loss.is_cancelled() {
+            return None;
+        }
+        let route = doc.tunnels.entries.get(&self.id)?;
+        if !matches!(route.state, State::Ready) || !route.owners.contains(&self.owner) {
+            return None;
+        }
+        let result = f();
+        drop(doc);
+        Some(result)
+    }
 
     pub(crate) fn take_stream(&mut self) -> Result<TcpStream, String> {
         if self.loss.is_cancelled() { return Err(STALE.into()); }
@@ -338,7 +377,7 @@ impl TunnelTabs {
             let mut owners: Vec<_> = view.owners.iter().filter_map(|owner| tabs.get(&owner.tab))
                 .map(|tab| tab.label.clone()).collect();
             owners.sort_unstable();
-            Some(status(view, owners, entries.get(id)?))
+            Some(status(view, owners, entries.get(id)?, &tab.target))
         }).collect())
     }
 
