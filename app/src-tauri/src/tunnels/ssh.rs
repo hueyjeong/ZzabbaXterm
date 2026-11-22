@@ -100,7 +100,7 @@ pub(crate) struct SshChild {
 
 impl SshChild {
     fn spawn(connection: Arc<ConnectionPlan>, plan: SshPlan) -> Result<Self, String> {
-        let call = connection.invocation(Client::Ssh);
+        let call = connection.invocation(Client::Ssh).map_err(|error| format!("SSH 전달 준비: {error:?}"))?;
         let mut command = Command::new(call.program);
         command.args(&call.args[..2]);
         command.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]);

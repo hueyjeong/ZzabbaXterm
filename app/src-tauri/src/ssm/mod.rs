@@ -7,7 +7,7 @@ mod plugin;
 mod profile;
 mod session;
 #[cfg(windows)]
-mod windows_acl;
+pub(crate) mod windows_acl;
 
 pub use cli::{CliError, CommandSpec};
 pub(crate) use home::{sso_cache_entry, user_home};

@@ -1,4 +1,6 @@
 pub mod ai;
+#[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+mod auth;
 mod connections;
 mod editor;
 mod local_ipc;
@@ -13,6 +15,11 @@ mod workspace_window;
 
 pub mod editor_cli {
     pub use crate::editor::cli::{CliError, run};
+}
+
+#[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+pub mod local_auth {
+    pub use crate::auth::run_askpass;
 }
 
 use editor::registry::LocalEditors;

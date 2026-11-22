@@ -25,12 +25,18 @@ struct Process {
 
 impl Session {
     pub(crate) async fn connect(plan: Arc<ConnectionPlan>, cancel: CancellationToken, worker: TaskTrackerToken) -> Result<Self> {
-        let command = Self::command(&plan);
+        let command = Self::command(&plan)?;
         Self::spawn(plan, cancel, worker, command, DEADLINE).await
     }
 
-    pub(super) fn command(plan: &ConnectionPlan) -> Command {
-        let invocation = plan.invocation(Client::Sftp);
+    pub(super) fn command(plan: &ConnectionPlan) -> Result<Command> {
+        let invocation = plan.invocation(Client::Sftp).map_err(|error| {
+            Error::Terminal(match error {
+                crate::ssh::Error::StoredSftpAskpassRequired =>
+                    "SFTP는 저장된 SSH 암호의 별도 승인을 지원하지 않습니다".into(),
+                error => format!("SFTP 준비: {error:?}"),
+            })
+        })?;
         let mut command = Command::new(invocation.program);
         command.args(invocation.args);
         for &(key, value) in invocation.environment {
@@ -42,7 +48,7 @@ impl Session {
         command.env_remove("BW_SESSION");
         #[cfg(windows)]
         command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
-        command
+        Ok(command)
     }
 
     pub(super) async fn spawn(

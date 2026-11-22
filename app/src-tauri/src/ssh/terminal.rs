@@ -21,8 +21,11 @@ impl DirectLaunch {
         if account != approved_account {
             return Err(Error::ApprovedAccountMismatch);
         }
+        if matches!(auth, Authentication::StoredPassword { .. }) {
+            return Err(Error::StoredAuthenticationUnavailable);
+        }
         let plan = Arc::new(ConnectionPlan::prepare(store, approved_host, account, Transport::Direct, auth)?);
-        let command = command(plan.invocation(Client::Ssh));
+        let command = command(plan.invocation(Client::Ssh)?);
         Ok(Self { command, plan })
     }
 
@@ -84,7 +87,7 @@ fn pin_error(error: Error) -> String {
     }
 }
 
-fn command(invocation: Invocation<'_>) -> CommandBuilder {
+pub(crate) fn command(invocation: Invocation<'_>) -> CommandBuilder {
     let mut command = CommandBuilder::new(invocation.program);
     command.args(invocation.args);
     for &(name, value) in invocation.environment {
@@ -94,6 +97,9 @@ fn command(invocation: Invocation<'_>) -> CommandBuilder {
         }
     }
     command.env_remove("BW_SESSION");
+    for name in ["ZZABBA_ASKPASS_ENDPOINT", "ZZABBA_ASKPASS_BROKER_PID"] {
+        command.env_remove(name);
+    }
     // ConPTY의 실행기 검색이 ssh.exe 부재 시 PATHEXT의 다른 확장자를 시도한다.
     #[cfg(windows)]
     command.env_remove("PATHEXT");

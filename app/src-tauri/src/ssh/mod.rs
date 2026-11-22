@@ -36,6 +36,7 @@ pub(crate) enum Error {
     InvalidTrustRecord,
     SsmProxyUnavailable,
     StoredAuthenticationUnavailable,
+    StoredSftpAskpassRequired,
     Io(io::Error),
 }
 
@@ -55,7 +56,7 @@ pub(crate) enum Authentication<'a> {
     AgentFile { public_key_path: &'a Path },
     KeyFile { private_key: &'a Path },
     ManualPassword,
-    StoredPassword,
+    StoredPassword { item: &'a str },
 }
 
 pub(crate) enum Client {
@@ -73,8 +74,22 @@ const NO_ASKPASS: [(&str, Option<&str>); 2] = [
 pub(crate) struct ConnectionPlan {
     ssh: PathBuf,
     config: PathBuf,
+    #[cfg(any(windows, target_os = "linux"))]
+    stored: Option<Stored>,
     _files: SessionFiles,
     _root: trust::RootGuard,
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+pub(crate) struct Stored {
+    pub(crate) target: String,
+    pub(crate) user: String,
+    pub(crate) fingerprint: String,
+    pub(crate) item: String,
+    // 승인 화면이 읽은 대상과 접속 시 검증하는 PIN을 계획의 수명 동안 고정한다.
+    _snapshot: [fs::File; 2],
+    #[cfg(windows)]
+    _directory: trust::RootGuard,
 }
 
 pub(crate) struct Invocation<'a> {
@@ -103,7 +118,12 @@ impl ConnectionPlan {
         if matches!(transport, Transport::Ssm) {
             return Err(Error::SsmProxyUnavailable);
         }
-        if matches!(auth, Authentication::StoredPassword) {
+        let stored_item = match auth {
+            Authentication::StoredPassword { item } => Some(item),
+            _ => None,
+        };
+        #[cfg(not(any(windows, target_os = "linux")))]
+        if stored_item.is_some() {
             return Err(Error::StoredAuthenticationUnavailable);
         }
 
@@ -111,7 +131,16 @@ impl ConnectionPlan {
         let ssh = programs.join(if cfg!(windows) { "ssh.exe" } else { "ssh" });
         let files = session_files(&store.root)?;
         let known_hosts = files.path().join("known_hosts");
+        #[cfg(target_os = "linux")]
+        let pinned = stored_item.map(|_| sealed_snapshot(pin.as_bytes())).transpose()?;
+        #[cfg(target_os = "linux")]
+        let known_hosts = pinned.as_ref().map(snapshot_path).unwrap_or(known_hosts);
         let known_hosts_value = config_path(&known_hosts)?;
+        #[cfg(target_os = "linux")]
+        if pinned.is_none() {
+            new_session_file(&known_hosts)?.write_all(pin.as_bytes())?;
+        }
+        #[cfg(not(target_os = "linux"))]
         new_session_file(&known_hosts)?.write_all(pin.as_bytes())?;
 
         let agent_key;
@@ -134,20 +163,24 @@ impl ConnectionPlan {
             Authentication::KeyFile { private_key } => {
                 ("publickey", "yes", "no", Some("none"), "no", config_path(private_key)?)
             }
-            Authentication::ManualPassword => {
+            Authentication::ManualPassword | Authentication::StoredPassword { .. } => {
                 ("password", "no", "yes", Some("none"), "no", "none".to_owned())
             }
-            Authentication::StoredPassword => return Err(Error::StoredAuthenticationUnavailable),
             Authentication::AgentFile { .. } => unreachable!("Agent 공개 키를 먼저 로드합니다"),
         };
 
         // OpenSSH 9.5는 CertificateFile none을 상대 파일명으로 읽는다.
         let certificate_disabled = config_path(&files.path().join("no-certificate"))?;
         let config = files.path().join("ssh_config");
-        let mut file = new_session_file(&config)?;
+        let mut contents = Vec::new();
+        let mut file = if stored_item.is_none() { Some(new_session_file(&config)?) } else { None };
+        let output: &mut dyn Write = match &mut file {
+            Some(file) => file,
+            None => &mut contents,
+        };
         // Host 패턴 대신 단일 목적지를 고정해 대상 인자가 달라도 기본 설정으로 빠지지 않는다.
         writeln!(
-            file,
+            output,
             "HostName {}\nPort {}\nUser {account}\nHostKeyAlias {alias}\n\
              StrictHostKeyChecking yes\nUserKnownHostsFile {known_hosts_value}\n\
              GlobalKnownHostsFile none\nKnownHostsCommand none\nVerifyHostKeyDNS no\n\
@@ -164,23 +197,84 @@ impl ConnectionPlan {
             endpoint.host, endpoint.port,
         )?;
         if let Some(agent) = agent {
-            writeln!(file, "IdentityAgent {agent}")?;
+            writeln!(output, "IdentityAgent {agent}")?;
+        }
+        if stored_item.is_some() {
+            writeln!(output, "NumberOfPasswordPrompts 1")?;
         }
         drop(file);
+        #[cfg(target_os = "linux")]
+        let sealed = stored_item.map(|_| sealed_snapshot(&contents)).transpose()?;
+        #[cfg(target_os = "linux")]
+        let config = sealed.as_ref().map(snapshot_path).unwrap_or(config);
         #[cfg(windows)]
-        {
-            trust_windows::root(files.path())?;
-            trust_windows::pin(&known_hosts)?;
-            trust_windows::pin(&config)?;
+        if stored_item.is_some() {
+            new_session_file(&config)?.write_all(&contents)?;
+        }
+        #[cfg(windows)]
+        let (directory, snapshots) = {
+            let directory = trust_windows::root(files.path())?;
+            let snapshots = [trust_windows::pin(&known_hosts)?, trust_windows::pin(&config)?];
+            if stored_item.is_some() {
+                use std::io::Read;
+                for (file, expected) in snapshots.iter().zip([pin.as_bytes(), contents.as_slice()]) {
+                    let mut actual = Vec::with_capacity(expected.len() + 1);
+                    file.take((expected.len() + 1) as u64).read_to_end(&mut actual)?;
+                    if actual != expected {
+                        return Err(Error::InvalidTrustRecord);
+                    }
+                }
+            }
             if agent.is_none() {
                 trust_windows::pin(&files.path().join("agent.pub"))?;
             }
-        }
-        Ok(Self { ssh, config, _files: files, _root: root })
+            (directory, snapshots)
+        };
+        #[cfg(any(windows, target_os = "linux"))]
+        let stored = stored_item.map(|item| Stored {
+            target: alias,
+            user: account.to_owned(),
+            fingerprint: approved.fingerprint(),
+            item: item.to_owned(),
+            #[cfg(target_os = "linux")]
+            _snapshot: [pinned.unwrap(), sealed.unwrap()],
+            #[cfg(windows)]
+            _snapshot: snapshots,
+            #[cfg(windows)]
+            _directory: directory,
+        });
+        Ok(Self {
+            ssh, config,
+            #[cfg(any(windows, target_os = "linux"))]
+            stored,
+            _files: files, _root: root,
+        })
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    pub(crate) fn stored(&self) -> Option<&Stored> { self.stored.as_ref() }
+
+    /// 승인된 askpass 교환에서만 사용한다. 이 호출 자체는 askpass를 활성화하지 않는다.
+    #[cfg(any(windows, target_os = "linux"))]
+    pub(crate) fn stored_ssh_invocation(&self) -> Result<Invocation<'_>, Error> {
+        self.stored().ok_or(Error::StoredAuthenticationUnavailable)?;
+        Ok(self.client_invocation(Client::Ssh))
     }
 
     /// argv는 셸 문자열로 조합하지 않고, 자식 환경에 지정한 항목을 모두 적용한다.
-    pub(crate) fn invocation(&self, client: Client) -> Invocation<'_> {
+    pub(crate) fn invocation(&self, client: Client) -> Result<Invocation<'_>, Error> {
+        #[cfg(any(windows, target_os = "linux"))]
+        if self.stored().is_some() {
+            return Err(match client {
+                Client::Ssh => Error::StoredAuthenticationUnavailable,
+                // 별도 자식을 여는 배치 SFTP에는 PTY 승인을 재사용할 수 없다.
+                Client::Sftp => Error::StoredSftpAskpassRequired,
+            });
+        }
+        Ok(self.client_invocation(client))
+    }
+
+    fn client_invocation(&self, client: Client) -> Invocation<'_> {
         let config = self.config.as_os_str();
         let tail = [OsStr::new("-F"), config, OsStr::new("--"), OsStr::new(DESTINATION)];
         let args = match client {
@@ -190,6 +284,35 @@ impl ConnectionPlan {
         };
         Invocation { program: &self.ssh, args, environment: &NO_ASKPASS }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn sealed_snapshot(contents: &[u8]) -> io::Result<fs::File> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: 커널이 새 파일 디스크립터의 소유권을 반환한다.
+    let fd = unsafe { libc::memfd_create(c"zzabba-ssh-plan".as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: 성공한 memfd_create가 반환한 디스크립터다.
+    let mut file = unsafe { fs::File::from_raw_fd(fd) };
+    // SAFETY: 열린 디스크립터와 일반 파일 권한 마스크를 전달한다.
+    if unsafe { libc::fchmod(fd, 0o600) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    file.write_all(contents)?;
+    let seals = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+    // SAFETY: 열린 디스크립터에 F_ADD_SEALS 비트마스크를 전달한다.
+    if unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, seals) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(file)
+}
+
+#[cfg(target_os = "linux")]
+fn snapshot_path(file: &fs::File) -> PathBuf {
+    use std::os::fd::AsRawFd;
+    PathBuf::from(format!("/proc/{}/fd/{}", std::process::id(), file.as_raw_fd()))
 }
 
 #[cfg(unix)]

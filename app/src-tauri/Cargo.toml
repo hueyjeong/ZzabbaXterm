@@ -9,6 +9,7 @@ default-run = "zzabbaxterm"
 default = ["local-cli"]
 local-cli = []
 ai-control = []
+stored-auth = ["windows-sys/Win32_System_Diagnostics_ToolHelp", "windows-sys/Win32_System_Pipes"]
 
 # 배포 빌드에서는 Cargo 타깃 대신 준비된 sidecar를 넣는다.
 [[bin]]
@@ -26,6 +27,11 @@ required-features = ["local-cli"]
 name = "zzabba-ai-control"
 path = "src/bin/zzabba-ai-control.rs"
 required-features = ["ai-control"]
+
+[[bin]]
+name = "zzabba-askpass"
+path = "src/bin/zzabba-askpass.rs"
+required-features = ["stored-auth"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
