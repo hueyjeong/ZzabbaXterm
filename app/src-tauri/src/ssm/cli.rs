@@ -240,6 +240,9 @@ impl CommandSpec {
     }
 
     pub(super) async fn capture_with_timeout(&self, cancel: &CancellationToken, timeout: Duration) -> Result<Captured, CliError> {
+        if matches!(self.tool, Tool::Aws) {
+            super::plugin::validate_aws(self.program())?;
+        }
         if let Some((_, credentials)) = &self.bound {
             credentials.require_current()?;
         }
@@ -257,6 +260,7 @@ impl CommandSpec {
     }
 
     pub(super) async fn login(&self, cancel: &CancellationToken) -> Result<(), CliError> {
+        super::plugin::validate_aws(self.program())?;
         capture(self.command(), self.tool, LOGIN_TIMEOUT, cancel)
             .await?
             .success()?;

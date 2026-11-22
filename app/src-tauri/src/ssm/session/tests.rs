@@ -562,6 +562,38 @@ async fn already_terminating_session_uses_only_reads() {
     ]).await, Ok(()));
 }
 
+#[tokio::test]
+async fn readiness_retries_only_reads_after_timeout() {
+    let request = request();
+    let cancel = CancellationToken::new();
+    let mut connected = session();
+    connected["Status"] = json!("Connected");
+    let mut results = [Err(CliError::TimedOut), Ok(inventory(vec![connected]))].into_iter();
+    assert_eq!(request.wait_connected_with(&cancel, async |command, timeout| {
+        assert_eq!(&command.args()[..2], &ACTIVE[..2]);
+        assert!(command.args().windows(2).any(|args| args == ["--state", "Active"]));
+        assert!(timeout <= CLOSE_LOOKUP_TIMEOUT);
+        results.next().expect("unexpected read")
+    }).await, Ok(()));
+    assert!(results.next().is_none());
+}
+
+#[tokio::test]
+async fn cleanup_retries_each_timed_out_read_without_repeating_the_write() {
+    let mut request = request();
+    let scope = request.scope.clone();
+    assert_eq!(check_close(&mut request, &scope, [
+        (HISTORY, Err(CliError::TimedOut)),
+        (HISTORY, Ok(inventory(vec![]))),
+        (ACTIVE, Err(CliError::TimedOut)),
+        (HISTORY, Ok(inventory(vec![]))),
+        (ACTIVE, Ok(inventory(vec![active_session()]))),
+        (TERMINATE, Err(CliError::TimedOut)),
+        (CONFIRM, Err(CliError::TimedOut)),
+        (CONFIRM, Ok(inventory(vec![session()]))),
+    ]).await, Ok(()));
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn denied_ambiguous_or_unowned_sessions_never_authorize_a_write() {
     use VerificationError::Unconfirmed;

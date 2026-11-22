@@ -187,22 +187,7 @@ impl AwsCli {
         cancel: &CancellationToken,
     ) -> Result<(), VerificationError> {
         request.require_issued_scope(&self.0, scope)?;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            match request.find_session(request.lookup_command(SessionLookup::Active, None)
-                .capture_with_timeout(cancel, deadline.saturating_duration_since(tokio::time::Instant::now()).min(CLOSE_LOOKUP_TIMEOUT)).await)? {
-                Some(session) if session.is_connected() => return Ok(()),
-                Some(session) if session.status != SessionStatus::Connecting => return Err(VerificationError::Unconfirmed),
-                _ => {}
-            }
-            if tokio::time::Instant::now() + OBSERVE_INTERVAL >= deadline {
-                return Err(VerificationError::Unconfirmed);
-            }
-            tokio::select! {
-                _ = cancel.cancelled() => return Err(VerificationError::Unconfirmed),
-                _ = tokio::time::sleep(OBSERVE_INTERVAL) => {}
-            }
-        }
+        request.wait_connected_with(cancel, async |spec, timeout| spec.capture_with_timeout(cancel, timeout).await).await
     }
 
     pub async fn close_session(
@@ -233,6 +218,35 @@ impl AwsCli {
 }
 
 impl StartRequest {
+    async fn wait_connected_with(
+        &self,
+        cancel: &CancellationToken,
+        mut capture: impl AsyncFnMut(CommandSpec, Duration) -> Result<Captured, CliError>,
+    ) -> Result<(), VerificationError> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if cancel.is_cancelled() || tokio::time::Instant::now() >= deadline {
+                return Err(VerificationError::Unconfirmed);
+            }
+            let timeout = deadline.saturating_duration_since(tokio::time::Instant::now()).min(CLOSE_LOOKUP_TIMEOUT);
+            let result = capture(self.lookup_command(SessionLookup::Active, None), timeout).await;
+            if !matches!(result, Err(CliError::TimedOut)) {
+                match self.find_session(result)? {
+                    Some(session) if session.is_connected() => return Ok(()),
+                    Some(session) if session.status != SessionStatus::Connecting => return Err(VerificationError::Unconfirmed),
+                    _ => {}
+                }
+            }
+            if tokio::time::Instant::now() + OBSERVE_INTERVAL >= deadline {
+                return Err(VerificationError::Unconfirmed);
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => return Err(VerificationError::Unconfirmed),
+                _ = tokio::time::sleep(OBSERVE_INTERVAL) => {}
+            }
+        }
+    }
+
     async fn authorize_with(
         &mut self,
         program: &Path,
@@ -325,7 +339,9 @@ impl StartRequest {
         let mut active = None;
         for attempt in 0..CLOSE_ATTEMPTS {
             if attempt != 0 { tokio::time::sleep(OBSERVE_INTERVAL).await; }
-            if let Some(history) = self.find_session(capture(self.lookup_command(SessionLookup::History, None)).await)? {
+            let history = capture(self.lookup_command(SessionLookup::History, None)).await;
+            if matches!(history, Err(CliError::TimedOut)) { continue; }
+            if let Some(history) = self.find_session(history)? {
                 return match history.status {
                     SessionStatus::Terminated => Ok(()),
                     SessionStatus::Terminating => {
@@ -335,7 +351,9 @@ impl StartRequest {
                     _ => Err(Unconfirmed),
                 };
             }
-            active = self.find_session(capture(self.lookup_command(SessionLookup::Active, None)).await)?;
+            let result = capture(self.lookup_command(SessionLookup::Active, None)).await;
+            if matches!(result, Err(CliError::TimedOut)) { continue; }
+            active = self.find_session(result)?;
             if active.is_some() { break; }
         }
         let active = active.ok_or(Unconfirmed)?;
@@ -387,7 +405,9 @@ impl StartRequest {
         use VerificationError::Unconfirmed;
         for attempt in 0..CLOSE_ATTEMPTS {
             if attempt != 0 { tokio::time::sleep(OBSERVE_INTERVAL).await; }
-            match self.find_session(capture(self.lookup_command(SessionLookup::History, id)).await)? {
+            let result = capture(self.lookup_command(SessionLookup::History, id)).await;
+            if matches!(result, Err(CliError::TimedOut)) { continue; }
+            match self.find_session(result)? {
                 Some(session) if id.is_some_and(|id| session.session_id() != id) => return Err(Unconfirmed),
                 Some(session) if session.is_terminated() => return Ok(()),
                 Some(session) if session.status != SessionStatus::Terminating => return Err(Unconfirmed),

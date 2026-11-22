@@ -73,6 +73,9 @@ fn start_error(error: CliError) -> String {
     let status = match error {
         CliError::AwsCliMissing => "AWS CLI 없음",
         CliError::AwsCliNotV2 => "AWS CLI v2 필요",
+        CliError::InvalidConfiguration if cfg!(target_os = "linux") => "AWS 구성 또는 설치 오류. AWS CLI v2와 Session Manager 플러그인의 관리자 관리 시스템 설치가 필요합니다.",
+        CliError::InvalidConfiguration => "AWS 구성 또는 설치 오류",
+        CliError::PluginMissing if cfg!(target_os = "linux") => "Session Manager 플러그인 없음. 관리자 관리 시스템 설치가 필요합니다.",
         CliError::PluginMissing => "Session Manager 플러그인 없음",
         CliError::TargetNotConnected => "노드 연결 불가",
         CliError::AccessDenied => "권한 거부",

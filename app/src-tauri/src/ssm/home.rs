@@ -6,12 +6,17 @@ use std::{
     io::{ErrorKind, Read, Write},
     path::Path,
 };
+#[cfg(not(windows))]
 use tempfile::TempDir;
 use zeroize::Zeroizing;
 
-pub(super) struct CliHome(TempDir);
+pub(super) struct CliHome(
+    #[cfg(not(windows))] TempDir,
+    #[cfg(windows)] std::path::PathBuf,
+);
 
 impl CliHome {
+    #[cfg(not(windows))]
     pub(super) fn new() -> Result<Self, CliError> {
         let mut builder = tempfile::Builder::new();
         #[cfg(unix)]
@@ -26,7 +31,29 @@ impl CliHome {
             .map_err(|_| CliError::ProcessIo)
     }
 
+    #[cfg(windows)]
+    pub(super) fn new() -> Result<Self, CliError> {
+        use windows_sys::Win32::UI::Shell::FOLDERID_LocalAppData;
+        let parent = super::windows_acl::known_folder(&FOLDERID_LocalAppData)
+            .map_err(|_| CliError::ProcessIo)?;
+        super::windows_acl::trusted_chain(&parent, false)
+            .map_err(|_| CliError::InvalidConfiguration)?;
+        Self::create_in(&parent)
+    }
+
+    #[cfg(windows)]
+    fn create_in(parent: &Path) -> Result<Self, CliError> {
+        let mut nonce = [0; 16];
+        getrandom::fill(&mut nonce).map_err(|_| CliError::RandomUnavailable)?;
+        let path = parent.join(format!("zzabba-aws-{:032x}", u128::from_ne_bytes(nonce)));
+        super::windows_acl::private_dir(&path).map_err(|_| CliError::ProcessIo)?;
+        Ok(Self(path))
+    }
+
     pub(super) fn path(&self) -> &Path {
+        #[cfg(windows)]
+        return &self.0;
+        #[cfg(not(windows))]
         self.0.path()
     }
 
@@ -78,6 +105,13 @@ impl CliHome {
     }
 }
 
+#[cfg(windows)]
+impl Drop for CliHome {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 pub(super) fn user_home() -> Result<std::path::PathBuf, CliError> {
     // Python은 POSIX에서 HOME, Windows에서 USERPROFILE을 우선한다.
     let value = if cfg!(windows) {
@@ -117,5 +151,23 @@ mod tests {
         );
         assert!(!isolated.path().join(".aws/sso/cache/other.json").exists());
         assert!(!isolated.path().join(".aws/cli/alias").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn copied_cache_cannot_inherit_broad_parent_access() {
+        use super::super::windows_acl::tests::{assert_user_only, fixture_dir};
+        let root = tempfile::tempdir().unwrap();
+        let shared = root.path().join("shared");
+        fixture_dir(&shared, "FA");
+        let source = CliHome::create_in(root.path()).unwrap();
+        let relative = Path::new(".aws/sso/cache/a9993e364706816aba3e25717850c26c9cd0d89d.json");
+        let cache = source.path().join(relative);
+        fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        fs::write(cache, b"fixture-only-token").unwrap();
+        let home = CliHome::create_in(&shared).unwrap();
+        home.import_sso_token(source.path(), "abc").unwrap();
+        assert_user_only(home.path(), true, true);
+        assert_user_only(&home.path().join(relative), false, false);
     }
 }

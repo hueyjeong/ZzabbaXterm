@@ -6,6 +6,8 @@
 
 **준비물:** 네이티브 Windows 11(한국어 두벌식)·Ubuntu 24.04 GNOME Wayland(IBus Hangul 두벌식), 두 PC의 AWS CLI v2와 공식 Session Manager 플러그인, IAM Identity Center 시험 프로필, UTF-8 대화형 셸이 있는 승인된 비운영 온라인 노드. 관리자에게 목록 조회·세션 시작·자기 세션 종료와 검증용 세션 상태 조회 범위를 확인한다. 빈 리전, 조회가 거부된 시험 프로필, 만료된 별도 시험 로그인, 오프라인 시험 노드를 준비한다. 설치·권한 변경·Agent 정지는 앱 밖에서 별도 승인받는다.
 
+Linux에서는 관리자가 [AWS CLI v2 공식 안내의 시스템 설치(`--system`)](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html#install-linux)와 [Session Manager 플러그인 공식 Linux 설치 안내](https://docs.aws.amazon.com/systems-manager/latest/userguide/install-plugin-linux-overview.html)에 따라 두 도구를 설치해야 한다. C02는 root가 소유하고 일반 사용자가 수정할 수 없는 시스템 설치만 지원한다. 사용자 홈 설치는 미지원이다.
+
 | Given (조건) | When (행동) | Then (관찰) |
 |---|---|---|
 | 선택한 프로필·리전에 온라인 노드가 있다 | 마법사에서 시험·저장 후 같은 노드를 두 번 연다 | 독립된 두 탭에서 `whoami`가 응답한다. 첫 탭을 닫은 뒤에도 둘째 탭은 입력을 받고 첫 AWS 세션만 끝난다. |
@@ -59,9 +61,15 @@ Rust는 두 방식이 섞인 레코드와 비밀·실행 파일·임의 인자 �
 
 연결 시험은 공식 준비 확인 후 Linux 셸 표식과 종료 코드 0을 확인하고, 원격 종료까지 확인한 뒤 C01 저장 자격을 발급한다. `terminal_close({ id })`와 `connection_test_cancel({ run })`에서 `null`은 정리 완료를 뜻한다. 로컬 자식 회수와 원격 종료 확인은 별도 상태이며, 원격 미시작이면 원격 정리가 필요 없다. SSM의 탭이나 마법사는 응답을 기다리고, 종료 미확인 시 `종료 확인 불가: <대상>`과 다시 확인하는 동작을 남긴다. 로컬 마법사의 취소 대기 제한은 2초를 유지한다.
 
-소유권이 확인된 원격 세션에만 한 번 종료 요청을 보내며, `Terminating` 또는 빈 History에는 읽기만 반복한다. 같은 문서에서 같은 앱 세션 ID나 시험 실행으로 다시 확인할 때도 History만 읽는다. 임시 자격이 만료되거나 권한이 거부되면 다른 자격으로 전환하지 않는다.
+준비·종료 확인의 개별 조회가 2초 안에 끝나지 않으면 전체 제한 안에서 읽기만 재시도한다. 소유권이 확인된 원격 세션에만 한 번 종료 요청을 보내며, `Terminating` 또는 빈 History에는 읽기만 반복한다. 같은 문서에서 같은 앱 세션 ID나 시험 실행으로 다시 확인할 때도 History만 읽는다. 임시 자격이 만료되거나 권한이 거부되면 다른 자격으로 전환하지 않는다.
+
+확인된 자연 종료는 자격이나 세션 객체 없이 결과만 보존한다. 같은 문서에서 탭을 닫거나 문서가 종료되면 그 기록을 회수한다.
 
 Windows에서는 시작 직후 전용 Job에 프로세스를 배정한다. 직접 실행한 CLI의 종료만 확인 결과에 포함하며, Job 배정 전에 생성된 자손의 회수 여부는 미확인이다.
+
+**로컬 신뢰 경계:** Windows에서는 현재 사용자 전용 보호 DACL로 임시 홈을 만들고, 캐시는 이 권한을 상속한다. 설치된 AWS CLI와 Session Manager 플러그인의 파일·디렉터리 ACL을 검사해 다른 일반 계정이 실행 파일이나 검색 경로를 바꿀 수 있으면 시작을 거부한다. Linux에서는 root 소유와 쓰기 권한을 검사한다. 관리자 업데이트나 같은 계정의 프로세스가 검사와 실행 사이에 설치 경로·파일을 바꾸는 경합은 이 검사의 범위 밖이다.
+
+**지원 CLI 배치:** 공식 AWS CLI v2의 PyInstaller `onedir` 배치만 지원한다. `aws`/`aws.exe` 옆에 `base_library.zip`, `awscli/data`, `awscli/botocore/data`가 있어야 한다. 검사 범위는 동봉 런타임 트리와 실행 경로를 보호하는 조상이며, 전체 PATH와 사용자 홈은 제외한다. 필요한 표식이 없거나 동봉 파일·디렉터리의 권한이 안전하지 않으면 `InvalidConfiguration`을 반환한다.
 
 **완료 증거:** `Windows SSM T1 / Ubuntu SSM T1 / Windows T3 / Ubuntu T3` 네 결과에 OS·WebView·입력기·CLI/플러그인 버전과 실제 관찰을 적는다. T3에는 실패별 화면 상태와 마법사 시험·탭별 세션 정리 근거를 포함한다. 계정·노드·세션 ID는 일관된 별칭으로 가리고 토큰·로그인 URL은 제외한다. 접근할 수 없는 조합은 `미실행(사유)`, macOS는 후속 실기기 검증이다.
 

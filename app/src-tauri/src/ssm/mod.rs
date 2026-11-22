@@ -1,3 +1,4 @@
+mod aws_install;
 mod cli;
 mod credentials;
 mod home;
@@ -5,6 +6,8 @@ pub mod ipc;
 mod plugin;
 mod profile;
 mod session;
+#[cfg(windows)]
+mod windows_acl;
 
 pub use cli::{CliError, CommandSpec};
 pub use session::{SessionLookup, StartPermit, StartRequest, VerificationError, VerifiedSession};
@@ -137,7 +140,8 @@ impl AwsCli {
     {
         use std::io::Write;
 
-        let mut snapshot = tempfile::NamedTempFile::new().map_err(|_| CliError::ProcessIo)?;
+        let mut snapshot =
+            tempfile::NamedTempFile::new_in(home.path()).map_err(|_| CliError::ProcessIo)?;
         snapshot
             .write_all(config.as_bytes())
             .map_err(|_| CliError::ProcessIo)?;
@@ -152,9 +156,10 @@ impl AwsCli {
                 "process",
             ],
         )
-        .with_config(snapshot.path(), home);
+        .with_config(snapshot.path(), home.clone());
         let credentials = Arc::new(Credentials::parse(capture(export).await?)?);
         drop(snapshot);
+        drop(home);
         let identity = session::identity_command(&self.0, scope, &credentials);
         let owner = session::captured_caller_arn(capture(identity).await?)?;
         let result = capture(
