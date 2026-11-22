@@ -164,7 +164,7 @@ impl Session {
         target: Target,
         approved_roots: rustls::RootCertStore,
         resolve: F,
-        lease: Option<&crate::tunnels::ipc::DesktopLease>,
+        auth: ipc::AuthIo<'_>,
     ) -> Result<Self, Error>
     where
         F: FnOnce() -> Fut,
@@ -178,7 +178,7 @@ impl Session {
             .map_err(|_| Error::InvalidServerName)?;
         let permit = SLOTS.try_acquire().map_err(|_| Error::Busy)?;
         let roots = connect::trusted_roots(approved_roots)?;
-        Self::open_with_tls(target, name, connect::tls_config(roots), resolve, permit, lease).await
+        Self::open_with_tls(target, name, connect::tls_config(roots), resolve, permit, auth).await
     }
 
     async fn open_with_tls<F, Fut>(
@@ -187,7 +187,7 @@ impl Session {
         tls: Arc<rustls::ClientConfig>,
         resolve: F,
         permit: tokio::sync::SemaphorePermit<'static>,
-        lease: Option<&crate::tunnels::ipc::DesktopLease>,
+        auth: ipc::AuthIo<'_>,
     ) -> Result<Self, Error>
     where
         F: FnOnce() -> Fut,
@@ -201,7 +201,7 @@ impl Session {
                 Ok(Vec::new())
             }
         });
-        let (result, mut transport) = connect::connect(target, name, tls, resolve, display, lease).await?;
+        let (result, mut transport) = connect::connect(target, name, tls, resolve, display, auth).await?;
         let id = SessionId(
             NEXT_ID
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
@@ -246,7 +246,7 @@ impl Session {
                         () = wait_deadline(clipboard_deadline) => {
                             if let Some(event) = clipboard::expire(&mut active) { pending.push_back(event); }
                         }
-                        next = connect::read_bounded(&mut transport, &ironrdp::pdu::RDP_HINT, Error::Transport), if pending.is_empty() => {
+                        next = connect::read_bounded(&mut transport, &ironrdp::pdu::RDP_HINT, Error::Transport, None), if pending.is_empty() => {
                             let pdu = next?;
                             let action = ironrdp::pdu::find_size(&pdu).map_err(|_| Error::Protocol)?.ok_or(Error::Protocol)?.action;
                             let pixels = inbound.check(action, &pdu, &graphics.image)?;

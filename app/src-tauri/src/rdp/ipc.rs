@@ -1,6 +1,6 @@
 mod input;
 
-use std::{collections::HashMap, sync::{Arc, Mutex}, time::Duration};
+use std::{collections::HashMap, io, sync::{Arc, Mutex}, task::Poll, time::Duration};
 
 use ironrdp::connector::DesktopSize;
 use serde::{Deserialize, Serialize};
@@ -39,12 +39,38 @@ struct DocumentProof {
     tunnel_epoch: u64,
 }
 
-struct Slot {
+pub(super) struct Slot {
     generation: u64,
     life: CancellationToken,
     mailbox: Mutex<Option<Packet>>,
     controls: AsyncMutex<Controls>,
     cleanup: AsyncMutex<Cleanup>,
+}
+
+pub(super) struct AuthIo<'a> {
+    slot: &'a Slot,
+    lease: Option<&'a DesktopLease>,
+}
+
+impl<'a> AuthIo<'a> {
+    pub(super) fn new(slot: &'a Slot, lease: Option<&'a DesktopLease>) -> Self {
+        Self { slot, lease }
+    }
+
+    pub(super) fn poll<T>(&self, io: impl FnOnce() -> Poll<io::Result<T>>) -> Poll<Result<T, Error>> {
+        let poll = || {
+            let _mailbox = self.slot.mailbox.lock().unwrap();
+            if self.slot.life.is_cancelled() {
+                return Poll::Ready(Err(Error::Closed));
+            }
+            io().map_err(|_| Error::Authentication)
+        };
+        // R01 → mailbox → 비차단 TLS poll. Pending에서도 잠금은 즉시 풀린다.
+        match self.lease {
+            Some(lease) => lease.while_live(poll).unwrap_or(Poll::Ready(Err(Error::Transport))),
+            None => poll(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -118,11 +144,11 @@ impl Registry {
 }
 
 impl Slot {
-    fn new(generation: u64) -> Self {
+    pub(super) fn new(generation: u64) -> Self {
         Self { generation, life: CancellationToken::new(), mailbox: Mutex::default(), controls: AsyncMutex::default(), cleanup: AsyncMutex::default() }
     }
 
-    fn close(&self) {
+    pub(super) fn close(&self) {
         let mut mailbox = self.mailbox.lock().unwrap();
         self.life.cancel();
         mailbox.take();
@@ -396,7 +422,7 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
             return Err(message(error).into());
         },
         session = Session::open(target, tokio_rustls::rustls::RootCertStore::empty(),
-            || native::account(window.clone(), target_name, prompt.clone(), approval.clone()), lease.as_ref()) => session.map_err(message)?,
+            || native::account(window.clone(), target_name, prompt.clone(), approval.clone()), AuthIo::new(slot, lease.as_ref())) => session.map_err(message)?,
     };
     drop(approval);
     let operation = async {
