@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from
 import { LocalAiPanel } from "../ai/LocalAiPanel";
 import { createLocalConnectionIpc, type SavedConnections } from "../connections/connectionIpc";
 import { LocalConnectionWizard } from "../connections/LocalConnectionWizard";
-import type { ConnectionClose, LocalProfileDraft } from "../connections/profiles";
+import type { ConnectionClose, InitialWizardDraft } from "../connections/profiles";
 import { EditorTab, type EditorTabActions } from "../editor/EditorTab";
 import type { ApprovedEditorFile, ConfirmEditorDiscard } from "../editor/contract";
 import { closeLocalFile, localEditorError, localEditorTransport, openLocalFile } from "../editor/localEditorIpc";
@@ -27,7 +27,7 @@ const connections = createLocalConnectionIpc();
 const confirmEditorDiscard: ConfirmEditorDiscard = async ({ label, reason }) => window.confirm(
   reason === "reload" ? `${label}: 디스크에서 다시 읽을까요? 현재 편집 내용은 사라집니다.` : `${label}: 미저장 편집 내용을 버리고 닫을까요?`,
 );
-type WizardRequest = { draftId: string; initialDraft: LocalProfileDraft };
+type WizardRequest = { draftId: string; initialDraft: InitialWizardDraft };
 
 function terminalStatus(status: TerminalStatus) {
   switch (status.kind) {
