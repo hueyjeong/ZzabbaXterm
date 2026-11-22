@@ -18,11 +18,13 @@ export type EditorReadResult =
 
 export type EditorSaveResult =
   | { readonly kind: "saved" }
-  | { readonly kind: "conflict"; readonly current: string | null }
+  /** null은 삭제 확인, undefined는 현재 원본 미확인이다. */
+  | { readonly kind: "conflict"; readonly current?: string | null | undefined; readonly message?: string | undefined }
   | { readonly kind: "unknown"; readonly message: string }
   | EditorFileError;
 
 export interface EditorTransport {
+  /** 비교는 저장 기준을 변경하지 않는다. 다시 읽기가 성공할 때 저장 기준을 갱신한다. */
   compare(handle: EditorFileHandle): Promise<EditorReadResult>;
   reload(handle: EditorFileHandle): Promise<EditorReadResult>;
   /** saved는 Rust가 최종 교체 성공을 확인한 뒤에만 반환한다. */

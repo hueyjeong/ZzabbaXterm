@@ -1,9 +1,16 @@
 // @vitest-environment jsdom
+import { invoke } from "@tauri-apps/api/core";
 import { editor, Uri } from "monaco-editor/editor";
+import { act, createElement } from "react";
+import { createRoot } from "react-dom/client";
 import { describe, expect, it, vi } from "vitest";
 import type { ApprovedEditorFile, EditorFileHandle, EditorReadResult, EditorSaveResult, EditorTransport } from "./contract";
 import { connectEditor, type EditorState } from "./editor";
+import { EditorTab } from "./EditorTab";
+import { localEditorTransport } from "./localEditorIpc";
 import { createFileModel } from "./monaco";
+
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
 function file(id: string): ApprovedEditorFile {
   return { handle: id as EditorFileHandle, label: "한글.txt", text: "\uFEFF처음\r\n" };
@@ -358,23 +365,81 @@ describe("파일 편집 버퍼", () => {
     }
   });
 
-  it.each([true, false])("비교를 닫아도 충돌 시 원본 존재 상태(%s)는 유지한다", async (originalExists) => {
+  it.each([
+    { current: "디스크 원본", originalExists: true, message: undefined },
+    { current: null, originalExists: false, message: undefined },
+    { current: undefined, originalExists: undefined, message: "원본 읽기 권한 없음" },
+  ])("비교를 닫아도 충돌 원본($current)의 확인 상태와 메시지를 유지한다", async ({ current, originalExists, message }) => {
     const approved = file("dismiss-conflict");
     const io = transport(approved);
-    const original = "디스크 원본";
     const tab = open(approved, {
       ...io,
-      async save() { return { kind: "conflict", current: originalExists ? original : null }; },
+      async save() { return { kind: "conflict", current, message }; },
     });
     try {
       tab.model.setValue("미저장 편집본");
       await tab.session.save();
-      expect(tab.state?.comparison).toEqual(originalExists ? original : null);
+      expect(tab.state?.comparison).toBe(current);
       tab.session.dismissComparison();
-      expect(tab.state).toMatchObject({ comparison: undefined, status: { kind: "conflict", originalExists }, dirty: true });
+      expect(tab.state).toMatchObject({ comparison: undefined, status: { kind: "conflict", originalExists, message }, dirty: true });
       expect(tab.text()).toBe("미저장 편집본");
     } finally {
       tab.close();
+    }
+  });
+
+  it.each([
+    [{ reason: "missing" }, { kind: "conflict", current: null }],
+    [{ reason: "modified", diskText: "" }, { kind: "conflict", current: "" }],
+    [{ reason: "replaced", diskText: null }, { kind: "conflict", message: "replaced" }],
+    [{ reason: "permissionsChanged" }, { kind: "conflict", message: "permissionsChanged" }],
+  ])("로컬 충돌 %j의 실제 삭제와 비교 불가를 구분한다", async (conflict, result) => {
+    vi.mocked(invoke).mockRejectedValueOnce({ kind: "conflict", conflict });
+    const saved = await localEditorTransport.save(file("local-conflict").handle, "미저장");
+    expect(saved).toStrictEqual(result);
+  });
+
+  it("Ctrl+S는 실제 충돌 메시지를 표시하고 결과 미확인 뒤 재전송을 막는다", async () => {
+    const approved = file("shortcut");
+    const io = transport(approved);
+    const save = vi.fn<EditorTransport["save"]>()
+      .mockResolvedValueOnce({ kind: "conflict", message: "원본 읽기 권한 없음" })
+      .mockResolvedValueOnce({ kind: "unknown", message: "전송 응답 유실" });
+    const host = document.body.appendChild(document.createElement("div"));
+    const root = createRoot(host);
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    vi.stubGlobal("CSS", { escape: (value: string) => value.replace(/[^\w-]/g, "\\$&") });
+    vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener() {}, removeEventListener() {} }));
+    vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+    const canvas = vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation(() => ({
+      clearRect() {}, fillRect() {}, beginPath() {}, moveTo() {}, lineTo() {}, stroke() {},
+    }) as unknown as CanvasRenderingContext2D);
+    try {
+      await act(async () => root.render(createElement(EditorTab, {
+        file: approved, active: true, transport: { ...io, save }, confirmDiscard: async () => false, onClose() {},
+      })));
+      const section = host.querySelector("section")!;
+      const status = section.querySelector('output[role="status"]')!;
+      const model = editor.getModel(Uri.from({ scheme: "zzabba-editor", path: "/file", query: approved.handle }))!;
+      await act(async () => model.setValue("미저장"));
+      const shortcut = () => act(async () => {
+        const event = new KeyboardEvent("keydown", { key: "s", ctrlKey: true, bubbles: true, cancelable: true });
+        section.querySelector(".monaco-editor")!.dispatchEvent(event);
+        expect(event.defaultPrevented).toBe(true);
+      });
+      await shortcut();
+      expect(status.textContent).toBe("원본 비교 불가: 원본 읽기 권한 없음");
+      await shortcut();
+      expect(status.textContent).toBe("저장 결과 미확인: 전송 응답 유실 · 다시 읽기 필요");
+      expect(section.querySelector("button")?.disabled).toBe(true);
+      await shortcut();
+      expect(save.mock.calls).toEqual([[approved.handle, "미저장"], [approved.handle, "미저장"]]);
+      expect(model.getValue()).toBe("미저장");
+    } finally {
+      await act(async () => root.unmount());
+      host.remove();
+      canvas.mockRestore();
+      vi.unstubAllGlobals();
     }
   });
 
@@ -395,7 +460,7 @@ describe("파일 편집 버퍼", () => {
       const saving = tab.session.save();
       tab.model.setValue("미저장 편집본");
       disconnect?.("lost final response");
-      expect(tab.state).toMatchObject({ saving: true, busy: null, dirty: true, status: { kind: "unknown" } });
+      expect(tab.state).toMatchObject({ saving: true, busy: null, dirty: true, needsReload: true, status: { kind: "unknown" } });
       const close = vi.fn();
       await tab.session.requestClose(async () => true, close);
       expect(close).not.toHaveBeenCalled();
@@ -404,9 +469,11 @@ describe("파일 편집 버퍼", () => {
       reply.resolve();
       await saving;
       expect(io.backing.get(approved.handle)).toBe("서버가 받은 내용");
-      expect(tab.state).toMatchObject({ saving: false, status: { kind: "compare" }, dirty: true });
+      expect(tab.state).toMatchObject({ saving: false, status: { kind: "compare" }, dirty: true, needsReload: true });
       await tab.session.compare();
       expect(tab.state?.comparison).toBe("서버가 받은 내용");
+      await tab.session.save();
+      expect(io.backing.get(approved.handle)).toBe("서버가 받은 내용");
       expect(tab.text()).toBe("미저장 편집본");
     } finally {
       tab.close();
@@ -415,21 +482,94 @@ describe("파일 편집 버퍼", () => {
     expect(editor.getModel(Uri.from({ scheme: "zzabba-editor", path: "/file", query: approved.handle }))).toBeNull();
   });
 
-  it("확정 실패, 접근 거부, 단절과 결과 미확인을 구분한다", async () => {
-    const approved = file("errors");
-    const save = vi.fn<EditorTransport["save"]>();
-    const tab = open(approved, { ...transport(approved), save });
+  it("다시 읽기가 단절되면 늦은 읽기 응답은 버퍼나 실제 오류를 바꾸지 못한다", async () => {
+    const approved = file("disconnect-reload");
+    const reply = Promise.withResolvers<EditorReadResult>();
+    const reload = vi.fn(() => reply.promise);
+    let disconnect: ((message: string) => void) | undefined;
+    const tab = open(approved, {
+      ...transport(approved), reload,
+      subscribeDisconnect(_handle, notify) { disconnect = notify; return () => { disconnect = undefined; }; },
+    });
     try {
       tab.model.setValue("미저장");
-      for (const kind of ["failed", "denied", "disconnected", "unknown"] as const) {
+      const reading = tab.session.reload(async () => true);
+      await vi.waitFor(() => expect(reload).toHaveBeenCalledTimes(1));
+      disconnect?.("다시 읽기 중 채널이 끊어졌습니다");
+      await tab.session.reload(async () => true);
+      expect(reload).toHaveBeenCalledTimes(1);
+      reply.resolve({ kind: "read", text: "늦은 원본" });
+      await reading;
+      expect(tab.state).toMatchObject({ dirty: true, needsReload: true, busy: null,
+        status: { kind: "disconnected", message: "다시 읽기 중 채널이 끊어졌습니다" } });
+      expect(tab.text()).toBe("미저장");
+    } finally {
+      tab.close();
+    }
+  });
+
+  it("저장 응답 유실 뒤 편집을 되돌려도 폐기 확인이 필요하다", async () => {
+    const approved = file("unknown-after-undo");
+    const io = transport(approved);
+    const save = vi.fn<EditorTransport["save"]>().mockResolvedValue({ kind: "unknown", message: "응답 유실" });
+    const tab = open(approved, { ...io, save });
+    const confirm = vi.fn(async () => false);
+    const close = vi.fn();
+    try {
+      tab.model.pushEditOperations(null, [{ range: { startLineNumber: 1, startColumn: 1, endLineNumber: 1, endColumn: 1 }, text: "수정 " }], () => null);
+      await tab.session.save();
+      await tab.model.undo();
+      expect(tab.text()).toBe(approved.text);
+      expect(tab.state).toMatchObject({ dirty: true, needsReload: true });
+      await tab.session.requestClose(confirm, close);
+      expect(confirm).toHaveBeenCalledWith({ handle: approved.handle, label: approved.label, reason: "close" });
+      expect(close).not.toHaveBeenCalled();
+    } finally {
+      tab.close();
+    }
+  });
+
+  it("확정 실패, 접근 거부, 단절과 결과 미확인을 구분한다", async () => {
+    const approved = file("errors");
+    const io = transport(approved);
+    const save = vi.fn(io.save);
+    const reload = vi.fn(io.reload);
+    const tab = open(approved, { ...io, save, reload });
+    try {
+      tab.model.setValue("미저장");
+      for (const kind of ["failed", "denied", "disconnected"] as const) {
         save.mockResolvedValueOnce({ kind, message: "전송 응답" });
         await tab.session.save();
-        expect(tab.state).toMatchObject({ dirty: true, status: { kind, message: "전송 응답" } });
+        expect(tab.state).toMatchObject({ dirty: true, needsReload: false, status: { kind, message: "전송 응답" } });
         expect(tab.text()).toBe("미저장");
       }
+      save.mockResolvedValueOnce({ kind: "unknown", message: "전송 응답" });
+      await tab.session.save();
+      expect(tab.state).toMatchObject({ dirty: true, needsReload: true, status: { kind: "unknown", message: "전송 응답" } });
+      await tab.session.save();
+      await tab.session.reload(async () => false);
+      expect(reload).not.toHaveBeenCalled();
+      reload.mockResolvedValueOnce({ kind: "denied", message: "읽기 권한 없음" });
+      await tab.session.reload(async () => true);
+      expect(tab.state).toMatchObject({ dirty: true, needsReload: true, status: { kind: "denied", message: "읽기 권한 없음" } });
+      await tab.session.save();
+      expect(save).toHaveBeenCalledTimes(4);
+      expect(tab.text()).toBe("미저장");
+
+      await tab.session.reload(async () => true);
+      expect(tab.text()).toBe(approved.text);
+      expect(tab.state).toMatchObject({ dirty: false, needsReload: false, status: { kind: "ready" } });
+      tab.model.setValue("다시 읽은 뒤 편집");
+      await tab.session.save();
+      expect(io.backing.get(approved.handle)).toBe("다시 읽은 뒤 편집");
+
+      tab.model.setValue("응답 유실 뒤에도 보존할 편집");
       save.mockRejectedValueOnce(new Error("응답 유실"));
       await tab.session.save();
-      expect(tab.state?.status).toEqual({ kind: "unknown", message: "응답 유실" });
+      expect(tab.state).toMatchObject({ dirty: true, needsReload: true, status: { kind: "unknown", message: "응답 유실" } });
+      await tab.session.save();
+      expect(save).toHaveBeenCalledTimes(6);
+      expect(tab.text()).toBe("응답 유실 뒤에도 보존할 편집");
     } finally {
       tab.close();
     }
