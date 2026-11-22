@@ -2,6 +2,29 @@ use portable_pty::{Child, PtyPair, PtySize};
 
 use crate::ssm::{AwsCli, CancellationToken, CliError, Scope, StartRequest};
 
+const START_DIAGNOSTIC_LIMIT: usize = 8 * 1024;
+
+pub(super) struct StartDiagnostic(Option<Vec<u8>>);
+
+impl StartDiagnostic {
+    pub(super) fn new() -> Self { Self(Some(Vec::new())) }
+
+    pub(super) fn record(&mut self, bytes: &[u8]) {
+        if let Some(output) = &mut self.0 {
+            if output.len() + bytes.len() <= START_DIAGNOSTIC_LIMIT {
+                output.extend_from_slice(bytes);
+            } else {
+                self.0 = None;
+            }
+        }
+    }
+
+    pub(super) fn rejection(&self, exit_code: u32) -> Option<String> {
+        if exit_code != 254 { return None; }
+        crate::ssm::start_rejection(self.0.as_deref()?).map(start_error)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum RemoteClose {
@@ -14,22 +37,38 @@ pub(crate) enum RemoteClose {
 pub(super) struct Target {
     scope: Scope,
     instance_id: String,
+    #[cfg(test)]
+    pub(super) fixture: Option<std::path::PathBuf>,
 }
 
 impl Target {
     pub(super) fn new(profile: &str, region: &str, instance_id: &str) -> Result<Self, String> {
         let scope = Scope::new(profile.into(), region.into()).map_err(start_error)?;
-        Ok(Self { scope, instance_id: instance_id.into() })
+        Ok(Self {
+            scope,
+            instance_id: instance_id.into(),
+            #[cfg(test)]
+            fixture: None,
+        })
     }
 
     pub(super) async fn prepare(&self, cancel: &CancellationToken) -> Result<Remote, String> {
+        #[cfg(test)]
+        if let Some(program) = &self.fixture {
+            let (cli, scope, request, permit) = crate::ssm::fixture_start(program);
+            return Ok(Remote { cli, scope, request, spawned: false, fixture: Some(permit) });
+        }
         let cli = AwsCli::probe(cancel).await.map_err(start_error)?;
         let node = cli.online_nodes(&self.scope, cancel).await.map_err(start_error)?
             .into_iter().find(|node| node.instance_id() == self.instance_id)
             .ok_or_else(|| start_error(CliError::TargetNotConnected))?;
         cli.check_plugin(cancel).await.map_err(start_error)?;
         let request = cli.prepare_start(&self.scope, &node, cancel).await.map_err(start_error)?;
-        Ok(Remote { cli, scope: self.scope.clone(), request, spawn_attempted: false })
+        Ok(Remote {
+            cli, scope: self.scope.clone(), request, spawned: false,
+            #[cfg(test)]
+            fixture: None,
+        })
     }
 }
 
@@ -37,16 +76,27 @@ pub(super) struct Remote {
     cli: AwsCli,
     scope: Scope,
     request: StartRequest,
-    spawn_attempted: bool,
+    spawned: bool,
+    #[cfg(test)]
+    fixture: Option<crate::ssm::StartPermit>,
 }
 
 impl Remote {
     pub(super) fn spawn(&mut self, size: PtySize, cancel: &CancellationToken) -> Result<(PtyPair, Box<dyn Child + Send + Sync>), String> {
+        #[cfg(test)]
+        if let Some(permit) = self.fixture.take() {
+            return self.record_spawn(permit.spawn_fixture(size));
+        }
         let permit = tauri::async_runtime::block_on(self.cli.authorize_start(&mut self.request, &self.scope, cancel))
             .map_err(start_error)?.ok_or_else(|| start_error(CliError::Cancelled))?;
         if cancel.is_cancelled() { return Err(start_error(CliError::Cancelled)); }
-        self.spawn_attempted = true;
-        permit.spawn(size).map_err(|_| "SSM PTY: 시작 실패".into())
+        self.record_spawn(permit.spawn(size))
+    }
+
+    fn record_spawn(&mut self, child: std::io::Result<(PtyPair, Box<dyn Child + Send + Sync>)>) -> Result<(PtyPair, Box<dyn Child + Send + Sync>), String> {
+        let child = child.map_err(|_| "SSM PTY: 시작 실패".to_owned())?;
+        self.spawned = true;
+        Ok(child)
     }
 
     pub(super) fn wait_connected(&self, cancel: &CancellationToken) -> Result<(), String> {
@@ -55,7 +105,7 @@ impl Remote {
     }
 
     pub(super) fn close(&mut self) -> (RemoteClose, Option<String>) {
-        if !self.spawn_attempted {
+        if !self.spawned {
             return (RemoteClose::NotStarted, None);
         }
         // 문서 취소 토큰은 시작만 중단한다. 종료 조회에는 새 토큰을 사용한다.
@@ -77,7 +127,11 @@ fn start_error(error: CliError) -> String {
         CliError::InvalidConfiguration => "AWS 구성 또는 설치 오류",
         CliError::PluginMissing if cfg!(target_os = "linux") => "Session Manager 플러그인 없음. 관리자 관리 시스템 설치가 필요합니다.",
         CliError::PluginMissing => "Session Manager 플러그인 없음",
+        CliError::PluginUpgradeRequired { minimum } => {
+            return format!("SSM: Session Manager 플러그인 업그레이드 필요 ({minimum} 이상)");
+        }
         CliError::TargetNotConnected => "노드 연결 불가",
+        CliError::InvalidSessionDocument => "세션 문서 사용 불가",
         CliError::AccessDenied => "권한 거부",
         CliError::SsoLoginRequired => "SSO 재로그인 필요",
         CliError::CredentialsExpired => "자격 증명 만료",

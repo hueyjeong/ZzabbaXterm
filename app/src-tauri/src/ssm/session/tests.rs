@@ -18,6 +18,7 @@ fn request() -> StartRequest {
         program: fixture_cli().0,
         command_issued: true,
         termination_id: None,
+        fixture: false,
     }
 }
 

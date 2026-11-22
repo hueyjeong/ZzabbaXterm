@@ -11,6 +11,9 @@ mod windows_acl;
 
 pub use cli::{CliError, CommandSpec};
 pub use session::{SessionLookup, StartPermit, StartRequest, VerificationError, VerifiedSession};
+pub(crate) use session::start_rejection;
+#[cfg(test)]
+pub(crate) use session::fixture_start;
 pub use tokio_util::sync::CancellationToken;
 
 use cli::{Captured, Tool};

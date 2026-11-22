@@ -8,6 +8,8 @@
 
 Linux에서는 관리자가 [AWS CLI v2 공식 안내의 시스템 설치(`--system`)](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html#install-linux)와 [Session Manager 플러그인 공식 Linux 설치 안내](https://docs.aws.amazon.com/systems-manager/latest/userguide/install-plugin-linux-overview.html)에 따라 두 도구를 설치해야 한다. C02는 root가 소유하고 일반 사용자가 수정할 수 없는 시스템 설치만 지원한다. 사용자 홈 설치는 미지원이다.
 
+AWS의 [Session Manager 플러그인 릴리스 기록](https://docs.aws.amazon.com/systems-manager/latest/userguide/plugin-version-history.html)에 명시된 지원 하한은 `1.2.764.0`이다. C02는 Windows에서 국제 키보드 수정이 포함된 `1.2.792.0`부터 지원한다. 설치된 버전이 하한보다 낮으면 필요한 버전과 업그레이드 오류를 표시한다.
+
 | Given (조건) | When (행동) | Then (관찰) |
 |---|---|---|
 | 선택한 프로필·리전에 온라인 노드가 있다 | 마법사에서 시험·저장 후 같은 노드를 두 번 연다 | 독립된 두 탭에서 `whoami`가 응답한다. 첫 탭을 닫은 뒤에도 둘째 탭은 입력을 받고 첫 AWS 세션만 끝난다. |
@@ -60,6 +62,8 @@ Rust는 두 방식이 섞인 레코드와 비밀·실행 파일·임의 인자 �
 `terminal_open`이 PTY ID를 발급하면 SSM은 해당 ID의 `terminal_start`를 받은 뒤에 시작한다. SSM의 시작 응답은 로컬 PTY 부착을 뜻한다. 출력 채널은 `{ "kind": "connecting" }`에 이어, 공식 조회에서 Reason·Owner·Target이 일치하는 단일 세션의 `Connected`를 확인한 뒤 `{ "kind": "ready" }`를 보낸다. 프런트는 시작 요청 후 VT 응답과 출력 ACK를 전달하고, `ready` 전 사용자 입력과 붙여넣기는 폐기한다. 로컬 탭은 기존대로 시작 응답을 준비 기준으로 사용한다.
 
 연결 시험은 공식 준비 확인 후 Linux 셸 표식과 종료 코드 0을 확인하고, 원격 종료까지 확인한 뒤 C01 저장 자격을 발급한다. `terminal_close({ id })`와 `connection_test_cancel({ run })`에서 `null`은 정리 완료를 뜻한다. 로컬 자식 회수와 원격 종료 확인은 별도 상태이며, 원격 미시작이면 원격 정리가 필요 없다. SSM의 탭이나 마법사는 응답을 기다리고, 종료 미확인 시 `종료 확인 불가: <대상>`과 다시 확인하는 동작을 남긴다. 로컬 마법사의 취소 대기 제한은 2초를 유지한다.
+
+PTY 생성이나 CLI 실행 자체가 실패했거나 CLI가 `StartSession`의 확정 거부를 반환하면 원격 정리를 건너뛴다. 시작 결과를 판별할 수 없는 CLI·플러그인 종료는 History 확인으로 넘어가며, 빈 조회 결과만으로 정리 완료 처리하지 않는다.
 
 준비·종료 확인의 개별 조회가 2초 안에 끝나지 않으면 전체 제한 안에서 읽기만 재시도한다. 소유권이 확인된 원격 세션에만 한 번 종료 요청을 보내며, `Terminating` 또는 빈 History에는 읽기만 반복한다. 같은 문서에서 같은 앱 세션 ID나 시험 실행으로 다시 확인할 때도 History만 읽는다. 임시 자격이 만료되거나 권한이 거부되면 다른 자격으로 전환하지 않는다.
 
