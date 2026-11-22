@@ -1,0 +1,79 @@
+use serde::{Serialize, de::DeserializeOwned};
+use tauri::{Manager, Webview, ipc::{CommandArg, CommandItem, Invoke, InvokeError}};
+
+use crate::terminal::Sessions;
+use super::{probe, store::Store};
+
+pub(crate) fn handle(invoke: Invoke, other: fn(Invoke) -> bool) -> bool {
+    match invoke.message.command() {
+        "connection_test_start" => dispatch(invoke, "connection_test_start", |args| {
+            let draft_id = args.get("draftId")?;
+            let draft_version = args.get("draftVersion")?;
+            let draft = args.get("draft")?;
+            Ok(move |caller: Webview, document| {
+                probe::start(&caller.state::<Sessions>(), caller.label(), document, draft_id, draft_version, draft)
+            })
+        }),
+        "connection_test_wait" => dispatch(invoke, "connection_test_wait", |args| {
+            let run = args.get("run")?;
+            Ok(move |caller: Webview, document| probe::wait(&caller.state::<Sessions>(), caller.label(), document, &run))
+        }),
+        "connection_test_cancel" => dispatch(invoke, "connection_test_cancel", |args| {
+            let run = args.get("run")?;
+            Ok(move |caller: Webview, document| probe::cancel(&caller.state::<Sessions>(), caller.label(), document, &run))
+        }),
+        "connection_save" => dispatch(invoke, "connection_save", |args| {
+            let request = args.get("request")?;
+            Ok(move |caller: Webview, document| {
+                probe::save_confirmed(&caller.state::<Sessions>(), caller.label(), document, request, &store(&caller)?)
+            })
+        }),
+        "connections_load" => dispatch(invoke, "connections_load", |_| {
+            Ok(|caller: Webview, document| {
+                caller.state::<Sessions>().with_probes(caller.label(), document, |_| {
+                    store(&caller)?.load().map_err(|error| format!("프로필 읽기: {error:?}"))
+                })
+            })
+        }),
+        _ => return other(invoke),
+    }
+    true
+}
+
+struct Args<'a>(&'a Invoke, &'static str);
+
+impl Args<'_> {
+    fn get<T: DeserializeOwned>(&self, key: &'static str) -> Result<T, InvokeError> {
+        let Invoke { message, acl, .. } = self.0;
+        T::from_command(CommandItem { name: self.1, key, plugin: None, message, acl })
+    }
+}
+
+fn dispatch<T, Job>(invoke: Invoke, name: &'static str, parse: impl FnOnce(Args<'_>) -> Result<Job, InvokeError>)
+where
+    T: Serialize + Send + 'static,
+    Job: FnOnce(Webview, u64) -> Result<T, String> + Send + 'static,
+{
+    let caller = invoke.message.webview_ref();
+    // Tauri의 로컬 ACL을 통과한 요청에서 세대를 먼저 읽고, 작업 스레드에서 다시 검사한다.
+    if caller.label() != "main" || caller.window_ref().label() != "main" || invoke.acl.is_none() {
+        invoke.resolver.reject("앱의 로컬 기본 창에서만 연결 프로필을 사용할 수 있습니다");
+        return;
+    }
+    let document = caller.state::<Sessions>().document(caller.label());
+    let job = match parse(Args(&invoke, name)) {
+        Ok(job) => job,
+        Err(error) => { invoke.resolver.invoke_error(error); return; }
+    };
+    let caller = caller.clone();
+    invoke.resolver.respond_async(async move {
+        tauri::async_runtime::spawn_blocking(move || job(caller, document)).await
+            .map_err(|error| InvokeError::from(format!("연결 작업: {error}")))?
+            .map_err(Into::into)
+    });
+}
+
+fn store(caller: &Webview) -> Result<Store, String> {
+    let directory = caller.path().app_config_dir().map_err(|error| format!("앱 설정 디렉터리: {error}"))?;
+    Ok(Store::new(&directory))
+}

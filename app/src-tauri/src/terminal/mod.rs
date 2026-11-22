@@ -1,3 +1,4 @@
+use crate::connections::probe::Runs;
 use portable_pty::{CommandBuilder, PtySize};
 use std::{
     collections::{HashMap, HashSet},
@@ -6,6 +7,7 @@ use std::{
 
 pub(crate) mod ipc;
 mod process;
+pub(crate) mod probe;
 #[cfg(all(test, any(windows, unix)))]
 mod pty_flow_tests;
 #[cfg(test)]
@@ -24,6 +26,7 @@ struct Registry {
     sessions: HashMap<String, Arc<Session>>,
     destroyed: HashSet<String>,
     documents: HashMap<String, u64>,
+    probes: Runs,
     shutdown: bool,
 }
 
@@ -33,13 +36,28 @@ impl Sessions {
         self.open_document(owner, self.document(owner), size, command, send)
     }
 
-    fn document(&self, owner: &str) -> u64 {
+    pub(crate) fn document(&self, owner: &str) -> u64 {
         self.registry.lock().unwrap().documents.get(owner).copied().unwrap_or(0)
+    }
+
+    pub(crate) fn with_probes<T>(&self, owner: &str, document: u64, use_probes: impl FnOnce(&mut Runs) -> Result<T, String>) -> Result<T, String> {
+        let mut registry = self.registry.lock().unwrap();
+        if registry.shutdown || registry.destroyed.contains(owner) {
+            return Err("창이 닫혔습니다".into());
+        }
+        if registry.documents.get(owner).copied().unwrap_or(0) != document {
+            return Err("문서가 바뀌었습니다".into());
+        }
+        use_probes(&mut registry.probes)
+    }
+
+    pub(crate) fn next_id(&self) -> String {
+        self.next.fetch_add(1, Ordering::Relaxed).to_string()
     }
 
     fn open_document(&self, owner: &str, document: u64, size: PtySize, command: CommandBuilder, send: impl Fn(Event) -> Result<(), String> + Send + 'static) -> Result<String, String> {
         validate_size(size)?;
-        let id = self.next.fetch_add(1, Ordering::Relaxed).to_string();
+        let id = self.next_id();
         let session = Arc::new(Session::new(owner));
         {
             let mut registry = self.registry.lock().unwrap();
@@ -111,16 +129,17 @@ impl Sessions {
         if destroyed {
             registry.destroyed.insert(owner.into());
         }
+        registry.probes.stop_owner(owner);
         for session in registry.sessions.values().filter(|session| session.owner == owner) {
             session.stop(process::Stop::Closed);
         }
     }
 
     pub(crate) fn shutdown(&self) {
-        let sessions: Vec<_> = {
+        let (sessions, probes) = {
             let mut registry = self.registry.lock().unwrap();
             registry.shutdown = true;
-            registry.sessions.values().cloned().collect()
+            (registry.sessions.values().cloned().collect::<Vec<_>>(), registry.probes.stop_all())
         };
         for session in &sessions {
             session.stop(process::Stop::Closed);
@@ -128,6 +147,7 @@ impl Sessions {
         for session in sessions {
             session.wait_finished();
         }
+        probes.iter().for_each(|probe| probe.wait_finished());
     }
 }
 

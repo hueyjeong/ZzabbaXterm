@@ -62,7 +62,7 @@ pub(super) struct Local {
     pub(super) start_directory: PathBuf,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Draft {
     version: u32,
@@ -85,6 +85,12 @@ pub(crate) enum ValidationError {
 
 // 구조 검증 결과이며, 실제 셸 시험 결과는 상위 로컬 명령에서 관리한다.
 pub(crate) struct ValidatedDraft(Draft);
+
+impl ValidatedDraft {
+    pub(super) fn matches(&self, other: &Self) -> bool {
+        self.0 == other.0 && self.start_directory().as_os_str() == other.start_directory().as_os_str()
+    }
+}
 
 impl Draft {
     pub(crate) fn validate(self) -> Result<ValidatedDraft, ValidationError> {

@@ -1,0 +1,161 @@
+use std::{collections::HashMap, sync::Arc, thread};
+
+use serde::{Deserialize, Serialize};
+
+use crate::terminal::{Sessions, probe::Probe};
+use super::{profile::{Draft, ValidatedDraft}, store::{SaveStatus, Store}};
+
+const UNTESTED: &str = "이 초안의 현재 시험이 없습니다";
+
+#[derive(Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RunKey {
+    draft_id: String,
+    draft_version: u64,
+    run_id: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Passed {
+    #[serde(flatten)]
+    run: RunKey,
+    pub(super) session_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SaveRequest {
+    run: RunKey,
+    draft: Draft,
+}
+
+struct Run {
+    key: RunKey,
+    session_id: String,
+    draft: Arc<ValidatedDraft>,
+    probe: Arc<Probe>,
+    confirmed: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct Runs {
+    active: HashMap<String, HashMap<String, Run>>,
+    retiring: Vec<(String, RunKey, Arc<Probe>)>,
+}
+
+impl Runs {
+    fn get(&self, owner: &str, key: &RunKey) -> Result<&Run, String> {
+        self.active.get(owner).and_then(|runs| runs.get(&key.draft_id))
+            .filter(|run| run.key == *key).ok_or_else(|| UNTESTED.into())
+    }
+
+    fn retire(&mut self, owner: &str, key: RunKey, probe: Arc<Probe>) {
+        self.retiring.retain(|(_, _, probe)| !probe.finished());
+        if !probe.finished() {
+            probe.stop();
+            self.retiring.push((owner.into(), key, probe));
+        }
+    }
+
+    pub(crate) fn stop_owner(&mut self, owner: &str) {
+        if let Some(runs) = self.active.remove(owner) {
+            for run in runs.into_values() {
+                self.retire(owner, run.key, run.probe);
+            }
+        }
+    }
+
+    pub(crate) fn stop_all(&mut self) -> Vec<Arc<Probe>> {
+        let mut probes: Vec<_> = self.retiring.drain(..).map(|(_, _, probe)| probe).collect();
+        for run in self.active.drain().flat_map(|(_, runs)| runs.into_values()) {
+            run.probe.stop();
+            probes.push(run.probe);
+        }
+        probes
+    }
+}
+
+pub(super) fn start(sessions: &Sessions, owner: &str, document: u64, draft_id: String, draft_version: u64, draft: Draft) -> Result<RunKey, String> {
+    if draft_id.is_empty() || draft_version > (1 << 53) - 1 {
+        return Err("초안 ID 또는 버전이 올바르지 않습니다".into());
+    }
+    sessions.with_probes(owner, document, |runs| {
+        let active = runs.active.entry(owner.into()).or_default();
+        if active.get(&draft_id).is_some_and(|run| run.key.draft_version > draft_version) {
+            return Err("이전 초안 버전입니다".into());
+        }
+        // 재시험이 입력 검증에 실패해도 이전 성공은 폐기한다.
+        if let Some(previous) = active.remove(&draft_id) {
+            runs.retire(owner, previous.key, previous.probe);
+        }
+        let draft = Arc::new(draft.validate().map_err(|error| format!("초안 검증: {error:?}"))?);
+        let key = RunKey { draft_id, draft_version, run_id: sessions.next_id() };
+        let session_id = sessions.next_id();
+        let probe = Arc::new(Probe::new(owner));
+        let worker = Arc::clone(&probe);
+        let tested = Arc::clone(&draft);
+        thread::Builder::new().name("connection-probe".into()).spawn(move || worker.run(&tested))
+            .map_err(|error| format!("연결 시험: {error}"))?;
+        let run = Run { key: key.clone(), session_id, draft, probe, confirmed: false };
+        runs.active.get_mut(owner).unwrap().insert(key.draft_id.clone(), run);
+        Ok(key)
+    })
+}
+
+pub(super) fn wait(sessions: &Sessions, owner: &str, document: u64, key: &RunKey) -> Result<Passed, String> {
+    let probe = sessions.with_probes(owner, document, |runs| Ok(Arc::clone(&runs.get(owner, key)?.probe)))?;
+    let result = probe.wait();
+    sessions.with_probes(owner, document, |runs| {
+        runs.get(owner, key)?;
+        result?;
+        let run = runs.active.get_mut(owner).unwrap().get_mut(&key.draft_id).unwrap();
+        run.confirmed = true;
+        Ok(Passed { run: key.clone(), session_id: run.session_id.clone() })
+    })
+}
+
+pub(super) fn cancel(sessions: &Sessions, owner: &str, document: u64, key: &RunKey) -> Result<(), String> {
+    let probe = sessions.with_probes(owner, document, |runs| {
+        if runs.get(owner, key).is_ok() {
+            let run = runs.active.get_mut(owner).unwrap().remove(&key.draft_id).unwrap();
+            let probe = Arc::clone(&run.probe);
+            runs.retire(owner, run.key, run.probe);
+            return Ok(Some(probe));
+        }
+        if let Some((previous_owner, _, probe)) = runs.retiring.iter().find(|(_, old, _)| old.run_id == key.run_id) {
+            if previous_owner != owner {
+                return Err(UNTESTED.into());
+            }
+            return Ok(Some(Arc::clone(probe)));
+        }
+        if runs.active.iter().any(|(other, active)| other != owner && active.values().any(|run| run.key.run_id == key.run_id)) {
+            return Err(UNTESTED.into());
+        }
+        // 교체되거나 이미 회수된 실행의 재취소는 성공으로 끝낸다.
+        Ok(None)
+    })?;
+    if let Some(probe) = probe {
+        probe.wait_finished();
+    }
+    Ok(())
+}
+
+pub(super) fn save_confirmed(sessions: &Sessions, owner: &str, document: u64, request: SaveRequest, store: &Store) -> Result<(), String> {
+    let SaveRequest { run: key, draft } = request;
+    let draft = draft.validate().map_err(|error| format!("초안 검증: {error:?}"))?;
+    sessions.with_probes(owner, document, |runs| {
+        let run = runs.get(owner, &key)?;
+        if !run.confirmed || !run.draft.matches(&draft) {
+            return Err(UNTESTED.into());
+        }
+        match store.save(draft).map_err(|error| format!("프로필 저장: {error:?}"))? {
+            SaveStatus::GroupConflict => Err("다른 작업이 그룹을 변경했습니다".into()),
+            SaveStatus::TargetConflict => Err("다른 작업이 대상을 변경했습니다".into()),
+            SaveStatus::Saved => {
+                runs.active.get_mut(owner).unwrap().remove(&key.draft_id);
+                Ok(())
+            }
+        }
+    })
+}

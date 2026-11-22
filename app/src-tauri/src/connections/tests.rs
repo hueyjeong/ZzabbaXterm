@@ -60,6 +60,93 @@ fn save(store: &Store, input: Value) -> Result<SaveStatus, StoreError> {
     store.save(draft.validate().unwrap())
 }
 
+mod local_probe {
+    use super::*;
+    use crate::terminal::Sessions;
+    use crate::connections::probe::{RunKey, SaveRequest, start, wait, cancel, save_confirmed};
+
+    fn start_at(sessions: &Sessions, dir: &Path, version: u64) -> RunKey {
+        start(sessions, "main", sessions.document("main"), "draft".into(), version,
+            serde_json::from_value(draft(dir, "work", "first")).unwrap()).unwrap()
+    }
+
+    fn save_at(sessions: &Sessions, owner: &str, run: &RunKey, input: Value, store: &Store) -> Result<(), String> {
+        let request: SaveRequest = serde_json::from_value(json!({"run": run, "draft": input})).unwrap();
+        save_confirmed(sessions, owner, sessions.document(owner), request, store)
+    }
+
+    #[test]
+    fn c01_probe_normal_exit_authorizes_only_the_tested_draft() {
+        let dir = TestDir::new();
+        let store = Store::new(&dir.0);
+        let sessions = Sessions::default();
+        let input = draft(&dir.0, "work", "first");
+        let run = start_at(&sessions, &dir.0, 1);
+        assert!(save_at(&sessions, "main", &run, input.clone(), &store).is_err());
+        let result = wait(&sessions, "main", 0, &run).unwrap();
+        assert!(!result.session_id.is_empty());
+        assert!(save_at(&sessions, "other", &run, input.clone(), &store).is_err());
+        let forged = serde_json::from_value(json!({"draftId": "draft", "draftVersion": 1, "runId": "invented"})).unwrap();
+        assert!(save_at(&sessions, "main", &forged, input.clone(), &store).is_err());
+        let mut forged = serde_json::to_value(&run).unwrap();
+        forged["draftVersion"] = json!(2);
+        assert!(save_at(&sessions, "main", &serde_json::from_value(forged).unwrap(), input.clone(), &store).is_err());
+        let mut modified = input.clone();
+        modified["target"]["displayName"] = json!("시험 후 수정");
+        assert!(save_at(&sessions, "main", &run, modified, &store).is_err());
+        assert!(!dir.file().exists());
+        save_at(&sessions, "main", &run, input.clone(), &store).unwrap();
+        assert_eq!(store.load().unwrap().targets[0].profile.local.start_directory, dir.0);
+        assert!(save_at(&sessions, "main", &run, input, &store).is_err());
+    }
+
+    #[test]
+    fn c01_probe_missing_directory_invalidates_prior_success() {
+        let dir = TestDir::new();
+        let store = Store::new(&dir.0);
+        let sessions = Sessions::default();
+        let valid = draft(&dir.0, "work", "first");
+        assert_eq!(save(&store, valid.clone()).unwrap(), SaveStatus::Saved);
+        let original = fs::read(dir.file()).unwrap();
+        let run = start_at(&sessions, &dir.0, 1);
+        wait(&sessions, "main", 0, &run).unwrap();
+        let missing = dir.0.join("missing");
+        let second = start_at(&sessions, &missing, 2);
+        let error = wait(&sessions, "main", 0, &second).err().unwrap();
+        assert!(error.contains("작업 디렉터리"), "{error}");
+        cancel(&sessions, "main", 0, &second).unwrap();
+        cancel(&sessions, "main", 0, &run).unwrap();
+        assert!(save_at(&sessions, "main", &run, valid, &store).is_err());
+        assert_eq!(fs::read(dir.file()).unwrap(), original);
+    }
+
+    #[test]
+    fn c01_probe_cancel_and_navigation_revoke_only_owned_runs() {
+        let dir = TestDir::new();
+        let store = Store::new(&dir.0);
+        let sessions = Sessions::default();
+        let input = draft(&dir.0, "work", "first");
+        let run = start_at(&sessions, &dir.0, 1);
+        let other = start(&sessions, "other", 0, "draft".into(), 1,
+            serde_json::from_value(input.clone()).unwrap()).unwrap();
+        assert!(cancel(&sessions, "other", 0, &run).is_err());
+        cancel(&sessions, "main", 0, &run).unwrap();
+        assert!(wait(&sessions, "main", 0, &run).is_err());
+        let run = start_at(&sessions, &dir.0, 2);
+        wait(&sessions, "main", 0, &run).unwrap();
+        sessions.navigate("main");
+        assert!(wait(&sessions, "main", 0, &run).is_err());
+        assert!(start(&sessions, "main", 0, "draft".into(), 3,
+            serde_json::from_value(input.clone()).unwrap()).is_err());
+        assert!(save_at(&sessions, "main", &run, input.clone(), &store).is_err());
+        sessions.destroy("main");
+        assert!(start(&sessions, "main", sessions.document("main"), "draft".into(), 3,
+            serde_json::from_value(input.clone()).unwrap()).is_err());
+        wait(&sessions, "other", 0, &other).unwrap();
+        save_at(&sessions, "other", &other, input, &store).unwrap();
+    }
+}
+
 #[test]
 fn c01_forbidden_fields_cannot_change_an_existing_file() {
     let dir = TestDir::new();
