@@ -101,6 +101,52 @@ describe("파일 편집 버퍼", () => {
     }
   });
 
+  it("Monaco가 병합한 1,000개 교체는 원본을 그대로 두고 편집 버퍼를 유지한다", async () => {
+    const original = Array.from({ length: 1000 }, (_, i) => `a${i}${i % 2 ? "\n" : "\r\n"}`).join("");
+    const approved = { ...file("merged-edits"), text: original };
+    const io = transport(approved);
+    const save = vi.fn(io.save);
+    const tab = open(approved, { ...io, save });
+    const events: number[] = [];
+    const observer = tab.model.onDidChangeContent((event) => events.push(event.changes.length));
+    try {
+      tab.model.pushEditOperations(null, Array.from({ length: 1000 }, (_, i) => ({
+        range: { startLineNumber: i + 1, startColumn: 1, endLineNumber: i + 1, endColumn: 2 }, text: "B",
+      })), () => null);
+      tab.model.pushStackElement();
+      expect(events).toEqual([1]);
+      const edited = original.replace(/a/g, "B").replace(/\r\n|\n/g, tab.model.getEOL());
+      await tab.session.save();
+      expect(save).not.toHaveBeenCalled();
+      expect(io.backing.get(approved.handle)).toBe(original);
+      expect(tab.text()).toBe(edited);
+      expect(tab.state).toMatchObject({ dirty: true, status: { kind: "failed", message: "원래 줄바꿈을 확인할 수 없어 저장할 수 없습니다" } });
+      await tab.model.undo();
+      tab.model.applyEdits([{ range: { startLineNumber: 1000, startColumn: 1, endLineNumber: 1000, endColumn: 2 }, text: "C" }]);
+      await tab.session.save();
+      expect(io.backing.get(approved.handle)).toBe(original.replace("a999", "C999"));
+    } finally {
+      observer.dispose();
+      tab.close();
+    }
+  });
+
+  it("혼합 개행 밖의 같은 형식 교체는 해당 범위만 바꾼다", async () => {
+    const approved = { ...file("bounded-replace"), text: "a\nB\r\nC\nD" };
+    const io = transport(approved);
+    const tab = open(approved, io);
+    try {
+      tab.model.applyEdits([{ range: { startLineNumber: 1, startColumn: 1, endLineNumber: 2, endColumn: 2 }, text: "X\nY\nZ" }]);
+      await tab.session.save();
+      expect(io.backing.get(approved.handle)).toBe("X\nY\nZ\r\nC\nD");
+      tab.model.applyEdits([{ range: { startLineNumber: 3, startColumn: 1, endLineNumber: 4, endColumn: 2 }, text: "z\nc" }]);
+      await tab.session.save();
+      expect(io.backing.get(approved.handle)).toBe("X\nY\nz\r\nc\nD");
+    } finally {
+      tab.close();
+    }
+  });
+
   it("비교나 다시 읽기가 실패하면 이전 원본을 숨기고 미저장 버퍼와 오류를 유지한다", async () => {
     const approved = file("stale-comparison");
     const io = transport(approved);
