@@ -31,6 +31,8 @@ pub(crate) enum LocalClose {
 pub(crate) struct CloseResult {
     local: LocalClose,
     remote: RemoteClose,
+    #[serde(skip_serializing)]
+    local_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     target: Option<String>,
 }
@@ -40,7 +42,7 @@ impl CloseResult {
         if self.remote == RemoteClose::Unconfirmed {
             return self.target.as_ref().map(|target| format!("종료 확인 불가: {target}"));
         }
-        (self.local == LocalClose::Unconfirmed).then(|| "로컬 자식 종료 확인 불가".into())
+        self.local_error.clone().or_else(|| (self.local == LocalClose::Unconfirmed).then(|| "로컬 자식 종료 확인 불가".into()))
     }
 }
 
@@ -114,6 +116,7 @@ impl Sessions {
         validate_size(size)?;
         let id = self.next_id();
         let session = Arc::new(Session::new(owner, command.is_ssm()));
+        let ssh = matches!(command, Launch::Ssh(_));
         {
             let mut registry = self.registry.lock().unwrap();
             if registry.shutdown || registry.destroyed.contains(owner) {
@@ -129,7 +132,7 @@ impl Sessions {
         let result = session.launch(size, command, send, move |session| {
             let mut registry = registry.lock().unwrap();
             let result = session.close_result();
-            if session.is_ssm() && !registry.shutdown
+            if (session.is_ssm() || ssh && result.local != LocalClose::NotStarted) && !registry.shutdown
                 && registry.documents.get(&session.owner).copied().unwrap_or(0) == document
             {
                 let retired = if result.warning().is_some() {

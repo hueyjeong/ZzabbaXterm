@@ -170,7 +170,7 @@ export function Workspace() {
   async function closeTab(id: number) {
     const tab = liveTabs.current.find(item => item.id === id);
     if (!tab || closingTabs.current.has(id)) return;
-    if (tab.kind === "terminal" && tab.ssm) {
+    if (tab.kind === "terminal" && (tab.ssm || tab.ssh)) {
       closingTabs.current.add(id);
       setTabs(current => current.map(item => item.id === id && item.kind === "terminal" ? { ...item, closeStatus: "closing" } : item));
       try {
@@ -238,7 +238,7 @@ export function Workspace() {
             <div className="workspace-session" key={tab.id} hidden={tab.id !== active} inert={tab.id !== active}>
               {tab.kind === "terminal" ? (
                 <TerminalView active={tab.id === active} focusRequested={tab.id === focusTab} label={tab.label} targetId={tab.targetId}
-                  remote={!!tab.ssm} closing={!!tab.closeStatus} closeRef={tab.ssm ? (handle) => {
+                  remote={!!tab.ssm} ssh={tab.ssh} closing={!!tab.closeStatus} closeRef={tab.ssm || tab.ssh ? (handle) => {
                     if (handle) remoteTerminals.current.set(tab.id, handle);
                     else remoteTerminals.current.delete(tab.id);
                   } : undefined}
