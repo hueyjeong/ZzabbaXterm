@@ -143,31 +143,31 @@ impl StorageIpc {
     }
 
     fn close(&self, document: &Document, session_id: &str) -> bool {
-        let mut registry = self.0.lock().unwrap();
-        let Some(tab) = registry.tab(document, session_id) else {
-            return false;
+        let tab = {
+            let mut registry = self.0.lock().unwrap();
+            if registry.tab(document, session_id).is_none() { return false; }
+            registry.tabs.remove(session_id).unwrap()
         };
         tab.closed.send_replace(true);
-        registry.tabs.remove(session_id);
         true
     }
 
     pub(crate) fn navigate(&self, owner: &str) {
-        let mut registry = self.0.lock().unwrap();
-        *registry.documents.entry(owner.into()).or_default() += 1;
-        registry.tabs.retain(|_, tab| {
-            if tab.document.owner != owner {
-                return true;
-            }
-            tab.closed.send_replace(true);
-            false
-        });
+        let removed = {
+            let mut registry = self.0.lock().unwrap();
+            *registry.documents.entry(owner.into()).or_default() += 1;
+            registry.tabs.extract_if(|_, tab| tab.document.owner == owner).map(|(_, tab)| tab).collect::<Vec<_>>()
+        };
+        for tab in removed { tab.closed.send_replace(true); }
     }
 
     pub(crate) fn shutdown(&self) {
-        let mut registry = self.0.lock().unwrap();
-        registry.shutdown = true;
-        for (_, tab) in registry.tabs.drain() {
+        let removed = {
+            let mut registry = self.0.lock().unwrap();
+            registry.shutdown = true;
+            std::mem::take(&mut registry.tabs)
+        };
+        for (_, tab) in removed {
             tab.closed.send_replace(true);
         }
     }
@@ -702,6 +702,43 @@ mod tests {
             session_id: session.session_id.clone(),
             bucket: "selected-bucket".into(),
             key: KEY.into(),
+        }
+    }
+
+    #[test]
+    fn storage_revocation_does_not_hold_registry_while_signaling() {
+        for navigate in [false, true] {
+            let state = StorageIpc::default();
+            let replay = replay([response(200, "<ListAllMyBucketsResult><Buckets/></ListAllMyBucketsResult>")]);
+            let doc = state.document("target");
+            let peer_doc = state.document("peer");
+            let first = state.insert(doc.clone(), "test".into(), "eu-west-1".into(), client(&replay)).unwrap();
+            let peer = state.insert(peer_doc.clone(), "test".into(), "eu-west-1".into(), client(&replay)).unwrap();
+            let (_, closed) = state.client(&doc, &first.session_id, Stage::ListBuckets).unwrap();
+            let guard = closed.borrow();
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| {
+                    if navigate { state.navigate("target"); }
+                    else { assert!(state.close(&doc, &first.session_id)); }
+                });
+                let observed = (|| {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                    while std::time::Instant::now() < deadline {
+                        if let Ok(registry) = state.0.try_lock() && !registry.tabs.contains_key(&first.session_id) {
+                            drop(registry);
+                            return tauri::async_runtime::block_on(state.list_buckets(&peer_doc, BucketPageRequest {
+                                session_id: peer.session_id.clone(), token: None,
+                            })).is_ok();
+                        }
+                        std::thread::yield_now();
+                    }
+                    false
+                })();
+                drop(guard);
+                worker.join().unwrap();
+                assert!(observed, "peer blocked during revocation: navigate={navigate}");
+            });
+            assert!(*closed.borrow());
         }
     }
 
