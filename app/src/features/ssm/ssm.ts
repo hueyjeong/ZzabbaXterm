@@ -52,8 +52,12 @@ export function useSsmSelection(discovery: SsmDiscovery): SsmSelection {
   const [profiles, setProfiles] = useState<Profiles>({ kind: "loading" });
   const [step, setStep] = useState<Step>({ kind: "idle" });
   const login = useRef<AbortController | null>(null);
+  const nodeLookup = useRef<AbortController | null>(null);
 
-  useEffect(() => () => login.current?.abort(), []);
+  useEffect(() => () => {
+    login.current?.abort();
+    nodeLookup.current?.abort();
+  }, []);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -69,6 +73,7 @@ export function useSsmSelection(discovery: SsmDiscovery): SsmSelection {
     if (step.kind !== "region-loading" && step.kind !== "nodes-loading") return;
     const controller = new AbortController();
     const { signal } = controller;
+    let retainExpired = false;
     function advance(next: Step) {
       // 조회 콜백이 취소를 무시하거나 렌더링 전에 응답해도 현재 요청만 상태를 바꾼다.
       if (!signal.aborted) setStep((current) => current === step ? next : current);
@@ -82,13 +87,21 @@ export function useSsmSelection(discovery: SsmDiscovery): SsmSelection {
       });
     } else {
       const { scope } = step;
+      nodeLookup.current = controller;
       void resultOf(() => listOnlineNodes(scope, signal)).then((result) => {
+        if (signal.aborted) return;
+        retainExpired = !result.ok && result.error === "SsoLoginRequired";
         advance(result.ok
           ? { kind: "nodes-ready", scope, nodes: result.value, selectedId: null }
           : { kind: "nodes-error", scope, error: result.error });
       });
     }
-    return () => controller.abort();
+    // 만료 조회 ID는 화면을 떠나거나 재로그인에 넘길 때까지 살아 있어야 한다.
+    return () => {
+      if (retainExpired) return;
+      controller.abort();
+      if (nodeLookup.current === controller) nodeLookup.current = null;
+    };
   }, [configuredRegion, listOnlineNodes, step]);
 
   const scope = "scope" in step ? step.scope : null;
@@ -105,12 +118,16 @@ export function useSsmSelection(discovery: SsmDiscovery): SsmSelection {
       if (value && (profiles.kind !== "ready" || !profiles.values.includes(value))) return;
       login.current?.abort();
       login.current = null;
+      nodeLookup.current?.abort();
+      nodeLookup.current = null;
       setStep(value ? { kind: "region-loading", profile: value } : { kind: "idle" });
     },
     chooseRegion(value: string) {
       if (!profile || value === region) return;
       login.current?.abort();
       login.current = null;
+      nodeLookup.current?.abort();
+      nodeLookup.current = null;
       setStep(value ? { kind: "nodes-loading", scope: { profile, region: value } } : { kind: "region-required", profile });
     },
     chooseNode(instanceId: string) {
@@ -131,6 +148,8 @@ export function useSsmSelection(discovery: SsmDiscovery): SsmSelection {
         login.current = null;
         setStep(result.ok ? { kind: "nodes-loading", scope } : { kind: "nodes-error", scope, error: result.error });
       });
+      nodeLookup.current?.abort();
+      nodeLookup.current = null;
     },
   };
 }

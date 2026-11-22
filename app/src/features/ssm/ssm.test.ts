@@ -4,6 +4,10 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SsmSelectionView } from "./SsmSelectionView";
 import { useSsmSelection, type SsmDiscovery, type SsmOnlineNode, type SsmResult } from "./ssm";
+import { createSsmDiscovery } from "./ssmDiscovery";
+
+const invokeSsm = vi.hoisted(() => vi.fn());
+vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeSsm }));
 
 const east = "us-east-1";
 const west = "us-west-2";
@@ -186,5 +190,132 @@ describe("SSM 선택", () => {
     expect(adapter.listOnlineNodes.mock.calls.map(([scope]) => scope.region)).toEqual([east, west, east, west]);
     expect(adapter.relogin).not.toHaveBeenCalled();
     expect(selected()).toBeNull();
+  });
+});
+
+describe("SSM 검색 IPC", () => {
+  beforeEach(() => { invokeSsm.mockReset(); });
+  afterEach(() => { delete window.__ZZABBA_SSM_DOCUMENT__; });
+
+  it("문서 또는 ID가 나오기 전 취소를 처리하고 작업마다 문서 값을 고정한다", async () => {
+    const adapter = createSsmDiscovery();
+    const waiting = new AbortController();
+    const ready = new AbortController();
+    const abandoned = adapter.listProfiles(waiting.signal);
+    const pending = adapter.configuredRegion("alpha", ready.signal);
+    expect(invokeSsm).not.toHaveBeenCalled();
+    waiting.abort();
+    await expect(abandoned).resolves.toEqual({ ok: false, error: "Unknown" });
+
+    const reserved = Promise.withResolvers<string>();
+    invokeSsm.mockReturnValueOnce(reserved.promise).mockResolvedValueOnce(null);
+    window.__ZZABBA_SSM_DOCUMENT__ = "old-document";
+    window.dispatchEvent(new Event("zzabba:ssm-document"));
+    await Promise.resolve();
+    expect(invokeSsm.mock.calls).toEqual([["ssm_discovery", { document: "old-document", request: { action: "reserve" } }]]);
+    window.__ZZABBA_SSM_DOCUMENT__ = "new-document";
+    ready.abort();
+    reserved.resolve("15");
+    await expect(pending).resolves.toEqual({ ok: false, error: "Unknown" });
+    expect(invokeSsm.mock.calls).toEqual([
+      ["ssm_discovery", { document: "old-document", request: { action: "reserve" } }],
+      ["ssm_discovery", { document: "old-document", request: { action: "cancel", requestId: "15" } }],
+    ]);
+  });
+
+  it("늦은 만료 응답에는 재로그인 권한이 없고 구조적 오류 코드만 구별한다", async () => {
+    window.__ZZABBA_SSM_DOCUMENT__ = "document";
+    const adapter = createSsmDiscovery();
+    const scope = { profile: "alpha", region: east };
+    const controller = new AbortController();
+    const running = Promise.withResolvers<never>();
+    invokeSsm.mockResolvedValueOnce("1").mockReturnValueOnce(running.promise).mockResolvedValueOnce(null);
+    const pending = adapter.listOnlineNodes(scope, controller.signal);
+    await Promise.resolve();
+    await Promise.resolve();
+    controller.abort();
+    running.reject({ code: "SsoLoginRequired" });
+    await expect(pending).resolves.toEqual({ ok: false, error: "Unknown" });
+    await expect(adapter.relogin(scope, "SsoLoginRequired", new AbortController().signal))
+      .resolves.toEqual({ ok: false, error: "Unknown" });
+    expect(invokeSsm.mock.calls.map(([, args]) => args.request)).toEqual([
+      { action: "reserve" }, { action: "run", requestId: "1", operation: { kind: "listOnlineNodes", ...scope } },
+      { action: "cancel", requestId: "1" },
+    ]);
+    for (const [id, rejection, error] of [
+      ["2", { code: "AccessDenied" }, "AccessDenied"],
+      ["3", { code: "PluginMissing" }, "PluginMissing"],
+      ["4", "SsoLoginRequired", "Unknown"],
+    ] as const) {
+      invokeSsm.mockResolvedValueOnce(id).mockRejectedValueOnce(rejection);
+      await expect(adapter.listOnlineNodes(scope, new AbortController().signal)).resolves.toEqual({ ok: false, error });
+    }
+  });
+
+  it("화면에서 만료된 조회 ID만 한 번 사용하고 성공 뒤 새 ID로 동일 범위를 조회한다", async () => {
+    window.__ZZABBA_SSM_DOCUMENT__ = "document";
+    invokeSsm.mockResolvedValueOnce("1").mockResolvedValueOnce(["alpha"])
+      .mockResolvedValueOnce("2").mockResolvedValueOnce(east)
+      .mockResolvedValueOnce("3").mockRejectedValueOnce({ code: "SsoLoginRequired" })
+      .mockResolvedValueOnce(null).mockResolvedValueOnce("4").mockResolvedValueOnce([{ instanceId: one.instanceId }]);
+    await render(createSsmDiscovery());
+    await choose("프로필", "alpha");
+    expect(error()).toBe("alpha: SSO 로그인 만료");
+    const button = host.querySelector("button");
+    expect(button).not.toBeNull();
+    await act(async () => { button?.click(); button?.click(); });
+    const operation = { kind: "listOnlineNodes", profile: "alpha", region: east };
+    expect(invokeSsm.mock.calls.map(([, args]) => args.request)).toEqual([
+      { action: "reserve" }, { action: "run", requestId: "1", operation: { kind: "listProfiles" } },
+      { action: "reserve" }, { action: "run", requestId: "2", operation: { kind: "configuredRegion", profile: "alpha" } },
+      { action: "reserve" }, { action: "run", requestId: "3", operation },
+      { action: "relogin", requestId: "3" },
+      { action: "reserve" }, { action: "run", requestId: "4", operation },
+    ]);
+    await choose("온라인 노드", one.instanceId);
+    expect(selected()).toEqual({ profile: "alpha", region: east, instanceId: one.instanceId });
+  });
+
+  it("다른 범위 객체에서 만료 ID를 사용할 수 없고 실행 중 취소는 같은 ID에만 적용된다", async () => {
+    window.__ZZABBA_SSM_DOCUMENT__ = "document";
+    const adapter = createSsmDiscovery();
+    const scope = { profile: "alpha", region: east };
+    const lookup = new AbortController();
+    const login = new AbortController();
+    const running = Promise.withResolvers<null>();
+    invokeSsm.mockResolvedValueOnce("7").mockRejectedValueOnce({ code: "SsoLoginRequired" })
+      .mockReturnValueOnce(running.promise).mockResolvedValueOnce(null);
+    await expect(adapter.listOnlineNodes(scope, lookup.signal)).resolves.toEqual({ ok: false, error: "SsoLoginRequired" });
+    await expect(adapter.relogin({ ...scope }, "SsoLoginRequired", login.signal)).resolves.toEqual({ ok: false, error: "Unknown" });
+    const pending = adapter.relogin(scope, "SsoLoginRequired", login.signal);
+    lookup.abort();
+    login.abort();
+    running.resolve(null);
+    await expect(pending).resolves.toEqual({ ok: false, error: "Unknown" });
+    await expect(adapter.relogin(scope, "SsoLoginRequired", new AbortController().signal))
+      .resolves.toEqual({ ok: false, error: "Unknown" });
+    expect(invokeSsm.mock.calls.slice(2).map(([, args]) => args.request)).toEqual([
+      { action: "relogin", requestId: "7" }, { action: "cancel", requestId: "7" },
+    ]);
+  });
+
+  it("리전 전환과 마법사 닫기에서 사용하지 않은 만료 ID를 취소한다", async () => {
+    window.__ZZABBA_SSM_DOCUMENT__ = "document";
+    invokeSsm.mockResolvedValueOnce("1").mockResolvedValueOnce(["alpha"])
+      .mockResolvedValueOnce("2").mockResolvedValueOnce(east)
+      .mockResolvedValueOnce("3").mockRejectedValueOnce({ code: "SsoLoginRequired" })
+      .mockResolvedValueOnce(null).mockResolvedValueOnce("4").mockRejectedValueOnce({ code: "SsoLoginRequired" })
+      .mockResolvedValueOnce(null);
+    await render(createSsmDiscovery());
+    await choose("프로필", "alpha");
+    expect(error()).toBe("alpha: SSO 로그인 만료");
+    await choose("리전", west);
+    expect(error()).toBe("alpha: SSO 로그인 만료");
+    await act(async () => root.render(null));
+    expect(invokeSsm.mock.calls.slice(6).map(([, args]) => args.request)).toEqual([
+      { action: "cancel", requestId: "3" }, { action: "reserve" },
+      { action: "run", requestId: "4", operation: { kind: "listOnlineNodes", profile: "alpha", region: west } },
+      { action: "cancel", requestId: "4" },
+    ]);
   });
 });
