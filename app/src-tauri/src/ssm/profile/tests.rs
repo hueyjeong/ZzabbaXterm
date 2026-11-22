@@ -45,6 +45,7 @@ fn profile_fixture() {
         scope: scope.clone(),
         instance_id: "i-01234567".into(),
         owner: "fixture-owner".into(),
+        role: None,
         credentials: crate::ssm::tests::fixture_credentials(),
         program: cli.0.clone(),
     };

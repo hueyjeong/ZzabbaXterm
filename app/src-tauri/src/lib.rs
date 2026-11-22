@@ -53,7 +53,7 @@ pub fn run() {
                 && let tauri::WindowEvent::CloseRequested { api, .. } = event
             {
                 api.prevent_close();
-                workspace_window::request_close(window);
+                workspace_window::request_close(window, None);
             }
         })
         .on_page_load(|webview, payload| {
@@ -122,8 +122,12 @@ pub fn run() {
                     api.prevent_close();
                 }
             }
-            tauri::RunEvent::ExitRequested { api, .. } => {
-                if !app.state::<Sessions>().close_ssh_probes(None) {
+            tauri::RunEvent::ExitRequested { api, code, .. } => {
+                let sessions = app.state::<Sessions>();
+                if let Some(main) = app.get_webview_window(workspace_window::MAIN) {
+                    api.prevent_exit();
+                    workspace_window::request_close(&main.as_ref().window(), code);
+                } else if !sessions.consume_control_exit_approval(code) && !sessions.close_ssh_probes(None) {
                     api.prevent_exit();
                 }
             }
@@ -136,7 +140,7 @@ pub fn run() {
                     registration.document_changed(&label);
                 }
                 let sessions = app.state::<Sessions>();
-                sessions.destroy(&label);
+                let exit_code = sessions.destroy(&label);
                 app.state::<ai::session_selection::State>()
                     .document_changed(&label, sessions.document(&label));
                 app.state::<SftpIpc>().destroy(&label);
@@ -145,6 +149,9 @@ pub fn run() {
                 if label == "main" {
                     app.state::<tunnels::ipc::TunnelTabs>().navigate(true);
                 }
+                // Wry는 이 콜백 뒤 마지막 창의 자동 종료 이벤트를 보낸다.
+                // 명시적 종료만 재예약하고, 자동 이벤트에는 그 승인 코드를 소비시키지 않는다.
+                if let Some(code) = exit_code { app.exit(code); }
             }
             tauri::RunEvent::Exit => {
                 app.state::<rdp::ipc::Sessions>().retire();

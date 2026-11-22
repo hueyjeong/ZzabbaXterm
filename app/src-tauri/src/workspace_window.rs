@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, EventTarget, Manager, Url, Webview, Window};
 use tokio::sync::oneshot;
@@ -12,6 +14,7 @@ use crate::{
 pub(crate) const MAIN: &str = "main";
 
 pub(crate) const EXPIRED: &str = "창 닫기 요청이 만료되었습니다";
+const CONTROL_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) type WindowKey = usize;
 
@@ -58,8 +61,9 @@ fn trusted_url(webview: &Webview, url: &Url) -> bool {
     bundled || development
 }
 
-pub(crate) fn request_close(window: &Window) {
+pub(crate) fn request_close(window: &Window, exit_code: Option<i32>) {
     let Some(key) = window_key(window) else { return; };
+    let document = window.state::<Sessions>().document(MAIN);
     let webview = close_webview(window, key);
     let url = webview.as_ref().and_then(|webview| webview.url().ok());
     let trusted = webview.as_ref().zip(url.as_ref()).is_some_and(|(webview, url)| trusted_url(webview, url));
@@ -82,11 +86,12 @@ pub(crate) fn request_close(window: &Window) {
     ).is_ok();
     let window = window.clone();
     tauri::async_runtime::spawn(async move {
-        run_close(window, key, attempt, emitted, tunnel_epoch).await;
+        run_close(window, key, document, attempt, emitted, exit_code, tunnel_epoch).await;
     });
 }
 
-async fn run_close(window: Window, key: WindowKey, mut attempt: CloseAttempt, emitted: bool, tunnel_epoch: u64) {
+async fn run_close(window: Window, key: WindowKey, document: u64, mut attempt: CloseAttempt, emitted: bool,
+                   exit_code: Option<i32>, tunnel_epoch: u64) {
     let editors = window.state::<LocalEditors>();
     let report = if let Some(mut reply) = attempt.reply.take() {
         let received = if emitted {
@@ -118,18 +123,18 @@ async fn run_close(window: Window, key: WindowKey, mut attempt: CloseAttempt, em
     let result = if attempt.revoked.is_cancelled() {
         Err(EXPIRED.into())
     } else {
-        complete_close(&window, key, &attempt, decision, tunnel_epoch).await
+        complete_close(&window, key, document, &attempt, decision, exit_code, tunnel_epoch).await
     };
     if !matches!(result, Ok(true)) { editors.clear_window_close(&attempt.id); }
     if let Some(completed) = completed {
         let _ = completed.send(result);
-    } else if let Err(error) = result && error != EXPIRED {
-        eprintln!("창 닫기 보류: {error}");
+    } else if result.is_err_and(|error| error != EXPIRED) {
+        eprintln!("창 닫기 보류");
     }
 }
 
-async fn complete_close(window: &Window, key: WindowKey, attempt: &CloseAttempt, decision: Option<CloseDecision>,
-                        tunnel_epoch: u64) -> Result<bool, String> {
+async fn complete_close(window: &Window, key: WindowKey, document: u64, attempt: &CloseAttempt,
+                        decision: Option<CloseDecision>, exit_code: Option<i32>, tunnel_epoch: u64) -> Result<bool, String> {
     let require_trusted_url = decision.is_some();
     let prompt = match decision {
         Some(CloseDecision::Ready) => None,
@@ -163,6 +168,10 @@ async fn complete_close(window: &Window, key: WindowKey, attempt: &CloseAttempt,
                     return Err("창 입력 차단 실패".into());
                 }
             }
+            if !parent.state::<Sessions>().begin_control_exit(MAIN, document, &id) {
+                if was_enabled { parent.set_enabled(true).map_err(|error| error.to_string())?; }
+                return Err(EXPIRED.into());
+            }
             Ok(Some(was_enabled))
         })();
         let _ = answer.send(result);
@@ -173,12 +182,21 @@ async fn complete_close(window: &Window, key: WindowKey, attempt: &CloseAttempt,
     let result: Result<(), String> = async {
         let revoked = attempt.revoked.clone();
         let id = attempt.id.clone();
-        tauri::async_runtime::spawn_blocking(move || {
+        let report = tauri::async_runtime::spawn_blocking(move || {
             if revoked.is_cancelled() { return Err(EXPIRED.into()); }
-            if !app.state::<Sessions>().close_ssh_probes(Some(MAIN)) {
+            let sessions = app.state::<Sessions>();
+            let report = sessions.drain_controls_for_close(MAIN, document, &id, CONTROL_EXIT_TIMEOUT).ok_or(EXPIRED)?;
+            if revoked.is_cancelled() { return Err(EXPIRED.into()); }
+            if report.pending != 0 {
+                let error = format!("전용 제어 작업 종료 보류: 대기 {}건", report.pending);
+                eprintln!("{error}");
+                return Err(error);
+            }
+            if !sessions.close_ssh_probes_for_exit(MAIN, document, &id).ok_or(EXPIRED)? {
                 return Err("SSH 시험 자식 종료 확인 불가".into());
             }
-            app.state::<TunnelTabs>().confirm_desktop_cleanup(tunnel_epoch, &id, &revoked)
+            app.state::<TunnelTabs>().confirm_desktop_cleanup(tunnel_epoch, &id, &revoked)?;
+            Ok::<_, String>(report)
         }).await.map_err(|error| error.to_string())??;
 
         let (answer, completed) = oneshot::channel();
@@ -186,11 +204,15 @@ async fn complete_close(window: &Window, key: WindowKey, attempt: &CloseAttempt,
         let id = attempt.id.clone();
         // 실제 창과 현재 문서를 확인한 같은 이벤트 루프에서 폐기를 예약한다.
         window.run_on_main_thread(move || {
-            let result = (|| {
+            let result: Result<(), String> = (|| {
                 let url = valid_close(&parent, key, &id, require_trusted_url)?;
                 parent.state::<LocalEditors>().queue_window_destroy(key, &id, url.as_ref(), || {
-                    parent.destroy().map_err(|error| error.to_string())
-                })
+                    parent.state::<Sessions>().queue_control_exit(MAIN, document, &id, exit_code, || {
+                        parent.destroy().map_err(|error| error.to_string())
+                    })
+                })?;
+                if let Some(warning) = report.warning() { eprintln!("{warning}"); }
+                Ok(())
             })();
             let _ = answer.send(result);
         }).map_err(|error| error.to_string())?;
@@ -198,7 +220,7 @@ async fn complete_close(window: &Window, key: WindowKey, attempt: &CloseAttempt,
     }.await;
     if let Err(error) = result {
         window.state::<TunnelTabs>().release_desktop_close_gate(tunnel_epoch, &attempt.id);
-        window.state::<Sessions>().release_close_gate(Some(MAIN));
+        window.state::<Sessions>().release_control_exit(MAIN, document, &attempt.id);
         if was_enabled {
             let (answer, restored) = oneshot::channel();
             let parent = window.clone();

@@ -13,7 +13,7 @@ pub use cli::{CliError, CommandSpec};
 pub(crate) use home::{sso_cache_entry, user_home};
 pub(crate) use profile::DirectSsoConfig;
 pub use session::{SessionLookup, StartPermit, StartRequest, VerificationError, VerifiedSession};
-pub(crate) use session::{SessionDocument, start_rejection};
+pub(crate) use session::{AssumedRole, SessionDocument, start_rejection};
 #[cfg(test)]
 pub(crate) use session::fixture_start;
 pub use tokio_util::sync::CancellationToken;
@@ -170,13 +170,13 @@ impl AwsCli {
         drop(snapshot);
         drop(home);
         let identity = session::identity_command(&self.0, scope, &credentials);
-        let owner = session::captured_caller_arn(capture(identity).await?)?;
+        let (owner, role) = session::captured_caller(capture(identity).await?)?;
         let result = capture(
             self.nodes_command(scope)
                 .with_credentials(scope, &credentials),
         )
         .await?;
-        self.parse_online_nodes(scope, Arc::from(owner), credentials, result)
+        self.parse_online_nodes(scope, owner, role, credentials, result)
     }
 
     pub fn relogin_command(&self, scope: &Scope, cause: CliError) -> Result<CommandSpec, CliError> {
@@ -286,6 +286,7 @@ pub struct OnlineNode {
     scope: Scope,
     instance_id: String,
     owner: Arc<str>,
+    role: Option<Arc<AssumedRole>>,
     credentials: Arc<Credentials>,
     program: Arc<Path>,
 }
@@ -322,6 +323,7 @@ impl AwsCli {
         &self,
         scope: &Scope,
         owner: Arc<str>,
+        role: Option<Arc<AssumedRole>>,
         credentials: Arc<Credentials>,
         captured: Captured,
     ) -> Result<Vec<OnlineNode>, CliError> {
@@ -339,6 +341,7 @@ impl AwsCli {
                     scope: scope.clone(),
                     instance_id: node.instance_id,
                     owner: owner.clone(),
+                    role: role.clone(),
                     credentials: credentials.clone(),
                     program: self.0.clone(),
                 });

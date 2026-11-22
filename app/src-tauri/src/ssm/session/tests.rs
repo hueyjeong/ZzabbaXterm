@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 use std::{collections::VecDeque, ffi::OsStr};
 
 const OWNER: &str = "arn:aws:sts::123456789012:assumed-role/Sample/Sample";
+const ROLE_ID: &str = "AROADBQP57FF2AEXAMPLE";
 const TARGET: &str = "i-01234567";
 const REASON: &str = "zzabbaxterm-0123456789abcdef0123456789abcdef";
 const SESSION_ID: &str = "Sample-0123456789abcdef0";
@@ -15,6 +16,7 @@ fn request() -> StartRequest {
         document_name: None,
         reason: REASON.into(),
         owner: OWNER.into(),
+        role: None,
         credentials: fixture_credentials(),
         program: fixture_cli().0,
         command_issued: true,
@@ -193,13 +195,33 @@ fn ownership_uses_only_complete_exact_service_matches() {
 }
 
 #[test]
-fn owner_is_a_validated_sts_arn() {
-    assert_eq!(
-        parse_caller_arn(&serde_json::to_vec(&json!({"Arn": OWNER})).unwrap()),
-        Ok(OWNER.into())
-    );
+fn owner_is_validated_and_role_requires_consistent_assumed_role_evidence() {
+    let parse = |value| parse_caller(&serde_json::to_vec(&value).unwrap()).unwrap();
+    let (owner, missing_role) = parse(json!({"Arn": OWNER}));
+    assert_eq!(owner.as_ref(), OWNER);
+    assert!(missing_role.is_none());
+    let (_, role) = parse(json!({"Arn": OWNER, "Account": "123456789012", "UserId": format!("{ROLE_ID}:Sample")}));
+    assert_eq!(role, Some(AssumedRole::fixture("123456789012")));
+    for (arn, account, user_id) in [
+        (OWNER, "999999999999", format!("{ROLE_ID}:Sample")),
+        (OWNER, "123456789012", format!("{ROLE_ID}:Another")),
+        (OWNER, "123456789012", "AROA:Sample".into()),
+        (OWNER, "123456789012", "AIDADBQP57FF2AEXAMPLE:Sample".into()),
+        ("arn:aws:sts::123456789012:assumed-role//Sample", "123456789012", format!("{ROLE_ID}:Sample")),
+        ("arn:aws:sts::123456789012:assumed-role/Sample/Extra/Sample", "123456789012", format!("{ROLE_ID}:Sample")),
+        ("arn:awsfake:sts::123456789012:assumed-role/Sample/Sample", "123456789012", format!("{ROLE_ID}:Sample")),
+        ("arn:aws:iam::123456789012:root", "123456789012", "123456789012".into()),
+        ("arn:aws:iam::123456789012:user/Sample", "123456789012", "AIDADBQP57FF2AEXAMPLE".into()),
+        ("arn:aws:sts::123456789012:federated-user/Sample", "123456789012", "123456789012:Sample".into()),
+    ] {
+        let (owner, role) = parse(json!({"Arn": arn, "Account": account, "UserId": user_id}));
+        assert_eq!(owner.as_ref(), arn);
+        assert!(role.is_none(), "{arn}");
+    }
+    let (_, malformed) = parse(json!({"Arn": OWNER, "Account": 123456789012u64, "UserId": []}));
+    assert!(malformed.is_none());
     for identity in [b"{}".as_slice(), br#"{"Arn":""}"#, br#"{"Arn":"Sample"}"#] {
-        assert_eq!(parse_caller_arn(identity), Err(CliError::InvalidResponse));
+        assert_eq!(parse_caller(identity).err(), Some(CliError::InvalidResponse));
     }
 }
 
@@ -329,11 +351,21 @@ async fn start_requires_an_online_node_from_the_same_scope() {
         Err(CliError::InvalidTarget)
     );
     let cancel = CancellationToken::new();
-    let shared = SessionDocument::AiSharedControl { account_id: "123456789012", target: TARGET };
+    let (_, central_role) = parse_caller(&fixture(json!({
+        "Arn": "arn:aws:sts::123456789012:assumed-role/Sample/OldSession",
+        "Account": "123456789012", "UserId": format!("{ROLE_ID}:OldSession"),
+    })).stdout).unwrap();
+    let central_role = central_role.unwrap();
+    let wrong_account = AssumedRole::fixture("999999999999");
+    let wrong_id = AssumedRole { id: "AROAZZZZ57FF2AEXAMPLE".into(), account: "123456789012".into(), partition: "aws".into() };
+    let wrong_partition = AssumedRole { id: ROLE_ID.into(), account: "123456789012".into(), partition: "aws-cn".into() };
+    let shared = SessionDocument::AiSharedControl { role: &central_role, target: TARGET };
     for (scope, document, error) in [
         (&other, shared, CliError::InvalidTarget),
-        (&scope, SessionDocument::AiSharedControl { account_id: "999999999999", target: TARGET }, CliError::CallerChanged),
-        (&scope, SessionDocument::AiSharedControl { account_id: "123456789012", target: "i-11111111" }, CliError::InvalidTarget),
+        (&scope, SessionDocument::AiSharedControl { role: &wrong_account, target: TARGET }, CliError::CallerChanged),
+        (&scope, SessionDocument::AiSharedControl { role: &wrong_id, target: TARGET }, CliError::CallerChanged),
+        (&scope, SessionDocument::AiSharedControl { role: &wrong_partition, target: TARGET }, CliError::CallerChanged),
+        (&scope, SessionDocument::AiSharedControl { role: &central_role, target: "i-11111111" }, CliError::InvalidTarget),
     ] {
         assert_eq!(cli.prepare_document_start(scope, node, document, &cancel).err(), Some(error));
     }
@@ -395,6 +427,14 @@ async fn start_requires_an_online_node_from_the_same_scope() {
         );
         reasons.push(start.reason);
     }
+    let mut node = nodes.into_iter().next().unwrap();
+    for arn in [OWNER, "arn:aws:iam::123456789012:root", "arn:aws:iam::123456789012:user/Sample"] {
+        (node.owner, node.role) = parse_caller(&fixture(json!({"Arn": arn})).stdout).unwrap();
+        let regular = cli.prepare_start(&scope, &node, &cancel).await.unwrap();
+        assert_eq!(regular.account_id(), "123456789012");
+        assert!(regular.assumed_role().is_none());
+        assert_eq!(cli.prepare_document_start(&scope, &node, shared, &cancel).err(), Some(CliError::CallerChanged));
+    }
     assert_ne!(reasons[0], reasons[1]);
 }
 
@@ -420,7 +460,7 @@ fn fixture(value: Value) -> Captured {
 }
 
 fn identity() -> Captured {
-    fixture(json!({"Arn": OWNER}))
+    fixture(json!({"Arn": OWNER, "Account": "123456789012", "UserId": format!("{ROLE_ID}:Sample")}))
 }
 
 fn inventory(sessions: Vec<Value>) -> Captured {
