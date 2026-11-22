@@ -352,8 +352,10 @@ describe("중앙 원격 화면", () => {
       choice.dispatchEvent(new Event("change", { bubbles: true }));
     });
     expect(terminal.closest('[data-pane="left"]')).not.toBeNull();
+    const boundary = find(".splitter-center");
     await press(label);
-    expect(host.querySelector(".splitter-center")).toBeNull();
+    expect(find(".splitter-center")).toBe(boundary);
+    expect(host.querySelector(".workspace-center-split")).toBeNull();
     expect(terminal.closest("[hidden][inert]")).not.toBeNull();
     expect(pane.querySelector("canvas")).toBe(canvas);
     expect(pane.textContent).toContain("연결됨 · 1 × 1");
@@ -373,6 +375,8 @@ describe("중앙 원격 화면", () => {
     ]]);
     expect(document.activeElement).toBe(terminal);
     expect(terminal.closest('[data-pane="left"]')).not.toBeNull();
+    expect(find(".splitter-center")).toBe(boundary);
+    expect(boundary.parentElement?.classList.contains("workspace-center-split")).toBe(true);
     expect(calls("open")).toHaveLength(2);
     expect(calls("close")).toEqual([]);
   });

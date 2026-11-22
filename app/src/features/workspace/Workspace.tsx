@@ -550,7 +550,7 @@ export function Workspace() {
               )}
             </div>;
           })}
-          {visibleSplit && <Splitter edge="center" label="중앙 터미널 분할" controls={`${paneId}-left`}
+          {split && <Splitter edge="center" label="중앙 터미널 분할" controls={`${paneId}-left`}
             value={splitPosition} min={20} max={80} onChange={setSplitPosition} />}
         </div>
         <aside className="workspace-ai" hidden={focused} aria-label="오른쪽 도구">
