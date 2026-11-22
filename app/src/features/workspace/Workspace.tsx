@@ -7,6 +7,7 @@ import { subscribeLocalCliOpen } from "../editor/cliOpen";
 import { EditorTab, type EditorTabActions } from "../editor/EditorTab";
 import type { ApprovedEditorFile, ConfirmEditorDiscard, EditorTransport } from "../editor/contract";
 import { closeLocalFile, localEditorError, localEditorTransport, openLocalFile } from "../editor/localEditorIpc";
+import { subscribeRemoteNanoOpen } from "../editor/nanoOpen";
 import { RdpTab } from "../rdp/RdpTab";
 import { SftpPanel, type SftpPanelActions } from "../sftp/SftpPanel";
 import { sftpError } from "../sftp/sftpIpc";
@@ -26,7 +27,7 @@ type CloseStatus = "closing" | "unconfirmed";
 type Split = { left: number; right: number };
 type DesktopKind = "rdp" | "vnc";
 type Tab = { id: number; label: string } & (
-  | { kind: "terminal"; targetId?: string; ssm?: SsmTarget; ssh?: SshTransport["kind"]; status: TerminalStatus; sessionId?: string; sftpSessionId?: string; closeStatus?: CloseStatus }
+  | { kind: "terminal"; targetId?: string; remoteEditor?: true; ssm?: SsmTarget; ssh?: SshTransport["kind"]; status: TerminalStatus; sessionId?: string; sftpSessionId?: string; closeStatus?: CloseStatus }
   | { kind: "editor"; file: ApprovedEditorFile; transport: EditorTransport; close: () => Promise<void>; source: EditorSource; attaching?: true }
   | { kind: "tunnel"; handle: string; targetId: string; name: string; method: "ssh" | "ssm"; closeStatus?: CloseStatus; closeError?: string }
   | { kind: "rdp" }
@@ -102,10 +103,12 @@ export function Workspace() {
 
   useEffect(() => {
     const attachingHandles = new Set<ApprovedEditorFile["handle"]>();
-    const report = (error: unknown) => setFileError(`CLI 파일 열기 실패: ${localEditorError(error).message}`);
-    const unsubscribe = subscribeLocalCliOpen(async (file, respond, signal) => {
+    const reportLocal = (error: unknown) => setFileError(`CLI 파일 열기 실패: ${localEditorError(error).message}`);
+    const reportNano = (error: unknown) => setFileError(`nano 편집 연결 확인 불가: ${sftpError(error).message}`);
+    async function attach(file: ApprovedEditorFile, transport: EditorTransport, close: () => Promise<void>,
+      source: "local" | "sftp", acknowledge: () => Promise<boolean>, signal: AbortSignal) {
       if (signal.aborted || attachingHandles.has(file.handle) || liveTabs.current.some(tab =>
-        tab.kind === "editor" && tab.source === "local" && tab.file.handle === file.handle)) return;
+        tab.kind === "editor" && tab.source === source && tab.file.handle === file.handle)) return;
       attachingHandles.add(file.handle);
       const id = nextTab.current++;
       const removePreview = () => setTabs(current => current.filter(tab => tab.id !== id));
@@ -116,27 +119,41 @@ export function Workspace() {
         removePreview();
       };
       signal.addEventListener("abort", abort, { once: true });
-      setTabs(current => [...current, { id, label: file.label, kind: "editor", file,
-        source: "local", transport: localEditorTransport, close: () => closeLocalFile(file.handle), attaching: true }]);
+      setTabs(current => [...current, { id, label: file.label, kind: "editor", file, source, transport, close, attaching: true }]);
       try {
         const committed = await mounted;
         if (signal.aborted) return;
         if (!committed) throw new Error("편집기 탭을 부착할 수 없습니다");
-        await respond({ attached: true });
+        if (!await acknowledge()) { removePreview(); return; }
         if (signal.aborted) return;
         setTabs(current => current.map(tab => tab.id === id && tab.kind === "editor"
           ? { ...tab, attaching: undefined } : tab));
         selectTab(id);
       } catch (error) {
         removePreview();
-        if (!signal.aborted) report(error);
         throw error;
       } finally {
         cliMounts.current.delete(id);
         attachingHandles.delete(file.handle);
         signal.removeEventListener("abort", abort);
       }
-    }, report);
+    }
+    const local = subscribeLocalCliOpen((file, respond, signal) =>
+      attach(file, localEditorTransport, () => closeLocalFile(file.handle), "local", async () => {
+        await respond({ attached: true });
+        return true;
+      }, signal).catch(error => { if (!signal.aborted) reportLocal(error); throw error; }), reportLocal);
+    const nano = subscribeRemoteNanoOpen((file, acknowledge, signal) => {
+      if (!liveTabs.current.some(tab => tab.kind === "terminal" && tab.remoteEditor && tab.sessionId === file.sessionId && !tab.closeStatus)) {
+        return Promise.resolve();
+      }
+      return attach(file, file.transport, file.close, "sftp", async () => {
+        const result = await acknowledge();
+        if (result.kind === "unconfirmed" && !signal.aborted) reportNano(result.error);
+        return result.kind !== "aborted";
+      }, signal).catch(error => { if (!signal.aborted) reportNano(error); throw error; });
+    }, reportNano);
+    const unsubscribe = () => { local(); nano(); };
     window.addEventListener("pagehide", unsubscribe);
     return () => {
       window.removeEventListener("pagehide", unsubscribe);
@@ -234,7 +251,7 @@ export function Workspace() {
     return () => observer.disconnect();
   }, [active, left, focused]);
 
-  function openTab(target?: SavedConnections["targets"][number]["profile"]) {
+  function openTab(target?: SavedConnections["targets"][number]["profile"], options?: { readonly remoteEditor?: true }) {
     if (target?.defaultMethod === "s3") {
       openStorageTarget(target.id, target.displayName);
       return;
@@ -242,6 +259,7 @@ export function Workspace() {
     const id = nextTab.current++;
     setTabs((current) => [...current, {
       id, label: target?.displayName ?? `로컬 ${id}`, kind: "terminal", targetId: target?.id,
+      remoteEditor: options?.remoteEditor,
       ssm: target?.defaultMethod === "ssm" ? target.ssm : undefined,
       ssh: target?.ssh?.transport.kind, status: { kind: "opening" },
     }]);
@@ -517,7 +535,7 @@ export function Workspace() {
               }}>
               {tab.kind === "terminal" ? (
                 <TerminalView active={visible} focusRequested={id === focusTab} label={label} targetId={tab.targetId}
-                  remote={!!tab.ssm} ssh={!!tab.ssh} closing={!!tab.closeStatus} closeRef={tab.ssm || tab.ssh ? bindClose : undefined}
+                  remote={!!tab.ssm} ssh={!!tab.ssh} remoteEditor={tab.remoteEditor} closing={!!tab.closeStatus} closeRef={tab.ssm || tab.ssh ? bindClose : undefined}
                   onStatus={(status, sessionId) => updateStatus(id, status, sessionId)} />
               ) : tab.kind === "tunnel" ? (
                 <TunnelTab tab={tab.handle} targetId={tab.targetId} method={tab.method}

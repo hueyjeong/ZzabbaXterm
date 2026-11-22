@@ -22,6 +22,8 @@ fn main() {
         "editor_local_open", "editor_local_save", "editor_local_compare", "editor_local_reload",
         "editor_local_close",
         "editor_local_cli_pending", "editor_local_cli_claim", "editor_local_cli_respond",
+        "editor_remote_nano_pending", "editor_remote_nano_claim",
+        "editor_remote_nano_mounted", "editor_remote_nano_failed",
         "editor_sftp_attach", "editor_sftp_list", "editor_sftp_open", "editor_sftp_compare",
         "editor_sftp_reload", "editor_sftp_save", "editor_sftp_close", "editor_sftp_detach",
         "ai_targets", "ai_models", "ai_select", "ai_chat", "ai_propose", "ai_decide",
