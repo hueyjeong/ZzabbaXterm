@@ -184,10 +184,10 @@ impl LocalEditors {
         }
     }
 
-    pub(crate) fn request_window_close(&self, window: WindowKey, url: Option<tauri::Url>, trusted: bool) -> Result<Option<CloseAttempt>, EditorError> {
+    pub(crate) fn request_window_close(&self, window: WindowKey, url: Option<tauri::Url>, trusted: bool) -> Result<Option<CloseAttempt>, &'static str> {
         let mut registry = self.0.lock().unwrap();
         if registry.window_close.is_some() || registry.picker_active(window) { return Ok(None); }
-        let id = registry.new_handle()?;
+        let id = registry.new_handle().map_err(|_| "창 닫기 요청 생성 실패")?;
         let document = registry.main_document();
         let revoked = CancellationToken::new();
         let deadline = Instant::now() + CLOSE_RESPONSE_TIMEOUT;
