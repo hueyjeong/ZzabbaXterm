@@ -124,7 +124,7 @@ def bash(stack, uid=UID):
     term = stack.enter_context(Terminal(['/usr/bin/bash', '--noprofile', '--norc', '-i'], uid))
     term.read(rb'zzabba\$ ')
     term.send(f'set -o emacs; source {HOOK} && bind -X\n'.encode())
-    term.read(rb'\r\n"\\C-xp": "__zzabba_shared_key pair"\r\n')
+    term.read(rb'"\\C-xp": "__zzabba_shared_key pair"\r\n')
     term.read(rb'"\\C-xu": "__zzabba_shared_key claim"\r\n')
     term.read(rb'zzabba\$ ')
     return term
