@@ -1,10 +1,16 @@
-import { useId, useLayoutEffect, useRef, useState, type FormEvent } from "react";
+import { useId, useLayoutEffect, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
 import type { AiPanelProps, ChatMessage, Proposal, ProposalTarget, RecordedDecision } from "./contracts";
 import "./ai.css";
 
 type ChatState = { kind: "idle" } | { kind: "sending" } | { kind: "failed"; message: string };
 type ProposalState = { kind: "idle" } | { kind: "requesting" } | { kind: "failed" };
 type DecisionState = RecordedDecision | "reviewing" | "failed";
+
+export type AiTopTabs = Readonly<{
+  item: Readonly<{ id: string; label: string; content: ReactNode; hidden?: boolean }>;
+  selectedId: string | null;
+  onSelect: (id: string | null) => void;
+}>;
 
 function targetKey({ targetId, generation }: ProposalTarget | Proposal["target"]) {
   return JSON.stringify([targetId, generation]);
@@ -15,7 +21,23 @@ function visibleText(value: string) {
     `\\u{${character.codePointAt(0)?.toString(16)}}`);
 }
 
-export function AiPanel(props: AiPanelProps) {
+function navigateTopTabs(event: KeyboardEvent<HTMLDivElement>) {
+  const tabs = event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]');
+  const chat = tabs[0];
+  const item = tabs[1];
+  let next: HTMLButtonElement;
+  switch (event.key) {
+    case "Home": next = chat; break;
+    case "End": next = item; break;
+    case "ArrowLeft":
+    case "ArrowRight": next = event.target === chat ? item : chat; break;
+    default: return;
+  }
+  event.preventDefault();
+  next.click();
+}
+
+export function AiPanel(props: AiPanelProps & { topTabs?: AiTopTabs }) {
   const [modelName, setModelName] = useState("");
   const [selected, setSelected] = useState("");
   const model = props.models.includes(modelName) ? modelName : "";
@@ -23,37 +45,62 @@ export function AiPanel(props: AiPanelProps) {
   const attempted = useRef(new Set<string>());
   const chatTitle = useId();
   const proposalTitle = useId();
+  const { topTabs } = props;
+  const visibleTabs = topTabs && !topTabs.item.hidden ? topTabs : undefined;
+  const chatPanel = `${chatTitle}-panel`;
+  const itemPanel = `${chatTitle}-item`;
+  const itemSelected = !!visibleTabs && visibleTabs.selectedId === visibleTabs.item.id;
 
-  return <>
-    <section className="workspace-chat a01-chat" aria-labelledby={chatTitle}>
-      <h2 id={chatTitle}>AI 채팅</h2>
-      {props.modelError && <p role="alert">{props.modelError}</p>}
-      {props.onRefresh && <button type="button" onClick={props.onRefresh}>모델 및 대상 새로고침</button>}
-      <Chat models={props.models} model={model} onModelChange={setModelName} onSendChat={props.onSendChat} />
-    </section>
-    <section className="workspace-ai-terminal a01-proposals" aria-labelledby={proposalTitle}>
-      <h2 id={proposalTitle}>작업 제안</h2>
-      {props.targetError && <p role="alert">{props.targetError}</p>}
-      {props.policyControl}
-      <label className="a01-field">조회 대상
-        <select value={target ? selected : ""} onChange={(event) => {
-          const key = event.target.value;
-          setSelected(key);
-          const next = props.targets.find((candidate) => targetKey(candidate) === key);
-          props.onSelectTarget?.(next ? { targetId: next.targetId, generation: next.generation } : null);
-        }}>
-          <option value="">대상 선택</option>
-          {props.targets.map((candidate) => <option key={targetKey(candidate)} value={targetKey(candidate)}>
-            {visibleText(candidate.label)} ({visibleText(candidate.targetId)})
-          </option>)}
-        </select>
-      </label>
-      {target && props.onOpenCliReview && <button type="button" onClick={props.onOpenCliReview}>CLI 제안 열기</button>}
-      <ProposalReview key={JSON.stringify([selected, !!target, target && props.policyVersion])} model={model} target={target}
-        proposals={props.proposals} history={props.history} attempted={attempted.current}
-        onRequestProposal={props.onRequestProposal} onDecideProposal={props.onDecideProposal} onReadDecision={props.onReadDecision} />
-    </section>
-  </>;
+  return (
+    <div className={visibleTabs ? "a01-top a01-top-tabbed" : "a01-top"}>
+      {visibleTabs && <div className="a01-tabs" role="tablist" aria-label="오른쪽 패널" onKeyDown={navigateTopTabs}>
+        {[
+          { id: null, label: "AI 채팅", panel: chatPanel, selected: !itemSelected },
+          { id: visibleTabs.item.id, label: visibleTabs.item.label, panel: itemPanel, selected: itemSelected },
+        ].map(({ id, label, panel, selected }) =>
+          <button key={panel} type="button" role="tab" id={`${panel}-tab`} aria-controls={panel}
+            aria-selected={selected} tabIndex={selected ? 0 : -1} onClick={(event) => {
+              event.currentTarget.focus();
+              visibleTabs.onSelect(id);
+            }}>{label}</button>)}
+      </div>}
+      <section className="workspace-chat a01-chat" id={visibleTabs ? chatPanel : undefined}
+        role={visibleTabs ? "tabpanel" : undefined} aria-labelledby={visibleTabs ? `${chatPanel}-tab` : chatTitle}
+        hidden={itemSelected} inert={itemSelected} tabIndex={visibleTabs && !itemSelected ? 0 : undefined}>
+        {!visibleTabs && <h2 id={chatTitle}>AI 채팅</h2>}
+        {props.modelError && <p role="alert">{props.modelError}</p>}
+        {props.onRefresh && <button type="button" onClick={props.onRefresh}>모델 및 대상 새로고침</button>}
+        <Chat models={props.models} model={model} onModelChange={setModelName} onSendChat={props.onSendChat} />
+        <div className="a01-proposals" role="region" aria-labelledby={proposalTitle}>
+          <h2 id={proposalTitle}>작업 제안</h2>
+          {props.targetError && <p role="alert">{props.targetError}</p>}
+          {props.policyControl}
+          <label className="a01-field">조회 대상
+            <select value={target ? selected : ""} onChange={(event) => {
+              const key = event.target.value;
+              setSelected(key);
+              const next = props.targets.find((candidate) => targetKey(candidate) === key);
+              props.onSelectTarget?.(next ? { targetId: next.targetId, generation: next.generation } : null);
+            }}>
+              <option value="">대상 선택</option>
+              {props.targets.map((candidate) => <option key={targetKey(candidate)} value={targetKey(candidate)}>
+                {visibleText(candidate.label)} ({visibleText(candidate.targetId)})
+              </option>)}
+            </select>
+          </label>
+          {target && props.onOpenCliReview && <button type="button" onClick={props.onOpenCliReview}>CLI 제안 열기</button>}
+          <ProposalReview key={JSON.stringify([selected, !!target, target && props.policyVersion])} model={model} target={target}
+            proposals={props.proposals} history={props.history} attempted={attempted.current}
+            onRequestProposal={props.onRequestProposal} onDecideProposal={props.onDecideProposal} onReadDecision={props.onReadDecision} />
+        </div>
+      </section>
+      {topTabs && <div className="a01-top-item" role={visibleTabs ? "tabpanel" : undefined}
+        id={visibleTabs ? itemPanel : undefined} aria-labelledby={visibleTabs ? `${itemPanel}-tab` : undefined}
+        hidden={!itemSelected} inert={!itemSelected} tabIndex={itemSelected ? 0 : undefined}>
+        {topTabs.item.content}
+      </div>}
+    </div>
+  );
 }
 
 function Chat({ models, model, onModelChange, onSendChat }: Pick<AiPanelProps, "models" | "onSendChat"> & {

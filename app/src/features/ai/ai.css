@@ -1,15 +1,34 @@
-.a01-chat, .a01-proposals {
+.a01-top { display: grid; grid-template-rows: minmax(0, 1fr); min-width: 0; min-height: 0; }
+.a01-top-tabbed { grid-template-rows: auto minmax(0, 1fr); }
+.a01-tabs { display: flex; overflow: auto hidden; background: #253036; box-shadow: inset 0 -1px var(--border, #36454b); }
+.a01-tabs button { flex: none; min-height: 32px; padding-inline: 12px; }
+.a01-tabs button[aria-selected="true"] { background: #202a30; box-shadow: inset 0 -2px var(--accent, #9cd9bf); }
+.a01-top-item { display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: auto; }
+.a01-chat[hidden], .a01-top-item[hidden] { display: none; }
+
+.a01-chat {
   display: flex;
   flex-direction: column;
   gap: 10px;
   min-width: 0;
+  min-height: 0;
   padding: 12px;
   overflow: auto;
   color-scheme: dark;
 }
 
-.a01-chat h2, .a01-proposals h2 { margin: 0; font-size: 13px; }
-.a01-chat p, .a01-proposals p { margin: 0; }
+.a01-proposals {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  padding-block-start: 12px;
+  border-block-start: 1px solid var(--border, #36454b);
+}
+
+.a01-chat h2 { margin: 0; font-size: 13px; }
+.a01-chat p { margin: 0; }
 .a01-field, .a01-composer { display: grid; gap: 6px; }
 .a01-field select, .a01-composer textarea {
   min-width: 0;
@@ -24,10 +43,8 @@
 .a01-transcript {
   display: grid;
   gap: 8px;
-  min-height: 0;
   margin: 0;
   padding: 0;
-  overflow: auto;
   list-style: none;
 }
 
@@ -36,7 +53,7 @@
 .a01-composer { margin-top: auto; }
 .a01-composer button { justify-self: end; }
 .a01-actions { display: flex; flex-wrap: wrap; gap: 6px; }
-.a01-chat button, .a01-proposals button {
+.a01-chat button {
   padding: 4px 9px;
   border: 1px solid var(--border, #36454b);
   border-radius: 4px;
@@ -45,7 +62,7 @@
   font: inherit;
 }
 
-.a01-chat button:disabled, .a01-proposals button:disabled { opacity: .6; cursor: default; }
+.a01-chat button:disabled { opacity: .6; cursor: default; }
 .a01-proposal { display: grid; gap: 8px; padding: 8px; border: 1px solid var(--border, #36454b); }
 .a01-proposal dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 10px; margin: 0; }
 .a01-proposal dd { margin: 0; overflow-wrap: anywhere; }

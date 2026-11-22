@@ -2,6 +2,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import type { AiTopTabs } from "./AiPanel";
 import { LocalAiPanel } from "./LocalAiPanel";
 
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
@@ -24,7 +25,8 @@ afterEach(async () => {
   vi.unstubAllGlobals();
 });
 
-const render = (profilesVersion = 0) => act(async () => root.render(<LocalAiPanel profilesVersion={profilesVersion} />));
+const render = (profilesVersion = 0, topTabs?: AiTopTabs) =>
+  act(async () => root.render(<LocalAiPanel profilesVersion={profilesVersion} topTabs={topTabs} />));
 const selects = () => [...host.querySelectorAll("select")];
 const button = (name: string) => [...host.querySelectorAll("button")].find((item) => item.textContent === name);
 async function select(index: number, option: number) {
@@ -83,6 +85,31 @@ it("exposes model discovery failure and refreshes target properties after a save
   invoke.mockImplementation(async (command) => command === "ai_targets" ? [{ ...target, generation: "9007199254740994", label: "작업 셸" }] : true);
   await render(1);
   expect(selects()[1].value).toBe("");
+});
+
+it("SFTP 탭 버튼이 없는 동안에도 Workspace가 주입한 패널을 유지한다", async () => {
+  invoke.mockImplementation(async (command) => command === "ai_policy" ? false : []);
+  const content = <input aria-label="SFTP 경로" />;
+  const item = { id: "ssh-1", label: "SFTP", content };
+  const onSelect = vi.fn();
+  await render(0, { item, selectedId: item.id, onSelect });
+  const input = host.querySelector<HTMLInputElement>('[aria-label="SFTP 경로"]')!;
+  const panel = input.parentElement!;
+  input.value = "/srv";
+
+  await render(0, { item: { ...item, id: "ssh-2" }, selectedId: "ssh-2", onSelect });
+  expect(host.querySelector('[aria-label="SFTP 경로"]')).toBe(input);
+  await render(0, { item: { ...item, hidden: true }, selectedId: item.id, onSelect });
+  expect(host.querySelector('[role="tablist"]')).toBeNull();
+  expect(host.querySelector(".workspace-chat h2")?.textContent).toBe("AI 채팅");
+  expect(host.querySelector('[aria-label="SFTP 경로"]')).toBe(input);
+  expect(panel.hidden && panel.hasAttribute("inert")).toBe(true);
+
+  await render(0, { item, selectedId: item.id, onSelect });
+  expect(host.querySelector('[aria-label="SFTP 경로"]')).toBe(input);
+  expect(panel.hidden || panel.hasAttribute("inert")).toBe(false);
+  expect(input.value).toBe("/srv");
+  expect(onSelect).not.toHaveBeenCalled();
 });
 
 it.each([["승인", "approve", "승인 기록됨"], ["거절", "reject", "거절 기록됨"]])(
