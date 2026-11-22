@@ -99,7 +99,9 @@ impl<'a> Pty<'a> {
     }
 
     fn next(&mut self, deadline: Instant) -> Event {
-        let event = self.events.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        let now = Instant::now();
+        assert!(now < deadline, "세션 {}: PTY 출력 {}바이트 뒤 이벤트 대기 제한 시간 초과", self.id, self.output.len());
+        let event = self.events.recv_timeout(deadline - now)
             .unwrap_or_else(|error| panic!("세션 {}: PTY 출력 {}바이트 뒤 이벤트 대기: {error}; 끝부분 {:?}", self.id, self.output.len(), String::from_utf8_lossy(&self.output[self.output.len().saturating_sub(256)..])));
         if let Event::Bytes(bytes) = &event {
             assert!((1..=16 * 1024).contains(&bytes.len()), "출력 조각이 16 KiB 범위를 벗어남: {}", bytes.len());
@@ -198,8 +200,14 @@ fn l03_pty_credit_resumes_in_order_without_blocking_input_or_peer() {
             }
         }
         a.ack(a.output.len());
-        let event = a.next(Instant::now() + TIMEOUT);
-        assert!(matches!(event, Event::Exited(7)), "마지막 ACK 뒤 종료 이벤트: {event:?}");
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            match a.next(deadline) {
+                Event::Bytes(_) => a.ack(a.output.len()),
+                Event::Exited(7) => break,
+                event => panic!("마지막 ACK 뒤 종료 이벤트: {event:?}"),
+            }
+        }
 
         // ConPTY가 줄 사이에 생성하는 VT 제어는 허용하되 레코드 안의 원본 바이트를 비교한다.
         let prefix = b"L03-ROW:";
