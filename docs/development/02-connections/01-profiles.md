@@ -21,3 +21,22 @@
 5. **실기기에서 판정한다.** 아래 명령은 모두 후속 구현 시 `app/`에서 실행한다. `npx vitest run src/features/connections/profiles.test.ts`와 `cargo test --manifest-path src-tauri/Cargo.toml connections`에서 1단계 사례가 실제로 실행되는지 확인한다. `npm run tauri dev`로 두 OS에서 각각 정상 경로 시험·저장·재시작과 실패 경로 시험·취소를 반복한다. 정상 행을 열어 PowerShell은 `Get-Location`, Bash는 `pwd`로 선택했던 시작 경로를 대조한다.
 
 **완료 증거:** OS별로 정상 경로, 실패 이유, 재시작 후 열린 대상, 취소 전후 설정의 동일 여부와 시험용 자식 회수 결과를 남긴다. 저장 파일은 값 대신 필드 이름만 첨부한다. AWS 연결 결과는 이 증거에 포함하지 않는다.
+
+## 로컬 마법사 IPC
+
+Tauri의 로컬 `main` 창에서만 호출한다. `Run`은 `{ draftId: string, draftVersion: number, runId: string }`이다. 마법사가 편집 식별자와 버전을 넘기면 Rust가 `runId`를 발급한다. `draftVersion`은 0 이상의 안전한 정수이며 파일 스키마 버전과 별개다.
+
+| 명령 | 인자 | 성공 응답 |
+|---|---|---|
+| `connection_test_start` | `{ draftId, draftVersion, draft }` | `Run` |
+| `connection_test_wait` | `{ run: Run }` | `Run & { sessionId: string }` |
+| `connection_test_cancel` | `{ run: Run }` | `null` |
+| `connection_save` | `{ request: { run: Run, draft } }` | `null` |
+| `connections_load` | `{}` | `{ version, groups: [{ revision, profile }], targets: [{ revision, profile }] }` |
+
+`draft`는 `{ version: 1, groupRevision, targetRevision, group, target }`이다. 새 항목의 개정은 `null`이고, 저장된 항목을 수정할 때는 목록 응답의 개정을 넘긴다. `group`은 `{ id, displayName }`, `target`은 `{ id, groupId, displayName, defaultMethod: "local", local: { shell, startDirectory } }`다. `shell`은 Windows의 `"powerShell"` 또는 Ubuntu의 `"bash"`이며, `startDirectory`는 절대 경로다. 로컬 인증은 현재 사용자이므로 인증 필드는 없다.
+Windows의 시험과 저장 대상 열기는 일반 드라이브 절대 경로를 받는다. 확장 경로, 장치 경로, UNC 경로는 경로 오류로 반환한다.
+
+1. `start`에 현재 초안을 넘긴 뒤 반환된 `Run`을 `wait`에 그대로 전달한다. PTY 생성부터 시험 표식·정상 종료·회수까지 합쳐 8초 안에 끝나야 성공한다. 기한이 지나면 오류를 반환하고 아직 남아 있는 해당 시험은 백그라운드에서 회수한다.
+2. 편집하거나 마법사를 닫으면 이전 `Run`을 취소한다. `null`은 저장 자격 폐기와 중지 요청의 응답이다. 아직 진행 중인 OS 정리는 소유 창의 실행 목록에 남겨 완료 시 수거한다. `start` 응답이 늦으면 도착한 `Run`을 취소하며, 재시험·문서 이동·창 닫기도 해당 실행만 취소한다.
+3. 사용자가 성공한 초안에서 저장을 누를 때만 `connection_save`를 호출한다. Rust는 파일 잠금을 얻은 뒤와 최종 교체 직전에 창·문서·실행·초안이 여전히 일치하는지 확인한다. 최종 승인 전에 문서가 사라지면 기존 파일은 그대로다. 최종 승인 뒤에는 교체를 마치며, 성공한 실행의 저장 자격은 소진된다. 저장 뒤 `connections_load`로 새 개정과 목록을 받는다.
