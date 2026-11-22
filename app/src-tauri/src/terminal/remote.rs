@@ -73,8 +73,7 @@ impl Target {
         #[cfg(test)]
         if let Some(program) = &self.fixture {
             if central.is_some() { return Err(start_error(CliError::InvalidTarget)); }
-            let (cli, scope, request, permit) = crate::ssm::fixture_start(program);
-            return Ok(Remote { cli, scope, request, spawned: false, control: None, fixture: Some(permit), is_fixture: true });
+            return Ok(Remote::fixture(program));
         }
         let cli = AwsCli::probe(cancel).await.map_err(start_error)?;
         let node = cli.online_nodes(&self.scope, cancel).await.map_err(start_error)?
@@ -147,15 +146,31 @@ impl Remote {
         self.request.account_id()
     }
 
+    #[cfg(test)]
+    fn fixture(program: &std::path::Path) -> Self {
+        let (cli, scope, request, permit) = crate::ssm::fixture_start(program);
+        Self { cli, scope, request, spawned: false, control: None, fixture: Some(permit), is_fixture: true }
+    }
+
     pub(super) fn spawn(&mut self, size: PtySize, cancel: &CancellationToken) -> Result<(PtyPair, Box<dyn Child + Send + Sync>), String> {
         let control = self.control.take();
         let cancel = control.as_deref().map_or(cancel, ControlBinding::cancel_token);
         let permit = self.authorize(cancel)?;
-        let child = start_authorized(permit, cancel, control.as_deref(), |permit| {
+        let child = {
             #[cfg(test)]
-            if self.is_fixture { return permit.spawn_fixture(size); }
-            permit.spawn(size)
-        })?.map_err(|_| "SSM PTY: 시작 실패".to_owned())?;
+            if self.is_fixture {
+                return self.record_spawn(permit.spawn_fixture(size, cancel, control.as_deref(), || {}, || {}));
+            }
+            permit.spawn_cancellable(size, cancel, control.as_deref())
+        };
+        self.record_spawn(child)
+    }
+
+    fn record_spawn(&mut self, child: std::io::Result<(PtyPair, Box<dyn Child + Send + Sync>)>) -> Result<(PtyPair, Box<dyn Child + Send + Sync>), String> {
+        let child = child.map_err(|error| match error.kind() {
+            std::io::ErrorKind::Interrupted => error.to_string(),
+            _ => "SSM PTY: 시작 실패".to_owned(),
+        })?;
         self.spawned = true;
         Ok(child)
     }
@@ -197,19 +212,57 @@ impl Remote {
     }
 }
 
-pub(crate) fn start_authorized<T>(permit: StartPermit, cancel: &CancellationToken, control: Option<&ControlBinding>, start: impl FnOnce(StartPermit) -> T) -> Result<T, String> {
-    let require_active = || {
-        if let Some(binding) = control { binding.check_request()?; }
-        if cancel.is_cancelled() { Err(start_error(CliError::Cancelled)) } else { Ok(()) }
-    };
-    // 거절된 허가가 보유한 플러그인과 자격 증명도 잠금 밖에서 해제한다.
-    let mut permit = Some(permit);
-    let permit = match control {
-        Some(binding) => binding.admit(|| { require_active()?; Ok(permit.take().unwrap()) })?,
-        None => permit.take().unwrap(),
-    };
-    require_active()?;
-    Ok(start(permit))
+#[cfg(all(test, any(windows, unix)))]
+#[test]
+fn submitted_control_start_is_reaped_and_checks_exact_ssm_cleanup_after_revocation() {
+    use crate::terminal::{LocalClose, Sessions, process::Session};
+    use std::{sync::mpsc, thread, time::Duration};
+
+    const WAIT: Duration = Duration::from_secs(10);
+    let root = tempfile::tempdir().unwrap();
+    let program = root.path().join(format!("ssm fixture{}", std::env::consts::EXE_SUFFIX));
+    let compiled = std::process::Command::new(option_env!("RUSTC").unwrap_or("rustc"))
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/src/terminal/ssm_fixture.rs"))
+        .arg("-o").arg(&program).output().unwrap();
+    assert!(compiled.status.success(), "{}", String::from_utf8_lossy(&compiled.stderr));
+    std::fs::write(root.path().join("mode"), "unknown").unwrap();
+    let sessions = Sessions::default();
+    let central = sessions.insert_live_ssm_fixture("main", 0, "123456789012", "us-west-2", "i-01234567");
+    let binding = sessions.bind_ssm_control("main", &central.identity, &CancellationToken::new()).unwrap();
+    let cancel = binding.cancel_token();
+    let mut remote = Remote::fixture(&program);
+    let selected = sessions.get("main", &central.identity.id).unwrap();
+    let permit = remote.authorize(cancel).unwrap();
+
+    let (pair, mut child) = thread::scope(|scope| {
+        let (submit, submitted) = mpsc::channel();
+        let (close, closed) = mpsc::channel();
+        let closer = scope.spawn(move || {
+            submitted.recv_timeout(WAIT).unwrap();
+            central.stop();
+            close.send(()).unwrap();
+        });
+        let spawn = permit.spawn_fixture(PtySize::default(), cancel, Some(&binding), || {}, || {
+            assert!(binding.registry_unlocked_fixture());
+            submit.send(()).unwrap();
+            tauri::async_runtime::block_on(async {
+                tokio::time::timeout(WAIT, cancel.cancelled()).await.unwrap();
+            });
+            assert!(matches!(selected.control_submit.try_lock(), Err(std::sync::TryLockError::WouldBlock)));
+            assert!(matches!(closed.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        });
+        let child = remote.record_spawn(spawn).unwrap();
+        closed.recv_timeout(WAIT).unwrap();
+        closer.join().unwrap();
+        child
+    });
+    assert!(cancel.is_cancelled());
+    let session = Session::dedicated(&binding);
+    session.terminate_fixture(child.as_mut(), pair.master.as_ref());
+    drop(pair);
+    assert_eq!(session.close_result().local, LocalClose::CliReaped);
+    assert_eq!(remote.close(), (RemoteClose::Unconfirmed, Some("i-01234567".into())));
+    assert!(root.path().join("History").is_file());
 }
 
 fn start_error(error: CliError) -> String {

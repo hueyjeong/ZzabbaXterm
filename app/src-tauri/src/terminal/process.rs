@@ -91,6 +91,7 @@ pub(crate) struct Session {
     pub(super) document: Option<u64>,
     control: bool,
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
+    pub(super) control_submit: Mutex<()>,
     cancel: Option<CancellationToken>,
     close_result: Mutex<CloseResult>,
     unconfirmed: Mutex<Option<remote::Remote>>,
@@ -120,6 +121,7 @@ impl Session {
             document: None,
             control,
             cancel,
+            control_submit: Mutex::new(()),
             close_result: Mutex::new(CloseResult::default()),
             unconfirmed: Mutex::new(None),
             ssh_pending: Mutex::new(None),
@@ -393,6 +395,8 @@ impl Session {
                 }
                 let event = self.reap(child.as_mut(), ssh_plan.is_some());
                 if let Some(cancel) = &self.cancel { cancel.cancel(); }
+                // 레지스트리에서 세션을 빼기 전에 승인된 로컬 생성 호출을 회수한다.
+                if self.document.is_some() && ssm { self.wait_control_submit(); }
                 event
             });
             let sftp = self.flow.lock().unwrap().sftp.take();
@@ -623,6 +627,11 @@ impl Session {
         }
     }
 
+    #[cfg(all(test, any(windows, unix)))]
+    pub(super) fn terminate_fixture(&self, child: &mut dyn Child, master: &dyn MasterPty) {
+        self.terminate(child, Some(master));
+    }
+
     fn drain(&self, mut reader: Box<dyn Read + Send>, send: &impl Fn(Event) -> Result<(), String>, mut diagnostic: Option<&mut remote::StartDiagnostic>) -> Result<(), String> {
         let mut buffer = [0; CHUNK];
         loop {
@@ -826,6 +835,11 @@ impl Session {
         self.wake.notify_all();
     }
 
+    pub(super) fn wait_control_submit(&self) {
+        debug_assert!(self.is_ssm());
+        drop(self.control_submit.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+    }
+
     fn finish(&self) {
         self.flow.lock().unwrap().finished = true;
         self.wake.notify_all();
@@ -895,14 +909,17 @@ impl LiveSsmFixture<'_> {
     pub(crate) fn stop(&self) {
         let session = self.sessions.registry.lock().unwrap().sessions[&self.id].clone();
         session.stop(Stop::Closed);
+        session.wait_control_submit();
     }
 }
 
 #[cfg(test)]
 impl Drop for LiveSsmFixture<'_> {
     fn drop(&mut self) {
-        if let Some(session) = self.sessions.registry.lock().unwrap().sessions.remove(&self.id) {
+        let session = self.sessions.registry.lock().unwrap().sessions.remove(&self.id);
+        if let Some(session) = session {
             session.stop(Stop::Closed);
+            session.wait_control_submit();
         }
     }
 }

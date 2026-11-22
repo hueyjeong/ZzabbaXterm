@@ -13,6 +13,7 @@ use portable_pty::{
 };
 use serde::Deserialize;
 use std::{ffi::OsStr, io, path::Path, sync::Arc};
+use crate::terminal::ControlBinding;
 
 #[derive(Clone, Copy)]
 pub(crate) enum SessionDocument<'a> {
@@ -45,8 +46,20 @@ pub struct StartRequest {
 /// ```
 pub struct StartPermit(CommandBuilder, Arc<Credentials>, plugin::CheckedPlugin);
 
+type StartedPty = (PtyPair, Box<dyn Child + Send + Sync>);
+
 impl StartPermit {
     pub fn spawn(self, size: PtySize) -> io::Result<(PtyPair, Box<dyn Child + Send + Sync>)> {
+        let pair = self.prepare_pty(size)?;
+        self.spawn_in(pair, None, None, || {})
+    }
+
+    pub(crate) fn spawn_cancellable(self, size: PtySize, cancel: &CancellationToken, control: Option<&ControlBinding>) -> io::Result<StartedPty> {
+        let pair = self.prepare_pty(size)?;
+        self.spawn_in(pair, Some(cancel), control, || {})
+    }
+
+    fn prepare_pty(&self, size: PtySize) -> io::Result<PtyPair> {
         self.1.require_current().map_err(|_| {
             io::Error::new(io::ErrorKind::PermissionDenied, "SSM credentials expired")
         })?;
@@ -66,18 +79,26 @@ impl StartPermit {
                 cwd.as_os_str().as_ref(),
             )
             .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "SSM plugin search changed"))?;
-        self.spawn_in(pair)
+        Ok(pair)
     }
 
-    fn spawn_in(self, pair: PtyPair) -> io::Result<(PtyPair, Box<dyn Child + Send + Sync>)> {
-        let child = pair.slave.spawn_command(self.0).map_err(io::Error::other)?;
+    fn spawn_in(self, pair: PtyPair, cancel: Option<&CancellationToken>, control: Option<&ControlBinding>, before_spawn: impl FnOnce()) -> io::Result<StartedPty> {
+        let Self(command, credentials, plugin) = self;
+        let spawn = || {
+            before_spawn();
+            pair.slave.spawn_command(command).map_err(io::Error::other)
+        };
+        let child = if let Some(binding) = control {
+            binding.submit_start(spawn).map_err(|error| io::Error::new(io::ErrorKind::Interrupted, error))??
+        } else {
+            if cancel.is_some_and(CancellationToken::is_cancelled) {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "SSM: 시작 취소"));
+            }
+            spawn()?
+        };
         Ok((
             pair,
-            Box::new(SessionChild {
-                child,
-                _plugin: self.2,
-                _credentials: self.1,
-            }),
+            Box::new(SessionChild { child, _plugin: plugin, _credentials: credentials }),
         ))
     }
 }
@@ -107,8 +128,10 @@ pub(crate) fn fixture_start(program: &Path) -> (AwsCli, Scope, StartRequest, Sta
 
 #[cfg(test)]
 impl StartPermit {
-    pub(crate) fn spawn_fixture(self, size: PtySize) -> io::Result<(PtyPair, Box<dyn Child + Send + Sync>)> {
-        self.spawn_in(native_pty_system().openpty(size).map_err(io::Error::other)?)
+    pub(crate) fn spawn_fixture(self, size: PtySize, cancel: &CancellationToken, control: Option<&ControlBinding>, after_open: impl FnOnce(), before_spawn: impl FnOnce()) -> io::Result<StartedPty> {
+        let pair = native_pty_system().openpty(size).map_err(io::Error::other)?;
+        after_open();
+        self.spawn_in(pair, Some(cancel), control, before_spawn)
     }
 }
 

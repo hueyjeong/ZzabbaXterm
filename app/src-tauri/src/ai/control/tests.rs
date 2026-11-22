@@ -105,10 +105,11 @@ fn cli_exit_is_distinct_from_ssm_connection_and_frame_output() {
     assert!(!transport.connected);
 }
 
+#[cfg(any(windows, unix))]
 #[test]
-fn cancellation_before_submission_skips_authorized_start_and_frame_writer() {
-    use std::{cell::Cell, io::{self, Write}, path::Path, sync::Mutex};
-    use crate::{ssm::fixture_start, terminal::remote::start_authorized};
+fn cancellation_after_start_preparation_skips_spawn_and_frame_writer() {
+    use std::{cell::Cell, io::{self, Write}, sync::Mutex};
+    use crate::ssm::fixture_start;
 
     struct Writer {
         binding: Arc<ControlBinding>,
@@ -122,6 +123,9 @@ fn cancellation_before_submission_skips_authorized_start_and_frame_writer() {
         }
         fn flush(&mut self) -> io::Result<()> { Ok(()) }
     }
+
+    let root = tempfile::tempdir().unwrap();
+    let missing = root.path().join("fixture-aws");
 
     enum End { Live, Close, Navigate, CancelRequest }
     for (end, error) in [
@@ -140,25 +144,33 @@ fn cancellation_before_submission_skips_authorized_start_and_frame_writer() {
         });
         transport.connected = true;
         let starts = Cell::new(0);
-        let (_, _, _, permit) = fixture_start(Path::new("fixture-aws"));
-        let _replacement = match end {
-            End::Live => None,
-            End::Close => { selected.stop(); None }
-            End::Navigate => {
-                sessions.navigate(OWNER);
-                Some(sessions.insert_live_ssm_fixture(OWNER, sessions.document(OWNER), ACCOUNT, REGION, NODE))
-            }
-            End::CancelRequest => { request.cancel(); None }
-        };
+        assert!(transport.binding.admit(|| Ok(())).is_ok());
+        let (_, _, _, permit) = fixture_start(&missing);
+        let mut _replacement = None;
         let cancel = transport.binding.cancel_token();
-        assert_eq!(cancel.is_cancelled(), matches!(end, End::Close | End::Navigate));
-
-        let start = start_authorized(permit, cancel, Some(&transport.binding), |_| {
+        let start = permit.spawn_fixture(PtySize::default(), cancel, Some(&transport.binding), || {
+            assert!(transport.binding.registry_unlocked_fixture());
+            match end {
+                End::Live => {},
+                End::Close => selected.stop(),
+                End::Navigate => {
+                    sessions.navigate(OWNER);
+                    _replacement = Some(sessions.insert_live_ssm_fixture(OWNER, sessions.document(OWNER), ACCOUNT, REGION, NODE));
+                }
+                End::CancelRequest => request.cancel(),
+            }
+            assert_eq!(cancel.is_cancelled(), matches!(end, End::Close | End::Navigate));
+        }, || {
             assert!(transport.binding.registry_unlocked_fixture());
             starts.set(starts.get() + 1);
         });
         let expected = error.map_or(Ok(()), |error| Err(error.to_owned()));
-        assert_eq!(start, expected);
+        if error.is_none() {
+            // 생성 접점은 열리고, 존재하지 않는 시험 실행 파일은 로컬 생성 오류를 돌려준다.
+            assert_ne!(start.err().unwrap().kind(), io::ErrorKind::Interrupted);
+        } else {
+            assert_eq!(start.map(|_| ()).map_err(|error| error.to_string()), expected);
+        }
         assert_eq!(transport.write(b"frame"), expected);
         assert_eq!(starts.get(), usize::from(error.is_none()));
         assert_eq!(*writes.lock().unwrap(), usize::from(error.is_none()));
