@@ -5,6 +5,8 @@ fn main() {
         "connection_test_start", "connection_test_wait", "connection_test_cancel", "connection_save",
         "connections_load",
         "verify_ssh_host",
+        "editor_local_open", "editor_local_save", "editor_local_compare", "editor_local_reload",
+        "editor_local_close",
         "ssm_discovery",
     ]);
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(app))
