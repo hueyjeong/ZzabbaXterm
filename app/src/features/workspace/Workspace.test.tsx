@@ -97,7 +97,7 @@ beforeEach(async () => {
   saveFile = async () => null;
   native.invoke.mockImplementation(async (command, args) => {
     if (command === "connections_load") return loadProfiles();
-    if (command === "ai_models" || command === "ai_targets") return [];
+    if (command === "ai_models" || command === "ai_targets" || command === "ai_decisions") return [];
     if (command.startsWith("connection_") || ["verify_ssh_host", "commit_ssh_host", "cancel_ssh_host"].includes(command)) return runConnectionCommand(command, args);
     if (command === "ssm_discovery") return runDiscovery(args);
     if (command === "editor_local_open") return openFile();

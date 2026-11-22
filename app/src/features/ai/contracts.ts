@@ -15,12 +15,16 @@ export type Proposal = Readonly<{
   );
 export type ProposalDecision = Readonly<{ proposalId: string; decision: "approve" | "reject" | "cancel" }>;
 export type RecordedDecision = "approved" | "rejected" | "cancelled";
+export type DecisionRecord = Readonly<{ proposal: Proposal; decision: RecordedDecision }>;
 
 // Rust resolves targets and revalidates the recorded proposal by ID; a decision is not an execution request.
 export type AiPanelProps = Readonly<{
   models: readonly string[];
   targets: readonly ProposalTarget[];
   proposals: readonly Proposal[];
+  history?: readonly DecisionRecord[];
+  policyVersion?: number;
+  onReadDecision?: (proposalId: string) => Promise<RecordedDecision | undefined>;
   onSelectTarget?: (target: TargetRef | null) => void;
   modelError?: string;
   targetError?: string;

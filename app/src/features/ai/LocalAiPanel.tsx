@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState } from "react";
 import { AiPanel } from "./AiPanel";
-import type { AiPanelProps, ChatReply, Proposal, ProposalTarget, TargetRef } from "./contracts";
+import type { AiPanelProps, ChatReply, DecisionRecord, Proposal, ProposalTarget, RecordedDecision, TargetRef } from "./contracts";
 
 const sendChat: AiPanelProps["onSendChat"] = async (request) => {
   try {
@@ -11,11 +11,13 @@ const sendChat: AiPanelProps["onSendChat"] = async (request) => {
   }
 };
 
-const decide: AiPanelProps["onDecideProposal"] = (request) => invoke("ai_decide", request);
 let nextRequestId = 0;
 
 export function LocalAiPanel({ profilesVersion }: { profilesVersion: number }) {
   const [models, setModels] = useState<readonly string[]>([]);
+  const [history, setHistory] = useState<readonly DecisionRecord[]>([]);
+  const [policyVersion, setPolicyVersion] = useState(0);
+  const historyRequest = useRef(0);
   const [targets, setTargets] = useState<readonly ProposalTarget[]>([]);
   const [modelError, setModelError] = useState("");
   const [targetError, setTargetError] = useState("");
@@ -66,8 +68,38 @@ export function LocalAiPanel({ profilesVersion }: { profilesVersion: number }) {
     return () => { current = false; };
   }, [profilesVersion, retry]);
 
+  async function readHistory() {
+    const version = ++historyRequest.current;
+    const records = await invoke<DecisionRecord[]>("ai_decisions", {});
+    if (version === historyRequest.current) setHistory(records);
+    return records;
+  }
+
+  useEffect(() => {
+    void readHistory().catch(console.error);
+    return () => { historyRequest.current++; };
+  }, []);
+
+  async function readDecision(proposalId: string) {
+    const records = await readHistory();
+    return records.find(({ proposal }) => proposal.id === proposalId)?.decision;
+  }
+
+  const decide: AiPanelProps["onDecideProposal"] = async (request) => {
+    try {
+      const result = await invoke<RecordedDecision>("ai_decide", request);
+      void readHistory().catch(console.error);
+      return result;
+    } catch (error) {
+      const existing = await readDecision(request.proposalId);
+      if (existing) return existing;
+      throw error;
+    }
+  };
+
   function select(target: TargetRef | null) {
     setCliCard(undefined);
+    void readHistory().catch(console.error);
     setTargetError("");
     const next = selection.current.then(() => invoke<boolean>("ai_select", { target })).catch((error: unknown) => {
       if (selection.current === next) setTargetError(String(error));
@@ -122,6 +154,8 @@ export function LocalAiPanel({ profilesVersion }: { profilesVersion: number }) {
       await invoke("ai_set_policy", { blocked: next });
       setBlocked(next);
       setCliCard(undefined);
+      setPolicyVersion((value) => value + 1);
+      void readHistory().catch(console.error);
     } catch (error) {
       setPolicyError(String(error));
     } finally {
@@ -131,6 +165,7 @@ export function LocalAiPanel({ profilesVersion }: { profilesVersion: number }) {
   }
 
   return <AiPanel models={models} targets={targets} proposals={cliCard ? [cliCard] : []} onSelectTarget={select}
+    history={history} policyVersion={policyVersion} onReadDecision={readDecision}
     onOpenCliReview={openCliReview}
     policyControl={<>
       {blocked !== undefined && <label><input type="checkbox" checked={blocked} disabled={savingPolicy}

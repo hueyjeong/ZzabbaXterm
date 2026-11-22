@@ -49,9 +49,9 @@ export function AiPanel(props: AiPanelProps) {
         </select>
       </label>
       {target && props.onOpenCliReview && <button type="button" onClick={props.onOpenCliReview}>CLI 제안 열기</button>}
-      {target ? <ProposalReview key={selected} model={model} target={target} proposals={props.proposals}
-        attempted={attempted.current} onRequestProposal={props.onRequestProposal} onDecideProposal={props.onDecideProposal} />
-        : <p role="status">대기</p>}
+      <ProposalReview key={JSON.stringify([selected, target && props.policyVersion])} model={model} target={target}
+        proposals={props.proposals} history={props.history} attempted={attempted.current}
+        onRequestProposal={props.onRequestProposal} onDecideProposal={props.onDecideProposal} onReadDecision={props.onReadDecision} />
     </section>
   </>;
 }
@@ -113,10 +113,10 @@ function Chat({ models, model, onModelChange, onSendChat }: Pick<AiPanelProps, "
   </>;
 }
 
-function ProposalReview({ model, target, proposals, attempted, onRequestProposal, onDecideProposal }:
-  Pick<AiPanelProps, "proposals" | "onRequestProposal" | "onDecideProposal"> & {
+function ProposalReview({ model, target, proposals, history, attempted, onRequestProposal, onDecideProposal, onReadDecision }:
+  Pick<AiPanelProps, "proposals" | "history" | "onRequestProposal" | "onDecideProposal" | "onReadDecision"> & {
     model: string;
-    target: ProposalTarget;
+    target: ProposalTarget | undefined;
     attempted: Set<string>;
   }) {
   const [request, setRequest] = useState<ProposalState>({ kind: "idle" });
@@ -124,18 +124,30 @@ function ProposalReview({ model, target, proposals, attempted, onRequestProposal
   const [decisions, setDecisions] = useState<ReadonlyMap<string, DecisionState>>(new Map());
   const pending = useRef<AbortController | null>(null);
   const mounted = useRef(false);
+  const requestActions = useRef<HTMLDivElement>(null);
+  const proposeButton = useRef<HTMLButtonElement>(null);
+  const cancelButton = useRef<HTMLButtonElement>(null);
   useLayoutEffect(() => {
     mounted.current = true;
     return () => { mounted.current = false; pending.current?.abort(); pending.current = null; };
   }, []);
 
-  const key = targetKey(target);
+  const key = target && targetKey(target);
   const cards = new Map([...created, ...proposals]
     .filter((proposal) => targetKey(proposal.target) === key)
     .map((proposal) => [proposal.id, proposal]));
+  const recorded = new Map(history?.map(({ proposal, decision }) => [proposal.id, decision]));
+  for (const { proposal } of history ?? []) cards.set(proposal.id, proposal);
+
+  function keepRequestFocus() {
+    const cancel = cancelButton.current;
+    if (cancel && cancel.ownerDocument.activeElement === cancel) {
+      (proposeButton.current?.disabled ? requestActions.current : proposeButton.current)?.focus({ preventScroll: true });
+    }
+  }
 
   async function propose() {
-    if (!model || pending.current) return;
+    if (!model || !target || pending.current) return;
     const token = new AbortController();
     pending.current = token;
     setRequest({ kind: "requesting" });
@@ -143,6 +155,7 @@ function ProposalReview({ model, target, proposals, attempted, onRequestProposal
     try {
       const result = await onRequestProposal({ model, target: { targetId, generation }, operation: "uptime" }, token.signal);
       if (pending.current !== token) return;
+      keepRequestFocus();
       if (targetKey(result.target) !== key) {
         setRequest({ kind: "failed" });
       } else {
@@ -150,42 +163,52 @@ function ProposalReview({ model, target, proposals, attempted, onRequestProposal
         setRequest({ kind: "idle" });
       }
     } catch {
-      if (pending.current === token) setRequest({ kind: "failed" });
+      if (pending.current === token) {
+        keepRequestFocus();
+        setRequest({ kind: "failed" });
+      }
     } finally {
       if (pending.current === token) pending.current = null;
     }
   }
 
-  async function decide(proposal: Proposal, decision: "approve" | "reject" | "cancel", button: HTMLButtonElement) {
-    if (!mounted.current || attempted.has(proposal.id) || targetKey(proposal.target) !== key ||
-      (decision === "approve" && proposal.kind !== "reviewable")) return;
-    attempted.add(proposal.id);
+  async function recordDecision(proposalId: string, button: HTMLButtonElement, read: () => Promise<RecordedDecision | undefined>) {
+    if (!mounted.current) return;
     if (button.ownerDocument.activeElement === button) button.closest("article")?.focus({ preventScroll: true });
     const mark = (state: DecisionState) => {
-      if (mounted.current) setDecisions((previous) => new Map(previous).set(proposal.id, state));
+      if (mounted.current) setDecisions((previous) => new Map(previous).set(proposalId, state));
     };
     mark("reviewing");
     try {
-      mark(await onDecideProposal({ proposalId: proposal.id, decision }));
+      mark(await read() ?? "failed");
     } catch {
       mark("failed");
     }
   }
 
+  function decide(proposal: Proposal, decision: "approve" | "reject" | "cancel", button: HTMLButtonElement) {
+    if (!mounted.current || attempted.has(proposal.id) || targetKey(proposal.target) !== key ||
+      (decision === "approve" && proposal.kind !== "reviewable")) return;
+    attempted.add(proposal.id);
+    void recordDecision(proposal.id, button, () => onDecideProposal({ proposalId: proposal.id, decision }));
+  }
+
   return <>
-    <div className="a01-actions">
-      <button type="button" disabled={!model || request.kind === "requesting"} onClick={propose}>가동 시간 조회 제안</button>
-      {request.kind === "requesting" && <button type="button" onClick={() => {
+    {target && <div className="a01-actions" ref={requestActions} tabIndex={-1}>
+      <button type="button" ref={proposeButton} disabled={!model} aria-disabled={request.kind === "requesting" || undefined}
+        onClick={propose}>가동 시간 조회 제안</button>
+      {request.kind === "requesting" && <button type="button" ref={cancelButton} onClick={() => {
+        keepRequestFocus();
         pending.current?.abort();
         pending.current = null;
         setRequest({ kind: "idle" });
       }}>요청 취소</button>}
-    </div>
+    </div>}
     {request.kind === "requesting" && <p role="status">제안 요청 중</p>}
     {request.kind === "failed" && <p role="alert">제안 요청 실패</p>}
     {request.kind === "idle" && cards.size === 0 && <p role="status">대기</p>}
     {[...cards.values()].map((proposal) => {
-      const decision = decisions.get(proposal.id) ?? (attempted.has(proposal.id) ? "closed" : undefined);
+      const decision = recorded.get(proposal.id) ?? decisions.get(proposal.id) ?? (attempted.has(proposal.id) ? "closed" : undefined);
       return <article key={proposal.id} className="a01-proposal" aria-label="조회 제안" tabIndex={-1}>
         <dl>
           {proposal.ssm && <>
@@ -209,6 +232,11 @@ function ProposalReview({ model, target, proposals, attempted, onRequestProposal
           <button type="button" onClick={(event) => decide(proposal, "reject", event.currentTarget)}>거절</button>
           <button type="button" onClick={(event) => decide(proposal, "cancel", event.currentTarget)}>취소</button>
         </div>}
+        {decision === "failed" && onReadDecision && <button type="button" onClick={(event) => {
+          if (decisions.get(proposal.id) === "failed") {
+            void recordDecision(proposal.id, event.currentTarget, () => onReadDecision(proposal.id));
+          }
+        }}>결정 다시 조회</button>}
       </article>;
     })}
   </>;

@@ -10,6 +10,7 @@ fn main() {
         "editor_local_close",
         "ai_targets", "ai_models", "ai_select", "ai_chat", "ai_propose", "ai_decide",
         "ai_cancel_proposal",
+        "ai_decisions",
         "ssm_discovery",
         "ai_cli_review", "ai_cli_draft",
         "ai_policy", "ai_set_policy",

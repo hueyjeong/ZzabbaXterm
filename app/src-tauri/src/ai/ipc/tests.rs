@@ -43,7 +43,7 @@ fn stored_generation_and_document_gate_late_results_and_decisions() {
     let mut state = ReviewState::default();
     state.select(4, Some(target.clone())).unwrap();
     assert!(state.begin(5, &targets, 1, target.into()).is_err());
-    let (epoch, selected) = state.begin(4, &targets, 1, target.into()).unwrap();
+    let (epoch, selected, _) = state.begin(4, &targets, 1, target.into()).unwrap();
     let candidate = || review_proposal(r#"{"operation":"uptime","arguments":{}}"#, selected.clone()).unwrap();
     let card = state.finish(4, &local, &targets, 1, epoch, candidate()).unwrap();
     let wire = serde_json::to_value(&card).unwrap();
@@ -166,11 +166,12 @@ fn cancelling_either_side_of_model_completion_keeps_shared_capacity_available() 
         let mut state = host.0.lock().unwrap();
         state.select(2, Some(target.clone())).unwrap();
         state.cancel(2, &local, 1);
-        assert_eq!(state.begin(2, &targets, 1, (&target).into()), Err(CANCELLED.into()));
+        assert_eq!(state.begin(2, &targets, 1, (&target).into()).err().as_deref(), Some(CANCELLED));
         for request_id in 2..66 {
-            let (epoch, _) = state.begin(2, &targets, request_id, (&target).into()).unwrap();
+            let (epoch, _, token) = state.begin(2, &targets, request_id, (&target).into()).unwrap();
             if request_id % 2 == 0 {
                 state.cancel(2, &local, request_id);
+                assert!(token.is_cancelled());
                 assert_eq!(state.finish(2, &local, &targets, request_id, epoch, candidate()).err().as_deref(), Some(CANCELLED));
             } else {
                 let card = state.finish(2, &local, &targets, request_id, epoch, candidate()).unwrap();
@@ -178,12 +179,47 @@ fn cancelling_either_side_of_model_completion_keeps_shared_capacity_available() 
                 assert!(state.decide(2, &local, &targets, Decision { proposal_id: card.id, decision: PanelChoice::Approve }).is_err());
             }
         }
-        let (epoch, _) = state.begin(2, &targets, 66, (&target).into()).unwrap();
+        let (epoch, _, token) = state.begin(2, &targets, 66, (&target).into()).unwrap();
         state.cancel(2, &local, 65);
+        state.cancel(2, &local, 67);
+        assert!(!token.is_cancelled());
+        assert_eq!(state.begin(2, &targets, 67, (&target).into()).err().as_deref(), Some(CANCELLED));
         assert!(state.finish(2, &local, &targets, 66, epoch, candidate()).is_ok());
     }
     let request = CliProposal { target_id: "dev".into(), generation: "1".into(), operation: Query::Uptime };
     assert!(host.receive_proposal(&targets, request, Instant::now() + Duration::from_secs(3)).is_ok());
+}
+
+#[test]
+fn policy_change_frees_all_slots_and_retains_only_local_read_only_history() {
+    let host = State::default();
+    let target = SelectedTarget { profile_id: "dev".into(), ssm_profile: None, region: String::new(),
+        node_id: "내 PC".into(), display_name: "시험".into(), generation: NonZeroU64::MIN };
+    let targets = [target.clone()];
+    let local = LocalReview::check("main", "main", true, 2).unwrap();
+    let other = LocalReview::check("main", "main", true, 3).unwrap();
+    let mut state = host.0.lock().unwrap();
+    state.select(2, Some(target.clone())).unwrap();
+    let (epoch, _, _) = state.begin(2, &targets, 1, (&target).into()).unwrap();
+    let candidate = || review_proposal(r#"{"operation":"uptime","arguments":{}}"#, target.clone()).unwrap();
+    let card = state.finish(2, &local, &targets, 1, epoch, candidate()).unwrap();
+    let decision = || Decision { proposal_id: card.id.clone(), decision: PanelChoice::Approve };
+    assert_eq!(state.decide(2, &local, &targets, decision()), Ok(RecordedDecision::Approved));
+    for id in 2..34 {
+        state.begin(2, &targets, id, (&target).into()).unwrap();
+        state.finish(2, &local, &targets, id, epoch, candidate()).unwrap();
+    }
+    state.begin(2, &targets, 34, (&target).into()).unwrap();
+    assert!(state.finish(2, &local, &targets, 34, epoch, candidate()).is_err());
+    state.set_policy(true).unwrap();
+    let (epoch, _, _) = state.begin(2, &targets, 35, (&target).into()).unwrap();
+    assert!(state.finish(2, &local, &targets, 35, epoch, candidate()).is_ok());
+    state.select(2, None).unwrap();
+    assert_eq!(state.history(&local).unwrap()[0]["decision"], "approved");
+    assert_eq!(state.history(&local).unwrap()[0]["proposal"]["id"], card.id);
+    assert_eq!(state.history(&other).unwrap(), json!([]));
+    state.select(2, Some(target)).unwrap();
+    assert!(state.decide(2, &local, &targets, decision()).is_err());
 }
 
 #[test]
