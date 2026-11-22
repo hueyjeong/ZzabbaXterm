@@ -59,7 +59,7 @@ impl Probe {
         Self::with_timeout(owner, TIMEOUT, false, false)
     }
 
-    fn with_timeout(owner: &str, timeout: Duration, ssm: bool, ssh: bool) -> Self {
+    pub(super) fn with_timeout(owner: &str, timeout: Duration, ssm: bool, ssh: bool) -> Self {
         Self { session: Arc::new(Session::new(owner, ssm)), ssh, deadline: Instant::now() + timeout, state: Mutex::default(), ready: Condvar::new() }
     }
 
@@ -146,7 +146,7 @@ impl Probe {
         combine_cleanup(result, self.session.cleanup_result())
     }
 
-    fn finish(&self, result: Result<(), String>) {
+    pub(super) fn finish(&self, result: Result<(), String>) {
         self.state.lock().unwrap().result = Some(if result.is_ok() && Instant::now() >= self.deadline { Err(TIMED_OUT.into()) } else { result });
         self.ready.notify_all();
     }
@@ -175,18 +175,30 @@ impl Probe {
         drop(self.ready.wait_while(self.state.lock().unwrap(), |state| state.result.is_none()).unwrap());
     }
 
+    pub(crate) fn is_ssh(&self) -> bool {
+        self.ssh
+    }
+
+    pub(super) fn confirm_ssh_close(&self) -> bool {
+        self.cancel_result(true).is_ok()
+    }
+
     pub(crate) fn cleanup_unconfirmed(&self) -> bool {
         self.session.cleanup_result().is_err()
     }
 
     pub(crate) fn cancel_result(&self, retry: bool) -> Result<(), String> {
-        if self.session.is_ssm() {
+        if self.ssh {
+            let (state, _) = self.ready.wait_timeout_while(self.state.lock().unwrap(), Duration::from_secs(5),
+                |state| state.result.is_none()).unwrap();
+            if state.result.is_none() { return Err("SSH 시험 자식 종료 확인 불가".into()); }
+        } else if self.session.is_ssm() {
             self.wait_finished();
-            if retry { return self.session.recheck_cleanup().warning().map_or(Ok(()), Err); }
-            self.session.cleanup_result()?;
+        } else {
+            return Ok(());
         }
-        if self.ssh { self.wait_finished(); self.session.cleanup_result()?; }
-        Ok(())
+        if retry { return self.session.recheck_cleanup().warning().map_or(Ok(()), Err); }
+        self.session.cleanup_result()
     }
 
     fn after_cleanup(&self, result: Result<(), String>) -> Result<(), String> {

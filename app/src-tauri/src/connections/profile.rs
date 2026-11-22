@@ -170,7 +170,7 @@ pub(crate) struct Draft {
     group_revision: Option<Revision>,
     target_revision: Option<Revision>,
     group: Group,
-    target: Target,
+    pub(super) target: Target,
 }
 
 #[derive(Debug, PartialEq, Eq)]

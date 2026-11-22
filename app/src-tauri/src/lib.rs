@@ -60,6 +60,16 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| match event {
+            tauri::RunEvent::WindowEvent { label, event: tauri::WindowEvent::CloseRequested { api, .. }, .. } => {
+                if !app.state::<Sessions>().close_ssh_probes(Some(&label)) {
+                    api.prevent_close();
+                }
+            }
+            tauri::RunEvent::ExitRequested { api, .. } => {
+                if !app.state::<Sessions>().close_ssh_probes(None) {
+                    api.prevent_exit();
+                }
+            }
             tauri::RunEvent::WindowEvent { label, event: tauri::WindowEvent::Destroyed, .. } => {
                 if let Some(registration) = app.try_state::<ssh::registration::Registration>() {
                     registration.document_changed(&label);

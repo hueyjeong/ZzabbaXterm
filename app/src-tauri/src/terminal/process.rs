@@ -714,4 +714,6 @@ fn kill_foreground(master: &dyn MasterPty, pid: libc::pid_t) {
 mod process_job;
 
 mod ssh_child;
+#[cfg(test)]
+mod probe_cleanup_tests;
 use ssh_child::{poll as poll_ssh, terminate as terminate_ssh};
