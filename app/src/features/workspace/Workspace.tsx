@@ -31,7 +31,7 @@ type Split = { left: number; right: number };
 type DesktopKind = "rdp" | "vnc";
 type Tab = { id: number; label: string } & (
   | { kind: "terminal"; targetId?: string; remoteEditor?: true; ssm?: SsmTarget; ssh?: SshTransport["kind"]; status: TerminalStatus; sessionId?: string; sftpSessionId?: string; closeStatus?: CloseStatus }
-  | { kind: "editor"; file: ApprovedEditorFile; transport: EditorTransport; close: () => Promise<void>; source: EditorSource; attaching?: true }
+  | { kind: "editor"; file: ApprovedEditorFile; transport: EditorTransport; close: () => Promise<void>; source: EditorSource; attaching?: true; readOnly?: true }
   | { kind: "tunnel"; handle: string; targetId: string; name: string; method: "ssh" | "ssm"; closeStatus?: CloseStatus; closeError?: string }
   | { kind: "rdp" }
   | { kind: "vnc" }
@@ -223,7 +223,7 @@ export function Workspace() {
     const reportLocal = (error: unknown) => setFileError(`CLI 파일 열기 실패: ${localEditorError(error).message}`);
     const reportNano = (error: unknown) => setFileError(`nano 편집 연결 확인 불가: ${sftpError(error).message}`);
     async function attach(file: ApprovedEditorFile, transport: EditorTransport, close: () => Promise<void>,
-      source: "local" | "sftp", acknowledge: () => Promise<boolean>, signal: AbortSignal) {
+      source: "local" | "sftp", acknowledge: () => Promise<"mounted" | "unconfirmed" | "unavailable">, signal: AbortSignal) {
       if (closingWindow.current || signal.aborted || attachingHandles.has(file.handle) || liveTabs.current.some(tab =>
         tab.kind === "editor" && tab.source === source && tab.file.handle === file.handle)) return;
       attachingHandles.add(file.handle);
@@ -241,10 +241,11 @@ export function Workspace() {
         const committed = await mounted;
         if (signal.aborted) return;
         if (!committed) throw new Error("편집기 탭을 부착할 수 없습니다");
-        if (!await acknowledge()) { removePreview(); return; }
+        const result = await acknowledge();
+        if (result === "unavailable") { removePreview(); return; }
         if (signal.aborted) return;
         setTabs(current => current.map(tab => tab.id === id && tab.kind === "editor"
-          ? { ...tab, attaching: undefined } : tab));
+          ? { ...tab, attaching: undefined, readOnly: result === "unconfirmed" ? true : undefined } : tab));
         selectTab(id);
       } catch (error) {
         removePreview();
@@ -259,7 +260,7 @@ export function Workspace() {
     const local = subscribeLocalCliOpen((file, respond, signal) =>
       attach(file, localEditorTransport, () => closeLocalFile(file.handle), "local", async () => {
         await respond({ attached: true });
-        return true;
+        return "mounted";
       }, signal).catch(error => { if (!signal.aborted) reportLocal(error); throw error; }), reportLocal);
     const nano = subscribeRemoteNanoOpen((file, acknowledge, signal) => {
       if (!liveTabs.current.some(tab => tab.kind === "terminal" && tab.remoteEditor && tab.sessionId === file.sessionId && !tab.closeStatus)) {
@@ -268,7 +269,7 @@ export function Workspace() {
       return attach(file, file.transport, file.close, "sftp", async () => {
         const result = await acknowledge();
         if (result.kind === "unconfirmed" && !signal.aborted) reportNano(result.error);
-        return result.kind !== "aborted";
+        return result.kind === "aborted" ? "unavailable" : result.kind;
       }, signal).catch(error => { if (!signal.aborted) reportNano(error); throw error; });
     }, reportNano);
     const unsubscribe = () => { local(); nano(); };
@@ -688,7 +689,7 @@ export function Workspace() {
               ) : tab.kind === "vnc" ? (
                 <VncView active={id === active} />
               ) : (
-                <EditorTab file={tab.file} active={id === active && !tab.attaching} transport={tab.transport}
+                <EditorTab file={tab.file} active={id === active && !tab.attaching} transport={tab.transport} readOnly={tab.readOnly}
                   confirmDiscard={(request) => confirmEditorDiscard(tab.source, request)}
                   focusRequested={id === focusTab}
                   ref={(actions) => {

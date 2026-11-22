@@ -1794,7 +1794,7 @@ describe("F01 직접 SSH", () => {
     runNanoEditor = async command => {
       if (command === "editor_remote_nano_claim") return { handle, name: "원격 편집.txt", text: "원격 원본" };
       if (command === "editor_remote_nano_mounted") throw new Error("응답 유실");
-      if (command === "editor_remote_nano_failed") return;
+      if (command === "editor_remote_nano_failed") throw new Error("부착 확인 유실");
       throw new Error(command);
     };
     runSftp = async command => { if (command !== "editor_sftp_close") throw new Error(command); };
@@ -1813,6 +1813,9 @@ describe("F01 직접 SSH", () => {
     await act(async () => { void receiveNanoOpen?.({ event, id: 1, payload: { offerId, sessionId } }); });
     expect(connectionCalls("editor_remote_nano_mounted")).toEqual([["editor_remote_nano_mounted", { offerId, handle }]]);
     expect(find('.editor-tab[aria-label="원격 편집.txt"]').hidden).toBe(false);
+    const editorPane = find('.editor-tab[aria-label="원격 편집.txt"]');
+    expect(editorPane.querySelector<HTMLButtonElement>(".editor-toolbar button")?.disabled).toBe(true);
+    expect(connectionCalls("editor_remote_nano_failed")).toContainEqual(["editor_remote_nano_failed", { offerId, handle }]);
     expect(status()).toContain("nano 편집 연결 확인 불가: 응답 유실");
     expect(confirm).toHaveBeenCalledTimes(1);
     expect(connectionCalls("editor_sftp_attach")).toHaveLength(0);
