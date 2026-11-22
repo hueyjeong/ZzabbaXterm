@@ -28,6 +28,23 @@ fn reference() -> ServiceKeyRef {
 }
 
 #[test]
+fn revision_preserves_only_the_original_service_and_normalized_origin() {
+    let original = || Settings::new(input(ORIGIN, "기존"), reference()).unwrap();
+    let mut draft = input(ENDPOINT, " 새 별칭 ");
+    draft.region = "local-test-1".into();
+    draft.addressing = AddressStyle::Path;
+    let revised = original().revise(draft).unwrap();
+    let view = revised.view();
+    assert_eq!(revised.item_id(), ITEM);
+    assert_eq!((&*view.origin, &*view.alias, &*view.region, view.addressing), (ORIGIN, "새 별칭", "local-test-1", AddressStyle::Path));
+
+    let mut another_service = input(ENDPOINT, "다른 서비스");
+    another_service.service_id = "another".into();
+    assert_eq!(original().revise(another_service).err(), Some(SettingsError::WrongService));
+    assert_eq!(original().revise(input("https://store.example.test:444", "다른 출처")).err(), Some(SettingsError::WrongService));
+}
+
+#[test]
 fn settings_replace_atomically_and_expose_only_the_public_view() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("compatible.json");

@@ -1110,6 +1110,15 @@ pub(crate) fn dispatch<R: tauri::Runtime>(invoke: Invoke<R>) -> bool {
     }
     match name {
         "storage_compatible_load" => handle!("storage_compatible_load", compatible::LoadRequest, compatible::load),
+        "storage_compatible_enroll" => {
+            let item = CommandItem { name: "storage_compatible_enroll", key: "request", plugin: None, message: &message, acl: &acl };
+            let request = match compatible::enroll::EnrollRequest::from_command(item) {
+                Ok(request) => request,
+                Err(error) => { resolver.invoke_error(error); return true; }
+            };
+            let reserved = webview.state::<StorageIpc>().reserve_compatible(&document, &request.session_id);
+            resolver.respond_async(compatible::enroll::enroll(webview, document, request, reserved));
+        }
         "storage_compatible_open" => {
             let item = CommandItem { name: "storage_compatible_open", key: "request", plugin: None, message: &message, acl: &acl };
             let compatible::OpenCommand { session_id, target } = match compatible::OpenCommand::from_command(item) {

@@ -30,6 +30,7 @@ fn main() {
         "ssm_discovery",
         "storage_open", "storage_list_buckets", "storage_list_objects", "storage_select_local_file",
         "storage_compatible_load", "storage_compatible_open",
+        "storage_compatible_enroll",
         "storage_count_previous_files",
         "storage_upload", "storage_download", "storage_cancel_approval", "storage_close",
         "storage_relogin",

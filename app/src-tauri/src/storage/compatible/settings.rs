@@ -5,6 +5,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tempfile::{NamedTempFile, PersistError};
 
 use super::{
@@ -33,6 +34,17 @@ pub(crate) struct SettingsView {
     pub origin: String,
     pub region: String,
     pub addressing: AddressStyle,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(in crate::storage) struct SavedSettingsView {
+    pub service_id: String,
+    alias: String,
+    origin: String,
+    region: String,
+    addressing: AddressStyle,
+    revision: String,
 }
 
 #[derive(Deserialize)]
@@ -68,6 +80,8 @@ pub(crate) enum SettingsError {
     KeyLocked,
     KeyUnavailable,
     KeyInvalid,
+    KeyAlreadyExists,
+    KeyOutcomeUnknown,
 }
 
 impl From<ConfigError> for SettingsError {
@@ -91,6 +105,8 @@ impl From<KeyAccessError> for SettingsError {
             KeyAccessError::Locked => Self::KeyLocked,
             KeyAccessError::Unavailable => Self::KeyUnavailable,
             KeyAccessError::Invalid => Self::KeyInvalid,
+            KeyAccessError::AlreadyExists => Self::KeyAlreadyExists,
+            KeyAccessError::OutcomeUnknown => Self::KeyOutcomeUnknown,
         }
     }
 }
@@ -116,6 +132,7 @@ pub(crate) struct Settings {
     alias: String,
     addressing: AddressStyle,
     key: ServiceKeyRef,
+    revision: Option<sha2::digest::Output<Sha256>>,
 }
 
 pub(in crate::storage) struct StagedSettings {
@@ -148,8 +165,36 @@ impl Settings {
         Self::from_validated(service, input.alias, input.addressing, key)
     }
 
+    pub(in crate::storage) fn revise(self, input: SettingsInput) -> Result<Self, SettingsError> {
+        let service = CompatibleService::new(input.service_id, &input.endpoint, input.region, input.addressing)?;
+        Self::from_validated(service, input.alias, input.addressing, self.key)
+    }
+
+    pub(in crate::storage) fn saved_view(&self) -> Result<SavedSettingsView, SettingsError> {
+        let SettingsView { service_id, alias, origin, region, addressing } = self.view();
+        let revision = self.revision.as_ref().ok_or(SettingsError::NotFound)?;
+        Ok(SavedSettingsView {
+            service_id, alias, origin, region, addressing,
+            revision: format!("{revision:x}"),
+        })
+    }
+
+    pub(in crate::storage) fn check_saved(
+        path: &Path, expected: &SavedSettingsView, approved_item: &str,
+    ) -> Result<(), SettingsError> {
+        let saved = Self::load(path)?;
+        if saved.item_id() != approved_item || &saved.saved_view()? != expected {
+            return Err(SettingsError::WrongService);
+        }
+        Ok(())
+    }
+
     pub(crate) fn item_id(&self) -> &str {
         self.key.item_id()
+    }
+
+    pub(in crate::storage) fn scope(&self) -> &ServiceKeyScope {
+        self.service.scope()
     }
 
     fn from_validated(
@@ -175,6 +220,7 @@ impl Settings {
             alias,
             addressing,
             key,
+            revision: None,
         })
     }
 
@@ -252,7 +298,9 @@ impl Settings {
             return Err(SettingsError::WrongService);
         }
         let key = ServiceKeyRef::new(&definition, key.item_id)?;
-        Self::from_validated(definition, service.alias, service.addressing, key)
+        let mut settings = Self::from_validated(definition, service.alias, service.addressing, key)?;
+        settings.revision = Some(Sha256::digest(&bytes));
+        Ok(settings)
     }
 
     pub(crate) fn connect(

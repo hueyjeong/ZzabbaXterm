@@ -1,6 +1,8 @@
 use std::fmt::Write;
 
 use sha2::{Digest, Sha256};
+#[cfg(any(windows, target_os = "linux", test))]
+use zeroize::Zeroizing;
 
 use super::{KeyAccessError, ServiceKey, ServiceKeyScope, opaque_id};
 
@@ -61,6 +63,28 @@ fn read_with(
     read(&target)
 }
 
+#[cfg(any(windows, target_os = "linux", test))]
+fn encode_payload(access: &str, secret: &str) -> Result<Zeroizing<Vec<u8>>, KeyAccessError> {
+    let len = access.len().saturating_add(secret.len()).saturating_add(1);
+    if len > 2_560 || !valid_payload_fields(access, secret) {
+        return Err(KeyAccessError::Invalid);
+    }
+    let mut payload = Zeroizing::new(Vec::with_capacity(len));
+    payload.extend_from_slice(access.as_bytes());
+    payload.push(b'\n');
+    payload.extend_from_slice(secret.as_bytes());
+    Ok(payload)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) use linux::{prompt, write_new};
+#[cfg(windows)]
+pub(crate) use windows::{prompt, write_new};
+
+fn valid_payload_fields(access: &str, secret: &str) -> bool {
+    !access.is_empty() && !secret.is_empty() && !access.chars().chain(secret.chars()).any(char::is_control)
+}
+
 #[cfg(target_os = "linux")]
 use linux::read as read_os;
 #[cfg(windows)]
@@ -74,11 +98,8 @@ fn decode(payload: &[u8]) -> Result<ServiceKey, KeyAccessError> {
     let (access_key, secret_key) = std::str::from_utf8(payload)
         .ok()
         .and_then(|text| text.split_once('\n'))
-        .filter(|(access, secret)| !access.chars().chain(secret.chars()).any(char::is_control))
+        .filter(|(access, secret)| valid_payload_fields(access, secret))
         .ok_or(KeyAccessError::Invalid)?;
-    if access_key.is_empty() || secret_key.is_empty() {
-        return Err(KeyAccessError::Invalid);
-    }
     ServiceKey::new(access_key.into(), secret_key.into())
 }
 

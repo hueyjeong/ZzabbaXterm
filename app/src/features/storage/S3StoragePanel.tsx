@@ -3,6 +3,7 @@ import type { VersionedFilesStatus } from "../files/FileBrowser";
 import { ObjectTable } from "./ObjectTable";
 import type { BucketRow, ObjectRow, S3Actions, S3FileSelection, S3Location, S3Session, StorageEditorOpen } from "./s3";
 import { StorageProblem, TransferStatus, type Problem, type Transfer } from "./StorageStatus";
+import type { CompatibleBucketPage } from "./compatible-settings";
 import { bindStorageEditor } from "./storageEditorIpc";
 import { countPreviousFiles } from "./storageIpc";
 import "./storage.css";
@@ -29,6 +30,7 @@ const initial: View = { confirmed: false, loading: false, selectedKey: null, upl
 
 type Props = Readonly<{
   session: S3Session;
+  initialBuckets?: CompatibleBucketPage;
   actions: S3Actions;
   onRelogin?: () => void;
   refresh?: number;
@@ -37,8 +39,12 @@ type Props = Readonly<{
   countHistory?: typeof countPreviousFiles;
 }>;
 
-export function S3StoragePanel({ session, actions, onRelogin, refresh = 0, editEnabled = true, onEditFile, countHistory = countPreviousFiles }: Props) {
-  const [views, setViews] = useState(() => new Map<string, View>());
+export function S3StoragePanel({ session, initialBuckets, actions, onRelogin, refresh = 0, editEnabled = true, onEditFile, countHistory = countPreviousFiles }: Props) {
+  const [views, setViews] = useState(() => {
+    const initialViews = new Map<string, View>();
+    if (initialBuckets) initialViews.set(session.sessionId, { ...initial, listing: { kind: "buckets", ...initialBuckets } });
+    return initialViews;
+  });
   const [history, setHistory] = useState<{ request: Parameters<typeof countPreviousFiles>[0]; count: typeof countPreviousFiles; status: VersionedFilesStatus }>();
   const [menuKey, setMenuKey] = useState<string>();
   const editAttempt = useRef<{ sessionId: string } | null>(null);

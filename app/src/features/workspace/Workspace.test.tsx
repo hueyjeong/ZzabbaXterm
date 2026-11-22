@@ -1702,8 +1702,12 @@ describe("현재 SSH 세션의 SFTP", () => {
     let failClose = true;
     runStorage = async (command, args) => {
       const { request: { sessionId } } = args as { request: { sessionId: string } };
-      if (command === "storage_compatible_open") return { ok: true, value: { sessionId, target } };
-      if (command === "storage_list_buckets") return { ok: true, value: { rows: [{ name: "fixture-bucket", region: target.region }], nextToken: null } };
+      if (command === "storage_compatible_open") return {
+        ok: true, value: {
+          sessionId, target,
+          initialBuckets: { rows: [{ name: "fixture-bucket", region: target.region }], nextToken: null }
+        }
+      };
       if (command === "storage_close") {
         if (failClose) throw new Error("종료 응답 유실");
         return true;
@@ -1738,14 +1742,13 @@ describe("현재 SSH 세션의 SFTP", () => {
     expect(opens).toHaveLength(1);
     const { sessionId } = opens[0][1].request as { sessionId: string };
     expect(sessionId).toBeTruthy();
-    await press("버킷 목록");
     const bucket = button("fixture-bucket");
     expect(bucket).toBeDefined();
     await chooseFileConnection("");
     await chooseFileConnection(key);
     expect(button("fixture-bucket")).toBe(bucket);
     expect(connectionCalls("storage_compatible_open")).toHaveLength(1);
-    expect(connectionCalls("storage_list_buckets")).toEqual([["storage_list_buckets", { request: { sessionId, token: null } }]]);
+    expect(connectionCalls("storage_list_buckets")).toHaveLength(0);
     expect(connectionCalls("storage_close")).toHaveLength(0);
     await press("S3 호환 HTTPS 닫기");
     expect(panel.querySelector('[role="alert"]')?.textContent).toBe("종료 확인 불가");

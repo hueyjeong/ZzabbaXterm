@@ -48,6 +48,8 @@ pub(crate) enum KeyAccessError {
     Locked,
     Unavailable,
     Invalid,
+    AlreadyExists,
+    OutcomeUnknown,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -178,6 +180,15 @@ impl CompatibleS3 {
             .list_buckets(token, &self.target.region)
             .await
             .map_err(|err| self.with_target(err))
+    }
+
+    pub(super) async fn verify_connection(&self) -> Result<Page<BucketRow>, Error> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            self.operations.list_buckets(None, &self.target.region),
+        )
+        .await
+        .map_err(|_| Error::at(super::Stage::ListBuckets, Failure::TimedOut))?
     }
 
     pub(crate) async fn list_objects(

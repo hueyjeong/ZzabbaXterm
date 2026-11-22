@@ -8,6 +8,7 @@
     "allow-storage-open",
     "allow-storage-compatible-load",
     "allow-storage-compatible-open",
+    "allow-storage-compatible-enroll",
     "allow-storage-relogin",
     "allow-storage-list-buckets",
     "allow-storage-list-objects",

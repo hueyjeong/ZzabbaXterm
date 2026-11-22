@@ -39,27 +39,57 @@ impl Drop for SearchResults {
 static LIBSECRET: LazyLock<Option<Library>> =
     LazyLock::new(|| unsafe { Library::new("libsecret-1.so.0").ok() });
 
-pub(super) fn read(target: &str) -> Result<ServiceKey, KeyAccessError> {
-    let target = CString::new(target).map_err(|_| KeyAccessError::Invalid)?;
-    let application = CString::new(APPLICATION).map_err(|_| KeyAccessError::Invalid)?;
-    unsafe {
-        let library = LIBSECRET.as_ref().ok_or(KeyAccessError::Unavailable)?;
+macro_rules! with_symbols {
+    ($library:ident, $body:block) => {{
+        let $library = LIBSECRET.as_ref().ok_or(KeyAccessError::Unavailable)?;
         macro_rules! symbol {
             ($name:ident: $ty:ty) => {
-                *library
+                *$library
                     .get::<$ty>(stringify!($name).as_bytes())
                     .map_err(|_| KeyAccessError::Unavailable)?
             };
         }
-        let hash = symbol!(g_str_hash: unsafe extern "C" fn(*const c_void) -> c_uint);
-        let equal =
-            symbol!(g_str_equal: unsafe extern "C" fn(*const c_void, *const c_void) -> c_int);
-        let table_new = symbol!(g_hash_table_new: unsafe extern "C" fn(
-            unsafe extern "C" fn(*const c_void) -> c_uint,
-            unsafe extern "C" fn(*const c_void, *const c_void) -> c_int,
-        ) -> Ptr);
-        let table_unref = symbol!(g_hash_table_unref: Release);
-        let insert = symbol!(g_hash_table_insert: unsafe extern "C" fn(Ptr, *const c_char, *const c_char) -> c_int);
+        $body
+    }};
+}
+
+mod prompt;
+mod write;
+pub(crate) use prompt::prompt;
+pub(crate) use write::write_new;
+
+const SECRET_SEARCH_ALL: c_uint = 1 << 1;
+
+struct Attributes {
+    table: Owned,
+    _target: CString,
+    _application: CString,
+}
+
+impl Attributes {
+    fn new(target: &str) -> Result<Self, KeyAccessError> {
+        let target = CString::new(target).map_err(|_| KeyAccessError::Invalid)?;
+        let application = CString::new(APPLICATION).map_err(|_| KeyAccessError::Invalid)?;
+        unsafe { with_symbols!(library, {
+            let hash = symbol!(g_str_hash: unsafe extern "C" fn(*const c_void) -> c_uint);
+            let equal = symbol!(g_str_equal: unsafe extern "C" fn(*const c_void, *const c_void) -> c_int);
+            let table_new = symbol!(g_hash_table_new: unsafe extern "C" fn(
+                unsafe extern "C" fn(*const c_void) -> c_uint,
+                unsafe extern "C" fn(*const c_void, *const c_void) -> c_int,
+            ) -> Ptr);
+            let table_unref = symbol!(g_hash_table_unref: Release);
+            let insert = symbol!(g_hash_table_insert: unsafe extern "C" fn(Ptr, *const c_char, *const c_char) -> c_int);
+            let table = Owned(table_new(hash, equal), table_unref);
+            insert(table.0, c"application".as_ptr(), application.as_ptr());
+            insert(table.0, c"target".as_ptr(), target.as_ptr());
+            Ok(Self { table, _target: target, _application: application })
+        }) }
+    }
+}
+
+pub(super) fn read(target: &str) -> Result<ServiceKey, KeyAccessError> {
+    let attributes = Attributes::new(target)?;
+    unsafe { with_symbols!(library, {
         let search = symbol!(secret_service_search_sync: unsafe extern "C" fn(
             Ptr, *const c_void, Ptr, c_uint, Ptr, *mut Ptr,
         ) -> *mut List);
@@ -74,11 +104,7 @@ pub(super) fn read(target: &str) -> Result<ServiceKey, KeyAccessError> {
         let bytes = symbol!(secret_value_get: unsafe extern "C" fn(Ptr, *mut usize) -> *const u8);
         let value_unref = symbol!(secret_value_unref: Release);
 
-        let attributes = Owned(table_new(hash, equal), table_unref);
-        insert(attributes.0, c"application".as_ptr(), application.as_ptr());
-        insert(attributes.0, c"target".as_ptr(), target.as_ptr());
         // SECRET_SEARCH_ALL만 사용해서 중복 항목을 검출한다. 검색 중 잠금 해제나 비밀 로드는 없다.
-        const SECRET_SEARCH_ALL: c_uint = 1 << 1;
         let mut error = null_mut();
         let service = service_get(0, null_mut(), &mut error);
         if !error.is_null() {
@@ -93,7 +119,7 @@ pub(super) fn read(target: &str) -> Result<ServiceKey, KeyAccessError> {
         let items = search(
             service.0,
             null(),
-            attributes.0,
+            attributes.table.0,
             SECRET_SEARCH_ALL,
             null_mut(),
             &mut error,
@@ -128,5 +154,5 @@ pub(super) fn read(target: &str) -> Result<ServiceKey, KeyAccessError> {
             return Err(KeyAccessError::Invalid);
         }
         decode(slice::from_raw_parts(payload, len))
-    }
+    }) }
 }

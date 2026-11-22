@@ -1,3 +1,5 @@
+import type { BucketRow } from "./s3";
+
 export type CompatibleAddressing = "path" | "virtual_hosted";
 
 export type CompatibleSettingsInput = Readonly<{
@@ -12,11 +14,20 @@ export type CompatibleSettingsView = Readonly<
   Omit<CompatibleSettingsInput, "endpoint"> & { origin: string }
 >;
 
+export type CompatibleSavedSettings = CompatibleSettingsView & Readonly<{ revision: string }>;
+
+export type CompatibleBucketPage = Readonly<{ rows: readonly BucketRow[]; nextToken: string | null }>;
+
 export type CompatibleOpenRequest =
-  | Readonly<{ kind: "saved"; expected: CompatibleSettingsView }>
+  | Readonly<{ kind: "saved"; expected: CompatibleSavedSettings }>
+  | Readonly<{ kind: "revise"; expected: CompatibleSavedSettings; settings: CompatibleSettingsInput }>
   | Readonly<{ kind: "select"; settings: CompatibleSettingsInput; itemId: string }>;
 
-export type CompatibleSession = Readonly<{ sessionId: string; target: CompatibleSettingsView }>;
+export type CompatibleSession = Readonly<{
+  sessionId: string;
+  target: CompatibleSettingsView;
+  initialBuckets: CompatibleBucketPage;
+}>;
 
 export type CompatibleSettingsError =
   | "invalid_endpoint"
@@ -33,4 +44,6 @@ export type CompatibleSettingsError =
   | "key_missing"
   | "key_locked"
   | "key_unavailable"
-  | "key_invalid";
+  | "key_invalid"
+  | "key_already_exists"
+  | "key_outcome_unknown";
