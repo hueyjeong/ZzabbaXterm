@@ -209,7 +209,8 @@ fn control_shutdown_before_start_case() {
         let closing = Sessions::default();
         let peer = closing.insert_live_ssm_fixture(OWNER, closing.document(OWNER), ACCOUNT, REGION, NODE);
         let late = closing.bind_ssm_control(OWNER, &peer.identity, &CancellationToken::new()).unwrap();
-        assert_eq!(closing.drain_controls_for_exit(Duration::ZERO), crate::terminal::ControlExitReport::default());
+        assert!(closing.begin_control_exit(OWNER, peer.identity.document, "exit"));
+        assert_eq!(closing.drain_controls_for_close(OWNER, peer.identity.document, "exit", Duration::ZERO), Some(crate::terminal::ControlExitReport::default()));
         assert!(!late.cancel_token().is_cancelled());
         assert_eq!(late.admit(|| unreachable!()), Err::<(), _>(UNAVAILABLE.into()));
         assert!(matches!(closing.launch_control(&late, PtySize::default(), Target::new("fixture", REGION, NODE).unwrap(), |_| unreachable!()), Err(error) if error == UNAVAILABLE));
@@ -217,6 +218,7 @@ fn control_shutdown_before_start_case() {
 
     let sessions = Sessions::default();
     let central = sessions.insert_live_ssm_fixture(OWNER, sessions.document(OWNER), ACCOUNT, REGION, NODE);
+    let document = central.identity.document;
     let request = CancellationToken::new();
     let binding = sessions.bind_ssm_control(OWNER, &central.identity, &request).unwrap();
     let (events, output) = mpsc::channel();
@@ -230,7 +232,8 @@ fn control_shutdown_before_start_case() {
     // 중앙 픽스처에는 완료를 통지할 작업자가 없다. 중앙 탭이 닫힌 상태를 만든다.
     drop(central);
 
-    assert_eq!(sessions.drain_controls_for_exit(Duration::from_secs(5)), crate::terminal::ControlExitReport::default());
+    assert!(sessions.begin_control_exit(OWNER, document, "exit"));
+    assert_eq!(sessions.drain_controls_for_close(OWNER, document, "exit", Duration::from_secs(5)), Some(crate::terminal::ControlExitReport::default()));
     assert!(matches!(output.try_recv(), Err(mpsc::TryRecvError::Disconnected)));
     assert!(binding.cancel_token().is_cancelled());
     assert!(control.start_until(None).is_err());

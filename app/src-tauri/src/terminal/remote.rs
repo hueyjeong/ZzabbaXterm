@@ -238,10 +238,12 @@ fn submitted_control_start_is_reaped_and_checks_exact_ssm_cleanup_after_revocati
 
 #[cfg(all(test, any(windows, unix)))]
 fn submitted_control_start_shutdown_case(program: &std::path::Path, exit_started: bool) {
-    use crate::terminal::{ControlExitReport, LocalClose, Sessions, process::Session};
+    use crate::terminal::{CENTRAL_UNAVAILABLE, ControlExitReport, LocalClose, Sessions, process::Session};
     use std::{sync::mpsc, thread, time::Duration};
 
     const WAIT: Duration = Duration::from_secs(10);
+    const OWNER: &str = "main";
+    const DOCUMENT: u64 = 0;
     let sessions = Sessions::default();
     let central = sessions.insert_live_ssm_fixture("main", 0, "123456789012", "us-west-2", "i-01234567");
     let binding = sessions.bind_ssm_control("main", &central.identity, &CancellationToken::new()).unwrap();
@@ -253,6 +255,8 @@ fn submitted_control_start_shutdown_case(program: &std::path::Path, exit_started
     let tracked = sessions.track_control(&binding, &session).unwrap();
     let id = tracked.id;
     let transport = crate::ai::control::ControlTransport::from_tracked_fixture(id, Arc::clone(&binding), Arc::clone(&session));
+    let destroy_count = std::cell::Cell::new(0);
+    let destroy = || { destroy_count.set(destroy_count.get() + 1); Ok(()) };
     assert!(sessions.get("main", &id.to_string()).is_err());
 
     let (pair, mut child) = thread::scope(|scope| {
@@ -265,6 +269,32 @@ fn submitted_control_start_shutdown_case(program: &std::path::Path, exit_started
         });
         let spawn = permit.spawn_fixture(PtySize::default(), cancel, Some(&binding), || {}, || {
             assert!(binding.registry_unlocked_fixture());
+            if exit_started {
+                assert!(sessions.begin_control_exit(OWNER, DOCUMENT, "first"));
+                assert!(matches!(sessions.bind_ssm_control(OWNER, binding.identity(), &CancellationToken::new()), Err(error) if error == CENTRAL_UNAVAILABLE));
+                thread::scope(|drains| {
+                    let old = drains.spawn(|| sessions.drain_controls_for_close(OWNER, DOCUMENT, "first", WAIT));
+                    tauri::async_runtime::block_on(async {
+                        tokio::time::timeout(WAIT, cancel.cancelled()).await.unwrap();
+                    });
+                    assert_eq!(sessions.drain_controls_for_close(OWNER, DOCUMENT, "first", Duration::ZERO), Some(ControlExitReport {
+                        pending: 1, ..ControlExitReport::default()
+                    }));
+                    assert!(matches!(selected.control_submit.try_lock(), Err(std::sync::TryLockError::WouldBlock)));
+                    assert!(sessions.queue_control_exit(OWNER, DOCUMENT, "first", &destroy).is_err());
+                    assert_eq!(destroy_count.get(), 0);
+                    assert!(!sessions.close_ssh_probes(None));
+                    assert!(!sessions.consume_control_exit_approval());
+                    assert_eq!(sessions.check_control_exit_ssh(OWNER, DOCUMENT, "first", |_| unreachable!()), Some(false));
+                    assert_eq!(binding.admit(|| unreachable!()), Err::<(), _>(CENTRAL_UNAVAILABLE.into()));
+                    sessions.release_control_exit(OWNER, DOCUMENT, "first");
+                    let fresh = sessions.bind_ssm_control(OWNER, binding.identity(), &CancellationToken::new()).unwrap();
+                    assert_eq!(fresh.admit(|| Ok(())), Ok(()));
+                    assert!(sessions.begin_control_exit(OWNER, DOCUMENT, "retry"));
+                    assert_eq!(old.join().unwrap(), None);
+                    sessions.release_control_exit(OWNER, DOCUMENT, "retry");
+                });
+            }
             submit.send(()).unwrap();
             tauri::async_runtime::block_on(async {
                 tokio::time::timeout(WAIT, cancel.cancelled()).await.unwrap();
@@ -279,9 +309,7 @@ fn submitted_control_start_shutdown_case(program: &std::path::Path, exit_started
     });
     assert!(cancel.is_cancelled());
     if exit_started {
-        assert_eq!(sessions.drain_controls_for_exit(Duration::ZERO), ControlExitReport {
-            pending: 1, ..ControlExitReport::default()
-        });
+        assert_eq!(sessions.drain_controls_for_close(OWNER, DOCUMENT, "first", Duration::ZERO), None);
     }
     session.terminate_fixture(child.as_mut(), pair.master.as_ref());
     drop(pair);
@@ -290,11 +318,71 @@ fn submitted_control_start_shutdown_case(program: &std::path::Path, exit_started
     let result = transport.close();
     assert_eq!((result.local, result.remote, result.target.as_deref()),
         (LocalClose::CliReaped, RemoteClose::Unconfirmed, Some("i-01234567")));
-    // 정확한 닫기가 첫 완료 보고의 레지스트리 잠금을 앞서 획득한다.
-    assert_eq!(sessions.drain_controls_for_exit(WAIT), ControlExitReport {
+    assert!(sessions.begin_control_exit(OWNER, DOCUMENT, "closing"));
+    sessions.release_control_exit(OWNER, DOCUMENT, "first");
+    assert_eq!(sessions.drain_controls_for_close(OWNER, DOCUMENT, "closing", WAIT), Some(ControlExitReport {
         remote_unconfirmed: usize::from(exit_started), ..ControlExitReport::default()
-    });
+    }));
+    assert_eq!(sessions.close_ssh_probes_for_exit(OWNER, DOCUMENT, "closing"), Some(true));
+    sessions.queue_control_exit(OWNER, DOCUMENT, "closing", &destroy).unwrap();
+    assert_eq!(destroy_count.get(), 1);
+    assert!(!sessions.consume_control_exit_approval());
+    sessions.destroy(OWNER);
+    assert!(sessions.consume_control_exit_approval());
+    assert!(!sessions.consume_control_exit_approval());
     assert!(program.with_file_name("History").is_file());
+}
+
+#[cfg(test)]
+#[test]
+fn close_attempt_release_only_affects_the_current_unsealed_document() {
+    use crate::terminal::{CENTRAL_UNAVAILABLE, Sessions};
+    use std::time::Duration;
+
+    const OWNER: &str = "main";
+    let sessions = Sessions::default();
+    let old = sessions.document(OWNER);
+    assert!(sessions.begin_control_exit(OWNER, old, "first"));
+    assert_eq!(sessions.check_control_exit_ssh(OWNER, old, "first", |_| false), Some(false));
+    assert!(sessions.begin_control_exit(OWNER, old, "navigation"));
+
+    // 첫 SSH 확인이 반환되기 전에 문서가 바뀌고 새 확인이 시작되는 순서를 고정한다.
+    assert_eq!(sessions.check_control_exit_ssh(OWNER, old, "navigation", |_| {
+        sessions.navigate(OWNER);
+        let document = sessions.document(OWNER);
+        assert!(!sessions.begin_control_exit(OWNER, old, "stale"));
+        assert!(sessions.begin_control_exit(OWNER, document, "retry"));
+        assert!(!sessions.begin_control_exit(OWNER, document, "other"));
+        assert_eq!(sessions.check_control_exit_ssh(OWNER, document, "retry", |_| {
+            sessions.release_control_exit(OWNER, old, "navigation");
+            sessions.release_control_exit(OWNER, old, "retry");
+            sessions.release_control_exit(OWNER, document, "other");
+            true
+        }), Some(true));
+        false
+    }), None);
+
+    let document = sessions.document(OWNER);
+    assert_eq!(sessions.drain_controls_for_close(OWNER, old, "navigation", Duration::ZERO), None);
+    let expired = sessions.queue_control_exit(OWNER, old, "navigation", || unreachable!());
+    assert_eq!(expired, Err("창 닫기 요청이 만료되었습니다".into()));
+    let failed = sessions.queue_control_exit(OWNER, document, "retry", || Err("폐기 예약 실패".into()));
+    assert_eq!(failed, Err("폐기 예약 실패".into()));
+
+    let central = sessions.insert_live_ssm_fixture(OWNER, document, "123456789012", "us-west-2", "i-01234567");
+    let binding = sessions.bind_ssm_control(OWNER, &central.identity, &CancellationToken::new()).unwrap();
+    assert_eq!(binding.admit(|| Ok(())), Ok(()));
+    assert!(sessions.begin_control_exit(OWNER, document, "success"));
+    assert_eq!(sessions.close_ssh_probes_for_exit(OWNER, document, "success"), Some(true));
+    sessions.queue_control_exit(OWNER, document, "success", || Ok(())).unwrap();
+    sessions.release_control_exit(OWNER, document, "success");
+    assert_eq!(binding.admit(|| unreachable!()), Err::<(), _>(CENTRAL_UNAVAILABLE.into()));
+    sessions.navigate(OWNER);
+    assert!(!sessions.begin_control_exit(OWNER, sessions.document(OWNER), "after-queue"));
+    assert!(!sessions.consume_control_exit_approval());
+    sessions.destroy(OWNER);
+    assert!(sessions.consume_control_exit_approval());
+    assert!(!sessions.consume_control_exit_approval());
 }
 
 fn start_error(error: CliError) -> String {

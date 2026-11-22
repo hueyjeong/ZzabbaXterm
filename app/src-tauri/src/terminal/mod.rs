@@ -105,6 +105,45 @@ struct ControlCleanup {
     remote_unconfirmed: bool,
 }
 
+impl ControlCleanup {
+    fn count(&self, report: &mut ControlExitReport) {
+        report.local_unconfirmed += usize::from(self.local_unconfirmed);
+        report.remote_unconfirmed += usize::from(self.remote_unconfirmed);
+    }
+}
+
+struct TrackedControl {
+    session: Arc<Session>,
+    retain_cleanup: bool,
+}
+
+struct ControlExit {
+    owner: String,
+    document: u64,
+    request_id: String,
+    phase: ControlExitPhase,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ControlExitPhase {
+    Draining,
+    CheckingSsh,
+    Ready,
+    DestroyQueued,
+    Destroyed,
+    Consumed,
+}
+
+impl ControlExit {
+    fn matches(&self, owner: &str, document: u64, request_id: &str) -> bool {
+        self.owner == owner && self.document == document && self.request_id == request_id
+    }
+
+    fn sealed(&self) -> bool {
+        matches!(self.phase, ControlExitPhase::DestroyQueued | ControlExitPhase::Destroyed | ControlExitPhase::Consumed)
+    }
+}
+
 pub(crate) struct ControlBinding {
     registry: Arc<Mutex<Registry>>,
     central: Weak<Session>,
@@ -145,8 +184,7 @@ impl ControlBinding {
 
     pub(crate) fn consume_control_close(&self, id: u64) {
         let mut registry = self.registry.lock().unwrap();
-        // 앱 종료 중에는 정확한 결과를 받은 호출보다 종료 보고를 우선한다.
-        if !registry.control_exit && !registry.shutdown {
+        if !registry.shutdown {
             registry.control_cleanup.remove(&id);
         }
     }
@@ -155,7 +193,7 @@ impl ControlBinding {
     pub(crate) fn admit<T>(&self, action: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
         let registry = self.registry.lock().unwrap();
         self.check_request()?;
-        if registry.control_exit { return Err(CENTRAL_UNAVAILABLE.into()); }
+        if registry.control_exit.is_some() { return Err(CENTRAL_UNAVAILABLE.into()); }
         registry.with_live_ssm_session(&self.owner, &self.identity, |_, _| {
             self.check_request()?;
             action()
@@ -177,9 +215,10 @@ impl ControlBinding {
 #[derive(Default)]
 struct Registry {
     sessions: HashMap<String, Arc<Session>>,
-    controls: HashMap<u64, Arc<Session>>,
+    controls: HashMap<u64, TrackedControl>,
     control_cleanup: HashMap<u64, ControlCleanup>,
-    control_exit: bool,
+    retained_control_cleanup: ControlExitReport,
+    control_exit: Option<ControlExit>,
     close_results: HashMap<String, Retired>,
     destroyed: HashSet<String>,
     documents: HashMap<String, u64>,
@@ -198,32 +237,50 @@ struct ControlJob {
 impl Drop for ControlJob {
     fn drop(&mut self) {
         let mut registry = self.registry.lock().unwrap();
-        let result = registry.controls[&self.id].close_result();
+        // 레지스트리 잠금이 종료 결과 기록과 pending 감소를 같은 관찰로 묶는다.
+        let control = registry.controls.remove(&self.id).unwrap();
+        let result = control.session.close_result();
         let cleanup = ControlCleanup {
             local_unconfirmed: result.local == LocalClose::Unconfirmed,
             remote_unconfirmed: result.remote == RemoteClose::Unconfirmed,
         };
-        if cleanup.local_unconfirmed || cleanup.remote_unconfirmed {
+        if control.retain_cleanup {
+            cleanup.count(&mut registry.retained_control_cleanup);
+        } else if cleanup.local_unconfirmed || cleanup.remote_unconfirmed {
             registry.control_cleanup.insert(self.id, cleanup);
         }
-        registry.controls[&self.id].finish();
-        registry.controls.remove(&self.id);
+        control.session.finish();
         self.changed.notify_all();
     }
 }
 
 impl Registry {
+    fn closing_owner(&self, owner: &str) -> bool {
+        self.closing.contains(owner) || self.control_exit.as_ref().is_some_and(|exit| {
+            exit.owner == owner && exit.phase != ControlExitPhase::Draining
+        })
+    }
+
+    fn control_exit_in(&self, owner: &str, document: u64, request_id: &str, phase: ControlExitPhase) -> bool {
+        !self.shutdown && self.control_exit.as_ref().is_some_and(|exit| {
+            exit.phase == phase && exit.matches(owner, document, request_id)
+        })
+    }
+
+    fn retain_control_cleanup(&mut self) {
+        // 요청자에게 아직 전달되지 않은 미확인 결과는 시도 수명과 분리해 보존한다.
+        for (_, cleanup) in self.control_cleanup.drain() { cleanup.count(&mut self.retained_control_cleanup); }
+        for control in self.controls.values_mut() { control.retain_cleanup = true; }
+    }
+
     fn control_report(&self) -> ControlExitReport {
-        let mut report = ControlExitReport { pending: self.controls.len(), ..ControlExitReport::default() };
-        for cleanup in self.control_cleanup.values() {
-            report.local_unconfirmed += usize::from(cleanup.local_unconfirmed);
-            report.remote_unconfirmed += usize::from(cleanup.remote_unconfirmed);
-        }
+        let mut report = ControlExitReport { pending: self.controls.len(), ..self.retained_control_cleanup };
+        for cleanup in self.control_cleanup.values() { cleanup.count(&mut report); }
         report
     }
 
     fn main_session(&self, owner: &str, document: u64, id: &str) -> Option<&Arc<Session>> {
-        if self.shutdown || self.exiting || self.closing.contains(owner) || self.destroyed.contains(owner)
+        if self.shutdown || self.exiting || self.closing_owner(owner) || self.destroyed.contains(owner)
             || self.documents.get(owner).copied().unwrap_or(0) != document
         {
             return None;
@@ -273,7 +330,9 @@ impl Sessions {
     pub(crate) fn bind_ssm_control(&self, owner: &str, identity: &LiveSsmIdentity, request: &CancellationToken) -> Result<Arc<ControlBinding>, String> {
         if request.is_cancelled() { return Err(CONTROL_CANCELLED.into()); }
         if identity.role.is_none() { return Err(CENTRAL_UNAVAILABLE.into()); }
-        let (central, cancel) = self.registry.lock().unwrap()
+        let registry = self.registry.lock().unwrap();
+        if registry.control_exit.is_some() { return Err(CENTRAL_UNAVAILABLE.into()); }
+        let (central, cancel) = registry
             .with_live_ssm_session(owner, identity, |session, cancel| (Arc::downgrade(session), cancel.child_token()))
             .ok_or(CENTRAL_UNAVAILABLE)?;
         Ok(Arc::new(ControlBinding {
@@ -302,14 +361,14 @@ impl Sessions {
         if !Arc::ptr_eq(&self.registry, &binding.registry) { return Err(CENTRAL_UNAVAILABLE.into()); }
         let mut registry = self.registry.lock().unwrap();
         binding.check_request()?;
-        if registry.control_exit { return Err(CENTRAL_UNAVAILABLE.into()); }
+        if registry.control_exit.is_some() { return Err(CENTRAL_UNAVAILABLE.into()); }
         registry.with_live_ssm_session(&binding.owner, &binding.identity, |_, _| {
             binding.check_request()?;
             if binding.cancel.is_cancelled() { return Err(CONTROL_CANCELLED.into()); }
             Ok::<_, String>(())
         }).ok_or(CENTRAL_UNAVAILABLE)??;
         let id = self.next.fetch_add(1, Ordering::Relaxed);
-        registry.controls.insert(id, Arc::clone(session));
+        registry.controls.insert(id, TrackedControl { session: Arc::clone(session), retain_cleanup: false });
         Ok(ControlJob { id, registry: Arc::clone(&self.registry), changed: Arc::clone(&self.controls_changed) })
     }
 
@@ -321,7 +380,7 @@ impl Sessions {
         use_probes: impl FnOnce(&mut Runs) -> Result<T, String>) -> Result<T, String> {
         let mut registry = self.registry.lock().unwrap();
         if registry.shutdown || registry.destroyed.contains(owner)
-            || starting_ssh && (registry.exiting || registry.closing.contains(owner))
+            || starting_ssh && (registry.exiting || registry.closing_owner(owner))
         {
             return Err("창이 닫혔습니다".into());
         }
@@ -494,12 +553,14 @@ impl Sessions {
             let mut registry = self.registry.lock().unwrap();
             match owner {
                 Some(owner) => { registry.closing.insert(owner.into()); }
-                None => registry.exiting = true,
+                None => {
+                    if !registry.controls.is_empty() || registry.control_exit.is_some() { return false; }
+                    registry.exiting = true;
+                }
             }
             registry.probes.closing_ssh(owner)
         };
-        for probe in &probes { probe.stop(); }
-        let confirmed = probes.into_iter().all(|probe| probe.confirm_ssh_close());
+        let confirmed = confirm_ssh_probes(probes);
         if !confirmed { self.release_close_gate(owner); }
         confirmed
     }
@@ -514,45 +575,123 @@ impl Sessions {
             registry.closing.remove(owner);
             registry.destroyed.insert(owner.into());
         }
+        if let Some(exit) = registry.control_exit.as_mut().filter(|exit| exit.owner == owner) {
+            if !exit.sealed() {
+                registry.control_exit = None;
+                self.controls_changed.notify_all();
+            } else if destroyed && exit.phase == ControlExitPhase::DestroyQueued {
+                exit.phase = ControlExitPhase::Destroyed;
+            }
+        }
         registry.probes.stop_owner(owner, previous);
         let mut ssm = Vec::new();
         for session in registry.sessions.values().filter(|session| session.owner == owner) {
             session.stop(process::Stop::Closed);
             if session.is_ssm() { ssm.push(Arc::clone(session)); }
         }
-        // 생성 중인 제출만 기다린다. PTY 준비와 원격 종료 확인은 각 작업자가 맡는다.
+        // 제출은 control_submit → 레지스트리 순서다. 먼저 세션을 중지하고 레지스트리 밖에서 생성 호출을 회수한다.
         drop(registry);
         for session in ssm { session.wait_control_submit(); }
     }
 
-    /// 신규 제어 제출을 닫고 취소한다. 기한이 지나도 작업과 종료 결과는 유지된다.
-    pub(crate) fn drain_controls_for_exit(&self, timeout: Duration) -> ControlExitReport {
+    /// 사용자 승인 뒤에만 진입을 막고, 현재 작업의 미확인 증거는 시도가 끝나도 보존한다.
+    pub(crate) fn begin_control_exit(&self, owner: &str, document: u64, request_id: &str) -> bool {
+        let mut registry = self.registry.lock().unwrap();
+        if registry.control_exit.is_some() || registry.shutdown || registry.exiting || registry.destroyed.contains(owner)
+            || registry.documents.get(owner).copied().unwrap_or(0) != document
+        {
+            return false;
+        }
+        registry.retain_control_cleanup();
+        registry.control_exit = Some(ControlExit {
+            owner: owner.into(), document, request_id: request_id.into(), phase: ControlExitPhase::Draining,
+        });
+        true
+    }
+
+    pub(crate) fn release_control_exit(&self, owner: &str, document: u64, request_id: &str) {
+        let mut registry = self.registry.lock().unwrap();
+        if registry.control_exit.as_ref().is_some_and(|exit| !exit.sealed() && exit.matches(owner, document, request_id)) {
+            registry.control_exit = None;
+            self.controls_changed.notify_all();
+        }
+    }
+
+    /// 취소를 전달하고 기한까지 기다린다. 대기 중 해제되거나 바뀐 시도의 결과는 반환 대상이 아니다.
+    pub(crate) fn drain_controls_for_close(&self, owner: &str, document: u64, request_id: &str, timeout: Duration) -> Option<ControlExitReport> {
         let started = Instant::now();
         let controls = {
-            let mut registry = self.registry.lock().unwrap();
-            registry.control_exit = true;
-            registry.controls.values().cloned().collect::<Vec<_>>()
+            let registry = self.registry.lock().unwrap();
+            if !registry.control_exit_in(owner, document, request_id, ControlExitPhase::Draining) { return None; }
+            registry.controls.values().map(|control| Arc::clone(&control.session)).collect::<Vec<_>>()
         };
         for session in controls {
             session.stop(process::Stop::Closed);
         }
         let registry = self.registry.lock().unwrap();
-        let (registry, _) = self.controls_changed.wait_timeout_while(
-            registry, timeout.saturating_sub(started.elapsed()), |registry| !registry.controls.is_empty(),
-        ).unwrap();
-        registry.control_report()
+        let current = |registry: &Registry| registry.control_exit_in(owner, document, request_id, ControlExitPhase::Draining);
+        let (registry, _) = self.controls_changed.wait_timeout_while(registry, timeout.saturating_sub(started.elapsed()), |registry| {
+            current(registry) && !registry.controls.is_empty()
+        }).unwrap();
+        current(&registry).then(|| registry.control_report())
+    }
+
+    pub(crate) fn close_ssh_probes_for_exit(&self, owner: &str, document: u64, request_id: &str) -> Option<bool> {
+        self.check_control_exit_ssh(owner, document, request_id, confirm_ssh_probes)
+    }
+
+    fn check_control_exit_ssh(&self, owner: &str, document: u64, request_id: &str, confirm: impl FnOnce(Vec<Arc<probe::Probe>>) -> bool) -> Option<bool> {
+        let probes = {
+            let mut registry = self.registry.lock().unwrap();
+            if !registry.control_exit_in(owner, document, request_id, ControlExitPhase::Draining) { return None; }
+            if !registry.controls.is_empty() { return Some(false); }
+            registry.control_exit.as_mut().unwrap().phase = ControlExitPhase::CheckingSsh;
+            self.controls_changed.notify_all();
+            registry.probes.closing_ssh(Some(owner))
+        };
+        let confirmed = confirm(probes);
+        let mut registry = self.registry.lock().unwrap();
+        if !registry.control_exit_in(owner, document, request_id, ControlExitPhase::CheckingSsh) { return None; }
+        if confirmed {
+            registry.control_exit.as_mut().unwrap().phase = ControlExitPhase::Ready;
+        } else {
+            registry.control_exit = None;
+        }
+        Some(confirmed)
+    }
+
+    /// 두 레지스트리를 잠근 상태에서는 이벤트를 큐에 넣는 호출만 실행한다.
+    pub(crate) fn queue_control_exit(&self, owner: &str, document: u64, request_id: &str, destroy: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+        let mut registry = self.registry.lock().unwrap();
+        if !registry.controls.is_empty() { return Err("전용 제어 작업 종료 대기 중".into()); }
+        if !registry.control_exit_in(owner, document, request_id, ControlExitPhase::Ready) {
+            return Err("창 닫기 요청이 만료되었습니다".into());
+        }
+        registry.control_exit.as_mut().unwrap().phase = ControlExitPhase::DestroyQueued;
+        let result = destroy();
+        if result.is_err() { registry.control_exit = None; }
+        result
+    }
+
+    pub(crate) fn consume_control_exit_approval(&self) -> bool {
+        let mut registry = self.registry.lock().unwrap();
+        let Some(exit) = registry.control_exit.as_mut().filter(|exit| exit.phase == ControlExitPhase::Destroyed) else { return false; };
+        exit.phase = ControlExitPhase::Consumed;
+        true
     }
 
     pub(crate) fn shutdown(&self) {
         let (sessions, probes, fallback) = {
             let mut registry = self.registry.lock().unwrap();
             registry.shutdown = true;
+            self.controls_changed.notify_all();
             registry.close_results.clear();
             let mut sessions = registry.sessions.values().cloned().collect::<Vec<_>>();
-            if !registry.control_exit {
-                sessions.extend(registry.controls.values().cloned());
+            let fallback = !registry.control_exit.as_ref().is_some_and(ControlExit::sealed);
+            if fallback {
+                sessions.extend(registry.controls.values().map(|control| Arc::clone(&control.session)));
             }
-            (sessions, registry.probes.stop_all(), !registry.control_exit)
+            (sessions, registry.probes.stop_all(), fallback)
         };
         for session in &sessions {
             session.stop(process::Stop::Closed);
@@ -569,6 +708,11 @@ impl Sessions {
             if let Some(warning) = report.warning() { eprintln!("{warning}"); }
         }
     }
+}
+
+fn confirm_ssh_probes(probes: Vec<Arc<probe::Probe>>) -> bool {
+    for probe in &probes { probe.stop(); }
+    probes.into_iter().all(|probe| probe.confirm_ssh_close())
 }
 
 fn validate_size(size: PtySize) -> Result<(), String> {
