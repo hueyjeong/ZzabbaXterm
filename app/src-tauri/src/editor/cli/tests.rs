@@ -100,6 +100,27 @@ async fn closing_the_transport_or_dropping_the_tab_is_an_error() {
 }
 
 #[tokio::test]
+async fn disconnect_cancels_opening_before_attachment() {
+    let (mut client, mut server) = duplex(MAX_FRAME);
+    let (started, opening) = oneshot::channel();
+    let (finished, attachment) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let request = receive(&mut server).await;
+        serve_edit(&mut server, request, |pending| async move {
+            assert!(started.send(()).is_ok());
+            pending.opening.cancel.cancelled().await;
+            assert!(finished.send(pending.opened().is_err()).is_ok());
+        }).await.unwrap_err().kind()
+    });
+    write_frame(&mut client, &body(false), MAX_FRAME).await.unwrap();
+    assert_eq!(read_receipt(&mut client).await.unwrap(), Response::Accepted);
+    timeout(DEADLINE, opening).await.unwrap().unwrap();
+    drop(client);
+    assert!(timeout(DEADLINE, attachment).await.unwrap().unwrap());
+    assert_eq!(timeout(DEADLINE, server).await.unwrap().unwrap(), io::ErrorKind::UnexpectedEof);
+}
+
+#[tokio::test]
 async fn rejects_close_before_open() {
     let (mut client, mut server) = duplex(MAX_FRAME);
     let server = async move {

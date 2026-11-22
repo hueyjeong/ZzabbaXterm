@@ -272,7 +272,7 @@ async fn actual_json_overflow_rejects_before_connect_and_returns_a_wire_error() 
 }
 
 async fn deny_edit(pending: edit::Pending) {
-    pending.decline();
+    pending.open_failed();
 }
 
 async fn edit_response(stream: &mut (impl AsyncRead + Unpin)) -> edit::Response {

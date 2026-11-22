@@ -85,7 +85,7 @@ struct Version {
 }
 
 impl LocalFile {
-    /// `path`는 네이티브 UI에서 승인한 경로다. 최종 심볼릭 링크는 거부한다.
+    /// `path`는 파일 선택기 또는 사용자 전용 CLI가 지정한다. 최종 심볼릭 링크는 거부한다.
     pub(crate) fn open(path: &Path) -> Result<(Self, String), OpenError> {
         let (Some(selected_parent), Some(name)) = (path.parent(), path.file_name()) else {
             return Err(OpenError::InvalidPath);

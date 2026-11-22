@@ -34,7 +34,6 @@ pub(crate) enum Response {
     Accepted,
     Opened,
     Closed,
-    Declined,
     Expired,
     OpenFailed,
     AppExited,
@@ -66,7 +65,6 @@ pub enum CliError {
     Disconnected,
     Transport(io::Error),
     InvalidResponse,
-    Declined,
     Expired,
     OpenFailed,
     AppExited,
@@ -82,8 +80,7 @@ impl std::fmt::Display for CliError {
             Self::Disconnected => f.write_str("ZzabbaXterm 앱과 연결이 끊겼습니다."),
             Self::Transport(error) => write!(f, "로컬 IPC 오류: {error}"),
             Self::InvalidResponse => f.write_str("ZzabbaXterm 앱의 응답이 올바르지 않습니다."),
-            Self::Expired => f.write_str("파일 열기 확인 시간이 만료되었습니다."),
-            Self::Declined => f.write_str("앱에서 파일 열기를 취소했습니다."),
+            Self::Expired => f.write_str("파일 열기 시간이 초과되었습니다."),
             Self::OpenFailed => f.write_str("앱에서 파일 또는 편집 탭을 열지 못했습니다."),
             Self::AppExited => f.write_str("편집 탭 완료 전에 앱 또는 편집 창이 종료되었습니다."),
         }
@@ -197,7 +194,6 @@ async fn exchange(
         };
     }
     match opened {
-        Response::Declined => Err(CliError::Declined),
         Response::Expired => Err(CliError::Expired),
         Response::OpenFailed => Err(CliError::OpenFailed),
         Response::AppExited => Err(CliError::AppExited),
@@ -228,7 +224,7 @@ pub(crate) async fn send_edit(
 pub(crate) async fn serve_edit<F, Work>(
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
     request: Request,
-    confirm: F,
+    open: F,
 ) -> io::Result<()>
 where
     F: FnOnce(Pending) -> Work,
@@ -243,7 +239,7 @@ where
         0 => Err(io::ErrorKind::UnexpectedEof.into()),
         _ => Ok(Response::InvalidRequest),
     } };
-    tokio::spawn(confirm(Pending::new(request, reply, mounted, opening.clone())));
+    tokio::spawn(open(Pending::new(request, reply, mounted, opening.clone())));
     let (edit, terminal) = tokio::select! {
         biased;
         incoming = stream.read(&mut extra) => {
@@ -284,8 +280,7 @@ where
 #[cfg(test)]
 mod tests;
 
-/// Owns a validated, unapproved CLI request. The native UI must show `path()`
-/// for review before admitting it to the existing local file registry.
+/// Owns a validated CLI request until the file is attached or opening ends.
 #[must_use]
 pub(crate) struct Pending {
     request: Request,
@@ -308,10 +303,6 @@ impl Opening {
 
     pub(crate) fn new(deadline: Instant) -> Self {
         Self { cancel: tokio_util::sync::CancellationToken::new(), deadline, phase: Default::default() }
-    }
-
-    pub(crate) fn for_dialog(&self) -> Self {
-        Self { cancel: self.cancel.child_token(), ..self.clone() }
     }
 
     pub(crate) fn cancel_pending(&self) -> bool {
@@ -344,15 +335,11 @@ impl Pending {
         self.reply.is_closed() || self.opening.is_inactive()
     }
 
-    pub(crate) fn decline(self) {
-        let _ = self.reply.send(Response::Declined);
-    }
-
     pub(crate) fn open_failed(self) {
         let _ = self.reply.send(Response::OpenFailed);
     }
 
-    /// Call after attaching the approved file to a new tab. Store the returned
+    /// Call after attaching the file to a new tab. Store the returned
     /// token in that exact tab's registry entry, never by pathname.
     pub(crate) fn opened(self) -> Result<WaitForClose, ()> {
         if !self.opening.attach() { return Err(()); }
