@@ -3,6 +3,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../../App";
+import { editor } from "../editor/monaco";
 import type { SavedConnections } from "../connections/connectionIpc";
 import type { ConnectionRequest, ConnectionTestDraft, ConnectionTestRun } from "../connections/profiles";
 
@@ -58,6 +59,7 @@ let loadProfiles: () => Promise<SavedConnections>;
 let runConnectionCommand: (command: string, args: unknown) => Promise<unknown>;
 let closeTerminal: (id: string) => Promise<unknown>;
 let runDiscovery: (args: unknown) => Promise<unknown>;
+let openFile: () => Promise<unknown>;
 
 beforeEach(async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
@@ -90,10 +92,12 @@ beforeEach(async () => {
   runConnectionCommand = async (command) => { throw new Error(`예상하지 않은 연결 명령: ${command}`); };
   closeTerminal = async () => null;
   runDiscovery = async () => { throw new Error("예상하지 않은 SSM 검색"); };
+  openFile = async () => ({ status: "cancelled" });
   native.invoke.mockImplementation(async (command, args) => {
     if (command === "connections_load") return loadProfiles();
     if (command.startsWith("connection_")) return runConnectionCommand(command, args);
     if (command === "ssm_discovery") return runDiscovery(args);
+    if (command === "editor_local_open") return openFile();
     if (command === "terminal_start") return starts.get(args.id);
     if (command === "terminal_close") return closeTerminal(args.id);
     if (command !== "terminal_open") return;
@@ -761,5 +765,49 @@ describe("C02 SSM 연결", () => {
     await act(async () => receive({ kind: "ready" }));
     expect(button("관리 노드")).toBeUndefined();
     expect(button("로컬 1")?.getAttribute("aria-pressed")).toBe("true");
+  });
+
+  it("원격 종료 대기 중 편집 탭의 저장과 폐기 취소는 파일 핸들에만 적용된다", async () => {
+    const ending = Promise.withResolvers<null>();
+    vi.stubGlobal("CSS", { escape: (value: string) => value.replace(/[^\w-]/g, "\\$&") });
+    vi.stubGlobal("matchMedia", vi.fn(() => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() })));
+    const canvas = HTMLCanvasElement.prototype;
+    vi.spyOn(canvas, "getContext").mockImplementation(() => ({
+      clearRect: vi.fn(), fillRect: vi.fn(), beginPath: vi.fn(), moveTo: vi.fn(), lineTo: vi.fn(), stroke: vi.fn(),
+    }) as unknown as CanvasRenderingContext2D);
+    loadProfiles = async () => ({
+      version: 1,
+      groups: [{ revision: 1, profile: { id: "dev", displayName: "개발" } }],
+      targets: [{ revision: 1, profile: { id: "saved-ssm", groupId: "dev", displayName: "관리 노드", defaultMethod: "ssm", ssm: node } }],
+    });
+    await restartWorkspace();
+    const row = [...tree().querySelectorAll<HTMLElement>('[role="treeitem"]')].find((item) => item.textContent === "관리 노드");
+    expect(row).toBeDefined();
+    await key(row!, "Enter");
+    const [remoteId] = [...channels.keys()].slice(-1);
+    const localInput = find('section[aria-label="로컬 1"] textarea');
+    closeTerminal = () => ending.promise;
+    await press("관리 노드 닫기");
+    expect(calls("close").slice(-1)).toEqual([{ id: remoteId }]);
+    await press("파일 열기");
+    expect(button("관리 노드")?.getAttribute("aria-pressed")).toBe("true");
+    openFile = async () => ({ status: "opened", handle: "selected-file", name: "시험.txt", text: "원본" });
+    await press("파일 열기");
+    const model = editor.getModels().find((item) => item.uri.query === "selected-file")!;
+    await act(async () => model.setValue("첫 편집"));
+    await press("저장");
+    expect(connectionCalls("editor_local_save")).toEqual([["editor_local_save", { handle: "selected-file", text: "첫 편집" }]]);
+    await act(async () => model.setValue("미저장"));
+    vi.spyOn(window, "confirm").mockReturnValueOnce(false).mockReturnValueOnce(true);
+    await press("시험.txt 닫기");
+    expect(connectionCalls("editor_local_close")).toHaveLength(0);
+    await act(async () => ending.resolve(null));
+    expect(button("관리 노드")).toBeUndefined();
+    expect(button("시험.txt")?.getAttribute("aria-pressed")).toBe("true");
+    expect(model.getValue()).toBe("미저장");
+    await press("시험.txt 닫기");
+    expect(connectionCalls("editor_local_close")).toEqual([["editor_local_close", { handle: "selected-file" }]]);
+    expect(button("로컬 1")?.getAttribute("aria-pressed")).toBe("true");
+    expect(find('section[aria-label="로컬 1"] textarea')).toBe(localInput);
   });
 });

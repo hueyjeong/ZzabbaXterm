@@ -17,11 +17,13 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+getrandom = "0.4"
 tauri = { version = "2", features = [] }
 portable-pty = "0.9"
+rfd = { version = "0.17", default-features = false, features = ["gtk3"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-getrandom = "0.4"
+sha2 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 sha1 = "0.10"
 shlex = "2"
@@ -34,7 +36,7 @@ zeroize = "1"
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_JobObjects", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_UI_Shell"] }
+windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_UI_Shell"] }
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]
