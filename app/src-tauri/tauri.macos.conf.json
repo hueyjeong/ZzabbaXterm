@@ -1,0 +1,19 @@
+{
+  "app": {
+    "windows": [
+      {
+        "title": "ZzabbaXterm",
+        "width": 1200,
+        "height": 720,
+        "minWidth": 660,
+        "minHeight": 400,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": {
+          "x": 14,
+          "y": 12
+        }
+      }
+    ]
+  }
+}

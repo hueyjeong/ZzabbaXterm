@@ -1,0 +1,20 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "local-connections",
+  "description": "Local connection tests and profile saves for the bundled main webview",
+  "local": true,
+  "webviews": ["main"],
+  "permissions": [
+    "allow-connection-test-start",
+    "allow-connection-ssh-test-attach",
+    "allow-connection-test-wait",
+    "allow-verify-ssh-host",
+    "allow-commit-ssh-host",
+    "allow-cancel-ssh-host",
+    "allow-register-saved-ssh-host",
+    "allow-connection-test-cancel",
+    "allow-connection-save",
+    "allow-connections-load",
+    "allow-ssm-discovery"
+  ]
+}

@@ -1,0 +1,353 @@
+use std::{
+    collections::{HashMap, VecDeque, hash_map::Entry},
+    num::NonZeroU64,
+    time::{Duration, Instant},
+};
+
+use serde::{Deserialize, Serialize};
+use tauri::ipc::Invoke;
+
+use super::{Operation, ReviewCandidate, SelectedTarget, UPTIME};
+
+const REVIEW_TIMEOUT: Duration = Duration::from_secs(300);
+const REVIEW_LIMIT: usize = 32;
+const DECISION_LIMIT: usize = 32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum Source {
+    Chat,
+    Cli,
+}
+
+pub enum Candidate<'a> {
+    Chat(ReviewCandidate),
+    Cli {
+        target_id: &'a str,
+        operation: &'a str,
+    },
+}
+
+// 앱 상태에서 다시 읽는다. 규칙이 바뀔 때마다 개정 번호를 증가시킨다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Policy {
+    pub revision: NonZeroU64,
+    pub blocked: bool,
+}
+
+impl Default for Policy {
+    fn default() -> Self {
+        Self { revision: NonZeroU64::MIN, blocked: false }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum Mode {
+    Review,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Card {
+    pub(super) proposal_id: u32,
+    source: Source,
+    pub(super) target: SelectedTarget,
+    pub(super) operation: Operation,
+    mode: Mode,
+    pub(super) command: Option<&'static str>,
+    pub(super) explanation: &'static str,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DecisionRequest {
+    pub(super) proposal_id: u32,
+    pub(super) choice: Choice,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) enum Choice {
+    Approve,
+    Reject,
+    Cancel,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Decision {
+    Approved,
+    Rejected,
+    Cancelled,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ReviewError {
+    NotLocalMain,
+    TargetUnavailable,
+    TargetMismatch,
+    Missing,
+    Stale,
+    Expired,
+    NotReviewed,
+    NotApprovable,
+    IdExhausted,
+    Capacity,
+}
+
+pub struct LocalReview(u64);
+
+impl LocalReview {
+    // 호출에 붙은 ACL과 문서 세대는 Rust에서 읽으며, 요청 JSON의 값을 받지 않는다.
+    pub fn from_invoke(invoke: &Invoke, document: u64) -> Result<Self, ReviewError> {
+        let webview = invoke.message.webview_ref();
+        Self::check(
+            webview.label(),
+            webview.window_ref().label(),
+            invoke.acl.is_some(),
+            document,
+        )
+    }
+
+    pub(super) fn check(
+        webview: &str,
+        window: &str,
+        has_acl: bool,
+        document: u64,
+    ) -> Result<Self, ReviewError> {
+        if webview == "main" && window == "main" && has_acl {
+            Ok(Self(document))
+        } else {
+            Err(ReviewError::NotLocalMain)
+        }
+    }
+}
+
+struct Pending {
+    card: Card,
+    policy: Policy,
+    expires_at: Instant,
+    opened_in: Option<u64>,
+    chat_request: Option<u32>,
+}
+
+impl Pending {
+    fn check(
+        &self,
+        local: &LocalReview,
+        selected: Option<&SelectedTarget>,
+        policy: Policy,
+    ) -> Result<(), ReviewError> {
+        if Instant::now() >= self.expires_at {
+            Err(ReviewError::Expired)
+        } else if selected != Some(&self.card.target)
+            || policy != self.policy
+            || self.opened_in.is_some_and(|document| document != local.0)
+        {
+            Err(ReviewError::Stale)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct Reviews {
+    next_id: u32,
+    pending: HashMap<u32, Pending>,
+    decisions: VecDeque<(Pending, Decision, bool)>,
+}
+
+impl Reviews {
+    pub(super) fn clear_open(&mut self) {
+        self.pending.retain(|_, pending| pending.opened_in.is_none());
+        for (_, _, replayable) in &mut self.decisions {
+            *replayable = false;
+        }
+    }
+
+    pub(super) fn clear_pending(&mut self) {
+        self.pending.clear();
+    }
+
+    pub(super) fn history(&self, local: &LocalReview) -> impl Iterator<Item = (&Card, Decision)> {
+        let now = Instant::now();
+        let document = local.0;
+        self.decisions.iter().rev().filter_map(move |(record, decision, _)| {
+            (record.opened_in == Some(document) && record.expires_at > now)
+                .then_some((&record.card, *decision))
+        })
+    }
+
+    pub(super) fn cancel_chat(&mut self, local: &LocalReview, request_id: u32) {
+        self.pending.retain(|_, pending| {
+            pending.opened_in != Some(local.0) || pending.chat_request != Some(request_id)
+        });
+    }
+
+    pub(super) fn cli_id(&mut self, target: &SelectedTarget, policy: Policy) -> Option<u32> {
+        let now = Instant::now();
+        self.pending.retain(|_, pending| pending.expires_at > now && pending.policy == policy);
+        self.pending.iter().filter_map(|(&id, pending)| {
+            (pending.card.source == Source::Cli && &pending.card.target == target).then_some(id)
+        }).min()
+    }
+
+    pub fn propose(
+        &mut self,
+        candidate: Candidate<'_>,
+        selected: Option<&SelectedTarget>,
+        policy: Policy,
+    ) -> Result<u32, ReviewError> {
+        let target = selected.ok_or(ReviewError::TargetUnavailable)?;
+        let (source, text, operation, target) = match candidate {
+            Candidate::Chat(candidate) if &candidate.target == target => (
+                Source::Chat,
+                UPTIME,
+                Some(candidate.operation),
+                candidate.target,
+            ),
+            Candidate::Chat(_) => return Err(ReviewError::Stale),
+            Candidate::Cli {
+                target_id,
+                operation,
+            } if target_id == target.profile_id => (
+                Source::Cli,
+                operation,
+                (operation == UPTIME).then_some(Operation::Uptime),
+                target.clone(),
+            ),
+            Candidate::Cli { .. } => return Err(ReviewError::TargetMismatch),
+        };
+        let (operation, command, explanation) = if policy.blocked {
+            (
+                Operation::Blocked {
+                    text: escaped(text),
+                },
+                None,
+                "정책에서 차단한 제안입니다",
+            )
+        } else if let Some(operation) = operation {
+            (
+                operation,
+                Some(UPTIME),
+                "선택한 노드의 가동 시간과 부하를 조회합니다",
+            )
+        } else {
+            (
+                Operation::RawReview {
+                    text: escaped(text),
+                },
+                None,
+                "원문만 검토할 수 있습니다",
+            )
+        };
+        let now = Instant::now();
+        self.pending.retain(|_, proposal| proposal.expires_at > now);
+        if self.pending.len() >= REVIEW_LIMIT {
+            return Err(ReviewError::Capacity);
+        }
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or(ReviewError::IdExhausted)?;
+        let proposal_id = self.next_id;
+        let card = Card {
+            proposal_id,
+            source,
+            target,
+            operation,
+            mode: Mode::Review,
+            command,
+            explanation,
+        };
+        self.pending.insert(
+            proposal_id,
+            Pending {
+                card,
+                policy,
+                expires_at: now + REVIEW_TIMEOUT,
+                opened_in: None,
+                chat_request: None,
+            },
+        );
+        Ok(proposal_id)
+    }
+
+    pub(super) fn open(
+        &mut self,
+        local: &LocalReview,
+        proposal_id: u32,
+        selected: Option<&SelectedTarget>,
+        policy: Policy,
+        chat_request: Option<u32>,
+    ) -> Result<&Card, ReviewError> {
+        let Entry::Occupied(entry) = self.pending.entry(proposal_id) else {
+            return Err(ReviewError::Missing);
+        };
+        if let Err(error) = entry.get().check(local, selected, policy) {
+            entry.remove();
+            return Err(error);
+        }
+        let pending = entry.into_mut();
+        pending.opened_in = Some(local.0);
+        pending.chat_request = chat_request;
+        Ok(&pending.card)
+    }
+
+    pub fn decide(
+        &mut self,
+        local: &LocalReview,
+        request: DecisionRequest,
+        selected: Option<&SelectedTarget>,
+        policy: Policy,
+    ) -> Result<Decision, ReviewError> {
+        if let Some((record, decision, replayable)) = self.decisions.iter().find(|(record, _, _)| {
+            record.card.proposal_id == request.proposal_id
+        }) {
+            record.check(local, selected, policy)?;
+            return if *replayable { Ok(*decision) } else { Err(ReviewError::Stale) };
+        }
+        let pending = self
+            .pending
+            .remove(&request.proposal_id)
+            .ok_or(ReviewError::Missing)?;
+        pending.check(local, selected, policy)?;
+        if pending.opened_in.is_none() {
+            return Err(ReviewError::NotReviewed);
+        }
+        let decision = match request.choice {
+            Choice::Approve if pending.card.operation == Operation::Uptime => Decision::Approved,
+            Choice::Approve => return Err(ReviewError::NotApprovable),
+            Choice::Reject => Decision::Rejected,
+            Choice::Cancel => Decision::Cancelled,
+        };
+        if self.decisions.len() == DECISION_LIMIT {
+            self.decisions.pop_front();
+        }
+        self.decisions.push_back((pending, decision, true));
+        Ok(decision)
+    }
+}
+
+fn escaped(text: &str) -> String {
+    let mut display = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_control()
+            || matches!(ch, '\u{061c}' | '\u{200e}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        {
+            display.extend(ch.escape_default());
+        } else if ch == '\\' {
+            display.push_str("\\\\");
+        } else {
+            display.push(ch);
+        }
+    }
+    display
+}
+
+#[cfg(test)]
+#[path = "approval/tests.rs"]
+mod tests;
