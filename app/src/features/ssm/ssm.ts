@@ -32,6 +32,9 @@ export type SsmSelection = Readonly<{
   step: Step;
   profile: string;
   region: string;
+  regionInput: string;
+  regionPending: boolean;
+  editRegion: (value: string) => void;
   selection: SsmTarget | null;
   chooseProfile: (profile: string) => void;
   chooseRegion: (region: string) => void;
@@ -47,10 +50,11 @@ async function resultOf<T>(request: () => Promise<SsmResult<T>>): Promise<SsmRes
   }
 }
 
-export function useSsmSelection(discovery: SsmDiscovery, enabled = true): SsmSelection {
+export function useSsmSelection(discovery: SsmDiscovery, enabled = true, onSelectionChange?: () => void): SsmSelection {
   const { listProfiles, configuredRegion, listOnlineNodes, relogin } = discovery;
   const [profiles, setProfiles] = useState<Profiles>({ kind: "loading" });
   const [step, setStep] = useState<Step>({ kind: "idle" });
+  const [regionEdit, setRegionEdit] = useState<string | null>(null);
   const login = useRef<AbortController | null>(null);
   const nodeLookup = useRef<AbortController | null>(null);
 
@@ -65,6 +69,7 @@ export function useSsmSelection(discovery: SsmDiscovery, enabled = true): SsmSel
     setProfiles({ kind: "loading" });
     if (!enabled) {
       setStep({ kind: "idle" });
+      setRegionEdit(null);
       return;
     }
     const controller = new AbortController();
@@ -114,15 +119,25 @@ export function useSsmSelection(discovery: SsmDiscovery, enabled = true): SsmSel
   const scope = "scope" in step ? step.scope : null;
   const profile = scope?.profile ?? ("profile" in step ? step.profile : "");
   const region = scope?.region ?? "";
-  const selection: SsmTarget | null = step.kind === "nodes-ready" && step.selectedId !== null
+  const regionInput = regionEdit ?? region;
+  const regionPending = regionInput.trim() !== region;
+  const selection: SsmTarget | null = !regionPending && step.kind === "nodes-ready" && step.selectedId !== null
     ? { ...step.scope, instanceId: step.selectedId }
     : null;
 
   return {
     profiles, step, profile, region, selection,
+    regionInput, regionPending,
+    editRegion(value: string) {
+      if (!profile) return;
+      if (value.trim() !== region) onSelectionChange?.();
+      setRegionEdit(value);
+    },
     chooseProfile(value: string) {
       if (value === profile) return;
       if (value && (profiles.kind !== "ready" || !profiles.values.includes(value))) return;
+      onSelectionChange?.();
+      setRegionEdit(null);
       login.current?.abort();
       login.current = null;
       nodeLookup.current?.abort();
@@ -131,6 +146,8 @@ export function useSsmSelection(discovery: SsmDiscovery, enabled = true): SsmSel
     },
     chooseRegion(value: string) {
       if (!profile || value === region) return;
+      onSelectionChange?.();
+      setRegionEdit(null);
       login.current?.abort();
       login.current = null;
       nodeLookup.current?.abort();
@@ -138,9 +155,11 @@ export function useSsmSelection(discovery: SsmDiscovery, enabled = true): SsmSel
       setStep(value ? { kind: "nodes-loading", scope: { profile, region: value } } : { kind: "region-required", profile });
     },
     chooseNode(instanceId: string) {
+      if (regionPending || step.kind !== "nodes-ready" || (instanceId || null) === step.selectedId) return;
+      if (instanceId && !step.nodes.some((node) => node.instanceId === instanceId)) return;
+      onSelectionChange?.();
       setStep((current) => {
         if (current !== step || current.kind !== "nodes-ready") return current;
-        if (instanceId && !current.nodes.some((node) => node.instanceId === instanceId)) return current;
         return { ...current, selectedId: instanceId || null };
       });
     },

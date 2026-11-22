@@ -34,7 +34,7 @@ function Wizard(props: LocalConnectionWizardProps) {
   const { step, draft, status } = useSyncExternalStore(wizard.subscribe, wizard.getSnapshot);
   const { target } = draft;
   const ssm = useSsmSelection(discovery, target.defaultMethod === "ssm" &&
-    status.kind !== "closing" && status.kind !== "closed" && status.kind !== "closeFailed");
+    status.kind !== "closing" && status.kind !== "closed" && status.kind !== "closeFailed", wizard.invalidateSsmSelection);
   const dialog = useRef<HTMLDialogElement>(null);
   useLayoutEffect(() => {
     const modal = dialog.current;
@@ -87,9 +87,12 @@ function Wizard(props: LocalConnectionWizardProps) {
         {step === "auth" && (target.defaultMethod === "local" ? <div>현재 사용자</div> : <SsmSelectionView state={ssm} />)}
         {step === "verify" && (
           <>
-            <div>{draft.group.displayName} / {draft.target.displayName}</div>
-            <div>{target.defaultMethod === "local" ? target.local.startDirectory : target.ssm &&
-              `${target.ssm.profile} / ${target.ssm.region} / ${target.ssm.instanceId}`}</div>
+            <div>{draft.group.displayName} / {target.displayName}</div>
+            {target.defaultMethod === "local" ? <div>{target.local.startDirectory}</div> : target.ssm && <dl aria-label="SSM 연결 대상">
+              <div><dt>SSO 프로필</dt><dd>{target.ssm.profile}</dd></div>
+              <div><dt>리전</dt><dd>{target.ssm.region}</dd></div>
+              <div><dt>인스턴스 ID</dt><dd>{target.ssm.instanceId}</dd></div>
+            </dl>}
             <button type="button" disabled={status.kind === "testing"} onClick={() => void wizard.test(props)}>연결 테스트</button>
             <button type="button" disabled={!canSave} onClick={() => void wizard.save(props)}>저장</button>
           </>

@@ -527,6 +527,18 @@ describe("C01 저장된 로컬 연결", () => {
 });
 
 describe("C02 SSM 연결", () => {
+  async function select(label: string, value: string) {
+    const control = [...find("dialog").querySelectorAll("label")]
+      .find((item) => item.firstChild?.textContent?.trim() === label)?.querySelector("select");
+    if (!control) throw new Error(label);
+    expect(control.disabled).toBe(false);
+    await act(async () => {
+      control.value = value;
+      control.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    return control;
+  }
+
   const node = { profile: "company", region: "ap-northeast-2", instanceId: "i-00000001" };
 
   it("선택한 노드 참조만 시험하고 실패 후에도 선택을 보존하며 저장은 비활성화한다", async () => {
@@ -544,17 +556,6 @@ describe("C02 SSM 연결", () => {
       if (command === "connection_test_start") throw "SSM 연결 시험을 사용할 수 없습니다";
       throw new Error(`예상하지 않은 연결 명령: ${command}`);
     };
-    async function select(label: string, value: string) {
-      const control = [...find("dialog").querySelectorAll("label")]
-        .find((item) => item.firstChild?.textContent?.trim() === label)?.querySelector("select");
-      expect(control?.disabled).toBe(false);
-      await act(async () => {
-        if (!control) throw new Error(label);
-        control.value = value;
-        control.dispatchEvent(new Event("change", { bubbles: true }));
-      });
-      return control;
-    }
 
     await press("연결 추가");
     await changeInput("그룹", "개발");
@@ -569,6 +570,13 @@ describe("C02 SSM 연결", () => {
     await press("리전 적용");
     const selected = await select("온라인 노드", node.instanceId);
     expect(selected?.value).toBe(node.instanceId);
+    await changeInput("리전", "us-west-2");
+    expect(find("dialog").textContent).toContain("리전 변경 미적용");
+    expect(selected.disabled).toBe(true);
+    expect(button("다음")?.disabled).toBe(true);
+    await press("다음");
+    expect(button("연결 테스트")).toBeUndefined();
+    await changeInput("리전", node.region);
     await press("다음");
     expect(button("저장")?.disabled).toBe(true);
     await press("연결 테스트");
@@ -583,9 +591,61 @@ describe("C02 SSM 연결", () => {
     expect([...find("dialog").querySelectorAll("select")].map((control) => control.value)).toEqual([node.profile, node.instanceId]);
     expect(find<HTMLInputElement>("dialog input").value).toBe(node.region);
     await press("다음");
-    expect(find("dialog").textContent).toContain(`${node.profile} / ${node.region} / ${node.instanceId}`);
+    expect([...find('[aria-label="SSM 연결 대상"]').querySelectorAll("dt, dd")].map((part) => part.textContent)).toEqual([
+      "SSO 프로필", node.profile, "리전", node.region, "인스턴스 ID", node.instanceId,
+    ]);
     await press("취소");
     expect(host.querySelector("dialog")).toBeNull();
+    expect(connectionCalls("connection_save")).toHaveLength(0);
+  });
+
+  it.each(["응답 대기", "시험 성공"])("A가 %s 상태에서 B를 선택하면 A 시험을 취소하고 A로 돌아가도 저장을 막는다", async (when) => {
+    vi.stubGlobal("__ZZABBA_SSM_DOCUMENT__", "test-document");
+    const otherNode = "i-00000002";
+    const reply = Promise.withResolvers<ConnectionTestRun & { sessionId: string }>();
+    let requestId = 0;
+    runDiscovery = async (args) => {
+      const { request } = args as { request: { action: string; operation?: { kind: string } } };
+      if (request.action === "reserve") return `request-${++requestId}`;
+      if (request.operation?.kind === "listProfiles") return [node.profile];
+      if (request.operation?.kind === "configuredRegion") return node.region;
+      if (request.operation?.kind === "listOnlineNodes") return [node.instanceId, otherNode].map(instanceId => ({ instanceId }));
+      throw new Error("예상하지 않은 요청");
+    };
+    runConnectionCommand = async (command, args) => {
+      if (command === "connection_test_start") {
+        const { draftId, draftVersion } = args as ConnectionTestDraft;
+        const run = { draftId, draftVersion, runId: "trial-a" };
+        if (when === "시험 성공") reply.resolve({ ...run, sessionId: "session-a" });
+        return run;
+      }
+      if (command === "connection_test_wait") return reply.promise;
+      if (command === "connection_test_cancel") return null;
+      throw new Error(`예상하지 않은 연결 명령: ${command}`);
+    };
+    await press("연결 추가");
+    await press("다음");
+    await select("접속 방식", "ssm");
+    await press("다음");
+    await select("프로필", node.profile);
+    await select("온라인 노드", node.instanceId);
+    await press("다음");
+    await press("연결 테스트");
+    expect(button("저장")?.disabled).toBe(when === "응답 대기");
+    const { run } = connectionCalls("connection_test_wait")[0][1] as RunArgs;
+    await press("이전");
+    await select("온라인 노드", otherNode);
+    expect(connectionCalls("connection_test_cancel")).toEqual([["connection_test_cancel", { run }]]);
+    await act(async () => reply.resolve({ ...run, sessionId: "session-a" }));
+    expect(find("dialog").textContent).not.toContain("테스트 성공");
+    await press("다음");
+    expect(find('[aria-label="SSM 연결 대상"]').textContent).toContain(otherNode);
+    expect(button("저장")?.disabled).toBe(true);
+    await press("이전");
+    await select("온라인 노드", node.instanceId);
+    await press("다음");
+    expect(button("저장")?.disabled).toBe(true);
+    await press("저장");
     expect(connectionCalls("connection_save")).toHaveLength(0);
   });
 
