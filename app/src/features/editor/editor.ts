@@ -1,13 +1,15 @@
 import type {
   ApprovedEditorFile, ConfirmEditorDiscard, EditorFileError, EditorTransport,
 } from "./contract";
+import type { editor } from "monaco-editor/editor";
+import { trackLineEndings } from "./lineEndings";
 
 interface EditorBuffer {
   getValue(eol?: undefined, preserveBOM?: boolean): string;
   setValue(text: string): void;
   getVersionId(): number;
   getAlternativeVersionId(): number;
-  onDidChangeContent(listener: () => void): { dispose(): void };
+  onDidChangeContent(listener: (event: editor.IModelContentChangedEvent) => void): { dispose(): void };
 }
 
 export type EditorStatus =
@@ -48,6 +50,7 @@ export function connectEditor(
   active = true,
 ): EditorConnection {
   let savedVersion = model.getAlternativeVersionId();
+  const lineEndings = trackLineEndings(file.text, savedVersion);
   let status: EditorStatus = { kind: "ready" };
   let comparison: EditorState["comparison"];
   let busy: EditorState["busy"] = null;
@@ -59,10 +62,14 @@ export function connectEditor(
   let generation = 0;
   const dirty = () => uncertain || savedVersion !== model.getAlternativeVersionId();
   const update = () => { if (active && !disposed) publish({ dirty: dirty(), saving, busy, status, comparison, needsReload }); };
-  const content = model.onDidChangeContent(update);
+  const content = model.onDidChangeContent((event) => {
+    lineEndings.change(event, model.getAlternativeVersionId());
+    update();
+  });
   const unsubscribe = transport.subscribeDisconnect?.(file.handle, (message) => {
     if (disposed) return;
     uncertain ||= busy === "save";
+    comparison = undefined;
     status = { kind: uncertain ? "unknown" : "disconnected", message };
     generation++;
     busy = null;
@@ -111,7 +118,15 @@ export function connectEditor(
     async save() {
       if (!active || disposed || busy || saving || closing || needsReload || !dirty()) return;
       const version = model.getAlternativeVersionId();
-      const text = model.getValue(undefined, true);
+      let text: string;
+      try {
+        text = lineEndings.serialize(model.getValue(undefined, true));
+      } catch (error) {
+        comparison = undefined;
+        status = { kind: "failed", message: errorMessage(error) };
+        update();
+        return;
+      }
       saving = true;
       const id = start("save");
       try {
@@ -126,11 +141,13 @@ export function connectEditor(
           comparison = result.current;
           status = { kind: "conflict", originalExists: result.current !== null };
         } else {
+          comparison = undefined;
           uncertain ||= result.kind === "unknown";
           status = result;
         }
       } catch (error) {
         if (current(id)) {
+          comparison = undefined;
           uncertain = true;
           status = { kind: "unknown", message: errorMessage(error) };
         }
@@ -138,6 +155,7 @@ export function connectEditor(
         saving = false;
         if (current(id) || busy === "save") {
           if (!current(id) && !disposed) {
+            comparison = undefined;
             uncertain = true;
             status = { kind: "unknown", message: "탭이 바뀌었습니다" };
           }
@@ -147,6 +165,7 @@ export function connectEditor(
     },
     async compare() {
       if (!active || disposed || busy || closing) return;
+      comparison = undefined;
       const id = start("compare");
       try {
         const result = await transport.compare(file.handle);
@@ -172,6 +191,7 @@ export function connectEditor(
         // Rust 기준을 갱신한 뒤 응답이 무효화되면 다시 승인받기 전에는 저장을 막는다.
         const previousNeedsReload = needsReload;
         needsReload = true;
+        comparison = undefined;
         const result = await transport.reload(file.handle);
         if (!current(id) || model.getVersionId() !== version) {
           status = { kind: "failed", message: "다시 읽기가 필요합니다" };
@@ -185,6 +205,7 @@ export function connectEditor(
         model.setValue(result.text);
         needsReload = false;
         savedVersion = model.getAlternativeVersionId();
+        lineEndings.reset(result.text, savedVersion);
         uncertain = false;
         comparison = undefined;
         status = { kind: "ready" };

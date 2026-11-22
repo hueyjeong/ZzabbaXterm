@@ -72,6 +72,61 @@ describe("파일 편집 버퍼", () => {
     }
   });
 
+  it("Monaco가 정규화한 혼합 개행과 BOM을 저장 때 복원한다", async () => {
+    const approved = { ...file("mixed-eol"), text: "\uFEFFa\r\nb\nc" };
+    const io = transport(approved);
+    const tab = open(approved, io);
+    try {
+      tab.model.applyEdits([{ range: { startLineNumber: 3, startColumn: 1, endLineNumber: 3, endColumn: 2 }, text: "C" }]);
+      await tab.session.save();
+      expect(io.backing.get(approved.handle)).toBe("\uFEFFa\r\nb\nC");
+      const removed = { startLineNumber: 1, startColumn: 2, endLineNumber: 2, endColumn: 1 };
+      tab.model.pushEditOperations(null, [{ range: removed, text: "" }], () => null);
+      tab.model.pushStackElement();
+      await tab.session.save();
+      expect(io.backing.get(approved.handle)).toBe("\uFEFFab\nC");
+      await tab.model.undo();
+      await tab.session.save();
+      expect(io.backing.get(approved.handle)).toBe("\uFEFFa\r\nb\nC");
+      await tab.model.redo();
+      await tab.session.save();
+      expect(io.backing.get(approved.handle)).toBe("\uFEFFab\nC");
+      io.backing.set(approved.handle, "x\ny\r\nz");
+      await tab.session.reload(async () => true);
+      tab.model.applyEdits([{ range: { startLineNumber: 3, startColumn: 1, endLineNumber: 3, endColumn: 2 }, text: "Z" }]);
+      await tab.session.save();
+      expect(io.backing.get(approved.handle)).toBe("x\ny\r\nZ");
+    } finally {
+      tab.close();
+    }
+  });
+
+  it("비교나 다시 읽기가 실패하면 이전 원본을 숨기고 미저장 버퍼와 오류를 유지한다", async () => {
+    const approved = file("stale-comparison");
+    const io = transport(approved);
+    const compare = vi.fn(io.compare);
+    const tab = open(approved, { ...io, compare });
+    try {
+      tab.model.setValue("미저장");
+      await tab.session.compare();
+      expect(tab.state?.comparison).toBe(approved.text);
+      compare.mockResolvedValueOnce({ kind: "failed", message: "missing" });
+      await tab.session.compare();
+      expect(tab.state).toMatchObject({ dirty: true, comparison: undefined, status: { kind: "failed", message: "missing" } });
+      await tab.session.compare();
+      compare.mockRejectedValueOnce(new Error("응답 유실"));
+      await tab.session.compare();
+      expect(tab.state).toMatchObject({ dirty: true, comparison: undefined, status: { kind: "failed", message: "응답 유실" } });
+      await tab.session.compare();
+      io.backing.delete(approved.handle);
+      await tab.session.reload(async () => true);
+      expect(tab.state).toMatchObject({ dirty: true, comparison: undefined, status: { kind: "denied", message: "unapproved handle" } });
+      expect(tab.text()).toBe("미저장");
+    } finally {
+      tab.close();
+    }
+  });
+
   it("같은 길이의 외부 변경을 비교만 하거나 다시 읽기를 취소하면 원본과 버퍼를 그대로 둔다", async () => {
     const approved = file("conflict");
     const io = transport(approved);
