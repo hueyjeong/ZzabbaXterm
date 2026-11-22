@@ -1,4 +1,5 @@
 use crate::connections::profile::{MethodRef, Shell, ValidatedDraft};
+use crate::ssm::CancellationToken;
 use portable_pty::CommandBuilder;
 use std::{
     sync::{Arc, Condvar, Mutex, mpsc},
@@ -13,6 +14,7 @@ const SSM_MARKER: &[u8] = b"ZZABBA-C02:314159";
 const SSM_CHECK: &[u8] = b"[ \"$(uname -s)\" = Linux ] || exit 19; printf 'ZZABBA-C02:%d\\n' \"$((314000+159))\" && exit 0; exit 19\r";
 const TIMEOUT: Duration = Duration::from_secs(8);
 const SSM_TIMEOUT: Duration = Duration::from_secs(60);
+const S3_TIMEOUT: Duration = Duration::from_secs(60);
 const SSH_TIMEOUT: Duration = Duration::from_secs(120);
 pub(super) const TIMED_OUT: &str = "연결 시험 시간이 초과되었습니다";
 
@@ -31,6 +33,7 @@ fn scan(needle: &[u8], matched: &mut usize, bytes: &[u8]) -> bool {
 pub(crate) struct Probe {
     session: Arc<Session>,
     ssh: bool,
+    s3_cancel: Option<CancellationToken>,
     deadline: Instant,
     state: Mutex<State>,
     ready: Condvar,
@@ -50,6 +53,10 @@ impl Probe {
         match draft.method() {
             MethodRef::Ssh { .. } => Self::with_timeout(owner, SSH_TIMEOUT, false, true),
             MethodRef::Ssm { .. } => Self::with_timeout(owner, SSM_TIMEOUT, true, false),
+            MethodRef::S3 { .. } => Self {
+                s3_cancel: Some(CancellationToken::new()),
+                ..Self::with_timeout(owner, S3_TIMEOUT, false, false)
+            },
             MethodRef::Local { .. } => Self::with_timeout(owner, TIMEOUT, false, false),
         }
     }
@@ -60,7 +67,7 @@ impl Probe {
     }
 
     pub(super) fn with_timeout(owner: &str, timeout: Duration, ssm: bool, ssh: bool) -> Self {
-        Self { session: Arc::new(Session::new(owner, ssm)), ssh, deadline: Instant::now() + timeout, state: Mutex::default(), ready: Condvar::new() }
+        Self { session: Arc::new(Session::new(owner, ssm)), ssh, s3_cancel: None, deadline: Instant::now() + timeout, state: Mutex::default(), ready: Condvar::new() }
     }
 
     pub(crate) fn attach(&self, size: portable_pty::PtySize, output: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>) -> Result<(), String> {
@@ -98,6 +105,21 @@ impl Probe {
             MethodRef::Ssm { profile, region, instance_id } => remote::Target::new(profile, region, instance_id).map(Launch::Ssm),
             MethodRef::Ssh { ssh } => {
                 self.finish(self.run_ssh(config, ssh).map(|()| None));
+                return;
+            }
+            MethodRef::S3 { s3 } => {
+                let cancel = self.s3_cancel.as_ref().unwrap();
+                let result = tauri::async_runtime::block_on(async {
+                    if self.remaining().is_zero() { return Err(TIMED_OUT.into()); }
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => Err("연결 시험이 취소되었습니다".into()),
+                        result = tokio::time::timeout_at(self.deadline.into(), crate::storage::profile_test::run(s3)) => {
+                            result.map_err(|_| TIMED_OUT.to_owned())?.map(Some)
+                        }
+                    }
+                });
+                self.finish(result);
                 return;
             }
         };
@@ -214,6 +236,7 @@ impl Probe {
     pub(crate) fn stop(&self) {
         self.session.stop(Stop::Closed);
         self.state.lock().unwrap().stopped = true;
+        if let Some(cancel) = &self.s3_cancel { cancel.cancel(); }
         self.ready.notify_all();
     }
 

@@ -34,6 +34,7 @@ pub(super) enum StoreError {
     RevisionExhausted,
     Replace(io::Error),
     Authorization(String),
+    InvalidTestedAccount,
 }
 
 impl From<io::Error> for StoreError {
@@ -120,7 +121,7 @@ impl Store {
 
     #[cfg(test)]
     pub(super) fn save(&self, draft: ValidatedDraft) -> Result<SaveStatus, StoreError> {
-        self.save_authorized(draft, None, || Ok(()), || {})
+        self.save_with_rename(draft, false, None, || Ok(()), || {}, |from, to| fs::rename(from, to))
     }
 
     pub(super) fn save_authorized(
@@ -130,6 +131,9 @@ impl Store {
         authorize: impl FnMut() -> Result<(), String>,
         committed: impl FnOnce(),
     ) -> Result<SaveStatus, StoreError> {
+        if draft.method().uses_tested_account() != tested_account_id.is_some() {
+            return Err(StoreError::InvalidTestedAccount);
+        }
         self.save_with_rename(draft, false, tested_account_id, authorize, committed, |from, to| fs::rename(from, to))
     }
 
@@ -158,6 +162,7 @@ impl Store {
         authorize().map_err(StoreError::Authorization)?;
         let mut file = self.read_file()?;
         let (group, group_revision, target, target_revision) = draft.into_parts();
+        validate_tested_account(tested_account_id.as_deref(), target.method().uses_tested_account())?;
         let old_group = file.groups.iter_mut().find(|entry| entry.profile.id == group.id);
         let old_target = file.targets.iter_mut().find(|entry| entry.profile.id == target.id);
 
@@ -354,6 +359,7 @@ impl ProfileFile {
         let mut groups = HashSet::with_capacity(self.groups.len());
         for entry in &self.groups {
             entry.profile.validate().map_err(StoreError::InvalidProfile)?;
+            validate_tested_account(entry.tested_account_id.as_deref(), false)?;
             if !groups.insert(&entry.profile.id) {
                 return Err(StoreError::DuplicateId);
             }
@@ -361,6 +367,7 @@ impl ProfileFile {
         let mut targets = HashSet::with_capacity(self.targets.len());
         for entry in &self.targets {
             entry.profile.validate().map_err(StoreError::InvalidProfile)?;
+            validate_tested_account(entry.tested_account_id.as_deref(), entry.profile.method().uses_tested_account())?;
             if !targets.insert(&entry.profile.id) {
                 return Err(StoreError::DuplicateId);
             }
@@ -370,6 +377,13 @@ impl ProfileFile {
         }
         Ok(())
     }
+}
+
+fn validate_tested_account(account: Option<&str>, allowed: bool) -> Result<(), StoreError> {
+    if account.is_some_and(|id| !allowed || id.len() != 12 || !id.bytes().all(|byte| byte.is_ascii_digit())) {
+        return Err(StoreError::InvalidTestedAccount);
+    }
+    Ok(())
 }
 
 impl<T> Entry<T> {

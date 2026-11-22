@@ -292,7 +292,9 @@ fn parse(command: &str, input: impl Read) -> Result<Command> {
                     return Err(Error::UnsupportedWindowsStartDirectory);
                 }
             }
-            _ => {}
+            #[cfg(not(windows))]
+            MethodRef::Local { .. } => {}
+            MethodRef::Ssm { .. } | MethodRef::S3 { .. } => {}
         }
         Ok(Command::Register(draft))
     } else {

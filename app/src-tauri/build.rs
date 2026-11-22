@@ -28,6 +28,8 @@ fn main() {
         "storage_count_previous_files",
         "storage_upload", "storage_download", "storage_cancel_approval", "storage_close",
         "storage_relogin",
+        "storage_edit_open", "storage_edit_compare", "storage_edit_reload", "storage_edit_save",
+        "storage_edit_close",
         "ai_cli_review",
         "ai_policy", "ai_set_policy",
     ]);

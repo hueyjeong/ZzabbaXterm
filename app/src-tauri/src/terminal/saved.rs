@@ -11,7 +11,19 @@ pub(super) fn launch(config: &Path, id: &str) -> Result<Launch, String> {
         MethodRef::Local { shell, start_directory } => local(shell, start_directory).map(Launch::Local),
         MethodRef::Ssm { profile, region, instance_id } => remote::Target::new(profile, region, instance_id).map(Launch::Ssm),
         MethodRef::Ssh { ssh } => crate::ssh::terminal::saved(config, ssh).map(Launch::Ssh),
+        MethodRef::S3 { .. } => Err("S3 연결은 스토리지 탭에서 열 수 있습니다".into()),
     })
+}
+
+#[cfg(test)]
+#[test]
+fn rejects_saved_s3_without_launching_a_pty() {
+    use crate::connections::{profile::Draft, save_test_profile, tests::{TestDir, s3_draft}};
+
+    let config = TestDir::new();
+    let draft = serde_json::from_value::<Draft>(s3_draft(config.path())).unwrap().validate().unwrap();
+    save_test_profile(config.path(), draft);
+    assert_eq!(launch(config.path(), "s3-bucket").err().as_deref(), Some("S3 연결은 스토리지 탭에서 열 수 있습니다"));
 }
 
 #[cfg(test)]

@@ -197,6 +197,90 @@ fn f01_rejects_ambiguous_ssh_methods_and_non_reference_values() {
     }
 }
 
+pub(crate) fn s3_draft(dir: &Path) -> Value {
+    let mut value = draft(dir, "work", "s3-bucket");
+    value["target"] = json!({
+        "id": "s3-bucket", "groupId": "work", "displayName": "개발 버킷", "defaultMethod": "s3",
+        "s3": {"profile": "company-sso", "region": "ap-northeast-2", "bucket": "dev.bucket", "prefix": " 폴더//한글/ "},
+    });
+    value
+}
+
+#[test]
+fn s3_v1_round_trip_preserves_references_and_verified_account() {
+    let dir = TestDir::new();
+    let store = Store::new(dir.path());
+    let local = draft(dir.path(), "work", "local-shell");
+    assert_eq!(save(&store, local.clone()).unwrap(), SaveStatus::Saved);
+    let ssm = ssm_draft(dir.path());
+    assert_eq!(save(&store, ssm.clone()).unwrap(), SaveStatus::Saved);
+
+    let s3 = s3_draft(dir.path());
+    let validate = |value: Value| serde_json::from_value::<Draft>(value).unwrap().validate().unwrap();
+    for account in [None, Some("12345678901x".into())] {
+        assert!(matches!(store.save_authorized(validate(s3.clone()), account, || Ok(()), || {}), Err(StoreError::InvalidTestedAccount)));
+    }
+    assert_eq!(store.save_authorized(validate(s3.clone()), Some("012345678901".into()), || Ok(()), || {}).unwrap(), SaveStatus::Saved);
+    super::with_saved_method(dir.path(), "s3-bucket", |method, account| {
+        let super::profile::MethodRef::S3 { s3 } = method else { panic!("S3 프로필이 필요합니다"); };
+        assert_eq!(s3.profile, "company-sso");
+        assert_eq!(s3.region, "ap-northeast-2");
+        assert_eq!(s3.bucket, "dev.bucket");
+        assert_eq!(s3.prefix, " 폴더//한글/ ");
+        assert_eq!(account, Some("012345678901"));
+        Ok(())
+    }).unwrap();
+    super::with_ai_targets(dir.path(), |targets| {
+        assert_eq!(targets.iter().map(|target| target.profile_id.as_str()).collect::<Vec<_>>(), ["local-shell", "ssm-node"]);
+    }).unwrap();
+
+    let mut file = serde_json::to_value(store.load().unwrap()).unwrap();
+    assert_eq!(file, json!({
+        "version": 1,
+        "groups": [{"revision": 1, "profile": local["group"]}],
+        "targets": [
+            {"revision": 1, "profile": local["target"]},
+            {"revision": 1, "profile": ssm["target"]},
+            {"revision": 1, "profile": s3["target"], "tested_account_id": "012345678901"},
+        ],
+    }));
+    file["targets"][0]["tested_account_id"] = json!("012345678901");
+    fs::write(dir.file(), serde_json::to_vec(&file).unwrap()).unwrap();
+    assert!(matches!(store.load(), Err(StoreError::InvalidTestedAccount)));
+}
+
+#[test]
+fn s3_accepts_literal_utf8_prefix_and_rejects_invalid_or_non_reference_fields() {
+    let dir = TestDir::new();
+    let valid = s3_draft(dir.path());
+    let checked = |value| serde_json::from_value::<Draft>(value).unwrap().validate().is_ok();
+    for prefix in [String::new(), format!("{}x", "한".repeat(341))] {
+        let mut input = valid.clone();
+        input["target"]["s3"]["prefix"] = json!(prefix);
+        assert!(checked(input));
+    }
+    for (key, value) in [
+        ("profile", json!("--profile")), ("region", json!("-region")),
+        ("bucket", json!("https://b.example")), ("bucket", json!("a..b")),
+        ("bucket", json!("dev.-blocked")), ("bucket", json!("127.0.0.1")),
+        ("bucket", json!("access-s3alias")), ("bucket", json!("xn--reserved")),
+        ("prefix", json!("한".repeat(342))),
+    ] {
+        let mut input = valid.clone();
+        input["target"]["s3"][key] = value;
+        assert!(!checked(input), "{key}");
+    }
+    for (pointer, key) in [
+        ("/target", "ssm"), ("/target", "testedAccountId"), ("/target/s3", "testedAccountId"),
+        ("/target/s3", "accessKeyId"), ("/target/s3", "secretAccessKey"),
+        ("/target/s3", "sessionToken"), ("/target/s3", "endpoint"),
+    ] {
+        let mut input = valid.clone();
+        input.pointer_mut(pointer).unwrap()[key] = json!("forbidden");
+        assert!(serde_json::from_value::<Draft>(input).is_err(), "{pointer}/{key}");
+    }
+}
+
 #[cfg(any(windows, unix))]
 pub(crate) fn with_saved_pty_targets(run: impl FnOnce(&Path, &Path)) {
     let root = TestDir::new();
@@ -255,7 +339,7 @@ mod local_probe {
         let run = start_at(&sessions, &dir.0, 1);
         assert!(save_at(&sessions, "main", &run, input.clone(), &store).is_err());
         let result = wait(&sessions, "main", 0, &run).unwrap();
-        assert!(!result.session_id.is_empty());
+        assert!(result.session_id.as_deref().is_some_and(|id| !id.is_empty()));
         assert!(save_at(&sessions, "other", &run, input.clone(), &store).is_err());
         let forged = serde_json::from_value(json!({"draftId": "draft", "draftVersion": 1, "runId": "invented"})).unwrap();
         assert!(save_at(&sessions, "main", &forged, input.clone(), &store).is_err());
