@@ -29,6 +29,7 @@ const CLI_READ_LIMIT: usize = 8 * 1024 * 1024;
 
 pub(crate) struct LocalFile {
     selected_parent: PathBuf,
+    cli_path: bool,
     parent: os::Directory,
     name: OsString,
     version: Version,
@@ -115,11 +116,13 @@ impl LocalFile {
             }
             os::Directory::open(canonical_parent).map_err(OpenError::Io)?
         };
-        let (original, version, bytes) = snapshot_with(selected_parent, &parent, name, cancelled)?;
+        let cli_path = cancelled.is_some();
+        let (original, version, bytes) = snapshot(selected_parent, &parent, name, cli_path, cancelled)?;
         let text = String::from_utf8(bytes).map_err(|_| OpenError::InvalidUtf8)?;
         Ok((
             Self {
                 selected_parent: selected_parent.into(),
+                cli_path,
                 parent,
                 name: name.into(),
                 version,
@@ -133,13 +136,17 @@ impl LocalFile {
         self.name.to_string_lossy().into_owned()
     }
 
+    fn snapshot(&self) -> Result<(File, Version, Vec<u8>), OpenError> {
+        snapshot(&self.selected_parent, &self.parent, &self.name, self.cli_path, None)
+    }
+
     fn compare(&self) -> Result<String, OpenError> {
-        let (_, _, bytes) = snapshot(&self.selected_parent, &self.parent, &self.name)?;
+        let (_, _, bytes) = self.snapshot()?;
         String::from_utf8(bytes).map_err(|_| OpenError::InvalidUtf8)
     }
 
     fn reload(&mut self) -> Result<String, OpenError> {
-        let (original, version, bytes) = snapshot(&self.selected_parent, &self.parent, &self.name)?;
+        let (original, version, bytes) = self.snapshot()?;
         let text = String::from_utf8(bytes).map_err(|_| OpenError::InvalidUtf8)?;
         self.original = original;
         self.version = version;
@@ -159,7 +166,7 @@ impl LocalFile {
     ) -> Result<(), SaveError> {
         use SaveStage::*;
 
-        check_parent(&self.selected_parent, &self.parent).map_err(save_read_error)?;
+        check_open_parent(&self.selected_parent, &self.parent, self.cli_path).map_err(save_read_error)?;
         let access = os::Access::read(&self.original).map_err(at(PreservePermissions))?;
         let mut temp = self.parent.stage(Some(&access)).map_err(at(CreateTemporary))?;
         let bytes = buffer.as_bytes();
@@ -176,8 +183,7 @@ impl LocalFile {
         let _commit = COMMIT.lock().map_err(|_| {
             at(InspectOriginal)(io::Error::other("local editor save lock poisoned"))
         })?;
-        let (current, version, disk_bytes) =
-            snapshot(&self.selected_parent, &self.parent, &self.name).map_err(save_read_error)?;
+        let (current, version, disk_bytes) = self.snapshot().map_err(save_read_error)?;
         if self.version != version {
             let disk = match String::from_utf8(disk_bytes) {
                 Ok(text) => LocalVersion::Text(text),
@@ -240,30 +246,28 @@ fn check_parent(selected: &Path, opened: &os::Directory) -> Result<(), OpenError
     Ok(())
 }
 
+fn check_open_parent(selected: &Path, opened: &os::Directory, cli_path: bool) -> Result<(), OpenError> {
+    if !cli_path {
+        return check_parent(selected, opened);
+    }
+    if !opened.still_at_cli_path(selected).map_err(lookup_error)? {
+        return Err(OpenError::Conflict(LocalConflict::PathChanged));
+    }
+    Ok(())
+}
+
 fn snapshot(
     selected_parent: &Path,
     parent: &os::Directory,
     name: &OsStr,
-) -> Result<(File, Version, Vec<u8>), OpenError> {
-    snapshot_with(selected_parent, parent, name, None)
-}
-
-fn snapshot_with(
-    selected_parent: &Path,
-    parent: &os::Directory,
-    name: &OsStr,
+    cli_path: bool,
     cancelled: Option<&dyn Fn() -> bool>,
 ) -> Result<(File, Version, Vec<u8>), OpenError> {
     let check_parent = || {
         if let Some(cancelled) = cancelled {
             check_cancelled(cancelled).map_err(OpenError::Io)?;
-            if !parent.still_at_cli_path(selected_parent).map_err(lookup_error)? {
-                return Err(OpenError::Conflict(LocalConflict::PathChanged));
-            }
-            Ok(())
-        } else {
-            check_parent(selected_parent, parent)
         }
+        check_open_parent(selected_parent, parent, cli_path)
     };
     check_parent()?;
     let mut file = parent
@@ -391,6 +395,40 @@ mod cli_read_tests {
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         assert_eq!(input.limit(), (CLI_READ_LIMIT - 32 * 1024) as u64);
         assert_eq!(calls.get(), 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cli_keeps_its_parent_policy_after_open_without_keeping_the_size_limit() {
+        use std::os::windows::fs::symlink_dir;
+
+        let sandbox = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(sandbox.path()).unwrap();
+        let parent = root.join("parent");
+        fs::create_dir(&parent).unwrap();
+        let path = parent.join("edit.txt");
+        fs::write(&path, "before").unwrap();
+        let (mut file, _) = LocalFile::open_cli(&path, &|| false).unwrap();
+
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(CLI_READ_LIMIT as u64 + 1)
+            .unwrap();
+        assert_eq!(file.compare().unwrap().len(), CLI_READ_LIMIT + 1);
+        assert_eq!(file.reload().unwrap().len(), CLI_READ_LIMIT + 1);
+
+        // 같은 파일을 가리키는 링크로 경로 재검증을 실행한다.
+        let alias = root.join("alias");
+        symlink_dir(&parent, &alias).unwrap();
+        let (gui_file, _) = LocalFile::open(&alias.join("edit.txt")).unwrap();
+        assert_eq!(gui_file.compare().unwrap().len(), CLI_READ_LIMIT + 1);
+        file.selected_parent = alias;
+        assert!(file.compare().is_err());
+        assert!(file.reload().is_err());
+        assert!(file.save("after").is_err());
+        assert_eq!(fs::metadata(&path).unwrap().len(), CLI_READ_LIMIT as u64 + 1);
     }
 }
 
