@@ -155,11 +155,12 @@ it("열린 SSM 세션의 선택·확정·해제만 호출하고 파일과 집중
   ]);
 });
 
-it.each(["파일", "집중 보기"])("%s에서 숨겨진 동안 도착한 확정 응답을 표시하지 않는다", async (view) => {
+it.each(["파일", "집중 보기"])("%s로 전환하면 진행 중인 연결 확인을 해제한다", async (view) => {
   const confirmation = Promise.withResolvers<SessionSelectionSnapshot>();
   invoke.mockImplementation(async (command) => {
     if (command === "ai_session_select") return sessionSelection;
     if (command === "ai_session_confirm") return confirmation.promise;
+    if (command === "ai_session_clear") return null;
     return command === "ai_policy" ? false : [];
   });
   await render(0, filesTab, [session]);
@@ -172,12 +173,13 @@ it.each(["파일", "집중 보기"])("%s에서 숨겨진 동안 도착한 확정
   await act(async () => confirmation.resolve({ ...sessionSelection, confirmed: true }));
   await render(0, filesTab, [session]);
 
-  expect(selects()[0].value).toBe(session.id);
+  expect(selects()[0].value).toBe("");
   expect(host.textContent).not.toContain("연결 확인됨");
-  expect(button("연결 확인")?.disabled).toBe(false);
+  expect(button("연결 확인")).toBeUndefined();
   expect(invoke.mock.calls).toEqual([
     ["ai_session_select", { id: session.id }],
     ["ai_session_confirm", { id: session.id, selectionId: sessionSelection.selectionId }],
+    ["ai_session_clear", { selectionId: sessionSelection.selectionId }],
   ]);
 });
 

@@ -60,10 +60,9 @@ export function SessionSelection({ candidates, visible = true, actions }: Sessio
     const closed = target && !candidates.some((item) => sameSession(item, target));
     if (closed && current.kind === "selecting" && !current.closed) {
       update({ ...current, closed: true });
-    } else if (closed && "selection" in current) {
+    } else if ("selection" in current && (closed || (!visible && current.kind === "confirming"))) {
+      // 확인 응답을 버릴 때 서버에 남을 수 있는 같은 선택도 해제한다.
       void clear(current.selection.selectionId);
-    } else if (!visible && current.kind === "confirming") {
-      update({ kind: "selected", selection: current.selection });
     }
   });
 

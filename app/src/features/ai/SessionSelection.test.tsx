@@ -88,21 +88,32 @@ it("다른 세션을 거쳐 같은 ID를 다시 선택해도 이전 확인 응�
   expect(port.confirm.mock.calls).toEqual([[alpha.id, "1"], [alpha.id, "3"]]);
 });
 
-it("숨겨지기 전에 끝나지 않은 확인은 다시 표시해도 적용되지 않는다", async () => {
+it("숨겨지기 전에 끝나지 않은 확인을 해제하고 새 선택 ID로만 확인한다", async () => {
   const port = actions();
   const late = Promise.withResolvers<SessionSelectionSnapshot>();
+  const clearing = Promise.withResolvers<null>();
   port.confirm.mockReturnValueOnce(late.promise);
+  port.clear.mockReturnValueOnce(clearing.promise);
+  port.select.mockResolvedValueOnce(snapshot(alpha, "1")).mockResolvedValueOnce(snapshot(alpha, "2"));
   await render(port);
   await choose(alpha.id);
   await click("연결 확인");
   await render(port, [alpha, beta], false);
-  await act(async () => late.resolve({ ...snapshot(alpha), confirmed: true }));
+  expect(port.clear).toHaveBeenCalledExactlyOnceWith("1");
   await render(port);
+  expect(field().value).toBe("");
+  expect(field().disabled).toBe(true);
+  expect(host.textContent).not.toContain("연결 확인됨");
+
+  await act(async () => clearing.resolve(null));
+  expect(field().disabled).toBe(false);
+  await choose(alpha.id);
+  await act(async () => late.resolve({ ...snapshot(alpha, "1"), confirmed: true }));
   expect(field().value).toBe(alpha.id);
   expect(host.textContent).not.toContain("연결 확인됨");
-  expect(port.clear).not.toHaveBeenCalled();
   await click("연결 확인");
-  expect(port.confirm).toHaveBeenCalledTimes(2);
+  expect(port.confirm.mock.calls).toEqual([[alpha.id, "1"], [alpha.id, "2"]]);
+  expect(port.clear).toHaveBeenCalledTimes(1);
   expect(host.textContent).toContain("연결 확인됨");
 });
 
