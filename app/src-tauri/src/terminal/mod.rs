@@ -21,11 +21,21 @@ pub(crate) struct Sessions {
 struct Registry {
     sessions: HashMap<String, Arc<Session>>,
     destroyed: HashSet<String>,
+    documents: HashMap<String, u64>,
     shutdown: bool,
 }
 
 impl Sessions {
+    #[cfg(test)]
     fn open(&self, owner: &str, size: PtySize, command: CommandBuilder, send: impl Fn(Event) -> Result<(), String> + Send + 'static) -> Result<String, String> {
+        self.open_document(owner, self.document(owner), size, command, send)
+    }
+
+    fn document(&self, owner: &str) -> u64 {
+        self.registry.lock().unwrap().documents.get(owner).copied().unwrap_or(0)
+    }
+
+    fn open_document(&self, owner: &str, document: u64, size: PtySize, command: CommandBuilder, send: impl Fn(Event) -> Result<(), String> + Send + 'static) -> Result<String, String> {
         validate_size(size)?;
         let id = self.next.fetch_add(1, Ordering::Relaxed).to_string();
         let session = Arc::new(Session::new(owner));
@@ -33,6 +43,9 @@ impl Sessions {
             let mut registry = self.registry.lock().unwrap();
             if registry.shutdown || registry.destroyed.contains(owner) {
                 return Err("open: 창이 닫혔습니다".into());
+            }
+            if registry.documents.get(owner).copied().unwrap_or(0) != document {
+                return Err("open: 문서가 바뀌었습니다".into());
             }
             registry.sessions.insert(id.clone(), session.clone());
         }
@@ -51,7 +64,7 @@ impl Sessions {
 
     fn get(&self, owner: &str, id: &str) -> Result<Arc<Session>, String> {
         let session = self.registry.lock().unwrap().sessions.get(id).cloned()
-            .ok_or("세션이 닫혔습니다")?;
+            .ok_or(CLOSED)?;
         if session.owner != owner {
             return Err("다른 창의 세션입니다".into());
         }
@@ -82,13 +95,21 @@ impl Sessions {
         Ok(())
     }
 
+    pub(crate) fn navigate(&self, owner: &str) {
+        self.stop_owner(owner, false);
+    }
+
     pub(crate) fn destroy(&self, owner: &str) {
-        let sessions: Vec<_> = {
-            let mut registry = self.registry.lock().unwrap();
+        self.stop_owner(owner, true);
+    }
+
+    fn stop_owner(&self, owner: &str, destroyed: bool) {
+        let mut registry = self.registry.lock().unwrap();
+        *registry.documents.entry(owner.into()).or_default() += 1;
+        if destroyed {
             registry.destroyed.insert(owner.into());
-            registry.sessions.values().filter(|session| session.owner == owner).cloned().collect()
-        };
-        for session in sessions {
+        }
+        for session in registry.sessions.values().filter(|session| session.owner == owner) {
             session.stop(process::Stop::Closed);
         }
     }

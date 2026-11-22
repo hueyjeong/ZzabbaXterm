@@ -7,8 +7,9 @@ async fn blocking<T: Send + 'static>(job: impl FnOnce() -> Result<T, String> + S
 
 #[tauri::command]
 pub(crate) async fn terminal_open(webview: WebviewWindow, rows: u16, cols: u16, output: Channel<InvokeResponseBody>) -> Result<String, String> {
+    let document = webview.state::<Sessions>().document(webview.label());
     blocking(move || {
-        webview.state::<Sessions>().open(webview.label(), size(rows, cols), shell(), move |event| {
+        webview.state::<Sessions>().open_document(webview.label(), document, size(rows, cols), shell(), move |event| {
             event.send(&output).map_err(|error| error.to_string())
         })
     }).await

@@ -7,6 +7,11 @@ use terminal::{Sessions, ipc::*};
 pub fn run() {
     tauri::Builder::default()
         .manage(Sessions::default())
+        .on_page_load(|webview, payload| {
+            if payload.event() == tauri::webview::PageLoadEvent::Started {
+                webview.state::<Sessions>().navigate(webview.label());
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             terminal_open, terminal_start, terminal_input, terminal_resize, terminal_ack,
             terminal_close,

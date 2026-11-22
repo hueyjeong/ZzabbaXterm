@@ -28,16 +28,18 @@ impl<'a> Peer<'a> {
         let (tx, rx) = mpsc::channel();
         let id = sessions.open("main", SIZE, shell(), move |event| tx.send(event).map_err(|e| e.to_string())).expect("L01: 네이티브 셸 열기");
         sessions.start("main", &id).unwrap();
-        let mut peer = Self { sessions, id, rx, bytes: Vec::new() };
+        let peer = Self { sessions, id, rx, bytes: Vec::new() };
         #[cfg(windows)]
-        {
+        let peer = {
+            let mut peer = peer;
             let deadline = Instant::now() + Duration::from_secs(15);
             while !peer.bytes.windows(4).any(|bytes| bytes == b"\x1b[6n") {
                 assert!(matches!(peer.next(deadline), Event::Bytes(_)));
             }
             // xterm answers ConPTY's initial cursor-position query through onData.
             peer.send(b"\x1b[1;1R");
-        }
+            peer
+        };
         peer
     }
 
@@ -147,5 +149,64 @@ fn l01_terminal_failed_opens_report_the_stage() {
     for size in [PtySize { rows: 0, ..SIZE }, PtySize { cols: 0, ..SIZE }] {
         let err = sessions.open("main", size, shell(), |_| Ok(())).unwrap_err();
         assert!(err.starts_with("size:"), "{err}");
+    }
+}
+
+#[test]
+fn l01_terminal_navigation_retires_old_document_and_accepts_new_document() {
+    let sessions = Sessions::default();
+    let old = Peer::open(&sessions);
+    let document = sessions.document("main");
+    sessions.navigate("main");
+    assert!(sessions.input("main", &old.id, b"x").is_err());
+    assert!(sessions.open_document("main", document, SIZE, shell(), |_| Ok(())).is_err());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match old.rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Event::Bytes(_)) => {},
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            other => panic!("이전 문서 채널 회수: {other:?}"),
+        }
+    }
+    let mut new = Peer::open(&sessions);
+    new.send(COMPUTE);
+    assert_eq!(new.number(0), 12);
+}
+
+#[test]
+fn l01_terminal_stalled_output_ack_disconnects_even_below_the_window() {
+    let sessions = Sessions::default();
+    let (tx, rx) = mpsc::channel();
+    let id = sessions.open("main", SIZE, shell(), move |event| tx.send(event).map_err(|e| e.to_string())).unwrap();
+    sessions.start("main", &id).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(22);
+    let mut received = 0;
+    loop {
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap() {
+            Event::Bytes(bytes) => received += bytes.len(),
+            Event::Disconnected(reason) => {
+                assert!(reason.starts_with("ack:"), "{reason}");
+                break;
+            }
+            Event::Exited(code) => panic!("ACK 단절 대신 종료: {code}"),
+        }
+    }
+    assert!((1..WINDOW).contains(&received));
+    assert!(sessions.input("main", &id, b"x").is_err());
+}
+
+#[cfg(windows)]
+#[test]
+fn l01_terminal_exit_259_is_not_a_running_process() {
+    let sessions = Sessions::default();
+    let mut peer = Peer::open(&sessions);
+    peer.send(b"exit 259\r");
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        match peer.next(deadline) {
+            Event::Bytes(_) => {},
+            Event::Exited(code) => { assert_eq!(code, 259); break; }
+            Event::Disconnected(reason) => panic!("종료 259 대신 단절: {reason}"),
+        }
     }
 }
