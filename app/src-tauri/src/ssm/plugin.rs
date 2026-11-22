@@ -23,6 +23,9 @@ impl CheckedPlugin {
     }
 
     pub(super) fn recheck(&self, aws: &Path, cwd: &Path) -> Result<(), CliError> {
+        validate_aws(aws)?;
+        #[cfg(windows)]
+        super::windows_acl::trusted_chain(&self.file, true).map_err(|_| CliError::PluginMissing)?;
         if self
             .file
             .parent()
@@ -50,6 +53,7 @@ pub(super) async fn checked_path(
     cwd: &Path,
     cancel: &CancellationToken,
 ) -> Result<CheckedPlugin, CliError> {
+    validate_aws(aws)?;
     let (plugin, guard) = official_file()?;
     let dir = plugin.parent().ok_or(CliError::PluginMissing)?;
     check_precedence(aws, cwd, &plugin)?;
@@ -68,10 +72,32 @@ pub(super) async fn checked_path(
     })
 }
 
+#[cfg(windows)]
+pub(super) fn validate_aws(path: &Path) -> Result<(), CliError> {
+    super::windows_acl::trusted_chain(path, true).map_err(|_| CliError::InvalidConfiguration)
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn validate_aws(path: &Path) -> Result<(), CliError> {
+    verify_linux_install(path).map_err(|_| CliError::InvalidConfiguration)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+pub(super) fn validate_aws(_: &Path) -> Result<(), CliError> {
+    Err(CliError::InvalidConfiguration)
+}
+
 #[cfg(target_os = "linux")]
 fn official_file() -> Result<(PathBuf, File), CliError> {
-    use std::os::unix::fs::MetadataExt;
     let path = PathBuf::from("/usr/local/sessionmanagerplugin/bin").join(FILE);
+    verify_linux_install(&path)?;
+    let file = File::open(&path).map_err(|_| CliError::PluginMissing)?;
+    Ok((path, file))
+}
+
+#[cfg(target_os = "linux")]
+fn verify_linux_install(path: &Path) -> Result<(), CliError> {
+    use std::os::unix::fs::MetadataExt;
     // 공식 패키지 경로의 모든 조상과 실행 파일은 root만 수정할 수 있어야 한다.
     for entry in path.ancestors() {
         let meta = entry
@@ -86,49 +112,18 @@ fn official_file() -> Result<(PathBuf, File), CliError> {
             return Err(CliError::PluginMissing);
         }
     }
-    let file = File::open(&path).map_err(|_| CliError::PluginMissing)?;
-    Ok((path, file))
+    Ok(())
 }
 
 #[cfg(windows)]
 fn official_file() -> Result<(PathBuf, File), CliError> {
     use std::fs::OpenOptions;
-    use std::os::windows::{
-        ffi::OsStringExt,
-        fs::{MetadataExt, OpenOptionsExt},
-    };
-    use windows_sys::Win32::{
-        System::Com::CoTaskMemFree,
-        UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath},
-    };
-    let mut ptr = std::ptr::null_mut();
-    // Known Folder를 사용해 상속된 ProgramFiles 환경 값을 신뢰하지 않는다.
-    let result =
-        unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramFiles, 0, std::ptr::null_mut(), &mut ptr) };
-    if result < 0 || ptr.is_null() {
-        return Err(CliError::PluginMissing);
-    }
-    let root = unsafe {
-        let len = (0..).take_while(|&offset| *ptr.add(offset) != 0).count();
-        let root = PathBuf::from(OsString::from_wide(std::slice::from_raw_parts(ptr, len)));
-        CoTaskMemFree(ptr.cast());
-        root
-    };
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::UI::Shell::FOLDERID_ProgramFiles;
+    let root = super::windows_acl::known_folder(&FOLDERID_ProgramFiles)
+        .map_err(|_| CliError::PluginMissing)?;
     let file = root.join("Amazon/SessionManagerPlugin/bin").join(FILE);
-    for entry in file
-        .ancestors()
-        .take_while(|entry| entry.starts_with(&root))
-    {
-        let meta = entry
-            .symlink_metadata()
-            .map_err(|_| CliError::PluginMissing)?;
-        if meta.file_attributes() & 0x400 != 0
-            || (entry == file && !meta.is_file())
-            || (entry != file && !meta.is_dir())
-        {
-            return Err(CliError::PluginMissing);
-        }
-    }
+    super::windows_acl::trusted_chain(&file, true).map_err(|_| CliError::PluginMissing)?;
     let file = file.canonicalize().map_err(|_| CliError::PluginMissing)?;
     // Windows allows the same executable to be opened for reading, but not written or deleted.
     let guard = OpenOptions::new()

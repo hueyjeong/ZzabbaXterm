@@ -65,6 +65,8 @@ Rust는 두 방식이 섞인 레코드와 비밀·실행 파일·임의 인자 �
 
 Windows에서는 시작 직후 전용 Job에 프로세스를 배정한다. 직접 실행한 CLI의 종료만 확인 결과에 포함하며, Job 배정 전에 생성된 자손의 회수 여부는 미확인이다.
 
+**로컬 신뢰 경계:** Windows에서는 현재 사용자 전용 보호 DACL로 임시 홈을 만들고, 캐시는 이 권한을 상속한다. 설치된 AWS CLI와 Session Manager 플러그인의 파일·디렉터리 ACL을 검사해 다른 일반 계정이 실행 파일이나 검색 경로를 바꿀 수 있으면 시작을 거부한다. Linux에서는 root 소유와 쓰기 권한을 검사한다. 관리자 업데이트나 같은 계정의 프로세스가 검사와 실행 사이에 설치 경로·파일을 바꾸는 경합은 이 검사의 범위 밖이다.
+
 **완료 증거:** `Windows SSM T1 / Ubuntu SSM T1 / Windows T3 / Ubuntu T3` 네 결과에 OS·WebView·입력기·CLI/플러그인 버전과 실제 관찰을 적는다. T3에는 실패별 화면 상태와 마법사 시험·탭별 세션 정리 근거를 포함한다. 계정·노드·세션 ID는 일관된 별칭으로 가리고 토큰·로그인 URL은 제외한다. 접근할 수 없는 조합은 `미실행(사유)`, macOS는 후속 실기기 검증이다.
 
 참고: [Session Manager 시작](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-sessions-start.html) · [세션 상태 조회](https://docs.aws.amazon.com/cli/latest/reference/ssm/describe-sessions.html)
