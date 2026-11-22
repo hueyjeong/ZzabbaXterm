@@ -970,7 +970,8 @@ describe("C02 SSM 연결", () => {
       .find((item) => item.textContent === "관리 노드");
     expect(row).toBeDefined();
     await key(row!, "ContextMenu");
-    expect(find('[role="menu"]').textContent).toBe("AWS Systems Manager");
+    expect([...find('[role="menu"]').querySelectorAll('[role="menuitem"]')].map(item => item.textContent))
+      .toEqual(["AWS Systems Manager", "터널 열기"]);
     await press("AWS Systems Manager");
     const [{ output, ...args }] = calls("open").slice(-1);
     expect(output).toBeDefined();
@@ -1218,7 +1219,8 @@ describe("F01 직접 SSH", () => {
     expect(connectionCalls("register_saved_ssh_host")).toEqual([]);
 
     await key(target, "ContextMenu");
-    expect([...find('[role="menu"]').querySelectorAll('[role="menuitem"]')].map(item => item.textContent)).toEqual(["SSH", "호스트 키 등록"]);
+    expect([...find('[role="menu"]').querySelectorAll('[role="menuitem"]')].map(item => item.textContent))
+      .toEqual(["SSH", "호스트 키 등록", "터널 열기"]);
     await press("호스트 키 등록");
     expect(host.querySelector('[role="menu"]')).toBeNull();
     expect(find('footer [role="alert"]').textContent).toContain("SSH 호스트 키 등록이 취소되었습니다");
