@@ -116,7 +116,7 @@ export function Workspace() {
   }
 
   function retestStorageTarget(id: string) {
-    if (draftPending.current || wizard) return;
+    if (wizard) return;
     const profiles = profileLoad.profiles;
     const target = profiles?.targets.find(({ profile }) => profile.id === id);
     const group = profiles?.groups.find(({ profile }) => profile.id === target?.profile.groupId);
