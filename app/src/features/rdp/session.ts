@@ -31,7 +31,7 @@ type Frame = Extract<RemoteDesktopEvent, { kind: "full" | "patch" }>;
 
 export function connect(draft: Draft, opened: (connection: Connection) => void,
   caps: (value: Capabilities) => void, ready: (value: boolean) => void, notice: (message: string) => void,
-  ended: (message: string) => void, clipboard: Pick<Clipboard, "readText" | "writeText"> = navigator.clipboard): () => void {
+  ended: (message: string, closed: boolean) => void, clipboard: Pick<Clipboard, "readText" | "writeText"> = navigator.clipboard): () => Promise<void> {
   const document = proof();
   const life = new AbortController();
   let output: Channel<string> | undefined;
@@ -54,16 +54,32 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
   let lastFrame = 0;
   const queue: { action: Action; epoch: number; displayGeneration: number }[] = [];
   let sending = false;
-  const end = (message?: string) => {
+  let closing: Promise<void> | undefined;
+  const stop = () => {
     if (done) return;
     done = true;
     life.abort();
     waiting?.();
     if (output) output.onmessage = () => { };
-    if (id) void run("rdp_close", { id }).catch(() => { });
     queue.length = 0;
     pending = undefined;
-    if (message) ended(message);
+  };
+  const close = () => {
+    stop();
+    if (!closing) {
+      closing = (async () => {
+        await prepared.catch(() => undefined);
+        if (id) await run("rdp_close", { id });
+      })().catch((error: unknown) => {
+        closing = undefined;
+        throw error;
+      });
+    }
+    return closing;
+  };
+  const end = (message: string) => {
+    if (done) return;
+    void close().then(() => ended(message, true), (error: unknown) => ended(String(error), false));
   };
 
   async function flush() {
@@ -205,16 +221,19 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
     } catch { end("RDP 화면 또는 상태를 적용할 수 없습니다"); }
   }
 
+  const prepared = run<unknown>("rdp_prepare").then((assigned) => {
+    if (!record(assigned) || typeof assigned.sessionId !== "string" || !token.test(assigned.sessionId) || !positive(assigned.generation)) throw new Error("RDP 세션 ID 오류");
+    id = { sessionId: assigned.sessionId, generation: assigned.generation };
+    return id;
+  });
   void (async () => {
     try {
-      const assigned: unknown = await run("rdp_prepare");
-      if (!record(assigned) || typeof assigned.sessionId !== "string" || !token.test(assigned.sessionId) || !positive(assigned.generation)) throw new Error("RDP 세션 ID 오류");
-      id = { sessionId: assigned.sessionId, generation: assigned.generation };
-      if (done) { await run("rdp_close", { id }); return; }
+      const assigned = await prepared;
+      if (done) return;
       output = new Channel<string>((ticket: unknown) => { void packet(ticket); });
       const completion = run("rdp_connect", { id, draft, output });
       opened({
-        ...id,
+        ...assigned,
         subscribe(listener) {
           receive = listener;
           waiting?.();
@@ -241,5 +260,5 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
       end("RDP 연결이 종료되었습니다");
     } catch (error) { end(error instanceof Error ? error.message : String(error)); }
   })();
-  return () => end();
+  return close;
 }

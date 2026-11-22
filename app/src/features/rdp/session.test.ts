@@ -133,7 +133,7 @@ it("이전 화면 입력은 폐기하고 같은 크기의 새 화면 ACK 후 입
   await vi.waitFor(() => expect(f.calls("rdp_input")[2]).toMatchObject({ input: { sequence: 3, displayGeneration: 2, action: { kind: "active" } } }));
   f.sendInput.mockRejectedValueOnce("RDP 전송 연결이 끊겼습니다");
   view.send(input);
-  await vi.waitFor(() => expect(f.ended).toHaveBeenCalledWith("RDP 전송 연결이 끊겼습니다"));
+  await vi.waitFor(() => expect(f.ended).toHaveBeenCalledWith("RDP 전송 연결이 끊겼습니다", true));
   expect(f.calls("rdp_input")[3]).toMatchObject({ input: { sequence: 4, displayGeneration: 2, action: { kind: "key" } } });
   view.dispose();
 });
@@ -176,8 +176,41 @@ it("터널 연결 거부 시 목적지와 TLS DNS를 구분해 전달하고 직�
     return Promise.resolve();
   });
   connect(draft, vi.fn(), vi.fn(), vi.fn(), vi.fn(), ended);
-  await vi.waitFor(() => expect(ended).toHaveBeenCalledWith("승인된 터널 목적지가 일치하지 않습니다"));
+  await vi.waitFor(() => expect(ended).toHaveBeenCalledWith("승인된 터널 목적지가 일치하지 않습니다", true));
   expect(invoke.mock.calls.map(([name]) => name)).toEqual(["rdp_prepare", "rdp_connect", "rdp_close"]);
   expect(invoke.mock.calls[1]?.[1]).toMatchObject({ id, draft });
   expect(invoke.mock.calls[1]?.[2]).toEqual({ headers: { "x-zzabba-rdp-document": proof } });
+});
+
+it("준비 중 닫기는 발급된 세션의 종료를 기다리고 연결을 시작하지 않는다", async () => {
+  vi.stubGlobal("__ZZABBA_RDP_DOCUMENT__", { proof });
+  const prepared = Promise.withResolvers<typeof id>();
+  const released = Promise.withResolvers<void>();
+  invoke.mockImplementation((name) => name === "rdp_prepare" ? prepared.promise : released.promise);
+  const opened = vi.fn();
+  const settled = vi.fn();
+  const close = connect({ host: "localhost", port: 3389 }, opened, vi.fn(), vi.fn(), vi.fn(), vi.fn());
+  const pending = close().then(settled);
+  expect(invoke.mock.calls.map(([name]) => name)).toEqual(["rdp_prepare"]);
+  prepared.resolve(id);
+  await vi.waitFor(() => expect(invoke.mock.calls.map(([name]) => name)).toEqual(["rdp_prepare", "rdp_close"]));
+  expect(settled).not.toHaveBeenCalled();
+  expect(opened).not.toHaveBeenCalled();
+  released.resolve();
+  await pending;
+  expect(settled).toHaveBeenCalledOnce();
+});
+
+it("종료 실패 후 다시 확인하면 같은 세션으로만 요청한다", async () => {
+  const f = await fixture();
+  const first = Promise.withResolvers<void>();
+  invoke.mockReturnValueOnce(first.promise);
+  const pending = f.close();
+  expect(f.close()).toBe(pending);
+  first.reject("RDP 종료 확인 불가");
+  await expect(pending).rejects.toBe("RDP 종료 확인 불가");
+  await f.close();
+  expect(f.calls("rdp_close")).toEqual([{ id }, { id }]);
+  expect(f.calls("rdp_prepare")).toHaveLength(1);
+  expect(f.calls("rdp_connect")).toHaveLength(1);
 });

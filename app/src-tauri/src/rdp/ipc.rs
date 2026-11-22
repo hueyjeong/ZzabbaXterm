@@ -9,7 +9,7 @@ use tauri::{Manager, UriSchemeContext, UriSchemeResponder, Webview, WebviewWindo
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::{connections::{profile::{SshTransport, valid_id}, with_saved_ssh}, tunnels::{Destination, ipc::{Protocol, TunnelTabs}}};
+use crate::{connections::{profile::{SshTransport, valid_id}, with_saved_ssh}, tunnels::{Destination, ipc::{DesktopCleanupError, DesktopLease, Protocol, TunnelTabs}}};
 use super::{Error, Event, Session, native, route};
 use input::{Command, Controls};
 
@@ -44,6 +44,22 @@ struct Slot {
     life: CancellationToken,
     mailbox: Mutex<Option<Packet>>,
     controls: AsyncMutex<Controls>,
+    cleanup: AsyncMutex<Cleanup>,
+}
+
+#[derive(Default)]
+enum Cleanup {
+    #[default]
+    Prepared,
+    Running(oneshot::Receiver<Result<(), CleanupFailure>>),
+    Failed(DesktopCleanupError),
+    Unconfirmed,
+    Done,
+}
+
+enum CleanupFailure {
+    Tunnel(DesktopCleanupError, Option<String>),
+    Unconfirmed,
 }
 
 struct Packet {
@@ -103,13 +119,44 @@ impl Registry {
 
 impl Slot {
     fn new(generation: u64) -> Self {
-        Self { generation, life: CancellationToken::new(), mailbox: Mutex::default(), controls: AsyncMutex::default() }
+        Self { generation, life: CancellationToken::new(), mailbox: Mutex::default(), controls: AsyncMutex::default(), cleanup: AsyncMutex::default() }
     }
 
     fn close(&self) {
         let mut mailbox = self.mailbox.lock().unwrap();
         self.life.cancel();
         mailbox.take();
+    }
+
+    async fn finish_close(&self) -> Result<(), String> {
+        let mut cleanup = self.cleanup.lock().await;
+        let result = match &mut *cleanup {
+            Cleanup::Prepared | Cleanup::Done => Ok(()),
+            Cleanup::Running(done) => done.await.unwrap_or(Err(CleanupFailure::Unconfirmed)),
+            Cleanup::Failed(_) => {
+                let Cleanup::Failed(mut ticket) = std::mem::replace(&mut *cleanup, Cleanup::Unconfirmed) else { unreachable!() };
+                tauri::async_runtime::spawn_blocking(move || {
+                    match ticket.retry() {
+                        Ok(()) => Ok(()),
+                        Err(error) => Err(CleanupFailure::Tunnel(ticket, Some(error))),
+                    }
+                }).await.unwrap_or(Err(CleanupFailure::Unconfirmed))
+            }
+            Cleanup::Unconfirmed => Err(CleanupFailure::Unconfirmed),
+        };
+        let (state, result) = match result {
+            Ok(()) => (Cleanup::Done, Ok(())),
+            Err(CleanupFailure::Tunnel(ticket, retry_error)) => {
+                let message = match retry_error {
+                    Some(error) => format!("RDP 종료 확인 불가: {error}"),
+                    None => format!("RDP 종료 확인 불가: {ticket}"),
+                };
+                (Cleanup::Failed(ticket), Err(message))
+            }
+            Err(CleanupFailure::Unconfirmed) => (Cleanup::Unconfirmed, Err("RDP 종료 확인 불가".into())),
+        };
+        *cleanup = state;
+        result
     }
 
     fn ack(&self, sequence: u64, offset: usize) -> Option<()> {
@@ -228,8 +275,15 @@ pub(crate) fn dispatch(invoke: Invoke) {
     match name {
         "rdp_close" => {
             slot.close();
-            state.tabs.remove(&id.session_id);
-            invoke.resolver.resolve(());
+            let window = caller.clone();
+            drop(state);
+            invoke.resolver.respond_async(async move {
+                slot.finish_close().await.map_err(InvokeError::from)?;
+                let sessions = window.state::<Sessions>();
+                let mut state = sessions.0.lock().unwrap();
+                if state.get(&id, document).is_some() { state.tabs.remove(&id.session_id); }
+                Ok(())
+            });
         }
         "rdp_ack" => {
             let sequence = read!(u64, "sequence");
@@ -259,19 +313,30 @@ pub(crate) fn dispatch(invoke: Invoke) {
             if state.approving.as_ref().is_some_and(|lease| Arc::strong_count(lease) > 1) {
                 invoke.resolver.reject("다른 RDP 연결을 승인하는 중입니다"); return;
             }
+            if slot.life.is_cancelled() { invoke.resolver.reject(CLOSED); return; }
+            let Ok(mut cleanup) = slot.cleanup.try_lock() else { invoke.resolver.reject(CLOSED); return; };
             let Ok(mut controls) = slot.controls.try_lock() else { invoke.resolver.reject(CLOSED); return; };
             if controls.started { invoke.resolver.reject(CLOSED); return; }
             controls.started = true;
             drop(controls);
+            let (closed, done) = oneshot::channel();
+            *cleanup = Cleanup::Running(done);
+            drop(cleanup);
             let approval = Arc::new(());
             state.approving = Some(approval.clone());
             drop(state);
             invoke.resolver.respond_async(async move {
-                let result = run(&window, &slot, &channel, draft, tunnel_epoch, approval).await;
-                let sessions = window.state::<Sessions>();
-                let mut state = sessions.0.lock().unwrap();
-                if state.get(&id, document).is_some() { state.tabs.remove(&id.session_id); }
+                let mut lease = None;
+                let result = run(&window, &slot, &channel, draft, tunnel_epoch, approval, &mut lease).await;
                 slot.close();
+                let cleanup = match lease {
+                    Some(lease) => tauri::async_runtime::spawn_blocking(move || {
+                        lease.release().map_err(|ticket| CleanupFailure::Tunnel(ticket, None))
+                    })
+                        .await.unwrap_or(Err(CleanupFailure::Unconfirmed)),
+                    None => Ok(()),
+                };
+                let _ = closed.send(cleanup);
                 result.map_err(InvokeError::from)
             });
         }
@@ -279,14 +344,14 @@ pub(crate) fn dispatch(invoke: Invoke) {
     }
 }
 
-async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draft: Draft, tunnel_epoch: u64, approval: Arc<()>) -> Result<(), String> {
+async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draft: Draft, tunnel_epoch: u64, approval: Arc<()>, lease: &mut Option<DesktopLease>) -> Result<(), String> {
     let life = &slot.life;
     let prompt = life.child_token();
     let _prompt_lifetime = prompt.clone().drop_guard();
     let dns = draft.host.to_ascii_lowercase();
     let description = draft.approval_text(&dns).map_err(message)?;
     let size = DesktopSize { width: 1024, height: 768 };
-    let (target, loss, target_name, lease) = if let Some(source) = draft.source {
+    let (target, loss, target_name) = if let Some(source) = draft.source {
         let directory = window.path().app_config_dir().map_err(|error| error.to_string())?;
         let load_directory = directory.clone();
         let target_id = source.target_id.clone();
@@ -302,20 +367,21 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
         let caller = window.clone();
         let live = prompt.clone();
         // 발급 중 취소되어도 작업을 기다려 인계 소켓과 임대를 이 경로에서 정리한다.
-        let (mut lease, approved_destination) = tauri::async_runtime::spawn_blocking(move || {
+        let (issued, approved_destination) = tauri::async_runtime::spawn_blocking(move || {
             if live.is_cancelled() { return Err(CLOSED.into()); }
             let lease = caller.state::<TunnelTabs>().open_desktop(tunnel_epoch, &directory,
                 (&source.tab_handle, &source.tunnel_id), &source.target_id, &destination, Protocol::Rdp, (revision, &ssh))?;
             Ok::<_, String>((lease, destination))
         }).await.map_err(|_| message(Error::Transport))??;
+        let lease = lease.insert(issued);
         if life.is_cancelled() { return Err(CLOSED.into()); }
         let loss = lease.loss();
-        let target = route::forwarded(dns, &approved_destination, size, &mut lease).map_err(message)?;
-        (target, Some(loss), target_name, Some(lease))
+        let target = route::forwarded(dns, &approved_destination, size, lease).map_err(message)?;
+        (target, Some(loss), target_name)
     } else {
         native::confirm(window.clone(), description, prompt.clone(), approval.clone()).await.map_err(message)?;
         let target_name = format!("{dns}:{}", draft.port);
-        (route::direct(dns, draft.port, size), None, target_name, None)
+        (route::direct(dns, draft.port, size), None, target_name)
     };
     let stopped = async {
         tokio::select! { biased;
@@ -438,6 +504,22 @@ pub(super) fn message(error: Error) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rdp_close_waits_for_session_shutdown_and_lease_release() {
+        use std::task::{Context, Waker};
+
+        let slot = Slot::new(1);
+        let (closed, done) = oneshot::channel();
+        *slot.cleanup.lock().await = Cleanup::Running(done);
+        slot.close();
+        assert!(slot.life.is_cancelled());
+        let mut close = std::pin::pin!(slot.finish_close());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(close.as_mut().poll(&mut cx).is_pending());
+        assert!(closed.send(Ok(())).is_ok());
+        assert!(matches!(close.as_mut().poll(&mut cx), std::task::Poll::Ready(Ok(()))));
+    }
 
     #[test]
     fn rdp_approval_separates_forward_destination_from_tls_dns() {
