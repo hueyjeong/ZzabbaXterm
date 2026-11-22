@@ -455,7 +455,10 @@ fn bridge() -> io::Result<()> {
     check_directory(&session.0)?;
     let path = session.0.join(SOCKET_NAME);
     unsafe { libc::umask(0o177) };
-    let listener = UnixListener::bind(&path)?;
+    let listener = UnixListener::bind(&path);
+    // 게시 스테이징 디렉터리(0700)가 소켓용 마스크로 소유자 실행 권한을 잃지 않게 한다.
+    unsafe { libc::umask(0o077) };
+    let listener = listener?;
     check_socket(&path)?;
     listener.set_nonblocking(true)?;
     relay(listener, channel_fd(libc::STDIN_FILENO)?, channel_fd(libc::STDOUT_FILENO)?, id)

@@ -3,7 +3,7 @@ use std::{
     fs::{File, Metadata},
     io::{self, BufRead, BufReader, Read, Seek, Write},
     mem::MaybeUninit,
-    os::{fd::AsRawFd, unix::{ffi::OsStrExt, fs::MetadataExt}},
+    os::{fd::AsRawFd, unix::{ffi::OsStrExt, fs::{MetadataExt, OpenOptionsExt}}},
     path::{Path, PathBuf},
 };
 
@@ -17,6 +17,8 @@ use super::{
 
 const MAX_PATH: usize = 4096;
 const DIRECTORY_FLAGS: libc::c_int = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW;
+// 조상 경로는 검색 권한만 요구한다(예: 0711 홈 상위). 읽기 열기는 최종 부모에만 한다.
+const ANCESTOR_FLAGS: libc::c_int = libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW;
 
 #[derive(Debug)]
 pub(super) enum Error {
@@ -245,12 +247,13 @@ fn trusted_dir(file: &File, uid: u32) -> io::Result<()> {
 }
 
 fn open_parent(path: &Path, uid: u32) -> io::Result<File> {
-    let root = File::open("/")?;
-    trusted_dir(&root, uid)?;
-    let mut directory = root;
-    for component in path.iter().skip(1) {
+    let flags = |last: bool| if last { DIRECTORY_FLAGS } else { ANCESTOR_FLAGS };
+    let mut components = path.iter().skip(1).peekable();
+    let mut directory = File::options().read(true).custom_flags(flags(components.peek().is_none())).open("/")?;
+    trusted_dir(&directory, uid)?;
+    while let Some(component) = components.next() {
         let name = CString::new(component.as_bytes()).map_err(|_| changed())?;
-        directory = os::open_at(&directory, &name, DIRECTORY_FLAGS)?;
+        directory = os::open_at(&directory, &name, flags(components.peek().is_none()))?;
         trusted_dir(&directory, uid)?;
     }
     Ok(directory)
