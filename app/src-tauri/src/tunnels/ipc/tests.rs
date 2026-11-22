@@ -326,6 +326,44 @@ fn test_lease(protocol: Protocol) -> (TunnelTabs, DesktopLease) {
 }
 
 #[test]
+fn desktop_preflight_rejects_closed_source_and_failed_cleanup_records() {
+    let (tabs, lease) = test_lease(Protocol::Rdp);
+    let id = lease.id;
+    let source = tabs.document(0).unwrap().tabs.keys().next().unwrap().clone();
+    let selector = id.0.to_string();
+    let preflight = || tabs.preflight_desktop(0, (&source, &selector), lease.target(), lease.destination(), Protocol::Rdp);
+    let owner = {
+        let mut doc = tabs.document(0).unwrap();
+        doc.entries.insert(id, Entry { endpoint: String::new(), protocol: Some(Protocol::Rdp) });
+        let tab = doc.tabs.get_mut(&source).unwrap();
+        tab.ids.push(id);
+        tab.owner.clone()
+    };
+    assert_eq!(lease.while_live(|| 7), Some(7));
+    {
+        let mut doc = tabs.document(0).unwrap();
+        assert!(doc.tunnels.entries.get_mut(&id).unwrap().owners.remove(&owner));
+    }
+    assert_eq!(preflight().unwrap_err(), "이 탭이 소유한 터널이 아닙니다");
+    {
+        let mut doc = tabs.document(0).unwrap();
+        doc.tunnels.entries.get_mut(&id).unwrap().owners.insert(owner.clone());
+        inject_desktop_cleanup_failure(&mut doc, id);
+    }
+    assert_eq!(preflight().unwrap_err(), "터널 수신이 준비되지 않았습니다");
+    {
+        let mut doc = tabs.document(0).unwrap();
+        assert!(doc.tunnels.cleanup.contains_key(&id));
+        assert!(doc.tunnels.close_tab(&owner).is_empty());
+        assert!(doc.tabs.contains_key(&source));
+        assert!(doc.entries.contains_key(&id));
+    }
+    assert_eq!(preflight().unwrap_err(), STALE);
+    tabs.close(0, &source).unwrap();
+    assert_eq!(preflight().unwrap_err(), STALE);
+}
+
+#[test]
 fn desktop_live_gate_rejects_removed_owner_and_retired_document() {
     let (tabs, lease) = test_lease(Protocol::Vnc);
     assert_eq!(lease.while_live(|| 7), Some(7));

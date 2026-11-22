@@ -392,6 +392,26 @@ impl TunnelTabs {
         Ok(Some(id.0.to_string()))
     }
 
+    // 승인 전에는 기록만 확인하고, 전송 상태 갱신과 소켓 발급은 승인 후에 한다.
+    pub(crate) fn preflight_desktop(&self, epoch: u64, source: (&str, &str), target: &str,
+                                    destination: &Destination, protocol: Protocol) -> Result<(), String> {
+        let (handle, id) = source;
+        let id = TunnelId(id.parse().map_err(|_| "터널 ID가 올바르지 않습니다")?);
+        let doc = self.document(epoch)?;
+        let tab = doc.tabs.get(handle).filter(|tab| doc.tunnels.is_open(&tab.owner)).ok_or(STALE)?;
+        if tab.ssh.is_none() || tab.target != target { return Err("승인된 SSH 대상이 일치하지 않습니다".into()); }
+        if !tab.ids.contains(&id) { return Err("이 탭이 소유한 터널이 아닙니다".into()); }
+        if doc.entries.get(&id).ok_or(STALE)?.protocol != Some(protocol) {
+            return Err("승인된 터널 서비스가 일치하지 않습니다".into());
+        }
+        let route = doc.tunnels.entries.get(&id).filter(|route| route.owners.contains(&tab.owner))
+            .ok_or("이 탭이 소유한 터널이 아닙니다")?;
+        if !matches!(route.state, State::Ready) { return Err("터널 수신이 준비되지 않았습니다".into()); }
+        desktop_listener(&route.route, target, destination)?;
+        route.transport.as_ref().ok_or(STALE)?;
+        Ok(())
+    }
+
     /// 네이티브 승인과 문서 검증을 마친 그래픽 작업에만 연결 소켓을 인계한다.
     #[allow(dead_code, reason = "R02·R03의 네이티브 세션에서 사용")]
     pub(crate) fn open_desktop(&self, epoch: u64, directory: &Path, source: (&str, &str),
