@@ -38,6 +38,10 @@ async fn fixture_target(listener: &TcpListener, size: DesktopSize) -> Target {
     Target { endpoint: Endpoint::Forwarded(stream), server_name: REMOTE.into(), size }
 }
 
+fn fixture_policy(_: &str, _: &[rustls::pki_types::CertificateDer<'_>]) -> Result<(), Error> {
+    Ok(())
+}
+
 async fn exercise(
     listener: &TcpListener,
     protocol: SecurityProtocol,
@@ -45,6 +49,7 @@ async fn exercise(
     dns: &str,
     expired: bool,
     known: bool,
+    policy: TestPeerPolicy,
 ) -> (Error, usize, bool) {
     let ca = root();
     let unknown = root();
@@ -66,7 +71,7 @@ async fn exercise(
     .unwrap()
     .with_no_client_auth()
     .with_single_cert(
-        vec![cert.der().clone()],
+        vec![cert.der().clone(), if known { ca.der() } else { unknown.der() }.clone()],
         PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
     )
     .unwrap();
@@ -129,6 +134,7 @@ async fn exercise(
         },
         ironrdp::displaycontrol::client::DisplayControlClient::new(|_| Ok(Vec::new())),
     );
+    let client = TEST_PEER_POLICY.scope(policy, client);
     let (result, saw_nla) = timeout(Duration::from_secs(5), async {
         tokio::join!(client, server)
     })
@@ -156,7 +162,8 @@ async fn verifies_remote_name_chain_and_expiry_before_credentials() {
                 true,
                 name,
                 expired,
-                known
+                known,
+                fixture_policy,
             )
             .await,
             (Error::TlsIdentity, 0, false)
@@ -164,7 +171,7 @@ async fn verifies_remote_name_chain_and_expiry_before_credentials() {
     }
     for protocol in [SecurityProtocol::HYBRID, SecurityProtocol::HYBRID_EX] {
         assert_eq!(
-            exercise(&listener, protocol, true, REMOTE, false, true).await,
+            exercise(&listener, protocol, true, REMOTE, false, true, fixture_policy).await,
             (Error::Authentication, 1, true)
         );
     }
@@ -174,13 +181,42 @@ async fn verifies_remote_name_chain_and_expiry_before_credentials() {
 async fn direct_connection_verifies_the_dns_name_before_credentials() {
     let listener = listener();
     assert_eq!(
-        exercise(&listener, SecurityProtocol::HYBRID, false, REMOTE, false, true).await,
+        exercise(&listener, SecurityProtocol::HYBRID, false, REMOTE, false, true, fixture_policy).await,
         (Error::TlsIdentity, 0, false)
     );
     assert_eq!(
-        exercise(&listener, SecurityProtocol::HYBRID, false, "localhost", false, true).await,
+        exercise(&listener, SecurityProtocol::HYBRID, false, "localhost", false, true, fixture_policy).await,
         (Error::Authentication, 1, true)
     );
+}
+
+#[tokio::test]
+async fn rejects_peer_policy_before_credentials_on_both_routes() {
+    static POLICY_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn deny_remote(name: &str, peer: &[rustls::pki_types::CertificateDer<'_>]) -> Result<(), Error> {
+        assert_eq!(name, REMOTE);
+        assert_eq!(peer.len(), 2);
+        POLICY_CALLS.fetch_add(1, Ordering::Relaxed);
+        Err(Error::TlsIdentity)
+    }
+    fn deny_localhost(name: &str, peer: &[rustls::pki_types::CertificateDer<'_>]) -> Result<(), Error> {
+        assert_eq!(name, "localhost");
+        assert_eq!(peer.len(), 2);
+        POLICY_CALLS.fetch_add(1, Ordering::Relaxed);
+        Err(Error::TlsIdentity)
+    }
+    let listener = listener();
+    for (forwarded, name, policy) in [
+        (true, REMOTE, deny_remote as TestPeerPolicy),
+        (false, "localhost", deny_localhost),
+    ] {
+        assert_eq!(
+            exercise(&listener, SecurityProtocol::HYBRID, forwarded, name, false, true, policy).await,
+            (Error::TlsIdentity, 0, false)
+        );
+    }
+    assert_eq!(POLICY_CALLS.load(Ordering::Relaxed), 2);
 }
 
 #[tokio::test]
@@ -192,7 +228,7 @@ async fn rejects_tls_only_and_legacy_modes_without_resolving_credentials() {
         SecurityProtocol::SSL | SecurityProtocol::HYBRID,
     ] {
         assert_eq!(
-            exercise(&listener, protocol, true, REMOTE, false, true).await,
+            exercise(&listener, protocol, true, REMOTE, false, true, fixture_policy).await,
             (Error::Negotiation, 0, false)
         );
         assert!(
@@ -391,7 +427,7 @@ async fn activates_and_delivers_pixels_and_key_input_only_for_the_authenticated_
             true
         };
         let client = async {
-            let mut session = Session::open_with_tls(
+            let mut session = TEST_PEER_POLICY.scope(fixture_policy, Session::open_with_tls(
                 fixture_target(&listener, size).await,
                 REMOTE.try_into().unwrap(),
                 Arc::clone(&tls),
@@ -403,7 +439,7 @@ async fn activates_and_delivers_pixels_and_key_input_only_for_the_authenticated_
                     })
                 },
                 SLOTS.try_acquire().unwrap(),
-            )
+            ))
             .await?;
             let id = session.id();
             let input = session.input_handle();

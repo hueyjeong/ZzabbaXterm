@@ -80,7 +80,10 @@ pub(super) fn trusted_roots(
     mut approved: rustls::RootCertStore,
 ) -> Result<rustls::RootCertStore, Error> {
     #[cfg(windows)]
-    if let Ok(store) = schannel::cert_store::CertStore::open_current_user("ROOT") {
+    if let Ok(store) = schannel::cert_store::CertStoreBuilder::new()
+        .read_only()
+        .open_current_user("ROOT")
+    {
         use schannel::cert_context::ValidUses;
         for cert in store.certs() {
             let tls = match cert.valid_uses() {
@@ -127,6 +130,34 @@ struct Verified {
     selected: SecurityProtocol,
 }
 
+#[cfg(windows)]
+mod windows_policy;
+
+#[cfg(test)]
+type TestPeerPolicy = fn(&str, &[rustls::pki_types::CertificateDer<'_>]) -> Result<(), Error>;
+
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_PEER_POLICY: TestPeerPolicy;
+}
+
+fn verify_peer_policy(
+    name: &str,
+    peer: &[rustls::pki_types::CertificateDer<'_>],
+) -> Result<(), Error> {
+    #[cfg(test)]
+    if let Ok(result) = TEST_PEER_POLICY.try_with(|policy| policy(name, peer)) {
+        return result;
+    }
+    #[cfg(windows)]
+    return windows_policy::verify(name, peer);
+    #[cfg(not(windows))]
+    {
+        let _ = (name, peer);
+        Ok(())
+    }
+}
+
 async fn verify(
     target: Target,
     server_name: ServerName<'static>,
@@ -163,12 +194,9 @@ async fn verify(
         .connect(server_name, stream)
         .await
         .map_err(|_| Error::TlsIdentity)?;
-    let cert = stream
-        .get_ref()
-        .1
-        .peer_certificates()
-        .and_then(|chain| chain.first())
-        .ok_or(Error::TlsIdentity)?;
+    let peer = stream.get_ref().1.peer_certificates().ok_or(Error::TlsIdentity)?;
+    let cert = peer.first().ok_or(Error::TlsIdentity)?;
+    verify_peer_policy(&name, peer)?;
     let cert = Certificate::from_der(cert.as_ref()).map_err(|_| Error::TlsIdentity)?;
     let public_key = cert.tbs_certificate
         .subject_public_key_info
