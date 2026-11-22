@@ -1,3 +1,5 @@
+use crate::nano_publish::{Error as PublishError, GuardedFile};
+use crate::nano_wire::publication::{ActiveOpen, OpIds, Operation, Outcome, is_operation_kind, read_operation};
 use crate::nano_wire::{ADMITTED, ADMIT_NANO, CONFIRM_LEN, Lease, NO_PROOF, PROOF_LEN, REGISTER, Ready, Request, Response, STARTUP_LIMIT, decode_len, startup_frame, valid_session_id};
 use std::env;
 use std::ffi::{CStr, OsStr, OsString};
@@ -250,46 +252,148 @@ fn register(listener: &UnixListener, input: &mut (impl Read + AsRawFd), output: 
     Ok(Login { shell, sid })
 }
 
+struct Active {
+    id: u64,
+    peer: Option<(UnixStream, Peer)>,
+    cancel_deadline: Option<Instant>,
+    file: GuardedFile,
+    ops: OpIds,
+}
+
+fn connected(login: &Login, peer: &(UnixStream, Peer), input: RawFd, output: RawFd) -> bool {
+    if STOPPING.load(Ordering::Relaxed) || !login.admits(&peer.1) {
+        return false;
+    }
+    let mut fds = [
+        pollfd(peer.0.as_raw_fd(), libc::POLLIN | libc::POLLRDHUP),
+        pollfd(input, libc::POLLRDHUP),
+        pollfd(output, 0),
+    ];
+    // SAFETY: poll accesses only the live entries in fds.
+    (unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, 0) }) == 0
+        && !STOPPING.load(Ordering::Relaxed)
+}
+
+struct DeadlineReader<'a, T>(&'a mut T, Instant);
+
+impl<T: Read + AsRawFd> Read for DeadlineReader<'_, T> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        if !bytes.is_empty() {
+            read_exact(self.0, bytes, Some(self.1)).map_err(|error| {
+                // Read::read_exact retries Interrupted; STOPPING must abort instead.
+                if error.kind() == io::ErrorKind::Interrupted {
+                    io::ErrorKind::ConnectionAborted.into()
+                } else {
+                    error
+                }
+            })?;
+        }
+        Ok(bytes.len())
+    }
+}
+
+enum RemoteFrame {
+    Close(Response),
+    Operation(u64, Operation),
+}
+
+fn remote_frame(input: &mut (impl Read + AsRawFd), id: u64, ids: &mut OpIds, deadline: Instant) -> io::Result<RemoteFrame> {
+    let mut reader = DeadlineReader(input, deadline);
+    let mut prefix = [0; 6];
+    reader.read_exact(&mut prefix)?;
+    if is_operation_kind(prefix[5]) {
+        let (op, operation) = read_operation(&mut (&prefix[..]).chain(reader), id, ids)?;
+        return Ok(RemoteFrame::Operation(op, operation));
+    }
+    let mut payload = [0; 10];
+    if decode_len(prefix[..4].try_into().unwrap())? != payload.len() {
+        return Err(invalid());
+    }
+    payload[..2].copy_from_slice(&prefix[4..]);
+    reader.read_exact(&mut payload[2..])?;
+    let response = Response::decode(&payload)?;
+    if response.id() != id {
+        return Err(invalid());
+    }
+    Ok(RemoteFrame::Close(response))
+}
+
+fn operate(file: &mut GuardedFile, operation: Operation, still_connected: impl Fn() -> bool) -> Outcome {
+    if !still_connected() {
+        return Outcome::Unavailable;
+    }
+    let saving = matches!(&operation, Operation::Save { .. });
+    let result = match operation {
+        Operation::Compare => file.compare().map(Outcome::Observation),
+        Operation::Reload(expected) => file.reload(expected).map(Outcome::Reloaded),
+        Operation::Save { token, text } => file.save(token, text.as_bytes(), || !still_connected()).map(Outcome::Saved),
+    };
+    match result {
+        Ok(outcome) => outcome,
+        Err(PublishError::Conflict) => Outcome::Conflict,
+        Err(PublishError::Unknown(path)) if saving => {
+            Outcome::Unknown(path.as_deref().and_then(|path| file.recovery_name(path)))
+        }
+        Err(_) => Outcome::Unavailable,
+    }
+}
+
 fn relay(listener: UnixListener, mut input: impl Read + AsRawFd, mut output: impl Write + AsRawFd, session_id: String) -> io::Result<()> {
     send(&mut output, &Ready { session_id }.encode()?)?;
     let login = register(&listener, &mut input, &mut output)?;
-    let mut active: Option<(u64, Option<UnixStream>)> = None;
-    let mut cancel_deadline = None;
+    let mut active: Option<Active> = None;
     let mut next_id = 1u64;
     loop {
-        let peer = active.as_ref().and_then(|(_, peer)| peer.as_ref());
+        let peer = active.as_ref().and_then(|active| active.peer.as_ref());
         let mut fds = [
             pollfd(input.as_raw_fd(), libc::POLLIN),
             pollfd(listener.as_raw_fd(), libc::POLLIN),
-            pollfd(peer.map_or(-1, AsRawFd::as_raw_fd), libc::POLLIN),
+            pollfd(peer.map_or(-1, |peer| peer.0.as_raw_fd()), libc::POLLIN | libc::POLLRDHUP),
             pollfd(output.as_raw_fd(), 0),
             pollfd(login.shell.handle.as_raw_fd(), libc::POLLIN),
+            pollfd(peer.map_or(-1, |peer| peer.1.handle.as_raw_fd()), libc::POLLIN),
         ];
-        poll(&mut fds, cancel_deadline)?;
+        poll(&mut fds, active.as_ref().and_then(|current| current.cancel_deadline))?;
         if fds[4].revents != 0 {
             return Err(io::ErrorKind::NotConnected.into());
         }
         if fds[0].revents != 0 {
-            let response = Response::decode(&receive(&mut input, Some(Instant::now() + IO))?)?;
-            let (id, peer) = active.take().ok_or_else(invalid)?;
-            if response.id() != id {
-                return Err(invalid());
+            let deadline = Instant::now() + IO;
+            let current = active.as_mut().ok_or_else(|| {
+                if fds[0].revents & libc::POLLHUP != 0 {
+                    io::Error::from(io::ErrorKind::UnexpectedEof)
+                } else {
+                    invalid()
+                }
+            })?;
+            let deadline = current.cancel_deadline.map_or(deadline, |end| end.min(deadline));
+            match remote_frame(&mut input, current.id, &mut current.ops, deadline)? {
+                RemoteFrame::Close(response) => {
+                    let current = active.take().ok_or_else(invalid)?;
+                    if let Some((mut peer, _)) = current.peer {
+                        let local = match response {
+                            Response::Closed { .. } => Response::Closed { id: 1 },
+                            Response::Unattached { .. } => Response::Unattached { id: 1 },
+                            Response::Failed { .. } => Response::Failed { id: 1 },
+                            Response::Busy { .. } => Response::Busy { id: 1 },
+                        };
+                        let _ = send(&mut peer, &local.encode()?);
+                    }
+                }
+                RemoteFrame::Operation(op, operation) => {
+                    let peer = &current.peer;
+                    let still_connected = || peer.as_ref().is_some_and(|peer| {
+                        connected(&login, peer, input.as_raw_fd(), output.as_raw_fd())
+                    });
+                    let outcome = operate(&mut current.file, operation, still_connected);
+                    send(&mut output, &outcome.encode(current.id, op)?)?;
+                }
             }
-            cancel_deadline = None;
-            if let Some(mut peer) = peer {
-                let local = match response {
-                    Response::Closed { .. } => Response::Closed { id: 1 },
-                    Response::Unattached { .. } => Response::Unattached { id: 1 },
-                    Response::Failed { .. } => Response::Failed { id: 1 },
-                    Response::Busy { .. } => Response::Busy { id: 1 },
-                };
-                let _ = send(&mut peer, &local.encode()?);
-            }
-        } else if fds[2].revents != 0 {
-            let (id, peer) = active.as_mut().ok_or_else(invalid)?;
-            peer.take();
-            send(&mut output, &Request::Cancel { id: *id }.encode()?)?;
-            cancel_deadline = Some(Instant::now() + CANCEL);
+        }
+        if (fds[2].revents != 0 || fds[5].revents != 0) && let Some(current) = active.as_mut() {
+            current.peer.take();
+            send(&mut output, &Request::Cancel { id: current.id }.encode()?)?;
+            current.cancel_deadline = Some(Instant::now() + CANCEL);
         }
         if fds[3].revents != 0 {
             return Err(io::ErrorKind::BrokenPipe.into());
@@ -301,24 +405,22 @@ fn relay(listener: UnixListener, mut input: impl Read + AsRawFd, mut output: imp
             let Ok(Request::Open { id: 1, path }) = receive(&mut peer, deadline).and_then(|payload| Request::decode(&payload)) else {
                 continue;
             };
-            if !login.admits(&identity) {
-                let _ = send(&mut peer, &Response::Unattached { id: 1 }.encode()?);
-                continue;
-            }
             if active.is_some() {
                 let _ = send(&mut peer, &Response::Busy { id: 1 }.encode()?);
-            } else {
-                let id = next_id;
-                next_id = next_id.checked_add(1).ok_or_else(invalid)?;
-                let mut channels = [pollfd(input.as_raw_fd(), libc::POLLIN), pollfd(output.as_raw_fd(), 0)];
-                // SAFETY: poll reads and writes only the live two-entry array.
-                checked(unsafe { libc::poll(channels.as_mut_ptr(), channels.len() as _, 0) })?;
-                if channels.iter().any(|fd| fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0) {
-                    return Err(io::ErrorKind::BrokenPipe.into());
-                }
-                send(&mut output, &Request::Open { id, path }.encode()?)?;
-                active = Some((id, Some(peer)));
+                continue;
             }
+            let mut peer = (peer, identity);
+            let still_connected = |peer| connected(&login, peer, input.as_raw_fd(), output.as_raw_fd());
+            let prepared = std::str::from_utf8(&path).ok().filter(|_| still_connected(&peer))
+                .and_then(|path| GuardedFile::prepare(Path::new(path)).ok());
+            let Some((file, snapshot)) = prepared.filter(|_| still_connected(&peer)) else {
+                let _ = send(&mut peer.0, &Response::Unattached { id: 1 }.encode()?);
+                continue;
+            };
+            let id = next_id;
+            next_id = next_id.checked_add(1).ok_or_else(invalid)?;
+            send(&mut output, &ActiveOpen { id, path, snapshot }.encode()?)?;
+            active = Some(Active { id, peer: Some(peer), cancel_deadline: None, file, ops: OpIds::default() });
         }
     }
 }
@@ -462,8 +564,7 @@ fn nano(args: &[OsString]) -> io::Result<()> {
         return fallback(args);
     };
     let Ok(socket) = socket_from_env(&socket) else { return fallback(args); };
-    // 파일 시스템 조회는 릴레이에 연결하기 전에 끝낸다.
-    let path = match path.canonicalize() {
+    let path = match std::path::absolute(path) {
         Ok(path) => path,
         Err(_) => return fallback(args),
     };
@@ -581,30 +682,95 @@ mod tests {
         assert_eq!(worker.join().unwrap().unwrap_err().kind(), io::ErrorKind::PermissionDenied);
     }
 
-    #[test]
-    fn relay_admits_only_the_registered_login_and_forwards_one_open() {
-        let (_dir, path, mut client, worker) = relay_fixture();
-        let (mut shell, lease) = registration(&path, &mut client);
-        send(&mut client, &lease.confirm()[..]).unwrap();
+    fn registered_relay(path: &Path, client: &mut UnixStream) {
+        let (mut shell, lease) = registration(path, client);
+        send(client, &lease.confirm()[..]).unwrap();
         expect_marker(&mut shell, ADMITTED, Some(Instant::now() + IO)).unwrap();
-        drop(shell);
+    }
+
+    #[test]
+    fn relay_admits_only_the_registered_login() {
+        let (_dir, path, mut client, worker) = relay_fixture();
+        registered_relay(&path, &mut client);
 
         wait_child(separate_login(&path, "admission"));
         let mut probe = [0];
         assert_eq!(client.read(&mut probe).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        let mut nano = UnixStream::connect(path).unwrap();
+        nano.set_nonblocking(true).unwrap();
+        send(&mut nano, &ADMIT_NANO).unwrap();
+        expect_marker(&mut nano, ADMITTED, Some(Instant::now() + IO)).unwrap();
+        drop(client);
+        assert_eq!(worker.join().unwrap().unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn relay_returns_unattached_for_a_missing_file() {
+        let (dir, path, mut client, worker) = relay_fixture();
+        registered_relay(&path, &mut client);
 
         let mut nano = UnixStream::connect(path).unwrap();
         nano.set_nonblocking(true).unwrap();
         send(&mut nano, &ADMIT_NANO).unwrap();
         let deadline = Some(Instant::now() + IO);
         expect_marker(&mut nano, ADMITTED, deadline).unwrap();
-        let open = Request::Open { id: 1, path: b"/test".to_vec() };
+        let open = Request::Open { id: 1, path: dir.path().join("missing").into_os_string().into_vec() };
         send(&mut nano, &open.encode().unwrap()).unwrap();
-        assert_eq!(Request::decode(&receive(&mut client, deadline).unwrap()).unwrap(), open);
-        send(&mut client, &Response::Closed { id: 1 }.encode().unwrap()).unwrap();
-        assert_eq!(Response::decode(&receive(&mut nano, deadline).unwrap()).unwrap(), Response::Closed { id: 1 });
+        assert_eq!(Response::decode(&receive(&mut nano, deadline).unwrap()).unwrap(), Response::Unattached { id: 1 });
+        let mut probe = [0];
+        assert_eq!(client.read(&mut probe).unwrap_err().kind(), io::ErrorKind::WouldBlock);
         drop(client);
         assert_eq!(worker.join().unwrap().unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn malformed_private_frames_fail_before_consuming_an_operation_id() {
+        let save = Operation::Save { token: [1; 16], text: "내용" };
+        let frame = save.encode(3, 1).unwrap();
+        let valid = [frame.header.as_slice(), frame.fragment].concat();
+        let mut oversized = valid.clone();
+        oversized[..4].copy_from_slice(&u32::MAX.to_be_bytes());
+        let mut wrong_id = valid.clone();
+        wrong_id[13] = 4;
+        let mut invalid_utf8 = valid.clone();
+        *invalid_utf8.last_mut().unwrap() = 0xff;
+        for (bytes, kind) in [
+            (&valid[..5], io::ErrorKind::UnexpectedEof),
+            (&valid[..valid.len() - 1], io::ErrorKind::UnexpectedEof),
+            (oversized.as_slice(), io::ErrorKind::InvalidData),
+            (wrong_id.as_slice(), io::ErrorKind::InvalidData),
+            (invalid_utf8.as_slice(), io::ErrorKind::InvalidData),
+        ] {
+            let (mut input, mut writer) = UnixStream::pair().unwrap();
+            writer.write_all(bytes).unwrap();
+            drop(writer);
+            let mut ids = OpIds::default();
+            assert!(matches!(remote_frame(&mut input, 3, &mut ids, Instant::now() + IO), Err(error) if error.kind() == kind));
+            assert_eq!(ids.next_id().unwrap(), 1);
+        }
+    }
+
+    #[test]
+    fn private_frames_keep_close_and_operation_ids_separate() {
+        let (mut input, mut writer) = UnixStream::pair().unwrap();
+        let frame = Operation::<&str>::Compare.encode(7, 1).unwrap();
+        writer.write_all(&frame.header).unwrap();
+        writer.write_all(&Response::Closed { id: 7 }.encode().unwrap()).unwrap();
+        writer.write_all(&frame.header).unwrap();
+        let mut ids = OpIds::default();
+        let deadline = Instant::now() + IO;
+        assert!(matches!(remote_frame(&mut input, 7, &mut ids, deadline), Ok(RemoteFrame::Operation(1, Operation::Compare))));
+        assert!(matches!(remote_frame(&mut input, 7, &mut ids, deadline), Ok(RemoteFrame::Close(Response::Closed { id: 7 }))));
+        assert!(matches!(remote_frame(&mut input, 7, &mut ids, deadline), Err(error) if error.kind() == io::ErrorKind::InvalidData));
+    }
+
+    #[test]
+    fn relay_rejects_an_operation_without_an_active_open() {
+        let (_dir, path, mut client, worker) = relay_fixture();
+        registered_relay(&path, &mut client);
+        let frame = Operation::<&str>::Compare.encode(1, 1).unwrap();
+        send(&mut client, &frame.header).unwrap();
+        assert_eq!(worker.join().unwrap().unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
