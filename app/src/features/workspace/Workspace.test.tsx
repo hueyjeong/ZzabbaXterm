@@ -1737,10 +1737,11 @@ describe("현재 SSH 세션의 SFTP", () => {
     await changeInput("HTTPS 출처", target.origin);
     await changeInput("서명 리전", target.region);
     await changeInput("키링 항목 ID", "fixture-key");
-    const scopeSelect = find<HTMLSelectElement>('.workspace-storage:not([hidden]) select[aria-label="연결 범위"]');
+    const scopeSelect = [...panel.querySelectorAll("select")].find(select => select.labels?.[0]?.firstChild?.textContent === "연결 범위");
+    expect(scopeSelect).toBeDefined();
     await act(async () => {
-      scopeSelect.value = "service_browse";
-      scopeSelect.dispatchEvent(new Event("change", { bubbles: true }));
+      scopeSelect!.value = "service_browse";
+      scopeSelect!.dispatchEvent(new Event("change", { bubbles: true }));
     });
     await press("설정 저장 및 연결");
     const opens = connectionCalls("storage_compatible_open");
