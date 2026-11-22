@@ -1705,7 +1705,7 @@ describe("현재 SSH 세션의 SFTP", () => {
       if (command === "storage_compatible_open") return {
         ok: true, value: {
           sessionId, target,
-          initialBuckets: { rows: [{ name: "fixture-bucket", region: target.region }], nextToken: null }
+          initial: { kind: "buckets", page: { rows: [{ name: "fixture-bucket", region: target.region }], nextToken: null } }
         }
       };
       if (command === "storage_close") {
@@ -1737,9 +1737,15 @@ describe("현재 SSH 세션의 SFTP", () => {
     await changeInput("HTTPS 출처", target.origin);
     await changeInput("서명 리전", target.region);
     await changeInput("키링 항목 ID", "fixture-key");
+    const scopeSelect = find<HTMLSelectElement>('.workspace-storage:not([hidden]) select[aria-label="연결 범위"]');
+    await act(async () => {
+      scopeSelect.value = "service_browse";
+      scopeSelect.dispatchEvent(new Event("change", { bubbles: true }));
+    });
     await press("설정 저장 및 연결");
     const opens = connectionCalls("storage_compatible_open");
     expect(opens).toHaveLength(1);
+    expect(opens[0][1].request).toMatchObject({ scope: { kind: "service_browse" } });
     const { sessionId } = opens[0][1].request as { sessionId: string };
     expect(sessionId).toBeTruthy();
     const bucket = button("fixture-bucket");

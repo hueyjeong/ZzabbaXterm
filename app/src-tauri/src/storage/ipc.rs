@@ -48,7 +48,7 @@ pub(crate) struct Session {
     location: Option<SavedLocation>,
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct SavedLocation {
     bucket: String,
     prefix: String,
@@ -70,6 +70,7 @@ struct Tab {
     expired: bool,
     logging_in: bool,
     listing: bool,
+    fixed_bucket: Option<String>,
     verified_bucket: Option<(String, String)>,
     edits: Edits,
 }
@@ -85,6 +86,7 @@ impl Tab {
             expired: false,
             logging_in: false,
             listing: false,
+            fixed_bucket: None,
             verified_bucket: None,
             edits: Edits::default(),
         }
@@ -277,8 +279,15 @@ impl StorageIpc {
         }
     }
 
-    fn insert_compatible_tab(registry: &mut Registry, session_id: String, document: Document, client: CompatibleS3) {
-        registry.tabs.insert(session_id, Tab::new(document, TabClient::Compatible(Arc::new(client))));
+    fn insert_compatible_tab(
+        registry: &mut Registry, session_id: String, document: Document, client: CompatibleS3, location: Option<&SavedLocation>,
+    ) {
+        let mut tab = Tab::new(document, TabClient::Compatible(Arc::new(client)));
+        if let Some(location) = location {
+            tab.fixed_bucket = Some(location.bucket.clone());
+            tab.verified_bucket = Some((location.bucket.clone(), location.region.clone()));
+        }
+        registry.tabs.insert(session_id, tab);
     }
 
     fn close(&self, document: &Document, session_id: &str) -> bool {
@@ -492,6 +501,9 @@ impl StorageIpc {
             let tab = registry.tab(document, &request.session_id).ok_or_else(|| unavailable(stage))?;
             if tab.listing || tab.logging_in { return Err(unavailable(stage)); }
             if tab.expired { return Err(Error::at(stage, Failure::SsoLoginRequired)); }
+            if tab.fixed_bucket.as_ref().is_some_and(|bucket| *bucket != request.bucket) {
+                return Err(Error::at(stage, Failure::Destination));
+            }
             if let TabClient::Compatible(client) = &tab.client && request.region != client.target().region {
                 return Err(Error::at(stage, Failure::InvalidRegion));
             }
@@ -653,6 +665,9 @@ impl StorageIpc {
             .tab(document, session_id)
             .ok_or_else(|| unavailable(stage))?;
         if tab.logging_in { return Err(unavailable(stage)); }
+        if stage == Stage::ListBuckets && tab.fixed_bucket.is_some() {
+            return Err(Error::at(stage, Failure::Destination));
+        }
         Ok((tab.client.clone(), tab.closed.subscribe()))
     }
 
@@ -1121,12 +1136,12 @@ pub(crate) fn dispatch<R: tauri::Runtime>(invoke: Invoke<R>) -> bool {
         }
         "storage_compatible_open" => {
             let item = CommandItem { name: "storage_compatible_open", key: "request", plugin: None, message: &message, acl: &acl };
-            let compatible::OpenCommand { session_id, target } = match compatible::OpenCommand::from_command(item) {
+            let request = match compatible::OpenCommand::from_command(item) {
                 Ok(request) => request,
                 Err(error) => { resolver.invoke_error(error); return true; }
             };
-            let reserved = webview.state::<StorageIpc>().reserve_compatible(&document, &session_id);
-            resolver.respond_async(compatible::open(webview, document, target, session_id, reserved));
+            let reserved = webview.state::<StorageIpc>().reserve_compatible(&document, &request.session_id);
+            resolver.respond_async(compatible::open(webview, document, request, reserved));
         }
         "storage_open" => {
             let item = CommandItem { name: "storage_open", key: "request", plugin: None, message: &message, acl: &acl };
@@ -1331,7 +1346,7 @@ mod tests {
         let document = state.document("main");
         let id = Uuid::new_v4();
         let session_id = id.to_string();
-        StorageIpc::insert_compatible_tab(&mut state.0.lock().unwrap(), session_id.clone(), document.clone(), client);
+        StorageIpc::insert_compatible_tab(&mut state.0.lock().unwrap(), session_id.clone(), document.clone(), client, None);
         let list = || BucketPageRequest { session_id: session_id.clone(), token: None };
         assert!(state.list_buckets(&state.document("other"), list()).await.is_err());
         assert_eq!(state.list_buckets(&document, list()).await.unwrap().rows, [BucketRow { name: BUCKET.into(), region: REGION.into() }]);

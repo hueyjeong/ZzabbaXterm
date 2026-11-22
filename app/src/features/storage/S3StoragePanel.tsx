@@ -3,7 +3,7 @@ import type { VersionedFilesStatus } from "../files/FileBrowser";
 import { ObjectTable } from "./ObjectTable";
 import type { BucketRow, ObjectRow, S3Actions, S3FileSelection, S3Location, S3Session, StorageEditorOpen } from "./s3";
 import { StorageProblem, TransferStatus, type Problem, type Transfer } from "./StorageStatus";
-import type { CompatibleBucketPage } from "./compatible-settings";
+import type { CompatibleSession } from "./compatible-settings";
 import { bindStorageEditor } from "./storageEditorIpc";
 import { countPreviousFiles } from "./storageIpc";
 import "./storage.css";
@@ -30,7 +30,7 @@ const initial: View = { confirmed: false, loading: false, selectedKey: null, upl
 
 type Props = Readonly<{
   session: S3Session;
-  initialBuckets?: CompatibleBucketPage;
+  initialPage?: CompatibleSession["initial"];
   actions: S3Actions;
   onRelogin?: () => void;
   refresh?: number;
@@ -39,10 +39,18 @@ type Props = Readonly<{
   countHistory?: typeof countPreviousFiles;
 }>;
 
-export function S3StoragePanel({ session, initialBuckets, actions, onRelogin, refresh = 0, editEnabled = true, onEditFile, countHistory = countPreviousFiles }: Props) {
+export function S3StoragePanel({ session, initialPage, actions, onRelogin, refresh = 0, editEnabled = true, onEditFile, countHistory = countPreviousFiles }: Props) {
+  const fixedLocation = initialPage?.kind === "objects" ? initialPage.location : undefined;
   const [views, setViews] = useState(() => {
     const initialViews = new Map<string, View>();
-    if (initialBuckets) initialViews.set(session.sessionId, { ...initial, listing: { kind: "buckets", ...initialBuckets } });
+    if (initialPage?.kind === "buckets") {
+      initialViews.set(session.sessionId, { ...initial, listing: { kind: "buckets", ...initialPage.page } });
+    } else if (initialPage?.kind === "objects") {
+      const { location, page } = initialPage;
+      initialViews.set(session.sessionId, {
+        ...initial, input: location, requestedLocation: location, confirmed: true, listing: { kind: "objects", location, ...page },
+      });
+    }
     return initialViews;
   });
   const [history, setHistory] = useState<{ request: Parameters<typeof countPreviousFiles>[0]; count: typeof countPreviousFiles; status: VersionedFilesStatus }>();
@@ -63,7 +71,7 @@ export function S3StoragePanel({ session, initialBuckets, actions, onRelogin, re
   }
 
   async function load(location: S3Location | null, token: string | null = null, afterRelogin = false) {
-    if (view.loading) return;
+    if (view.loading || (fixedLocation && (location?.bucket !== fixedLocation.bucket || location.region !== fixedLocation.region))) return;
     editAttempt.current = null;
     update(current => ({
       loading: true, requestedLocation: location, problem: undefined, editError: undefined,
@@ -250,15 +258,15 @@ export function S3StoragePanel({ session, initialBuckets, actions, onRelogin, re
         ` · ${compatible.serviceId} · ${session.endpoint} · ${compatible.addressing === "path" ? "경로" : "가상 호스트"}`}</span>
     </header>
     <form className="storage-controls" onSubmit={event => { event.preventDefault(); if (input.bucket && input.region && !view.loading && !transferring) open(input); }}>
-      {([["버킷", "bucket"], ["접두어", "prefix"], ["리전", "region"]] as const).map(([label, field]) =>
+      {([["버킷", "bucket"], ["접두어", "prefix"], ["리전", "region"]] as const).filter(([, field]) => !fixedLocation || field === "prefix").map(([label, field]) =>
         <label key={field}>{field === "region" && compatible ? "서명 리전" : label}<input value={input[field]} readOnly={field === "region" && !!compatible} disabled={view.loading || transferring} onChange={event => {
           if (field === "region" && compatible) return;
           const value = event.target.value;
           editAttempt.current = null;
           update(() => ({ input: { ...input, [field]: value }, confirmed: false }));
         }} /></label>)}
-      <button type="submit" disabled={!input.bucket || !input.region || view.loading || transferring}>버킷 열기</button>
-      <button type="button" disabled={view.loading || transferring} onClick={() => void load(null)}>버킷 목록</button>
+      <button type="submit" disabled={!input.bucket || !input.region || view.loading || transferring}>{fixedLocation ? "접두어 열기" : "버킷 열기"}</button>
+      {!fixedLocation && <button type="button" disabled={view.loading || transferring} onClick={() => void load(null)}>버킷 목록</button>}
     </form>
     {view.problem && <StorageProblem problem={view.problem} session={session} />}
     {view.editError && <p role="alert">파일 열기 실패: {view.editError}</p>}

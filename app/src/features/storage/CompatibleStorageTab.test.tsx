@@ -4,6 +4,8 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { CompatibleStorageTab } from "./CompatibleStorageTab";
+import { S3StoragePanel } from "./S3StoragePanel";
+import { storageActions } from "./storageIpc";
 import type { CompatibleSession, CompatibleSettingsView } from "./compatible-settings";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -16,6 +18,8 @@ const saved = { ...settings, revision: "fixture-revision" };
 const { origin, ...fieldsSent } = settings;
 const input = { ...fieldsSent, endpoint: origin };
 const firstPage = { rows: [{ name: "fixture-bucket", region: settings.region }], nextToken: "page-2" };
+const browseScope = { kind: "service_browse" } as const;
+const initialBuckets = { kind: "buckets", page: firstPage } as const;
 let host: HTMLDivElement;
 let root: Root;
 let closeRef: RefObject<{ confirmClose(): Promise<void> } | null>;
@@ -29,6 +33,12 @@ const click = (label: string) => act(async () => {
   const button = Array.from(host.querySelectorAll("button")).find(button => button.textContent === label);
   if (!button) throw new Error(`버튼 없음: ${label}`);
   button.click();
+});
+const chooseScope = (kind: "service_browse" | "bucket") => act(async () => {
+  const select = Array.from(host.querySelectorAll("label")).find(label => label.firstChild?.textContent === "연결 범위")?.querySelector("select");
+  if (!select) throw new Error("연결 범위 선택란이 없습니다");
+  select.value = kind;
+  select.dispatchEvent(new Event("change", { bubbles: true }));
 });
 
 function sessionIdFrom(payload: Parameters<typeof invoke>[1]) {
@@ -74,10 +84,14 @@ it("키 등록은 비밀 없는 설정만 전송하고 키링 ID를 채운 뒤 �
   expect(ipc).toHaveBeenCalledTimes(1);
 
   await click("설정 저장 및 연결");
+  expect(ipc).toHaveBeenCalledTimes(1);
+  await chooseScope("service_browse");
+  expect(fields()).toHaveLength(5);
+  await click("설정 저장 및 연결");
   const sessionId = sessionIdFrom(ipc.mock.calls[1][1]);
   expect(sessionId).not.toBe(enrollmentId);
   expect(ipc).toHaveBeenNthCalledWith(2, "storage_compatible_open", {
-    request: { sessionId, target: { kind: "select", settings: input, itemId: "new-key" } },
+    request: { sessionId, target: { kind: "select", settings: input, itemId: "new-key" }, scope: browseScope },
   });
 });
 
@@ -175,10 +189,11 @@ it("동일 출처의 설정 수정은 저장된 전체 스냅샷을 보내고 �
   const endpoint = "https://STORAGE.example.test:443/";
   await fill(2, endpoint);
   expect(fields()).toHaveLength(4);
+  await chooseScope("service_browse");
   await click("호환 스토리지 연결");
   const sessionId = sessionIdFrom(ipc.mock.calls[1][1]);
   expect(ipc).toHaveBeenNthCalledWith(2, "storage_compatible_open", {
-    request: { sessionId, target: { kind: "revise", expected: saved, settings: { ...input, alias: "수정한 별칭", endpoint } } },
+    request: { sessionId, target: { kind: "revise", expected: saved, settings: { ...input, alias: "수정한 별칭", endpoint } }, scope: browseScope },
   });
   expect(host.querySelector('[role="alert"]')?.textContent).toContain("버킷 목록: 권한 거부 (403 AccessDenied)");
   await fill(2, "https://other.example.test");
@@ -192,10 +207,11 @@ it("서비스 ID가 바뀌면 같은 출처라도 항목을 다시 지정한다"
   await fill(0, "other-service");
   expect(fields()[4].value).toBe("");
   await fill(4, "other-service-key");
+  await chooseScope("service_browse");
   await click("설정 저장 및 연결");
   const sessionId = sessionIdFrom(ipc.mock.calls[1][1]);
   expect(ipc).toHaveBeenNthCalledWith(2, "storage_compatible_open", {
-    request: { sessionId, target: { kind: "select", settings: { ...input, serviceId: "other-service" }, itemId: "other-service-key" } },
+    request: { sessionId, target: { kind: "select", settings: { ...input, serviceId: "other-service" }, itemId: "other-service-key" }, scope: browseScope },
   });
 });
 
@@ -210,14 +226,15 @@ it("출처 변경 시 키링 참조를 비우고, 종료 후 도착한 연결 �
   await fill(2, settings.origin);
   expect(fields()[4].value).toBe("");
   await fill(4, "new-reference");
+  await chooseScope("service_browse");
   await click("설정 저장 및 연결");
   const sessionId = sessionIdFrom(ipc.mock.calls[0][1]);
   expect(ipc).toHaveBeenNthCalledWith(1, "storage_compatible_open", {
-    request: { sessionId, target: { kind: "select", itemId: "new-reference", settings: input } },
+    request: { sessionId, target: { kind: "select", itemId: "new-reference", settings: input }, scope: browseScope },
   });
   await act(async () => {
     await Promise.all([closeRef.current!.confirmClose(), closeRef.current!.confirmClose()]);
-    pending.resolve({ ok: true, value: { sessionId, target: settings, initialBuckets: firstPage } });
+    pending.resolve({ ok: true, value: { sessionId, target: settings, initial: initialBuckets } });
   });
   expect(ipc).toHaveBeenLastCalledWith("storage_close", { request: { sessionId } });
   expect(ipc).toHaveBeenCalledTimes(2);
@@ -231,7 +248,7 @@ it("저장된 설정은 키링 참조 없이 열고 동일 세션으로 버킷 �
       case "storage_compatible_load": return { ok: true, value: saved };
       case "storage_compatible_open":
         sessionId = sessionIdFrom(payload);
-        return { ok: true, value: { sessionId, target: settings, initialBuckets: firstPage } };
+        return { ok: true, value: { sessionId, target: settings, initial: initialBuckets } };
       case "storage_list_buckets": return { ok: true, value: { rows: [{ name: "second-bucket", region: settings.region }], nextToken: null } };
       case "storage_list_objects": return { ok: true, value: { rows: [{ kind: "object", key: "한글.txt", bytes: 3 }], nextToken: null } };
       case "storage_select_local_file": return { kind: "approved", approvalId: "fixture-approval" };
@@ -243,10 +260,13 @@ it("저장된 설정은 키링 참조 없이 열고 동일 세션으로 버킷 �
   await fill(0, settings.serviceId);
   await click("저장된 설정 불러오기");
   expect(fields().map(field => field.value)).toEqual([settings.serviceId, settings.alias, settings.origin, settings.region]);
+  await chooseScope("service_browse");
   await click("호환 스토리지 연결");
   expect(host.textContent).toContain(settings.origin);
   expect(host.textContent).not.toContain("SSO");
-  expect(ipc).toHaveBeenNthCalledWith(2, "storage_compatible_open", { request: { sessionId, target: { kind: "saved", expected: saved } } });
+  expect(ipc).toHaveBeenNthCalledWith(2, "storage_compatible_open", {
+    request: { sessionId, target: { kind: "saved", expected: saved }, scope: browseScope },
+  });
   expect(host.textContent).toContain("fixture-bucket");
   expect(ipc).toHaveBeenCalledTimes(2);
   await click("다음 페이지");
@@ -265,6 +285,94 @@ it("저장된 설정은 키링 참조 없이 열고 동일 세션으로 버킷 �
   expect(ipc).toHaveBeenCalledTimes(7);
 });
 
+it("버킷 전용 연결은 첫 객체 페이지를 재사용하고 같은 버킷에서만 탐색하고 전송한다", async () => {
+  const location = { bucket: "fixed-bucket", prefix: "실험// ", region: settings.region };
+  const key = `${location.prefix}한글.txt`;
+  const nextPrefix = `${location.prefix}하위/`;
+  const initial: CompatibleSession["initial"] = { kind: "objects", location, page: {
+    rows: [{ kind: "prefix", prefix: nextPrefix }, { kind: "object", key, bytes: 3 }], nextToken: "objects-2",
+  } };
+  ipc.mockImplementation(async (command, payload) => {
+    switch (command) {
+      case "storage_compatible_open": return { ok: true, value: { sessionId: sessionIdFrom(payload), target: settings, initial } };
+      case "storage_list_objects": return { ok: true, value: { rows: [], nextToken: null } };
+      case "storage_select_local_file": return { kind: "approved", approvalId: "fixture-approval" };
+      case "storage_download": return { ok: true, value: { bytes: 3, integrity: "lengthOnly" } };
+      case "storage_upload": return { ok: true, value: 3 };
+      default: throw new Error(`예상하지 않은 요청: ${command}`);
+    }
+  });
+  await fillSettings();
+  await fill(4, "bucket-key");
+  await chooseScope("bucket");
+  expect(fields()).toHaveLength(7);
+  await click("설정 저장 및 연결");
+  expect(ipc).not.toHaveBeenCalled();
+  await fill(5, location.bucket);
+  await fill(6, location.prefix);
+  await click("설정 저장 및 연결");
+  const sessionId = sessionIdFrom(ipc.mock.calls[0][1]);
+  expect(ipc).toHaveBeenCalledExactlyOnceWith("storage_compatible_open", {
+    request: { sessionId, target: { kind: "select", settings: input, itemId: "bucket-key" },
+      scope: { kind: "bucket", bucket: location.bucket, prefix: location.prefix } },
+  });
+  expect(host.querySelector('[aria-label="객체 목록"]')?.textContent).toContain(key);
+  expect(host.querySelector('[aria-label="버킷 목록"]')).toBeNull();
+  expect([...host.querySelectorAll("button")].map(button => button.textContent)).not.toContain("버킷 목록");
+  expect(host.querySelector(".storage-location strong")?.textContent).toBe(location.bucket);
+  expect([...host.querySelectorAll("label")].filter(label => label.querySelector("input")).map(label => label.textContent))
+    .toEqual(["접두어", "업로드 전체 키"]);
+
+  await click(key);
+  await click("다운로드");
+  const target = { sessionId, bucket: location.bucket, region: location.region, key };
+  expect(ipc).toHaveBeenCalledWith("storage_select_local_file", { request: { ...target, direction: "download" } });
+  expect(ipc).toHaveBeenCalledWith("storage_download", { request: { ...target, approvalId: "fixture-approval" } });
+  expect(host.textContent).toContain("다운로드 완료: 3 바이트");
+  const uploadTarget = { ...target, key: `${location.prefix}새 파일.txt` };
+  await fill(1, uploadTarget.key);
+  await click("업로드");
+  expect(ipc).toHaveBeenCalledWith("storage_select_local_file", { request: { ...uploadTarget, direction: "upload" } });
+  expect(ipc).toHaveBeenCalledWith("storage_upload", { request: { ...uploadTarget, approvalId: "fixture-approval" } });
+  expect(host.textContent).toContain("업로드 완료: 3 바이트");
+
+  await click("다음 페이지");
+  await click(nextPrefix);
+  await fill(0, "");
+  await click("접두어 열기");
+  expect(ipc.mock.calls.filter(([command]) => command === "storage_list_buckets")).toHaveLength(0);
+  expect(ipc.mock.calls.filter(([command]) => command === "storage_list_objects")).toEqual([
+    ["storage_list_objects", { request: { sessionId, ...location, token: "objects-2" } }],
+    ["storage_list_objects", { request: { sessionId, ...location, token: null, prefix: nextPrefix } }],
+    ["storage_list_objects", { request: { sessionId, ...location, token: null, prefix: "" } }],
+  ]);
+});
+
+it("기존 AWS 패널은 초기 위치를 조회하고 버킷 목록에서 다른 버킷을 열 수 있다", async () => {
+  const sessionId = "aws-fixture";
+  const location = { bucket: "first-bucket", prefix: "start/", region: "ap-northeast-2" };
+  const other = { bucket: "other-bucket", prefix: "", region: "eu-west-1" };
+  ipc.mockImplementation(async command => {
+    if (command === "storage_list_objects") return { ok: true, value: { rows: [], nextToken: null } };
+    if (command === "storage_count_previous_files") return { ok: true, value: 0 };
+    if (command === "storage_list_buckets") return { ok: true, value: { rows: [{ name: other.bucket, region: other.region }], nextToken: null } };
+    throw new Error(`예상하지 않은 요청: ${command}`);
+  });
+  await act(async () => root.render(<S3StoragePanel actions={storageActions} session={{
+    sessionId, profile: "aws-sso", region: location.region, endpoint: "https://s3.ap-northeast-2.amazonaws.com", location,
+  }} />));
+  expect(host.querySelector('[aria-label="AWS S3"]')).not.toBeNull();
+  expect(fields().slice(0, 3).map(field => field.value)).toEqual([location.bucket, location.prefix, location.region]);
+  await click("버킷 목록");
+  await click(other.bucket);
+  expect(host.querySelector(".storage-location strong")?.textContent).toBe(other.bucket);
+  expect(ipc.mock.calls.filter(([command]) => command === "storage_list_buckets" || command === "storage_list_objects")).toEqual([
+    ["storage_list_objects", { request: { sessionId, ...location, token: null } }],
+    ["storage_list_buckets", { request: { sessionId, token: null } }],
+    ["storage_list_objects", { request: { sessionId, ...other, token: null } }],
+  ]);
+});
+
 it("종료 응답이 유실되면 같은 세션 ID로 다시 종료를 확인한다", async () => {
   const pending = Promise.withResolvers<{ ok: false; error: "cancelled" }>();
   ipc.mockResolvedValueOnce({ ok: true, value: saved })
@@ -273,6 +381,7 @@ it("종료 응답이 유실되면 같은 세션 ID로 다시 종료를 확인한
     .mockResolvedValueOnce(false);
   await fill(0, settings.serviceId);
   await click("저장된 설정 불러오기");
+  await chooseScope("service_browse");
   await click("호환 스토리지 연결");
   const sessionId = sessionIdFrom(ipc.mock.calls[1][1]);
   await act(async () => {

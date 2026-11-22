@@ -5,10 +5,10 @@ use tauri::Manager;
 use tokio::sync::watch;
 use uuid::Uuid;
 
-use super::{Document, Registry, StorageIpc, confirm_native};
-use crate::storage::{BucketRow, Error, Page};
+use super::{Document, Registry, SavedLocation, StorageIpc, confirm_native};
+use crate::storage::{BucketRow, Error, Failure, ObjectRow, Page, Stage};
 use crate::storage::compatible::{
-    AddressStyle, CompatibleS3, opaque_id,
+    AddressStyle, CompatibleS3, bucket_list_endpoint, opaque_id,
     settings::{ConnectIntent, SavedSettingsView, Settings, SettingsError, SettingsInput, SettingsView, StagedSettings},
 };
 
@@ -30,7 +30,37 @@ pub(super) enum OpenRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct OpenCommand {
     pub(super) session_id: String,
-    pub(super) target: OpenRequest,
+    target: OpenRequest,
+    scope: OpenScope,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum OpenScope {
+    ServiceBrowse,
+    Bucket { bucket: String, prefix: String },
+}
+
+impl OpenScope {
+    fn approval_target(&self, target: &SettingsView) -> Result<String, Error> {
+        match self {
+            Self::ServiceBrowse => Ok(format!("서비스 전체 버킷 목록: {}/", target.origin)),
+            Self::Bucket { bucket, prefix } => {
+                if prefix.len() > 1024 {
+                    return Err(Error::at(Stage::ListObjects, Failure::Request));
+                }
+                let endpoint = bucket_list_endpoint(&target.origin, target.addressing, bucket)?;
+                Ok(format!("버킷 주소: {endpoint}\n접두어: {prefix:?}"))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum InitialPage {
+    Buckets { page: Page<BucketRow> },
+    Objects { location: SavedLocation, page: Page<ObjectRow> },
 }
 
 #[derive(Serialize)]
@@ -38,7 +68,7 @@ pub(super) struct OpenCommand {
 pub(super) struct CompatibleSession {
     session_id: String,
     target: SettingsView,
-    initial_buckets: Page<BucketRow>,
+    initial: InitialPage,
 }
 
 #[derive(Serialize)]
@@ -67,6 +97,12 @@ pub(super) enum OpenError {
 impl From<SettingsError> for OpenError {
     fn from(error: SettingsError) -> Self {
         Self::Settings(error)
+    }
+}
+
+impl From<Error> for OpenError {
+    fn from(connection: Error) -> Self {
+        Self::Connection { connection }
     }
 }
 
@@ -105,7 +141,7 @@ struct PreparedOpen {
     client: CompatibleS3,
     target: SettingsView,
     settings: Option<StagedSettings>,
-    initial_buckets: Page<BucketRow>,
+    initial: InitialPage,
     approved_saved: ApprovedSaved,
 }
 
@@ -127,12 +163,28 @@ impl ApprovedSaved {
     }
 }
 
-async fn verify_open(client: &CompatibleS3, closed: &watch::Sender<bool>) -> Result<Page<BucketRow>, OpenError> {
+async fn verify_open(client: &CompatibleS3, scope: OpenScope, closed: &watch::Sender<bool>) -> Result<InitialPage, OpenError> {
     let mut cancelled = closed.subscribe();
+    let stage = match &scope {
+        OpenScope::ServiceBrowse => Stage::ListBuckets,
+        OpenScope::Bucket { .. } => Stage::ListObjects,
+    };
+    let first_page = async {
+        match scope {
+            OpenScope::ServiceBrowse => client.list_buckets(None).await.map(|page| InitialPage::Buckets { page }),
+            OpenScope::Bucket { bucket, prefix } => {
+                let page = client.list_objects(&bucket, &prefix, None).await?;
+                let location = SavedLocation { bucket, prefix, region: client.target().region.clone() };
+                Ok(InitialPage::Objects { location, page })
+            }
+        }
+    };
     tokio::select! {
         biased;
         _ = cancelled.wait_for(|closed| *closed) => Err(SettingsError::Cancelled.into()),
-        page = client.verify_connection() => page.map_err(|connection| OpenError::Connection { connection }),
+        page = tokio::time::timeout(std::time::Duration::from_secs(10), first_page) => page
+            .map_err(|_| Error::at(stage, Failure::TimedOut))?
+            .map_err(|error| error.operation.into()),
     }
 }
 
@@ -177,7 +229,7 @@ impl StorageIpc {
             return Err(SettingsError::Cancelled.into());
         }
         registry.pending_compatible.remove(&id);
-        let PreparedOpen { client, target, settings, initial_buckets, .. } = prepared?;
+        let PreparedOpen { client, target, settings, initial, .. } = prepared?;
         let _file_lock = match file_lock {
             Ok(lock) => lock,
             Err(error) => {
@@ -195,17 +247,22 @@ impl StorageIpc {
                 return Err(SettingsError::Io.into());
             }
         };
-        Self::insert_compatible_tab(&mut registry, id.clone(), document, client);
+        let location = match &initial {
+            InitialPage::Buckets { .. } => None,
+            InitialPage::Objects { location, .. } => Some(location),
+        };
+        Self::insert_compatible_tab(&mut registry, id.clone(), document, client, location);
         drop(registry);
         drop(published);
-        Ok(CompatibleSession { session_id: id, target, initial_buckets })
+        Ok(CompatibleSession { session_id: id, target, initial })
     }
 }
 
-pub(super) async fn open<R: tauri::Runtime>(webview: tauri::Webview<R>, document: Document, request: OpenRequest, session_id: String,
+pub(super) async fn open<R: tauri::Runtime>(webview: tauri::Webview<R>, document: Document, command: OpenCommand,
     reserved: Result<Arc<watch::Sender<bool>>, SettingsError>,
 ) -> Result<Reply<CompatibleSession, OpenError>, tauri::ipc::InvokeError> {
     let closed = match reserved { Ok(closed) => closed, Err(error) => return Ok(Err(error.into()).into()) };
+    let OpenCommand { session_id, target: request, scope } = command;
     let app = webview.app_handle().clone();
     let approved = async {
         let id = match &request {
@@ -241,16 +298,17 @@ pub(super) async fn open<R: tauri::Runtime>(webview: tauri::Webview<R>, document
             }
         }).await.map_err(|_| SettingsError::Io)??;
         let view = settings.view();
+        let approval_target = scope.approval_target(&view)?;
         let style = match view.addressing {
             AddressStyle::Path => "경로",
             AddressStyle::VirtualHosted => "가상 호스트",
         };
-        let prompt = format!("서비스: {} ({})\nHTTPS 출처: {}\n서명 리전: {}\n주소 방식: {}\n키링 항목: {}",
+        let prompt = format!("서비스: {} ({})\nHTTPS 출처: {}\n서명 리전: {}\n주소 방식: {}\n키링 항목: {}\n{approval_target}",
             view.alias, view.service_id, view.origin, view.region, style, settings.item_id());
         if !confirm_native(webview.window(), "S3 호환 키링 항목 사용", prompt, closed.subscribe()).await {
-            return Err(SettingsError::Cancelled);
+            return Err(SettingsError::Cancelled.into());
         }
-        Ok((settings, save.then_some(path), view, approved_saved))
+        Ok::<_, OpenError>((settings, save.then_some(path), view, approved_saved))
     }.await;
     let prepared = async {
         let (settings, path, target, approved_saved) = approved?;
@@ -291,16 +349,16 @@ pub(super) async fn open<R: tauri::Runtime>(webview: tauri::Webview<R>, document
         if !webview.state::<StorageIpc>().0.lock().unwrap().compatible_is_pending(&document, &session_id, &closed) {
             return Err(SettingsError::Cancelled.into());
         }
-        let initial_buckets = verify_open(&client, &closed).await?;
-        Ok((client, target, settings, path, initial_buckets, approved_saved))
+        let initial = verify_open(&client, scope, &closed).await?;
+        Ok((client, target, settings, path, initial, approved_saved))
     }.await;
     let result = tauri::async_runtime::spawn_blocking(move || {
-        let prepared = prepared.and_then(|(client, target, settings, path, initial_buckets, approved_saved)| {
+        let prepared = prepared.and_then(|(client, target, settings, path, initial, approved_saved)| {
             let settings = path.map(|path| {
                 std::fs::create_dir_all(path.parent().unwrap()).map_err(|_| SettingsError::Io)?;
                 settings.stage_save(path)
             }).transpose()?;
-            Ok(PreparedOpen { client, target, settings, initial_buckets, approved_saved })
+            Ok(PreparedOpen { client, target, settings, initial, approved_saved })
         });
         webview.state::<StorageIpc>().finish_compatible(document, session_id, &closed, prepared)
     }).await.unwrap_or_else(|_| Err(SettingsError::Io.into()));

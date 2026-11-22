@@ -182,15 +182,6 @@ impl CompatibleS3 {
             .map_err(|err| self.with_target(err))
     }
 
-    pub(super) async fn verify_connection(&self) -> Result<Page<BucketRow>, Error> {
-        tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            self.operations.list_buckets(None, &self.target.region),
-        )
-        .await
-        .map_err(|_| Error::at(super::Stage::ListBuckets, Failure::TimedOut))?
-    }
-
     pub(crate) async fn list_objects(
         &self,
         bucket: &str,
@@ -356,6 +347,24 @@ fn https_port(authority: &http::uri::Authority) -> Option<u16> {
         "" => Some(443),
         suffix if suffix.starts_with(':') => authority.port_u16().filter(|port| *port != 0),
         _ => None,
+    }
+}
+
+pub(super) fn bucket_list_endpoint(origin: &str, style: AddressStyle, bucket: &str) -> Result<String, Error> {
+    use super::Stage::ListObjects;
+
+    super::check_bucket(bucket, ListObjects)?;
+    match style {
+        AddressStyle::Path => Ok(format!("{origin}/{bucket}/")),
+        AddressStyle::VirtualHosted => {
+            let authority = origin.strip_prefix("https://").ok_or_else(|| Error::at(ListObjects, Failure::Destination))?;
+            let host = authority.split(':').next().unwrap_or_default();
+            // SDK는 점이 있는 버킷을 HTTPS 가상 호스트로 사용하지 않는다.
+            if bucket.contains('.') || bucket.len() + 1 + host.len() > 253 {
+                return Err(Error::at(ListObjects, Failure::Destination));
+            }
+            Ok(format!("https://{bucket}.{authority}/"))
+        }
     }
 }
 
@@ -551,4 +560,4 @@ pub(super) mod keyring;
 
 #[cfg(test)]
 #[path = "compatible/tests.rs"]
-mod tests;
+pub(super) mod tests;

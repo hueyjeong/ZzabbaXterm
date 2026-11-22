@@ -4,7 +4,7 @@ import { S3StoragePanel } from "./S3StoragePanel";
 import { StorageProblem } from "./StorageStatus";
 import type { S3Error } from "./s3";
 import { closeStorage, storageActions } from "./storageIpc";
-import type { CompatibleOpenRequest, CompatibleSavedSettings, CompatibleSession, CompatibleSettingsError, CompatibleSettingsInput } from "./compatible-settings";
+import type { CompatibleOpenRequest, CompatibleOpenScope, CompatibleSavedSettings, CompatibleSession, CompatibleSettingsError, CompatibleSettingsInput } from "./compatible-settings";
 import "./storage.css";
 
 type Result<T, E = CompatibleSettingsError> = { ok: true; value: T } | { ok: false; error: E };
@@ -44,6 +44,9 @@ export function CompatibleStorageTab({ closing, closeRef }: {
   const [input, setInput] = useState(empty);
   const [saved, setSaved] = useState<CompatibleSavedSettings>();
   const [itemId, setItemId] = useState("");
+  const [scopeKind, setScopeKind] = useState<CompatibleOpenScope["kind"] | "">("");
+  const [bucket, setBucket] = useState("");
+  const [prefix, setPrefix] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | { connection: S3Error; sessionId: string }>("");
   const [session, setSession] = useState<CompatibleSession>();
@@ -150,7 +153,8 @@ export function CompatibleStorageTab({ closing, closeRef }: {
   }
 
   async function open() {
-    if (closing || busy || attempt.current) return;
+    if (closing || busy || attempt.current || !scopeKind || (scopeKind === "bucket" && !bucket)) return;
+    const scope: CompatibleOpenScope = scopeKind === "bucket" ? { kind: "bucket", bucket, prefix } : { kind: "service_browse" };
     const target: CompatibleOpenRequest = !reusable ? { kind: "select", settings: input, itemId } :
       input.alias === reusable.alias && input.endpoint === reusable.origin && input.region === reusable.region && input.addressing === reusable.addressing
         ? { kind: "saved", expected: reusable }
@@ -161,7 +165,7 @@ export function CompatibleStorageTab({ closing, closeRef }: {
     setError("");
     try {
       const result = await invoke<Result<CompatibleSession, CompatibleSettingsError | { connection: S3Error }>>(
-        "storage_compatible_open", { request: { sessionId: current.id, target } },
+        "storage_compatible_open", { request: { sessionId: current.id, target, scope } },
       );
       if (current.closing) return;
       if (!result.ok) {
@@ -181,7 +185,7 @@ export function CompatibleStorageTab({ closing, closeRef }: {
 
   if (session) {
     const { target } = session;
-    return <div inert={closing}><S3StoragePanel initialBuckets={session.initialBuckets} actions={storageActions} session={{
+    return <div inert={closing}><S3StoragePanel initialPage={session.initial} actions={storageActions} session={{
       sessionId: session.sessionId, profile: target.alias, region: target.region, endpoint: target.origin,
       compatible: { serviceId: target.serviceId, addressing: target.addressing },
     }} /></div>;
@@ -203,7 +207,19 @@ export function CompatibleStorageTab({ closing, closeRef }: {
           <label>키링 항목 ID<input required value={itemId} onChange={event => setItemId(event.target.value)} /></label>
           <button type="button" disabled={!input.serviceId || !input.alias || !input.endpoint || !input.region} onClick={() => void enroll()}>키 등록</button>
         </>}
-        <button type="submit">{reusable ? "호환 스토리지 연결" : "설정 저장 및 연결"}</button>
+        <label>연결 범위<select required value={scopeKind} onChange={event => {
+          const kind = event.target.value;
+          if (kind === "service_browse" || kind === "bucket") setScopeKind(kind);
+        }}>
+          <option value="" disabled>범위 선택</option>
+          <option value="service_browse">전체 탐색</option>
+          <option value="bucket">버킷 직접 열기</option>
+        </select></label>
+        {scopeKind === "bucket" && <>
+          <label>버킷<input required value={bucket} onChange={event => setBucket(event.target.value)} /></label>
+          <label>접두어<input value={prefix} onChange={event => setPrefix(event.target.value)} /></label>
+        </>}
+        <button type="submit" disabled={!scopeKind || (scopeKind === "bucket" && !bucket)}>{reusable ? "호환 스토리지 연결" : "설정 저장 및 연결"}</button>
       </fieldset>
     </form>
     {busy && <p role="status">호환 스토리지 요청 중</p>}

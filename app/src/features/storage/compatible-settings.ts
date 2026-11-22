@@ -1,4 +1,4 @@
-import type { BucketRow } from "./s3";
+import type { BucketRow, ObjectRow, S3Location } from "./s3";
 
 export type CompatibleAddressing = "path" | "virtual_hosted";
 
@@ -16,7 +16,9 @@ export type CompatibleSettingsView = Readonly<
 
 export type CompatibleSavedSettings = CompatibleSettingsView & Readonly<{ revision: string }>;
 
-export type CompatibleBucketPage = Readonly<{ rows: readonly BucketRow[]; nextToken: string | null }>;
+export type CompatibleOpenScope =
+  | Readonly<{ kind: "service_browse" }>
+  | Readonly<{ kind: "bucket"; bucket: string; prefix: string }>;
 
 export type CompatibleOpenRequest =
   | Readonly<{ kind: "saved"; expected: CompatibleSavedSettings }>
@@ -26,7 +28,9 @@ export type CompatibleOpenRequest =
 export type CompatibleSession = Readonly<{
   sessionId: string;
   target: CompatibleSettingsView;
-  initialBuckets: CompatibleBucketPage;
+  initial:
+    | Readonly<{ kind: "buckets"; page: { rows: readonly BucketRow[]; nextToken: string | null } }>
+    | Readonly<{ kind: "objects"; location: S3Location; page: { rows: readonly ObjectRow[]; nextToken: string | null } }>;
 }>;
 
 export type CompatibleSettingsError =

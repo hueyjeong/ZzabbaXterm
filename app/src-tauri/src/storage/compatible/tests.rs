@@ -632,6 +632,94 @@ impl ResolveDns for LoopbackDns {
     }
 }
 
+pub(in crate::storage) fn loopback_list_client(
+    origin: &str, host: &'static str, path: &'static str, style: AddressStyle, trusted: bool, allowed: bool,
+    service_browse: bool,
+) -> (CompatibleS3, std::thread::JoinHandle<bool>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from_pem_slice(CERT).unwrap()],
+            PrivateKeyDer::from_pem_slice(TEST_PRIVATE_KEY).unwrap(),
+        )
+        .unwrap();
+        let mut tls = rustls::StreamOwned::new(
+            rustls::ServerConnection::new(Arc::new(config)).unwrap(),
+            stream,
+        );
+        let mut byte = [0];
+        if tls.read(&mut byte).ok() != Some(1) {
+            return false;
+        }
+        assert!(allowed, "HTTP reached a TLS identity that should have failed");
+        let mut line = vec![byte[0]];
+        while !line.ends_with(b"\r\n") {
+            assert!(line.len() < 1024);
+            tls.read_exact(&mut byte).unwrap();
+            line.push(byte[0]);
+        }
+        let line = std::str::from_utf8(&line).unwrap();
+        let uri: Uri = line.strip_prefix("GET ").unwrap().split_once(' ').unwrap().0.parse().unwrap();
+        assert_eq!(uri.path().trim_end_matches('/'), path);
+        assert_eq!(uri.query().is_some_and(|query| query.contains("list-type=2")), !service_browse);
+        assert_eq!(tls.conn.server_name(), Some(host));
+        // 헤더 원문을 기록하지 않고 HTTP 헤더의 끝까지만 읽는다.
+        let mut tail = [0, 0, b'\r', b'\n'];
+        while tail != *b"\r\n\r\n" {
+            tls.read_exact(&mut byte).unwrap();
+            tail.rotate_left(1);
+            tail[3] = byte[0];
+        }
+        let body = if service_browse {
+            "<ListAllMyBucketsResult><Buckets/></ListAllMyBucketsResult>"
+        } else {
+            "<ListBucketResult><EncodingType>url</EncodingType><IsTruncated>false</IsTruncated></ListBucketResult>"
+        };
+        write!(
+            tls,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        true
+    });
+    let selected = service(
+        SERVICE,
+        &format!("https://{origin}:{port}"),
+        style,
+    );
+    let reference = ServiceKeyRef::new(&selected, ITEM.into()).unwrap();
+    let mut trust = tls::TrustStore::empty();
+    if trusted {
+        trust = trust.with_pem_certificate(CERT);
+    }
+    let context = tls::TlsContext::builder()
+        .with_trust_store(trust)
+        .build()
+        .unwrap();
+    let client = selected
+        .connect_with(&reference, alias(), fake_key, || {
+            Builder::new().tls_provider(tls::Provider::Rustls(tls::rustls_provider::CryptoMode::AwsLc))
+                .tls_context(context).build_with_resolver(LoopbackDns(host))
+        })
+        .unwrap();
+    (client, server)
+}
+
 #[tokio::test]
 async fn real_https_keeps_chain_and_name_verification_on_loopback() {
     use AddressStyle::{Path, VirtualHosted};
@@ -642,83 +730,7 @@ async fn real_https_keeps_chain_and_name_verification_on_loopback() {
         ("127.0.0.1", "sample", "127.0.0.1", "", Path, true, false),
         ("localhost", "sample", "localhost", "", Path, false, false),
     ] {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            stream
-                .set_write_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let config = rustls::ServerConfig::builder_with_provider(Arc::new(
-                rustls::crypto::aws_lc_rs::default_provider(),
-            ))
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(
-                vec![CertificateDer::from_pem_slice(CERT).unwrap()],
-                PrivateKeyDer::from_pem_slice(TEST_PRIVATE_KEY).unwrap(),
-            )
-            .unwrap();
-            let mut tls = rustls::StreamOwned::new(
-                rustls::ServerConnection::new(Arc::new(config)).unwrap(),
-                stream,
-            );
-            let mut byte = [0];
-            if tls.read(&mut byte).ok() != Some(1) {
-                return false;
-            }
-            assert!(allowed, "HTTP reached a TLS identity that should have failed");
-            let mut line = vec![byte[0]];
-            while !line.ends_with(b"\r\n") {
-                assert!(line.len() < 1024);
-                tls.read_exact(&mut byte).unwrap();
-                line.push(byte[0]);
-            }
-            let line = std::str::from_utf8(&line).unwrap();
-            let uri: Uri = line.strip_prefix("GET ").unwrap().split_once(' ').unwrap().0.parse().unwrap();
-            assert_eq!(uri.path().trim_end_matches('/'), path);
-            assert!(uri.query().is_some_and(|query| query.contains("list-type=2")));
-            assert_eq!(tls.conn.server_name(), Some(host));
-            // 헤더 원문을 기록하지 않고 HTTP 헤더의 끝까지만 읽는다.
-            let mut tail = [0, 0, b'\r', b'\n'];
-            while tail != *b"\r\n\r\n" {
-                tls.read_exact(&mut byte).unwrap();
-                tail.rotate_left(1);
-                tail[3] = byte[0];
-            }
-            let body = "<ListBucketResult><EncodingType>url</EncodingType><IsTruncated>false</IsTruncated></ListBucketResult>";
-            write!(
-                tls,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .unwrap();
-            true
-        });
-        let selected = service(
-            SERVICE,
-            &format!("https://{origin}:{port}"),
-            style,
-        );
-        let reference = ServiceKeyRef::new(&selected, ITEM.into()).unwrap();
-        let mut trust = tls::TrustStore::empty();
-        if trusted {
-            trust = trust.with_pem_certificate(CERT);
-        }
-        let context = tls::TlsContext::builder()
-            .with_trust_store(trust)
-            .build()
-            .unwrap();
-        let client = selected
-            .connect_with(&reference, alias(), fake_key, || {
-                Builder::new().tls_provider(tls::Provider::Rustls(tls::rustls_provider::CryptoMode::AwsLc))
-                    .tls_context(context).build_with_resolver(LoopbackDns(host))
-            })
-            .unwrap();
+        let (client, server) = loopback_list_client(origin, host, path, style, trusted, allowed, false);
         let result = tokio::time::timeout(Duration::from_secs(5), client.list_objects(bucket, "", None))
             .await
             .unwrap();
