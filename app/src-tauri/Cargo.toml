@@ -67,6 +67,7 @@ tauri = { version = "2", features = ["test"] }
 libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+base64 = "0.23"
 gtk = "0.18"
 
 [target.'cfg(windows)'.dependencies]
