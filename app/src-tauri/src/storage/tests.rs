@@ -188,6 +188,18 @@ async fn s01_지정_버킷의_다음_페이지와_선택한_키를_그대로_요
     );
 }
 
+#[tokio::test]
+async fn aws_버킷_목록은_누락되거나_다른_파티션의_리전을_거부한다() {
+    let replay = replay([
+        response(200, "<ListAllMyBucketsResult><Buckets><Bucket><Name>selected-bucket</Name></Bucket></Buckets></ListAllMyBucketsResult>"),
+        response(200, "<ListAllMyBucketsResult><Buckets><Bucket><Name>selected-bucket</Name><BucketRegion>cn-north-1</BucketRegion></Bucket></Buckets></ListAllMyBucketsResult>"),
+    ]);
+    let s3 = client(&replay);
+    for _ in 0..2 {
+        assert_eq!(s3.list_buckets(None).await, Err(Error::at(Stage::ListBuckets, Failure::InvalidResponse)));
+    }
+}
+
 pub(super) fn object_response(length: u64, checksum: Option<&str>, body: SdkBody) -> HttpResponse {
     let mut raw = http::Response::builder()
         .status(200)

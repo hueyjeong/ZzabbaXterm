@@ -20,8 +20,12 @@ use crate::{
 };
 
 use super::{
-    AwsS3, BucketRow, Downloaded, Error, Failure, Page, Stage, VerifiedSsoSelection, check_bucket,
+    AwsS3, BucketRow, Downloaded, Error, Failure, ObjectRow, Page, Stage, VerifiedSsoSelection, check_bucket,
+    compatible::CompatibleS3,
 };
+
+#[path = "compatible/ipc.rs"]
+mod compatible;
 
 #[path = "edit_ipc.rs"]
 mod edit_ipc;
@@ -59,7 +63,7 @@ struct VerifiedStorageSelection {
 
 struct Tab {
     document: Document,
-    client: Arc<AwsS3>,
+    client: TabClient,
     closed: Arc<watch::Sender<bool>>,
     selection: Option<Selection>,
     binding: Option<LoginBinding>,
@@ -68,6 +72,38 @@ struct Tab {
     listing: bool,
     verified_bucket: Option<(String, String)>,
     edits: Edits,
+}
+
+impl Tab {
+    fn new(document: Document, client: TabClient) -> Self {
+        Self {
+            document,
+            client,
+            closed: Arc::new(watch::Sender::new(false)),
+            selection: None,
+            binding: None,
+            expired: false,
+            logging_in: false,
+            listing: false,
+            verified_bucket: None,
+            edits: Edits::default(),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum TabClient {
+    AwsSso(Arc<AwsS3>),
+    Compatible(Arc<CompatibleS3>),
+}
+
+impl TabClient {
+    fn aws(&self) -> Option<&Arc<AwsS3>> {
+        match self {
+            Self::AwsSso(client) => Some(client),
+            Self::Compatible(_) => None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -107,6 +143,7 @@ impl ApprovedFile {
 struct Registry {
     documents: HashMap<String, u64>,
     openings: HashMap<Uuid, Opening>,
+    pending_compatible: HashMap<String, compatible::Pending>,
     tabs: HashMap<String, Tab>,
     shutdown: bool,
 }
@@ -139,7 +176,10 @@ impl StorageIpc {
 
     fn reserve_open(&self, document: &Document, id: Uuid) -> Result<Arc<CancellationToken>, Error> {
         let mut registry = self.0.lock().unwrap();
-        if !registry.active(document) || registry.tabs.contains_key(&id.to_string()) || registry.openings.contains_key(&id) {
+        let mut uuid = Uuid::encode_buffer();
+        let session_id: &str = id.hyphenated().encode_lower(&mut uuid);
+        if !registry.active(document) || registry.tabs.contains_key(session_id)
+            || registry.openings.contains_key(&id) || registry.pending_compatible.contains_key(session_id) {
             return Err(unavailable(Stage::Profile));
         }
         let cancel = Arc::new(CancellationToken::new());
@@ -223,16 +263,9 @@ impl StorageIpc {
         registry.tabs.insert(
             session_id.clone(),
             Tab {
-                document,
-                client: Arc::new(client),
-                closed: Arc::new(watch::Sender::new(false)),
-                selection: None,
                 binding,
-                expired: false,
-                logging_in: false,
-                listing: false,
                 verified_bucket,
-                edits: Edits::default(),
+                ..Tab::new(document, TabClient::AwsSso(Arc::new(client)))
             },
         );
         Session {
@@ -244,9 +277,14 @@ impl StorageIpc {
         }
     }
 
+    fn insert_compatible_tab(registry: &mut Registry, session_id: String, document: Document, client: CompatibleS3) {
+        registry.tabs.insert(session_id, Tab::new(document, TabClient::Compatible(Arc::new(client))));
+    }
+
     fn close(&self, document: &Document, session_id: &str) -> bool {
-        let (opening, tab) = {
+        let (opening, tab, pending) = {
             let mut registry = self.0.lock().unwrap();
+            if !registry.active(document) { return false; }
             let opening = Uuid::parse_str(session_id).ok().and_then(|id| {
                 if registry.openings.get(&id)?.document != *document { return None; }
                 registry.openings.remove(&id)
@@ -256,36 +294,51 @@ impl StorageIpc {
             } else {
                 None
             };
-            (opening, tab)
+            let pending = if opening.is_none() && tab.is_none()
+                && registry.pending_compatible.get(session_id).is_some_and(|pending| pending.document == *document)
+            {
+                registry.pending_compatible.remove(session_id)
+            } else {
+                None
+            };
+            (opening, tab, pending)
         };
         if let Some(opening) = opening {
             opening.cancel.cancel();
             return true;
         }
-        let Some(tab) = tab else { return false; };
-        tab.closed.send_replace(true);
+        if let Some(tab) = tab {
+            tab.closed.send_replace(true);
+        } else if let Some(pending) = pending {
+            pending.closed.send_replace(true);
+        } else {
+            return false;
+        }
         true
     }
 
     pub(crate) fn navigate(&self, owner: &str) {
-        let (openings, tabs) = {
+        let (openings, pending, tabs) = {
             let mut registry = self.0.lock().unwrap();
             *registry.documents.entry(owner.into()).or_default() += 1;
             let openings = registry.openings.extract_if(|_, opening| opening.document.owner == owner).map(|(_, opening)| opening).collect::<Vec<_>>();
             let tabs = registry.tabs.extract_if(|_, tab| tab.document.owner == owner).map(|(_, tab)| tab).collect::<Vec<_>>();
-            (openings, tabs)
+            let pending = registry.pending_compatible.extract_if(|_, pending| pending.document.owner == owner).map(|(_, pending)| pending).collect::<Vec<_>>();
+            (openings, pending, tabs)
         };
         for opening in openings { opening.cancel.cancel(); }
+        for pending in pending { pending.closed.send_replace(true); }
         for tab in tabs { tab.closed.send_replace(true); }
     }
 
     pub(crate) fn shutdown(&self) {
-        let (openings, tabs) = {
+        let (openings, pending, tabs) = {
             let mut registry = self.0.lock().unwrap();
             registry.shutdown = true;
-            (std::mem::take(&mut registry.openings), std::mem::take(&mut registry.tabs))
+            (std::mem::take(&mut registry.openings), std::mem::take(&mut registry.pending_compatible), std::mem::take(&mut registry.tabs))
         };
         for (_, opening) in openings { opening.cancel.cancel(); }
+        for (_, pending) in pending { pending.closed.send_replace(true); }
         for (_, tab) in tabs {
             tab.closed.send_replace(true);
         }
@@ -352,6 +405,25 @@ impl StorageIpc {
         }
     }
 
+    fn selection_dialog(&self, document: &Document, session_id: &str, id: &str) -> Option<(String, watch::Receiver<bool>)> {
+        use std::fmt::Write as _;
+
+        let mut registry = self.0.lock().unwrap();
+        let tab = registry.tab(document, session_id)?;
+        let selection = tab.selection.as_ref().filter(|selection| selection.id == id)?;
+        let target = &selection.target;
+        let action = match selection.direction {
+            Direction::Upload => "업로드",
+            Direction::Download => "다운로드",
+        };
+        let mut title = format!("S3 {action} · {} / {:?} · {}", target.bucket, target.key, target.region);
+        if let TabClient::Compatible(client) = &tab.client {
+            let target = client.target();
+            let _ = write!(title, " · {} ({}) · {}", target.endpoint, target.service_id, target.key_alias.as_str());
+        }
+        Some((title, tab.closed.subscribe()))
+    }
+
     fn cancel_approval(&self, document: &Document, request: &ApprovalId) -> bool {
         let mut registry = self.0.lock().unwrap();
         let Some(tab) = registry.tab(document, &request.session_id) else {
@@ -398,8 +470,14 @@ impl StorageIpc {
         request: BucketPageRequest,
     ) -> Result<Page<BucketRow>, Error> {
         let (client, closed) = self.client(document, &request.session_id, Stage::ListBuckets)?;
-        let result = until_closed(&closed, Stage::ListBuckets, client.list_buckets(request.token.as_deref())).await;
-        self.record_expiration(document, &request.session_id, &result);
+        let token = request.token.as_deref();
+        let result = until_closed(&closed, Stage::ListBuckets, async {
+            match &client {
+                TabClient::AwsSso(client) => client.list_buckets(token).await,
+                TabClient::Compatible(client) => client.list_buckets(token).await.map_err(|error| error.operation),
+            }
+        }).await;
+        self.record_expiration(document, &request.session_id, &closed, &result);
         result
     }
 
@@ -407,13 +485,16 @@ impl StorageIpc {
         &self,
         document: &Document,
         request: ObjectPageRequest,
-    ) -> Result<Page<ListedRow>, Error> {
+    ) -> Result<ListedPage, Error> {
         let stage = Stage::ListObjects;
         let (client, closed) = {
             let mut registry = self.0.lock().unwrap();
             let tab = registry.tab(document, &request.session_id).ok_or_else(|| unavailable(stage))?;
             if tab.listing || tab.logging_in { return Err(unavailable(stage)); }
             if tab.expired { return Err(Error::at(stage, Failure::SsoLoginRequired)); }
+            if let TabClient::Compatible(client) = &tab.client && request.region != client.target().region {
+                return Err(Error::at(stage, Failure::InvalidRegion));
+            }
             if request.token.is_none() {
                 tab.verified_bucket = None;
                 tab.selection = None;
@@ -425,19 +506,30 @@ impl StorageIpc {
             (tab.client.clone(), tab.closed.subscribe())
         };
         let result = until_closed(&closed, stage, async {
-            let regional = client.in_region(&request.region, Stage::HeadBucket)?;
-            if request.token.is_none() { regional.check_bucket_region(&request.bucket).await?; }
-            regional.list_objects(&request.bucket, &request.prefix, request.token.as_deref()).await
+            match &client {
+                TabClient::AwsSso(client) => {
+                    let regional = client.in_region(&request.region, Stage::HeadBucket)?;
+                    if request.token.is_none() { regional.check_bucket_region(&request.bucket).await?; }
+                    regional.list_objects(&request.bucket, &request.prefix, request.token.as_deref()).await
+                }
+                TabClient::Compatible(client) => client.list_objects(&request.bucket, &request.prefix, request.token.as_deref())
+                    .await.map_err(|error| error.operation),
+            }
         }).await;
         let mut registry = self.0.lock().unwrap();
-        let tab = registry.tab(document, &request.session_id).ok_or_else(|| unavailable(stage))?;
+        let tab = registry.tab(document, &request.session_id)
+            .filter(|tab| closed.same_channel(&tab.closed.subscribe()))
+            .ok_or_else(|| unavailable(stage))?;
         tab.listing = false;
         mark_expired(tab, &result);
         if result.is_ok() && request.token.is_none() && !tab.expired {
             tab.verified_bucket = Some((request.bucket.clone(), request.region.clone()));
         }
         if tab.expired && result.is_ok() { return Err(unavailable(stage)); }
-        result.map(|page| tab.edits.listed(page, &request.bucket, &request.region))
+        result.map(|page| match client {
+            TabClient::AwsSso(_) => ListedPage::AwsSso(tab.edits.listed(page, &request.bucket, &request.region)),
+            TabClient::Compatible(_) => ListedPage::Compatible(page),
+        })
     }
 
     async fn count_previous_files(
@@ -452,7 +544,8 @@ impl StorageIpc {
             let mut registry = self.0.lock().unwrap();
             let tab = registry.tab(document, &target.session_id).ok_or_else(|| unavailable(stage))?;
             if !bucket_verified(tab, &target) { return Err(unavailable(stage)); }
-            (tab.client.clone(), tab.closed.subscribe())
+            let client = tab.client.aws().ok_or_else(|| unavailable(stage))?;
+            (client.clone(), tab.closed.subscribe())
         };
         let result = until_closed(&closed, stage, async {
             client.in_region(&target.region, stage)?
@@ -460,7 +553,7 @@ impl StorageIpc {
         }).await;
         let mut registry = self.0.lock().unwrap();
         let tab = registry.tab(document, &target.session_id).ok_or_else(|| unavailable(stage))?;
-        if !closed.same_channel(&tab.closed.subscribe()) || !Arc::ptr_eq(&tab.client, &client)
+        if !closed.same_channel(&tab.closed.subscribe()) || !tab.client.aws().is_some_and(|current| Arc::ptr_eq(current, &client))
             || !bucket_verified(tab, &target)
         {
             return Err(unavailable(stage));
@@ -469,8 +562,10 @@ impl StorageIpc {
         result
     }
 
-    fn record_expiration<T>(&self, document: &Document, id: &str, result: &Result<T, Error>) {
-        if is_login_required(result) && let Some(tab) = self.0.lock().unwrap().tab(document, id) {
+    fn record_expiration<T>(&self, document: &Document, id: &str, closed: &watch::Receiver<bool>, result: &Result<T, Error>) {
+        if is_login_required(result) && let Some(tab) = self.0.lock().unwrap().tab(document, id)
+            .filter(|tab| closed.same_channel(&tab.closed.subscribe()))
+        {
             mark_expired(tab, result);
         }
     }
@@ -494,6 +589,7 @@ impl StorageIpc {
                 (binding, opening.cancel.clone(), None)
             } else {
                 let tab = registry.tab(document, &id.to_string()).ok_or_else(|| unavailable(Stage::Profile))?;
+                tab.client.aws().ok_or_else(|| unavailable(Stage::Profile))?;
                 let binding = tab.binding.as_ref().filter(|_| tab.expired && !tab.listing && !tab.logging_in)
                     .ok_or_else(|| unavailable(Stage::Profile))?.clone();
                 tab.logging_in = true;
@@ -551,7 +647,7 @@ impl StorageIpc {
         document: &Document,
         session_id: &str,
         stage: Stage,
-    ) -> Result<(Arc<AwsS3>, watch::Receiver<bool>), Error> {
+    ) -> Result<(TabClient, watch::Receiver<bool>), Error> {
         let mut registry = self.0.lock().unwrap();
         let tab = registry
             .tab(document, session_id)
@@ -566,9 +662,16 @@ impl StorageIpc {
             .ok_or_else(|| unavailable(Stage::UploadSource))?;
         let ApprovedFile::Upload(file) = transfer.file else { return Err(unavailable(Stage::UploadSource)); };
         let target = transfer.target;
-        let regional = transfer.client.in_region(&target.region, Stage::PutObject)?;
-        let result = until_closed(&transfer.closed.subscribe(), Stage::PutObject, regional.upload(&target.bucket, &target.key, file)).await;
-        self.record_expiration(document, &target.session_id, &result);
+        let closed = transfer.closed.subscribe();
+        let result = until_closed(&closed, Stage::PutObject, async {
+            match transfer.client {
+                TabClient::AwsSso(client) => client.in_region(&target.region, Stage::PutObject)?
+                    .upload(&target.bucket, &target.key, file).await,
+                TabClient::Compatible(client) => client.upload(&target.bucket, &target.key, file)
+                    .await.map_err(|error| error.operation),
+            }
+        }).await;
+        self.record_expiration(document, &target.session_id, &closed, &result);
         result
     }
 
@@ -582,9 +685,14 @@ impl StorageIpc {
             .ok_or_else(|| unavailable(Stage::GetObject))?;
         let ApprovedFile::Download(file) = transfer.file else { return Err(unavailable(Stage::GetObject)); };
         let target = transfer.target;
-        let regional = transfer.client.in_region(&target.region, Stage::GetObject)?;
-        let result = regional.download(&target.bucket, &target.key, &file, &transfer.closed).await;
-        self.record_expiration(document, &target.session_id, &result);
+        let closed = transfer.closed.subscribe();
+        let result = match transfer.client {
+            TabClient::AwsSso(client) => client.in_region(&target.region, Stage::GetObject)?
+                .download(&target.bucket, &target.key, &file, &transfer.closed).await,
+            TabClient::Compatible(client) => client.download(&target.bucket, &target.key, &file, &transfer.closed)
+                .await.map_err(|error| error.operation),
+        };
+        self.record_expiration(document, &target.session_id, &closed, &result);
         result
     }
 }
@@ -594,7 +702,7 @@ fn is_login_required<T>(result: &Result<T, Error>) -> bool {
 }
 
 fn mark_expired<T>(tab: &mut Tab, result: &Result<T, Error>) {
-    if is_login_required(result) {
+    if tab.client.aws().is_some() && is_login_required(result) {
         tab.expired = true;
         tab.selection = None;
         tab.edits.clear_rows();
@@ -607,7 +715,7 @@ fn bucket_verified(tab: &Tab, target: &Target) -> bool {
 }
 
 struct Transfer {
-    client: Arc<AwsS3>,
+    client: TabClient,
     closed: Arc<watch::Sender<bool>>,
     target: Target,
     file: ApprovedFile,
@@ -728,6 +836,13 @@ struct ObjectPageRequest {
     prefix: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum ListedPage {
+    AwsSso(Page<ListedRow>),
+    Compatible(Page<ObjectRow>),
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PreviousFilesRequest {
@@ -773,15 +888,10 @@ async fn select_file(
     let state = webview.state::<StorageIpc>();
     let FileSelection { target, direction } = request;
     let session_id = target.session_id.clone();
-    let action = match direction {
-        Direction::Upload => "업로드",
-        Direction::Download => "다운로드",
-    };
-    let title = format!("S3 {action} · {} / {:?} · {}", target.bucket, target.key, target.region);
     let Some(id) = state.begin_selection(document, target, direction) else {
         return LocalFileApproval::Denied;
     };
-    let Ok((_, closed)) = state.client(document, &session_id, Stage::Profile) else {
+    let Some((title, closed)) = state.selection_dialog(document, &session_id, &id) else {
         return LocalFileApproval::Denied;
     };
     let window = webview.window();
@@ -908,9 +1018,21 @@ async fn choose_replace<R: tauri::Runtime>(window: tauri::Window<R>, closed: wat
     }
 }
 
+#[cfg(not(windows))]
+async fn confirm_replace<R: tauri::Runtime>(window: tauri::Window<R>, prompt: String, closed: watch::Receiver<bool>) -> bool {
+    confirm_native(window, "다운로드 파일 교체", prompt, closed).await
+}
+
+#[cfg(windows)]
+async fn confirm_native<R: tauri::Runtime>(window: tauri::Window<R>, title: &'static str, prompt: String, closed: watch::Receiver<bool>) -> bool {
+    use windows_sys::Win32::UI::{Controls::{TDCBF_CANCEL_BUTTON, TDCBF_OK_BUTTON}, WindowsAndMessaging::IDOK};
+
+    dialogs_windows::prompt(window, title, prompt, TDCBF_OK_BUTTON | TDCBF_CANCEL_BUTTON, closed).await == Some(IDOK)
+}
+
 #[cfg(not(any(windows, target_os = "linux")))]
-async fn confirm_replace<R: tauri::Runtime>(window: tauri::Window<R>, prompt: String, mut closed: watch::Receiver<bool>) -> bool {
-    let dialog = rfd::AsyncMessageDialog::new().set_parent(&window).set_title("다운로드 파일 교체")
+async fn confirm_native<R: tauri::Runtime>(window: tauri::Window<R>, title: &'static str, prompt: String, mut closed: watch::Receiver<bool>) -> bool {
+    let dialog = rfd::AsyncMessageDialog::new().set_parent(&window).set_title(title)
         .set_description(prompt).set_buttons(rfd::MessageButtons::OkCancel);
     tokio::select! {
         biased;
@@ -920,8 +1042,8 @@ async fn confirm_replace<R: tauri::Runtime>(window: tauri::Window<R>, prompt: St
 }
 
 #[cfg(target_os = "linux")]
-async fn confirm_replace<R: tauri::Runtime>(window: tauri::Window<R>, prompt: String, closed: watch::Receiver<bool>) -> bool {
-    download_dialog(window, "다운로드 파일 교체", prompt, false, closed).await == Some(gtk::ResponseType::Ok)
+async fn confirm_native<R: tauri::Runtime>(window: tauri::Window<R>, title: &'static str, prompt: String, closed: watch::Receiver<bool>) -> bool {
+    download_dialog(window, title, prompt, false, closed).await == Some(gtk::ResponseType::Ok)
 }
 
 #[cfg(target_os = "linux")]
@@ -987,6 +1109,16 @@ pub(crate) fn dispatch<R: tauri::Runtime>(invoke: Invoke<R>) -> bool {
         }};
     }
     match name {
+        "storage_compatible_load" => handle!("storage_compatible_load", compatible::LoadRequest, compatible::load),
+        "storage_compatible_open" => {
+            let item = CommandItem { name: "storage_compatible_open", key: "request", plugin: None, message: &message, acl: &acl };
+            let compatible::OpenCommand { session_id, target } = match compatible::OpenCommand::from_command(item) {
+                Ok(request) => request,
+                Err(error) => { resolver.invoke_error(error); return true; }
+            };
+            let reserved = webview.state::<StorageIpc>().reserve_compatible(&document, &session_id);
+            resolver.respond_async(compatible::open(webview, document, target, session_id, reserved));
+        }
         "storage_open" => {
             let item = CommandItem { name: "storage_open", key: "request", plugin: None, message: &message, acl: &acl };
             let request = match OpenRequest::from_command(item) {
@@ -1152,6 +1284,86 @@ mod tests {
             bucket: "selected-bucket".into(),
             region: session.region.clone(),
             key: KEY.into(),
+        }
+    }
+
+    #[test]
+    fn 호환_예약은_같은_ID의_AWS_예약을_막고_종료시_폐기된다() {
+        let state = StorageIpc::default();
+        let document = state.document("main");
+        let id = Uuid::new_v4();
+        let pending = state.reserve_compatible(&document, &id.to_string()).unwrap();
+        assert!(state.reserve_open(&document, id).is_err());
+        state.shutdown();
+        assert!(*pending.borrow());
+        assert!(state.reserve_compatible(&document, &id.to_string()).is_err());
+    }
+
+    #[tokio::test]
+    async fn 호환_목록과_업로드는_설정에_고정되고_AWS_기능은_거부된다() {
+        use crate::storage::compatible::{AddressStyle, CompatibleService, ServiceKey, ServiceKeyAlias, ServiceKeyRef};
+
+        const REGION: &str = "local-test-1";
+        const BUCKET: &str = "selected-bucket";
+        const ENDPOINT: &str = "https://storage.example.test";
+        let fixture = replay([
+            response(200, "<ListAllMyBucketsResult><Buckets><Bucket><Name>selected-bucket</Name><BucketRegion>us-east-1</BucketRegion></Bucket></Buckets></ListAllMyBucketsResult>"),
+            response(200, "<ListBucketResult><EncodingType>url</EncodingType><IsTruncated>false</IsTruncated><Contents><Key>object.txt</Key><Size>4</Size></Contents></ListBucketResult>"),
+            response(403, "<Error><Code>ExpiredToken</Code></Error>"),
+            response(200, SdkBody::empty()),
+        ]);
+        let service = CompatibleService::new("fixture".into(), ENDPOINT, REGION.into(), AddressStyle::Path).unwrap();
+        let reference = ServiceKeyRef::new(&service, "fixture-item".into()).unwrap();
+        let alias = ServiceKeyAlias::new("fixture-alias".into()).unwrap();
+        let client = service.connect_with(&reference, alias, |_, _| {
+            ServiceKey::new("fixture-access".into(), "fixture-secret".into())
+        }, || crate::storage::SharedHttpClient::new(fixture.clone())).unwrap();
+        let state = StorageIpc::default();
+        let document = state.document("main");
+        let id = Uuid::new_v4();
+        let session_id = id.to_string();
+        StorageIpc::insert_compatible_tab(&mut state.0.lock().unwrap(), session_id.clone(), document.clone(), client);
+        let list = || BucketPageRequest { session_id: session_id.clone(), token: None };
+        assert!(state.list_buckets(&state.document("other"), list()).await.is_err());
+        assert_eq!(state.list_buckets(&document, list()).await.unwrap().rows, [BucketRow { name: BUCKET.into(), region: REGION.into() }]);
+        let page = state.list_objects(&document, ObjectPageRequest {
+            session_id: session_id.clone(), bucket: BUCKET.into(), region: REGION.into(), prefix: String::new(), token: None,
+        }).await.unwrap();
+        assert_eq!(serde_json::to_value(page).unwrap()["rows"], serde_json::json!([
+            {"kind": "object", "key": "object.txt", "bytes": 4}
+        ]));
+        let object = || Target { session_id: session_id.clone(), bucket: BUCKET.into(), region: REGION.into(), key: "object.txt".into() };
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("object.txt");
+        std::fs::write(&file, b"data").unwrap();
+        let approve_upload = || {
+            let id = state.begin_selection(&document, object(), Direction::Upload).unwrap();
+            let (title, _) = state.selection_dialog(&document, &session_id, &id).unwrap();
+            assert_eq!(title, format!("S3 업로드 · {BUCKET} / \"object.txt\" · {REGION} · {ENDPOINT} (fixture) · fixture-alias"));
+            assert!(matches!(state.finish_selection(&document, &session_id, id.clone(), Some(ApprovedFile::open(&file, Direction::Upload))), LocalFileApproval::Approved { .. }));
+            ApprovedTransfer { target: object(), approval_id: id }
+        };
+        let first = approve_upload();
+        let approval_id = first.approval_id.clone();
+        assert_eq!(state.upload(&document, first).await, Err(Error::at(Stage::PutObject, Failure::Service { status: 403, code: Some("ExpiredToken".into()) })));
+        assert!(state.upload(&document, ApprovedTransfer { target: object(), approval_id }).await.is_err());
+        assert!(!state.0.lock().unwrap().tab(&document, &session_id).unwrap().expired);
+        assert_eq!(state.upload(&document, approve_upload()).await, Ok(4));
+        let edit = serde_json::from_value(serde_json::json!({ "sessionId": &session_id, "rowId": "forged" })).unwrap();
+        assert_eq!(serde_json::to_value(state.edit_open(&document, edit).await).unwrap()["kind"], "denied");
+        assert_eq!(state.count_previous_files(&document, PreviousFilesRequest {
+            session_id: session_id.clone(), bucket: BUCKET.into(), region: REGION.into(), prefix: String::new(),
+        }).await, Err(unavailable(Stage::ListObjects)));
+        assert_eq!(state.relogin_with(&document, id, PathBuf::new(), |_, _| async { panic!("호환 탭은 AWS SSO에 로그인할 수 없습니다") }).await,
+            Err(unavailable(Stage::Profile)));
+        let requests: Vec<_> = fixture.actual_requests().collect();
+        assert_eq!(requests.len(), 4);
+        for request in &requests[2..] {
+            assert_eq!(request.method(), "PUT");
+            let uri: http::Uri = request.uri().parse().unwrap();
+            assert_eq!(uri.scheme_str(), Some("https"));
+            assert_eq!(uri.host(), Some("storage.example.test"));
+            assert_eq!(uri.path(), "/selected-bucket/object.txt");
         }
     }
 
@@ -1339,7 +1551,7 @@ mod tests {
             assert_eq!(missing_region.stage, Stage::HeadBucket);
             assert!(matches!(missing_region.failure, Failure::Service { status: 403, .. }));
             assert!(state.begin_selection(&document, regional(), Direction::Upload).is_none());
-            assert!(objects("us-west-2").await.unwrap().rows.is_empty());
+            assert!(matches!(objects("us-west-2").await.unwrap(), ListedPage::AwsSso(page) if page.rows.is_empty()));
             let approval = state.begin_selection(&document, regional(), Direction::Upload).unwrap();
             assert!(matches!(state.finish_selection(&document, &session.session_id, approval, None), LocalFileApproval::Cancelled));
             let denied = objects("us-west-2").await.unwrap_err();
