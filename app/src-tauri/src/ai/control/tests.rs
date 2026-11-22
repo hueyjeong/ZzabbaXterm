@@ -10,6 +10,7 @@ fn transport(sessions: &Sessions, identity: &LiveSsmIdentity) -> (ControlTranspo
     let binding = sessions.bind_ssm_control(OWNER, identity, &request).unwrap();
     let (tx, output) = mpsc::channel();
     (ControlTransport {
+        job_id: None,
         session: Arc::new(Session::dedicated(&binding)),
         binding,
         output,
@@ -208,8 +209,9 @@ fn control_shutdown_before_start_case() {
         let closing = Sessions::default();
         let peer = closing.insert_live_ssm_fixture(OWNER, closing.document(OWNER), ACCOUNT, REGION, NODE);
         let late = closing.bind_ssm_control(OWNER, &peer.identity, &CancellationToken::new()).unwrap();
-        assert!(closing.close_ssh_probes(None));
+        assert_eq!(closing.drain_controls_for_exit(Duration::ZERO), crate::terminal::ControlExitReport::default());
         assert!(!late.cancel_token().is_cancelled());
+        assert_eq!(late.admit(|| unreachable!()), Err::<(), _>(UNAVAILABLE.into()));
         assert!(matches!(closing.launch_control(&late, PtySize::default(), Target::new("fixture", REGION, NODE).unwrap(), |_| unreachable!()), Err(error) if error == UNAVAILABLE));
     }
 
@@ -218,7 +220,7 @@ fn control_shutdown_before_start_case() {
     let request = CancellationToken::new();
     let binding = sessions.bind_ssm_control(OWNER, &central.identity, &request).unwrap();
     let (events, output) = mpsc::channel();
-    let (control, opened) = sessions.launch_control(
+    let (_, control, opened) = sessions.launch_control(
         &binding,
         PtySize::default(),
         Target::new("fixture", REGION, NODE).unwrap(),
@@ -228,7 +230,7 @@ fn control_shutdown_before_start_case() {
     // 중앙 픽스처에는 완료를 통지할 작업자가 없다. 중앙 탭이 닫힌 상태를 만든다.
     drop(central);
 
-    sessions.shutdown();
+    assert_eq!(sessions.drain_controls_for_exit(Duration::from_secs(5)), crate::terminal::ControlExitReport::default());
     assert!(matches!(output.try_recv(), Err(mpsc::TryRecvError::Disconnected)));
     assert!(binding.cancel_token().is_cancelled());
     assert!(control.start_until(None).is_err());

@@ -447,7 +447,7 @@ impl Session {
         })
     }
 
-    fn cleanup(&self, remote: Option<remote::Remote>) {
+    pub(super) fn cleanup(&self, remote: Option<remote::Remote>) {
         if let Some(mut remote) = remote {
             let (status, target) = remote.close();
             let mut result = self.close_result.lock().unwrap();

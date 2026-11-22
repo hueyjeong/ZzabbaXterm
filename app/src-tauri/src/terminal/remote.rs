@@ -229,7 +229,7 @@ fn submitted_control_start_is_reaped_and_checks_exact_ssm_cleanup_after_revocati
 
 #[cfg(all(test, any(windows, unix)))]
 fn submitted_control_start_shutdown_case() {
-    use crate::terminal::{LocalClose, Sessions, process::Session};
+    use crate::terminal::{ControlExitReport, LocalClose, Sessions, process::Session};
     use std::{sync::mpsc, thread, time::Duration};
 
     const WAIT: Duration = Duration::from_secs(10);
@@ -249,7 +249,9 @@ fn submitted_control_start_shutdown_case() {
     let permit = remote.authorize(cancel).unwrap();
     let session = Arc::new(Session::dedicated(&binding));
     let tracked = sessions.track_control(&binding, &session).unwrap();
-    assert!(sessions.get("main", &tracked.id.to_string()).is_err());
+    let id = tracked.id;
+    let transport = crate::ai::control::ControlTransport::from_tracked_fixture(id, Arc::clone(&binding), Arc::clone(&session));
+    assert!(sessions.get("main", &id.to_string()).is_err());
 
     let (pair, mut child) = thread::scope(|scope| {
         let (submit, submitted) = mpsc::channel();
@@ -275,31 +277,35 @@ fn submitted_control_start_shutdown_case() {
     });
     assert!(cancel.is_cancelled());
     let (cleanup, permit_cleanup) = mpsc::channel();
+    assert_eq!(sessions.drain_controls_for_exit(Duration::ZERO), ControlExitReport {
+        pending: 1, ..ControlExitReport::default()
+    });
     let (result, checked) = mpsc::channel();
     let (exit, exited) = mpsc::channel();
     thread::scope(|scope| {
         scope.spawn(|| {
-            sessions.shutdown();
-            exit.send(()).unwrap();
+            exit.send(sessions.drain_controls_for_exit(WAIT)).unwrap();
         });
         scope.spawn(move || {
             permit_cleanup.recv_timeout(WAIT).unwrap();
             session.terminate_fixture(child.as_mut(), pair.master.as_ref());
             drop(pair);
-            result.send((session.close_result().local, remote.close())).unwrap();
+            session.cleanup(Some(remote));
+            result.send(session.close_result()).unwrap();
             drop(tracked);
         });
-        let deadline = std::time::Instant::now() + WAIT;
-        while !sessions.registry.lock().unwrap().shutdown {
-            assert!(std::time::Instant::now() < deadline);
-            thread::yield_now();
-        }
         assert!(matches!(exited.recv_timeout(Duration::from_millis(100)), Err(mpsc::RecvTimeoutError::Timeout)));
         cleanup.send(()).unwrap();
-        assert_eq!(checked.recv_timeout(WAIT).unwrap(), (LocalClose::CliReaped, (RemoteClose::Unconfirmed, Some("i-01234567".into()))));
-        exited.recv_timeout(WAIT).unwrap();
+        let result = checked.recv_timeout(WAIT).unwrap();
+        assert_eq!((result.local, result.remote, result.target.as_deref()), (LocalClose::CliReaped, RemoteClose::Unconfirmed, Some("i-01234567")));
+        assert_eq!(exited.recv_timeout(WAIT).unwrap(), ControlExitReport {
+            remote_unconfirmed: 1, ..ControlExitReport::default()
+        });
     });
     assert!(root.path().join("History").is_file());
+    assert_eq!(sessions.drain_controls_for_exit(Duration::ZERO).remote_unconfirmed, 1);
+    assert_eq!(transport.close().remote, RemoteClose::Unconfirmed);
+    assert_eq!(sessions.drain_controls_for_exit(Duration::ZERO), ControlExitReport::default());
 }
 
 fn start_error(error: CliError) -> String {

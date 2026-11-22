@@ -33,6 +33,7 @@ pub(crate) enum Output {
 /// 독립 PTY는 중앙 세션에 결부하며 앱 종료 시 전용 작업으로만 추적한다.
 #[must_use]
 pub(crate) struct ControlTransport {
+    job_id: Option<u64>,
     binding: Arc<ControlBinding>,
     session: Arc<Session>,
     output: mpsc::Receiver<Event>,
@@ -44,6 +45,16 @@ pub(crate) struct ControlTransport {
 }
 
 impl ControlTransport {
+    #[cfg(test)]
+    pub(crate) fn from_tracked_fixture(job_id: u64, binding: Arc<ControlBinding>, session: Arc<Session>) -> Self {
+        Self {
+            job_id: Some(job_id), binding, session, output: mpsc::channel().1,
+            open_deadline: Instant::now() + OPEN_TIMEOUT, connected: false, received: 0,
+            #[cfg(windows)]
+            cursor_query: 0,
+        }
+    }
+
     /// 승인된 중앙 세션과 프로필로 블로킹 작업자에서 독립 운반을 연다.
     pub(crate) fn open(
         sessions: &Sessions,
@@ -56,10 +67,11 @@ impl ControlTransport {
         // 미확인 PTY 출력 크레딧이 바이트 큐를 제한한다. 블로킹 전송은 종료를 막을 수 있다.
         let (tx, output) = mpsc::channel();
         let open_deadline = Instant::now() + OPEN_TIMEOUT;
-        let (session, opened) = sessions.launch_control(&binding, PtySize::default(), target,
+        let (id, session, opened) = sessions.launch_control(&binding, PtySize::default(), target,
             move |event| tx.send(event).map_err(|_| CANCELLED.into()),
         )?;
         let transport = Self {
+            job_id: Some(id),
             binding, session, output,
             open_deadline, connected: false, received: 0,
             #[cfg(windows)]
@@ -180,7 +192,11 @@ impl ControlTransport {
     pub(crate) fn close(self) -> CloseResult {
         self.session.stop(Stop::Closed);
         self.session.wait_finished();
-        self.session.close_result()
+        let result = self.session.close_result();
+        if let Some(id) = self.job_id {
+            self.binding.consume_control_close(id);
+        }
+        result
     }
 }
 
