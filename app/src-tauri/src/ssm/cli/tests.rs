@@ -197,6 +197,28 @@ fn process_fixture() {
             let _ = io::stderr().write_all(&[b'b'; STDERR_LIMIT + 1]);
         }
         Ok("wait") => std::thread::sleep(Duration::from_secs(15)),
+        Ok("bound-credentials") => {
+            assert_eq!(
+                std::env::var("AWS_ACCESS_KEY_ID").as_deref(),
+                Ok("fixture-key")
+            );
+            assert_eq!(
+                std::env::var("AWS_SECRET_ACCESS_KEY").as_deref(),
+                Ok("fixture-secret")
+            );
+            assert_eq!(
+                std::env::var("AWS_SESSION_TOKEN").as_deref(),
+                Ok("fixture-token")
+            );
+            assert_eq!(
+                std::env::var("AWS_DEFAULT_REGION").as_deref(),
+                Ok("us-west-2")
+            );
+            assert!(std::env::var_os("AWS_PROFILE").is_none());
+            assert!(std::env::var_os("AWS_WEB_IDENTITY_TOKEN_FILE").is_none());
+            let config = std::env::var("AWS_CONFIG_FILE").unwrap();
+            assert_eq!(config, if cfg!(windows) { "NUL" } else { "/dev/null" });
+        }
         _ => {}
     }
 }
@@ -206,6 +228,19 @@ fn fixture(mode: &str) -> Command {
     cmd.args(["--exact", "ssm::cli::tests::process_fixture", "--nocapture"])
         .env("ZZABBA_SSM_TEST_FIXTURE", mode);
     cmd
+}
+
+#[tokio::test]
+async fn isolated_cli_child_receives_only_bound_credentials() {
+    use super::super::{Scope, tests::fixture_credentials};
+    let scope = Scope::new("team".into(), "us-west-2".into()).unwrap();
+    let mut spec = CommandSpec::aws(&std::env::current_exe().unwrap().into(), &[])
+        .with_credentials(&scope, &fixture_credentials());
+    spec.args = vec!["--exact".into(), "ssm::cli::tests::process_fixture".into()];
+    let mut cmd = spec.command();
+    cmd.env("ZZABBA_SSM_TEST_FIXTURE", "bound-credentials");
+    let result = capture(cmd, Tool::Aws, LOOKUP_TIMEOUT, &CancellationToken::new()).await;
+    assert_eq!(result.unwrap().exit_code, Some(0));
 }
 
 #[tokio::test]

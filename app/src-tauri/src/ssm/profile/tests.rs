@@ -12,6 +12,10 @@ fn profile_fixture() {
         filter_profiles(&profiles, candidates).unwrap(),
         ["direct team", "default"]
     );
+    assert_eq!(
+        profiles.export_config("direct team").unwrap(),
+        "[default]\nsso_account_id = 123456789012\nsso_role_name = Fixture\nsso_session = corp\n[sso-session \"corp\"]\nsso_region = us-east-1\nsso_start_url = https://example.invalid/start\n"
+    );
     for name in [
         "static",
         "via-process",
@@ -33,6 +37,7 @@ fn profile_fixture() {
         scope: scope.clone(),
         instance_id: "i-01234567".into(),
         owner: "fixture-owner".into(),
+        credentials: crate::ssm::tests::fixture_credentials(),
         program: cli.0.clone(),
     };
     assert_eq!(
@@ -62,10 +67,7 @@ fn profile_fixture() {
                 cli.online_nodes(&scope, &cancel).await.err(),
                 Some(CliError::UnsupportedProfile)
             );
-            assert_eq!(
-                cli.prepare_start(&scope, &node, &cancel).await.err(),
-                Some(CliError::UnsupportedProfile)
-            );
+            assert_eq!(cli.prepare_start(&scope, &node, &cancel).await.err(), None);
         });
 }
 

@@ -1,4 +1,4 @@
-use super::super::tests::fixture_cli;
+use super::super::tests::{EXPORT, fixture_cli, fixture_credentials};
 use super::*;
 use serde_json::{Value, json};
 use std::{collections::VecDeque, ffi::OsStr};
@@ -14,6 +14,7 @@ fn request() -> StartRequest {
         target: TARGET.into(),
         reason: REASON.into(),
         owner: OWNER.into(),
+        credentials: fixture_credentials(),
         program: fixture_cli().0,
         command_issued: true,
         termination_id: None,
@@ -37,7 +38,7 @@ fn capture(stdout: Vec<u8>) -> super::super::Captured {
 fn start_identity_and_lookup_commands_preserve_selected_scope() {
     let request = request();
     let cwd = std::path::Path::new("fixture-cwd");
-    let start = request.start_command(cwd);
+    let start = request.start_command(cwd, OsStr::new("fixture-plugin-path"));
     assert_eq!(start.get_cwd().unwrap(), cwd.as_os_str());
     assert_eq!(start.get_argv()[0], request.program.as_os_str());
     assert_eq!(
@@ -45,8 +46,6 @@ fn start_identity_and_lookup_commands_preserve_selected_scope() {
         &[
             "ssm",
             "start-session",
-            "--profile",
-            "team",
             "--region",
             "us-west-2",
             "--output",
@@ -59,18 +58,11 @@ fn start_identity_and_lookup_commands_preserve_selected_scope() {
             "--no-cli-auto-prompt",
         ]
     );
-    let shared = [
-        "--profile",
-        "team",
-        "--region",
-        "us-west-2",
-        "--output",
-        "json",
-    ];
+    let shared = ["--region", "us-west-2", "--output", "json"];
     let flags = ["--no-cli-pager", "--no-cli-auto-prompt"];
     for (spec, command, args) in [
         (
-            identity_command(&request.program, &request.scope),
+            identity_command(&request.program, &request.scope, &request.credentials),
             ["sts", "get-caller-identity"],
             vec![],
         ),
@@ -251,16 +243,46 @@ async fn start_requires_an_online_node_from_the_same_scope() {
     let scope = request().scope;
     let mut captured = Vec::new();
     let nodes = cli
-        .online_nodes_with(&scope, |spec| {
+        .online_nodes_with(&scope, "[default]\n", |spec| {
             assert_eq!(spec.program(), cli.0.as_ref());
             let action = spec.args()[1].clone();
-            let reply = if action == "describe-instance-information" {
-                fixture(json!({"InstanceInformationList": [
-                    {"InstanceId": TARGET, "PingStatus": "Online"},
-                    {"InstanceId": "i-11111111", "PingStatus": "ConnectionLost"}
-                ]}))
-            } else {
-                identity()
+            let mut environment = std::collections::HashMap::new();
+            spec.bound_environment(|key, value| {
+                environment.insert(key.to_owned(), value.to_os_string());
+            });
+            let reply = match action.as_str() {
+                "export-credentials" => {
+                    assert_eq!(
+                        spec.args()[2..6],
+                        ["--profile", "default", "--format", "process"]
+                    );
+                    assert_eq!(
+                        std::fs::read_to_string(&environment["AWS_CONFIG_FILE"]).unwrap(),
+                        "[default]\n"
+                    );
+                    assert!(!environment.contains_key("AWS_SESSION_TOKEN"));
+                    capture(EXPORT.as_bytes().to_vec())
+                }
+                action => {
+                    assert!(
+                        !spec
+                            .args()
+                            .iter()
+                            .any(|arg| arg == "--profile" || arg.contains("fixture-token"))
+                    );
+                    assert_eq!(environment["AWS_SESSION_TOKEN"], "fixture-token");
+                    assert_eq!(environment["AWS_DEFAULT_REGION"], "us-west-2");
+                    match action {
+                        "describe-instance-information" => {
+                            fixture(json!({"InstanceInformationList": [
+                                {"InstanceId": TARGET, "PingStatus": "Online"},
+                                {"InstanceId": "i-11111111", "PingStatus": "ConnectionLost"}
+                            ]}))
+                        }
+                        "get-caller-identity" => identity(),
+                        _ => panic!("unexpected command"),
+                    }
+                }
             };
             captured.push(action);
             std::future::ready(Ok(reply))
@@ -270,9 +292,9 @@ async fn start_requires_an_online_node_from_the_same_scope() {
     assert_eq!(
         captured,
         [
+            "export-credentials",
             "get-caller-identity",
-            "describe-instance-information",
-            "get-caller-identity"
+            "describe-instance-information"
         ]
     );
     assert_eq!(nodes.len(), 1);
@@ -296,24 +318,29 @@ async fn start_requires_an_online_node_from_the_same_scope() {
                 .await;
             assert_eq!(invalid.err(), Some(CliError::InvalidTarget));
         }
-        let changed = start
-            .authorize_with(&cli.0, &scope, async |_| {
-                Ok(fixture(
-                    json!({"Arn": "arn:aws:sts::123456789012:assumed-role/Sample/Other"}),
-                ))
-            })
+        let missing = start
+            .authorize_with(&cli.0, &scope, async |_| Err(CliError::PluginMissing))
             .await;
-        assert_eq!(changed.err(), Some(CliError::CallerChanged));
+        assert_eq!(missing.err(), Some(CliError::PluginMissing));
         let permit = start
-            .authorize_with(&cli.0, &scope, async |spec| {
-                assert_eq!(spec.program(), cli.0.as_ref());
-                assert_eq!(&spec.args()[..2], ["sts", "get-caller-identity"]);
-                Ok(identity())
-            })
+            .authorize_with(
+                &cli.0,
+                &scope,
+                async |_| Ok(plugin::tests::fixture_plugin()),
+            )
             .await
             .unwrap()
             .unwrap();
         assert_eq!(permit.0.get_argv()[0], cli.0.as_os_str());
+        assert_eq!(
+            permit.0.get_env("PATH"),
+            Some(OsStr::new("fixture-plugin-path"))
+        );
+        assert_eq!(
+            permit.0.get_env("AWS_SESSION_TOKEN"),
+            Some(OsStr::new("fixture-token"))
+        );
+        assert!(Arc::ptr_eq(&permit.1, &node.credentials));
         assert_eq!(start.target(), TARGET);
         let nonce = start.reason.strip_prefix("zzabbaxterm-").unwrap();
         assert_eq!(nonce.len(), 32);
@@ -331,22 +358,15 @@ async fn start_requires_an_online_node_from_the_same_scope() {
 }
 
 #[tokio::test]
-async fn changing_caller_during_discovery_discards_the_nodes() {
-    let cli = fixture_cli();
-    let mut responses = VecDeque::from([
-        identity(),
-        fixture(
-            json!({"InstanceInformationList": [{"InstanceId": TARGET, "PingStatus": "Online"}]}),
-        ),
-        fixture(json!({"Arn": "arn:aws:sts::123456789012:assumed-role/Sample/Other"})),
-    ]);
-    let result = cli
-        .online_nodes_with(&request().scope, |_| {
-            std::future::ready(Ok(responses.pop_front().unwrap()))
+async fn expired_export_stops_before_sts_or_discovery() {
+    let expired = EXPORT.replace("2099-01-01", "2000-01-01");
+    let result = fixture_cli()
+        .online_nodes_with(&request().scope, "[default]\n", |spec| {
+            assert_eq!(spec.args()[1], "export-credentials");
+            std::future::ready(Ok(capture(expired.as_bytes().to_vec())))
         })
         .await;
-    assert_eq!(result.err(), Some(CliError::CallerChanged));
-    assert!(responses.is_empty());
+    assert_eq!(result.err(), Some(CliError::CredentialsExpired));
 }
 
 fn fixture(value: Value) -> Captured {
@@ -388,19 +408,19 @@ async fn check_close(
         .close_with(&program, scope, async |spec| {
             let (args, reply) = replies.pop_front().expect("unexpected command");
             assert_eq!(spec.program(), program.as_ref());
+            let mut token_matches = false;
+            spec.bound_environment(|key, value| {
+                if key == "AWS_SESSION_TOKEN" {
+                    token_matches = value == "fixture-token";
+                }
+            });
+            assert!(token_matches);
             assert_eq!(
                 spec.args(),
                 args[..2]
                     .iter()
                     .copied()
-                    .chain([
-                        "--profile",
-                        "team",
-                        "--region",
-                        "us-west-2",
-                        "--output",
-                        "json"
-                    ])
+                    .chain(["--region", "us-west-2", "--output", "json"])
                     .chain(args[2..].iter().copied())
                     .chain(["--no-cli-pager", "--no-cli-auto-prompt"])
                     .collect::<Vec<_>>()
@@ -412,7 +432,16 @@ async fn check_close(
     result
 }
 
-const STS: &[&str] = &["sts", "get-caller-identity"];
+#[tokio::test]
+async fn expired_session_reports_unconfirmed_without_a_cli_call() {
+    let mut request = request();
+    let scope = request.scope.clone();
+    Arc::get_mut(&mut request.credentials).unwrap().expire_for_test();
+
+    assert_eq!(check_close(&mut request, &scope, []).await, Err(VerificationError::Unconfirmed));
+    assert!(request.termination_id.is_none());
+}
+
 const HISTORY: &[&str] = &[
     "ssm",
     "describe-sessions",
@@ -447,10 +476,7 @@ async fn existing_history_ends_cleanup_without_a_write() {
         check_close(
             &mut request,
             &scope,
-            [
-                (STS, Ok(identity())),
-                (HISTORY, Ok(inventory(vec![session()]))),
-            ]
+            [(HISTORY, Ok(inventory(vec![session()]))),]
         )
         .await,
         Ok(())
@@ -469,7 +495,6 @@ async fn active_session_is_terminated_once_and_confirmed_by_history() {
             &mut request,
             &scope,
             [
-                (STS, Ok(identity())),
                 (HISTORY, Ok(inventory(vec![]))),
                 (ACTIVE, Ok(inventory(vec![neighbor, active_session()]))),
                 (TERMINATE, Ok(fixture(json!({"SessionId": SESSION_ID})))),
@@ -501,28 +526,9 @@ async fn denied_ambiguous_or_unowned_sessions_never_authorize_a_write() {
         Err(Unconfirmed)
     );
     request.command_issued = true;
-    assert_eq!(
-        check_close(
-            &mut request,
-            &scope,
-            [(
-                STS,
-                Ok(fixture(
-                    json!({"Arn": "arn:aws:sts::123456789012:assumed-role/Sample/Other"})
-                ))
-            ),]
-        )
-        .await,
-        Err(Unconfirmed)
-    );
     for history in [denied(), inventory(vec![session(), session()])] {
         assert_eq!(
-            check_close(
-                &mut request,
-                &scope,
-                [(STS, Ok(identity())), (HISTORY, Ok(history)),]
-            )
-            .await,
+            check_close(&mut request, &scope, [(HISTORY, Ok(history))]).await,
             Err(Unconfirmed)
         );
     }
@@ -538,11 +544,7 @@ async fn denied_ambiguous_or_unowned_sessions_never_authorize_a_write() {
             check_close(
                 &mut request,
                 &scope,
-                [
-                    (STS, Ok(identity())),
-                    (HISTORY, Ok(inventory(vec![]))),
-                    (ACTIVE, Ok(active)),
-                ]
+                [(HISTORY, Ok(inventory(vec![]))), (ACTIVE, Ok(active)),]
             )
             .await,
             Err(Unconfirmed)
@@ -581,7 +583,6 @@ async fn missing_denied_and_mismatched_write_responses_cannot_trigger_another_wr
         let mut request = request();
         let scope = request.scope.clone();
         let mut replies = vec![
-            (STS, Ok(identity())),
             (HISTORY, Ok(inventory(vec![]))),
             (ACTIVE, Ok(inventory(vec![active_session()]))),
             (TERMINATE, write),
@@ -594,10 +595,7 @@ async fn missing_denied_and_mismatched_write_responses_cannot_trigger_another_wr
             check_close(
                 &mut request,
                 &scope,
-                [
-                    (STS, Ok(identity())),
-                    (CONFIRM, Ok(inventory(vec![different_id.clone()]))),
-                ]
+                [(CONFIRM, Ok(inventory(vec![different_id.clone()]))),]
             )
             .await,
             Err(Unconfirmed)

@@ -1,5 +1,7 @@
 mod cli;
+mod credentials;
 pub mod ipc;
+mod plugin;
 mod profile;
 mod session;
 
@@ -8,6 +10,7 @@ pub use session::{SessionLookup, StartPermit, StartRequest, VerificationError, V
 pub use tokio_util::sync::CancellationToken;
 
 use cli::{Captured, Tool};
+use credentials::{Credentials, export_env};
 use profile::Profiles;
 use serde::{Deserialize, de::DeserializeOwned};
 use std::{path::Path, sync::Arc};
@@ -50,8 +53,6 @@ impl Scope {
         let mut args = vec![
             service,
             action,
-            "--profile",
-            &self.profile,
             "--region",
             &self.region,
             "--output",
@@ -78,10 +79,8 @@ impl AwsCli {
     }
 
     pub async fn check_plugin(&self, cancel: &CancellationToken) -> Result<(), CliError> {
-        CommandSpec::version(Tool::Plugin, Tool::Plugin.resolve()?)
-            .capture(cancel)
-            .await?
-            .success()?;
+        let cwd = std::env::current_dir().map_err(|_| CliError::ProcessIo)?;
+        plugin::checked_path(&self.0, &cwd, cancel).await?;
         Ok(())
     }
 
@@ -106,30 +105,50 @@ impl AwsCli {
         scope: &Scope,
         cancel: &CancellationToken,
     ) -> Result<Vec<OnlineNode>, CliError> {
-        require_direct_profile(scope.profile())?;
-        self.online_nodes_with(scope, |spec| async move { spec.capture(cancel).await })
+        let profiles = Profiles::load()?;
+        let config = profiles.export_config(scope.profile())?;
+        self.online_nodes_with(scope, config, |spec| async move { spec.capture(cancel).await })
             .await
     }
 
-    // Tauri 작업으로 넘길 수 있도록 각 캡처 퓨처가 클로저의 가변 참조를 빌리지 않게 한다.
+    // Tauri 작업은 캡처 클로저를 빌리지 않는 Send 퓨처를 사용한다.
     async fn online_nodes_with<F>(
         &self,
         scope: &Scope,
+        config: &str,
         mut capture: impl FnMut(CommandSpec) -> F + Send,
     ) -> Result<Vec<OnlineNode>, CliError>
     where
         F: Future<Output = Result<Captured, CliError>> + Send,
     {
-        let identity = || session::identity_command(&self.0, scope);
-        let owner = session::captured_caller_arn(capture(identity()).await?)?;
-        let result = capture(self.nodes_command(scope)).await?;
-        let nodes = self.parse_online_nodes(scope, Arc::from(owner), result)?;
-        if let Some(node) = nodes.first()
-            && session::captured_caller_arn(capture(identity()).await?)? != node.owner.as_ref()
-        {
-            return Err(CliError::CallerChanged);
-        }
-        Ok(nodes)
+        use std::io::Write;
+
+        let mut snapshot = tempfile::NamedTempFile::new().map_err(|_| CliError::ProcessIo)?;
+        snapshot
+            .write_all(config.as_bytes())
+            .map_err(|_| CliError::ProcessIo)?;
+        let export = CommandSpec::aws(
+            &self.0,
+            &[
+                "configure",
+                "export-credentials",
+                "--profile",
+                "default",
+                "--format",
+                "process",
+            ],
+        )
+        .with_config(snapshot.path());
+        let credentials = Arc::new(Credentials::parse(capture(export).await?)?);
+        drop(snapshot);
+        let identity = session::identity_command(&self.0, scope, &credentials);
+        let owner = session::captured_caller_arn(capture(identity).await?)?;
+        let result = capture(
+            self.nodes_command(scope)
+                .with_credentials(scope, &credentials),
+        )
+        .await?;
+        self.parse_online_nodes(scope, Arc::from(owner), credentials, result)
     }
 
     pub fn relogin_command(&self, scope: &Scope, cause: CliError) -> Result<CommandSpec, CliError> {
@@ -228,6 +247,7 @@ pub struct OnlineNode {
     scope: Scope,
     instance_id: String,
     owner: Arc<str>,
+    credentials: Arc<Credentials>,
     program: Arc<Path>,
 }
 
@@ -263,6 +283,7 @@ impl AwsCli {
         &self,
         scope: &Scope,
         owner: Arc<str>,
+        credentials: Arc<Credentials>,
         captured: Captured,
     ) -> Result<Vec<OnlineNode>, CliError> {
         let inventory: InstanceInformation = decode(&captured.success()?)?;
@@ -279,6 +300,7 @@ impl AwsCli {
                     scope: scope.clone(),
                     instance_id: node.instance_id,
                     owner: owner.clone(),
+                    credentials: credentials.clone(),
                     program: self.0.clone(),
                 });
             }

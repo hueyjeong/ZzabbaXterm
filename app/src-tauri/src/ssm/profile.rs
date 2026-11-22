@@ -11,7 +11,7 @@ const CONFIG_LIMIT: u64 = 1024 * 1024;
 
 pub(super) struct Profiles {
     known: HashSet<String>,
-    direct: HashSet<String>,
+    direct: HashMap<String, String>,
 }
 
 impl Profiles {
@@ -22,13 +22,18 @@ impl Profiles {
     }
 
     pub(super) fn require(&self, name: &str) -> Result<(), CliError> {
-        if self.direct.contains(name) {
+        if self.direct.contains_key(name) {
             Ok(())
         } else if self.known.contains(name) {
             Err(CliError::UnsupportedProfile)
         } else {
             Err(CliError::ProfileNotFound)
         }
+    }
+
+    pub(super) fn export_config(&self, name: &str) -> Result<&str, CliError> {
+        self.require(name)?;
+        Ok(&self.direct[name])
     }
 
     fn parse(config: &str, credentials: &str) -> Result<Self, CliError> {
@@ -66,7 +71,7 @@ impl Profiles {
                 .or_insert(options);
         }
         let mut known = HashSet::new();
-        let mut direct = HashSet::new();
+        let mut direct = HashMap::new();
         for (name, mut profile) in profiles {
             if let Some(shared) = credentials.get(name.as_str()) {
                 profile.unsupported |= shared.unsupported;
@@ -79,9 +84,9 @@ impl Profiles {
             }
             if !profile.unsupported
                 && !name.contains(['#', '\\'])
-                && is_direct(&profile.options, &sessions)
+                && let Some(config) = direct_config(&profile.options, &sessions)
             {
-                direct.insert(name.clone());
+                direct.insert(name.clone(), config);
             }
             known.insert(name);
         }
@@ -90,7 +95,7 @@ impl Profiles {
     }
 }
 
-fn is_direct(options: &Options<'_>, sessions: &HashMap<String, Section<'_>>) -> bool {
+fn direct_config(options: &Options<'_>, sessions: &HashMap<String, Section<'_>>) -> Option<String> {
     if options.keys().any(|key| {
         key.starts_with("aws_")
             || matches!(
@@ -103,31 +108,21 @@ fn is_direct(options: &Options<'_>, sessions: &HashMap<String, Section<'_>>) -> 
                     | "login_session"
             )
     }) {
-        return false;
+        return None;
     }
-    let Some(account) = options.get("sso_account_id") else {
-        return false;
-    };
-    if account.len() != 12
-        || !account.bytes().all(|b| b.is_ascii_digit())
-        || !options
-            .get("sso_role_name")
-            .is_some_and(|role| !role.is_empty())
-    {
-        return false;
+    let account = options.get("sso_account_id")?;
+    let role = options.get("sso_role_name")?;
+    if account.len() != 12 || !account.bytes().all(|b| b.is_ascii_digit()) || role.is_empty() {
+        return None;
     }
-    if options
-        .get("sso_session")
-        .is_some_and(|name| name.contains(['#', '\\']))
-    {
-        return false;
-    }
-    let settings = if let Some(name) = options.get("sso_session") {
-        let Some(settings) = sessions.get(*name) else {
-            return false;
-        };
+    let name = options.get("sso_session").copied();
+    let settings = if let Some(name) = name {
+        if name.is_empty() || name.contains(['#', '\\', '\'', '"', '[', ']']) {
+            return None;
+        }
+        let settings = sessions.get(name)?;
         if settings.unsupported {
-            return false;
+            return None;
         }
         let settings = &settings.options;
         if ["sso_start_url", "sso_region"].into_iter().any(|key| {
@@ -135,20 +130,29 @@ fn is_direct(options: &Options<'_>, sessions: &HashMap<String, Section<'_>>) -> 
                 .get(key)
                 .is_some_and(|value| Some(value) != settings.get(key))
         }) {
-            return false;
+            return None;
         }
         settings
     } else {
         options
     };
-    settings
-        .get("sso_region")
-        .is_some_and(|region| valid_region(region))
-        && settings.get("sso_start_url").is_some_and(|url| {
-            url.strip_prefix("https://")
-                .is_some_and(|suffix| !suffix.is_empty())
-                && !url.chars().any(char::is_whitespace)
-        })
+    let region = settings.get("sso_region")?;
+    let url = settings.get("sso_start_url")?;
+    if !valid_region(region)
+        || !url
+            .strip_prefix("https://")
+            .is_some_and(|suffix| !suffix.is_empty())
+        || url.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+    // 이름은 앱의 Scope에 남기고 CLI에는 검증한 공급자 설정만 전달한다.
+    let mut config = format!("[default]\nsso_account_id = {account}\nsso_role_name = {role}\n");
+    if let Some(name) = name {
+        config.push_str(&format!("sso_session = {name}\n[sso-session \"{name}\"]\n"));
+    }
+    config.push_str(&format!("sso_region = {region}\nsso_start_url = {url}\n"));
+    Some(config)
 }
 
 type Options<'a> = HashMap<String, &'a str>;

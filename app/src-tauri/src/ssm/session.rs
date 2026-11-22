@@ -1,9 +1,10 @@
 use super::{
-    AwsCli, CancellationToken, Captured, CliError, CommandSpec, OnlineNode, Scope, decode,
+    AwsCli, CancellationToken, Captured, CliError, CommandSpec, Credentials, OnlineNode, Scope,
+    decode, plugin,
 };
 use portable_pty::{Child, CommandBuilder, PtyPair, PtySize, native_pty_system};
 use serde::Deserialize;
-use std::{io, path::Path, sync::Arc};
+use std::{ffi::OsStr, io, path::Path, sync::Arc};
 
 // 각 요청을 앱 세션에 보관하고 start-session은 요청당 한 번만 호출한다.
 pub struct StartRequest {
@@ -11,6 +12,7 @@ pub struct StartRequest {
     target: String,
     reason: String,
     owner: Arc<str>,
+    credentials: Arc<Credentials>,
     program: Arc<Path>,
     command_issued: bool,
     termination_id: Option<String>,
@@ -23,13 +25,29 @@ pub struct StartRequest {
 /// use zzabbaxterm_lib::ssm::StartPermit;
 /// fn duplicate(permit: StartPermit) { let _ = permit.clone(); }
 /// ```
-pub struct StartPermit(CommandBuilder);
+pub struct StartPermit(CommandBuilder, Arc<Credentials>, plugin::CheckedPlugin);
 
 impl StartPermit {
     pub fn spawn(self, size: PtySize) -> io::Result<(PtyPair, Box<dyn Child + Send + Sync>)> {
+        self.1.require_current().map_err(|_| {
+            io::Error::new(io::ErrorKind::PermissionDenied, "SSM credentials expired")
+        })?;
         let pair = native_pty_system()
             .openpty(size)
             .map_err(io::Error::other)?;
+        self.1.require_current().map_err(|_| {
+            io::Error::new(io::ErrorKind::PermissionDenied, "SSM credentials expired")
+        })?;
+        let cwd = self
+            .0
+            .get_cwd()
+            .ok_or_else(|| io::Error::other("SSM working directory missing"))?;
+        self.2
+            .recheck(
+                self.0.get_argv()[0].as_os_str().as_ref(),
+                cwd.as_os_str().as_ref(),
+            )
+            .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "SSM plugin search changed"))?;
         let child = pair.slave.spawn_command(self.0).map_err(io::Error::other)?;
         Ok((pair, child))
     }
@@ -72,7 +90,7 @@ impl AwsCli {
         if cancel.is_cancelled() {
             return Err(CliError::Cancelled);
         }
-        super::require_direct_profile(scope.profile())?;
+        node.credentials.require_current()?;
         prepare_start(scope, node)
     }
 
@@ -83,9 +101,8 @@ impl AwsCli {
         cancel: &CancellationToken,
     ) -> Result<Option<StartPermit>, CliError> {
         request
-            .authorize_with(&self.0, scope, async |spec| {
-                super::require_direct_profile(scope.profile())?;
-                spec.capture(cancel).await
+            .authorize_with(&self.0, scope, async |cwd| {
+                plugin::checked_path(&self.0, cwd, cancel).await
             })
             .await
     }
@@ -99,15 +116,10 @@ impl AwsCli {
     ) -> Result<VerifiedSession, VerificationError> {
         use VerificationError::Unconfirmed;
         request.require_issued_scope(&self.0, current_scope)?;
-        super::require_direct_profile(current_scope.profile()).map_err(|_| Unconfirmed)?;
-        let caller = caller_arn(&self.0, current_scope, async |spec| {
-            spec.capture(cancel).await
-        })
-        .await
-        .map_err(|_| Unconfirmed)?;
-        if caller != request.owner.as_ref() {
-            return Err(Unconfirmed);
-        }
+        request
+            .credentials
+            .require_current()
+            .map_err(|_| Unconfirmed)?;
         let result = request.lookup_command(lookup, None).capture(cancel).await;
         request.find_session(result)?.ok_or(Unconfirmed)
     }
@@ -119,7 +131,9 @@ impl AwsCli {
         cancel: &CancellationToken,
     ) -> Result<(), VerificationError> {
         request.require_issued_scope(&self.0, current_scope)?;
-        super::require_direct_profile(current_scope.profile())
+        request
+            .credentials
+            .require_current()
             .map_err(|_| VerificationError::Unconfirmed)?;
         request
             .close_with(&self.0, current_scope, async |spec| {
@@ -134,7 +148,7 @@ impl StartRequest {
         &mut self,
         program: &Path,
         scope: &Scope,
-        capture: impl AsyncFnMut(CommandSpec) -> Result<Captured, CliError>,
+        mut check_plugin: impl AsyncFnMut(&Path) -> Result<plugin::CheckedPlugin, CliError>,
     ) -> Result<Option<StartPermit>, CliError> {
         if !self.matches(program, scope) {
             return Err(CliError::InvalidTarget);
@@ -142,27 +156,30 @@ impl StartRequest {
         if self.command_issued {
             return Ok(None);
         }
+        self.credentials.require_current()?;
         let cwd = std::env::current_dir().map_err(|_| CliError::ProcessIo)?;
-        let command = self.start_command(&cwd);
-        // 인가 직전 신원을 확인한다. 외부의 실행 파일·프로필·캐시 변경은 이 경계 밖이다.
-        if caller_arn(&self.program, scope, capture).await? != self.owner.as_ref() {
-            return Err(CliError::CallerChanged);
-        }
+        let path = check_plugin(&cwd).await?;
+        self.credentials.require_current()?;
+        let command = self.start_command(&cwd, path.path());
         self.command_issued = true;
-        Ok(Some(StartPermit(command)))
+        Ok(Some(StartPermit(command, self.credentials.clone(), path)))
     }
 
-    fn start_command(&self, cwd: &Path) -> CommandBuilder {
-        let spec = self.scope.command(
-            &self.program,
-            "ssm",
-            "start-session",
-            &["--target", &self.target, "--reason", &self.reason],
-        );
+    fn start_command(&self, cwd: &Path, plugin_path: &OsStr) -> CommandBuilder {
+        let spec = self
+            .scope
+            .command(
+                &self.program,
+                "ssm",
+                "start-session",
+                &["--target", &self.target, "--reason", &self.reason],
+            )
+            .with_credentials(&self.scope, &self.credentials);
         let mut command = CommandBuilder::new(spec.program());
         command.args(spec.args());
         command.cwd(cwd);
         apply_start_environment(&mut command, &spec, std::env::vars_os());
+        command.env("PATH", plugin_path);
         command
     }
 
@@ -192,12 +209,14 @@ impl StartRequest {
         } else {
             format!("key=Target,value={}", self.target)
         };
-        self.scope.command(
-            &self.program,
-            "ssm",
-            "describe-sessions",
-            &["--state", state, "--filters", &filter],
-        )
+        self.scope
+            .command(
+                &self.program,
+                "ssm",
+                "describe-sessions",
+                &["--state", state, "--filters", &filter],
+            )
+            .with_credentials(&self.scope, &self.credentials)
     }
 
     async fn close_with(
@@ -208,13 +227,9 @@ impl StartRequest {
     ) -> Result<(), VerificationError> {
         use VerificationError::Unconfirmed;
         self.require_issued_scope(program, current_scope)?;
-        if caller_arn(&self.program, current_scope, &mut capture)
-            .await
-            .map_err(|_| Unconfirmed)?
-            != self.owner.as_ref()
-        {
-            return Err(Unconfirmed);
-        }
+        self.credentials
+            .require_current()
+            .map_err(|_| Unconfirmed)?;
         if let Some(id) = self.termination_id.as_deref() {
             return self.confirm_terminated(id, &mut capture).await;
         }
@@ -229,12 +244,16 @@ impl StartRequest {
             .ok_or(Unconfirmed)?;
 
         let id = self.termination_id.insert(active.session_id).as_str();
-        let result = capture(self.scope.command(
-            &self.program,
-            "ssm",
-            "terminate-session",
-            &["--session-id", id],
-        ))
+        let result = capture(
+            self.scope
+                .command(
+                    &self.program,
+                    "ssm",
+                    "terminate-session",
+                    &["--session-id", id],
+                )
+                .with_credentials(&self.scope, &self.credentials),
+        )
         .await
         .and_then(Captured::success);
         match result {
@@ -336,6 +355,9 @@ fn apply_start_environment(
     for (key, value) in spec.env_set() {
         command.env(key, value);
     }
+    spec.bound_environment(|key, value| {
+        command.env(key, value);
+    });
 }
 
 fn require_node_scope(program: &Path, scope: &Scope, node: &OnlineNode) -> Result<(), CliError> {
@@ -353,22 +375,21 @@ fn prepare_start(scope: &Scope, node: &OnlineNode) -> Result<StartRequest, CliEr
         target: node.instance_id.clone(),
         reason: format!("zzabbaxterm-{:032x}", u128::from_be_bytes(nonce)),
         owner: node.owner.clone(),
+        credentials: node.credentials.clone(),
         program: node.program.clone(),
         command_issued: false,
         termination_id: None,
     })
 }
 
-pub(super) fn identity_command(program: &Arc<Path>, scope: &Scope) -> CommandSpec {
-    scope.command(program, "sts", "get-caller-identity", &[])
-}
-
-pub(super) async fn caller_arn(
+pub(super) fn identity_command(
     program: &Arc<Path>,
     scope: &Scope,
-    mut capture: impl AsyncFnMut(CommandSpec) -> Result<Captured, CliError>,
-) -> Result<String, CliError> {
-    captured_caller_arn(capture(identity_command(program, scope)).await?)
+    credentials: &Arc<Credentials>,
+) -> CommandSpec {
+    scope
+        .command(program, "sts", "get-caller-identity", &[])
+        .with_credentials(scope, credentials)
 }
 
 pub(super) fn captured_caller_arn(captured: Captured) -> Result<String, CliError> {

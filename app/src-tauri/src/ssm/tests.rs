@@ -4,6 +4,12 @@ pub(super) fn fixture_cli() -> AwsCli {
     AwsCli(Arc::from(std::env::current_exe().unwrap()))
 }
 
+pub(super) const EXPORT: &str = r#"{"Version":1,"AccessKeyId":"fixture-key","SecretAccessKey":"fixture-secret","SessionToken":"fixture-token","Expiration":"2099-01-01T00:00:00Z"}"#;
+
+pub(super) fn fixture_credentials() -> Arc<Credentials> {
+    Arc::new(Credentials::parse(response(0, EXPORT, "")).unwrap())
+}
+
 fn response(exit_code: i32, stdout: &str, stderr: &str) -> Captured {
     Captured {
         exit_code: Some(exit_code),
@@ -125,6 +131,7 @@ fn online_list_only_accepts_complete_inventory() {
         let result = fixture_cli().parse_online_nodes(
             &scope,
             Arc::from("fixture-owner"),
+            fixture_credentials(),
             response(*exit, stdout, stderr),
         );
         match expected {
@@ -160,8 +167,6 @@ fn discovery_commands_use_literal_arguments_and_never_fallback() {
             vec![
                 "ssm",
                 "describe-instance-information",
-                "--profile",
-                profile,
                 "--region",
                 "us-west-2",
                 "--output",

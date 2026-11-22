@@ -96,6 +96,8 @@ fn resolve_on_path(file: &str, path: &OsStr) -> Option<PathBuf> {
 pub struct CommandSpec {
     tool: Tool,
     program: Arc<Path>,
+    config: Option<PathBuf>,
+    bound: Option<(super::Scope, Arc<super::Credentials>)>,
     args: Vec<String>,
 }
 
@@ -109,9 +111,6 @@ impl CommandSpec {
     }
 
     pub fn env_remove(&self) -> &'static [&'static str] {
-        if matches!(self.tool, Tool::Plugin) {
-            return &[];
-        }
         &[
             "AWS_PROFILE",
             "AWS_DEFAULT_PROFILE",
@@ -140,6 +139,21 @@ impl CommandSpec {
             "AWS_ENDPOINT_URL_SSO_OIDC",
             "AWS_ENDPOINT_URL_SIGNIN",
             "BROWSER",
+            "AWS_SSM_START_SESSION_RESPONSE",
+            "AWS_SSM_PLUGIN_ADDITIONAL_STREAM_HOSTS",
+            "AWS_SDK_LOAD_CONFIG",
+            "_AWS_CLI_PROFILE_CHAIN",
+            "AWS_CLI_FILE_ENCODING",
+            "AWS_USE_FIPS_ENDPOINT",
+            "AWS_USE_DUALSTACK_ENDPOINT",
+            "GODEBUG",
+            "SSLKEYLOGFILE",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "DYLD_INSERT_LIBRARIES",
+            "DYLD_LIBRARY_PATH",
+            "PYTHONPATH",
+            "PYTHONHOME",
         ]
     }
 
@@ -166,6 +180,8 @@ impl CommandSpec {
         Self {
             tool: Tool::Aws,
             program: program.clone(),
+            config: None,
+            bound: None,
             args,
         }
     }
@@ -174,7 +190,32 @@ impl CommandSpec {
         Self {
             tool,
             program,
+            config: None,
+            bound: None,
             args: vec!["--version".into()],
+        }
+    }
+
+    pub(super) fn with_config(mut self, path: &Path) -> Self {
+        self.config = Some(path.into());
+        self
+    }
+
+    pub(super) fn with_credentials(
+        mut self,
+        scope: &super::Scope,
+        credentials: &Arc<super::Credentials>,
+    ) -> Self {
+        self.bound = Some((scope.clone(), credentials.clone()));
+        self
+    }
+
+    pub(super) fn bound_environment(&self, mut set: impl FnMut(&str, &OsStr)) {
+        if let Some(path) = self.config.as_deref() {
+            super::export_env(path, &mut set);
+        }
+        if let Some((scope, credentials)) = &self.bound {
+            credentials.env(scope.region(), set);
         }
     }
 
@@ -187,10 +228,16 @@ impl CommandSpec {
         for (key, value) in self.env_set() {
             cmd.env(key, value);
         }
+        self.bound_environment(|key, value| {
+            cmd.env(key, value);
+        });
         cmd
     }
 
     pub(super) async fn capture(&self, cancel: &CancellationToken) -> Result<Captured, CliError> {
+        if let Some((_, credentials)) = &self.bound {
+            credentials.require_current()?;
+        }
         capture(self.command(), self.tool, LOOKUP_TIMEOUT, cancel).await
     }
 
@@ -313,6 +360,9 @@ fn classify(exit_code: Option<i32>, stderr: &[u8]) -> CliError {
         })
         .or_else(|| stderr.lines().last())
         .unwrap_or_default();
+    let message = message
+        .strip_prefix("Unable to retrieve credentials: ")
+        .unwrap_or(message);
     let code = serde_json::from_str::<ErrorCode<'_>>(stderr)
         .ok()
         .map(|error| error.code)
@@ -353,6 +403,7 @@ fn classify(exit_code: Option<i32>, stderr: &[u8]) -> CliError {
         None if message.starts_with("Could not connect to the endpoint URL:") => {
             EndpointUnavailable
         }
+        None if message == "no credentials found" => CredentialsUnavailable,
         None if message
             == "Error when retrieving token from sso: Token has expired and refresh failed"
             || message
