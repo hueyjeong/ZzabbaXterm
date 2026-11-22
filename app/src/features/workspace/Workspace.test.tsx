@@ -30,8 +30,11 @@ vi.mock("@xterm/xterm", () => ({
       this.field = screen.appendChild(document.createElement("textarea"));
     }
     focus() { this.field.focus(); }
+    blur() { this.field.blur(); }
     onData(input: (data: string) => void) {
-      this.field.addEventListener("input", () => input(this.field.value));
+      this.field.addEventListener("input", (event) => {
+        if (event instanceof InputEvent && event.data) input(event.data);
+      });
       return { dispose() { } };
     }
     write(bytes: Uint8Array, parsed: () => void) {
@@ -47,6 +50,7 @@ let root: Root;
 let viewportWidth: number;
 let observeWorkspace: () => void;
 const channels = new Map<string, (message: unknown) => void>();
+const starts = new Map<string, Promise<void>>();
 
 beforeEach(async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
@@ -65,7 +69,9 @@ beforeEach(async () => {
     return this.closest("[hidden]") ? 0 : 400;
   });
   channels.clear();
+  starts.clear();
   native.invoke.mockImplementation(async (command, args) => {
+    if (command === "terminal_start") return starts.get(args.id);
     if (command !== "terminal_open") return;
     const id = `pty-${channels.size + 10}`;
     channels.set(id, args.output.receive);
@@ -104,10 +110,10 @@ async function key(element: HTMLElement, value: string) {
   await act(async () => { element.dispatchEvent(new KeyboardEvent("keydown", { key: value, bubbles: true })); });
 }
 
-async function type(field: HTMLTextAreaElement, value: string) {
+async function type(field: HTMLTextAreaElement, value: string, inserted = value) {
   await act(async () => {
     Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(field, value);
-    field.dispatchEvent(new Event("input", { bubbles: true }));
+    field.dispatchEvent(new InputEvent("input", { bubbles: true, data: inserted }));
   });
 }
 
@@ -126,6 +132,27 @@ async function openSecond() {
 }
 
 describe("L02", () => {
+  it("셸이 준비되기 전에는 입력을 받지 않고 준비되면 선택한 터미널로 포커스가 이동한다", async () => {
+    const start = Promise.withResolvers<void>();
+    starts.set("pty-11", start.promise);
+    await openSecond();
+    const input = find<HTMLTextAreaElement>('section[aria-label="로컬 2"] textarea');
+    const screen = input.parentElement!;
+    expect(status()).toContain("pty-11 · 여는 중");
+    expect(screen.hasAttribute("inert")).toBe(true);
+    expect(document.activeElement).not.toBe(input);
+    // jsdom에서 합성 입력으로 inert를 우회해도 준비 전 데이터는 PTY로 가지 않는다.
+    await type(input, "EARLY");
+    expect(calls("input")).toEqual([]);
+
+    await act(async () => { start.resolve(); });
+    expect(status()).toContain("pty-11 · 연결됨");
+    expect(screen.hasAttribute("inert")).toBe(false);
+    expect(document.activeElement).toBe(input);
+    await type(input, "READY");
+    expect(calls("input")).toEqual([{ id: "pty-11", bytes: Array.from(new TextEncoder().encode("READY")) }]);
+  });
+
   it("집중 보기와 탭 왕복은 두 PTY와 패널 선호값, 미제출 입력, 채팅 초안을 유지한다", async () => {
     expect(status()).toContain("pty-10");
     await openSecond();
@@ -175,7 +202,9 @@ describe("L02", () => {
 
   it("숨은 탭의 출력과 종료는 활성 탭의 입력, 포커스, 상태를 바꾸지 않는다", async () => {
     await openSecond();
-    const active = document.activeElement;
+    const active = find<HTMLTextAreaElement>('section[aria-label="로컬 2"] textarea');
+    expect(document.activeElement).toBe(active);
+    await type(active, "echo ");
     native.fit.mockClear();
     await act(async () => {
       const bytes = new Uint8Array(new ArrayBuffer(6));
@@ -185,8 +214,11 @@ describe("L02", () => {
     });
     expect(document.activeElement).toBe(active);
     expect(native.fit).not.toHaveBeenCalled();
-    await type(active as HTMLTextAreaElement, "B_READY");
-    expect(calls("input").map(({ id }) => id)).toEqual(["pty-11"]);
+    expect(active.value).toBe("echo ");
+    await type(active, `${active.value}B_READY`, "B_READY");
+    expect(calls("input")).toEqual(["echo ", "B_READY"].map((text) => ({
+      id: "pty-11", bytes: Array.from(new TextEncoder().encode(text)),
+    })));
     expect(status()).toContain("pty-11");
     await press("로컬 1");
     expect(find('section[aria-label="로컬 1"]').textContent).toContain("A_DONE");
