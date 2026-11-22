@@ -536,7 +536,7 @@ pub(crate) fn start_rejection(output: &[u8]) -> Option<CliError> {
 
 #[cfg(windows)]
 fn conpty_diagnostic(mut output: &[u8]) -> Option<&[u8]> {
-    const SHUTDOWN_MODES: [&[u8]; 2] = [b"\x1b[?9001l", b"\x1b[?1004l"]];
+    const SHUTDOWN_MODES: [&[u8]; 2] = [b"\x1b[?9001l", b"\x1b[?1004l"];
     // ConPTY 종료 모드 제어열은 같은 스트림의 진단문 앞이나 뒤에 올 수 있다.
     while output.starts_with(b"\x1b") {
         if let Some(title) = output.strip_prefix(b"\x1b]0;") {
