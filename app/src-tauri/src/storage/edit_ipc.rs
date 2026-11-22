@@ -167,9 +167,10 @@ impl StorageIpc {
         let (client, target, mut closed) = {
             let mut registry = self.0.lock().unwrap();
             let tab = registry.tab(document, &session_id).ok_or_else(EditResult::stale)?;
+            let client = tab.client.aws().ok_or_else(EditResult::denied)?;
             if tab.expired { return Err(expired()); }
             let target = tab.edits.rows.get(&row_id).ok_or_else(EditResult::denied)?;
-            (tab.client.clone(), target.clone(), tab.closed.subscribe())
+            (client.clone(), target.clone(), tab.closed.subscribe())
         };
         let regional = if target.scope.region == client.region {
             client.clone()
@@ -184,7 +185,7 @@ impl StorageIpc {
         };
         let mut registry = self.0.lock().unwrap();
         let tab = registry.tab(document, &session_id).ok_or_else(EditResult::stale)?;
-        if !tab.edits.rows.contains_key(&row_id) || !Arc::ptr_eq(&tab.client, &client) {
+        if !tab.edits.rows.contains_key(&row_id) || !tab.client.aws().is_some_and(|current| Arc::ptr_eq(current, &client)) {
             return Err(EditResult::denied());
         }
         let object = match result {
@@ -249,12 +250,14 @@ impl StorageIpc {
     pub(super) fn edit_close(&self, document: &Document, request: EditRequest) -> bool {
         let mut registry = self.0.lock().unwrap();
         registry.tab(document, &request.session_id)
+            .filter(|tab| tab.client.aws().is_some())
             .is_some_and(|tab| tab.edits.editors.remove(&request.handle).is_some())
     }
 
     fn begin_edit<'a>(&'a self, document: &'a Document, request: &'a EditRequest, action: Action) -> Result<Pending<'a>, EditResult> {
         let mut registry = self.0.lock().unwrap();
         let tab = registry.tab(document, &request.session_id).ok_or_else(EditResult::stale)?;
+        let client = tab.client.aws().ok_or_else(EditResult::denied)?;
         if tab.expired { return Err(expired()); }
         let editor = tab.edits.editors.get_mut(&request.handle).ok_or_else(EditResult::denied)?;
         if editor.busy { return Err(EditResult::busy()); }
@@ -262,7 +265,7 @@ impl StorageIpc {
         editor.busy = action != Action::Compare;
         Ok(Pending {
             storage: self, document, request, action,
-            client: tab.client.clone(), closed: tab.closed.subscribe(),
+            client: client.clone(), closed: tab.closed.subscribe(),
             regional: editor.regional.clone(),
             target: editor.target.clone(), revision: editor.revision.clone(), finished: false,
         })
@@ -290,7 +293,7 @@ impl Pending<'_> {
         let mut registry = self.storage.0.lock().unwrap();
         let saving = self.action == Action::Save;
         let Some(tab) = registry.tab(self.document, &self.request.session_id)
-            .filter(|tab| Arc::ptr_eq(&tab.client, &self.client)) else {
+            .filter(|tab| tab.client.aws().is_some_and(|current| Arc::ptr_eq(current, &self.client))) else {
             return if saving { EditResult::unknown() } else { EditResult::stale() };
         };
         let Some(editor) = tab.edits.editors.get_mut(&self.request.handle) else {
@@ -321,7 +324,7 @@ impl Drop for Pending<'_> {
         // 요청 취소만으로는 이미 전송된 PUT의 적용 여부를 알 수 없다.
         let mut registry = self.storage.0.lock().unwrap();
         if let Some(editor) = registry.tab(self.document, &self.request.session_id)
-            .filter(|tab| Arc::ptr_eq(&tab.client, &self.client))
+            .filter(|tab| tab.client.aws().is_some_and(|current| Arc::ptr_eq(current, &self.client)))
             .and_then(|tab| tab.edits.editors.get_mut(&self.request.handle)) {
             editor.busy = false;
             editor.unknown |= self.action == Action::Save;

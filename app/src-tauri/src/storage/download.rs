@@ -6,7 +6,6 @@ use std::{
     },
 };
 
-use aws_sdk_s3::Client;
 use aws_smithy_checksums::body::validate;
 use aws_smithy_runtime::client::http::body::content_length_enforcement::ContentLengthError;
 use aws_smithy_runtime_api::{
@@ -31,10 +30,10 @@ use sha2::{Digest, Sha256};
 use crate::editor::storage_files::{DownloadPublicationError, DownloadTarget};
 use tokio::{fs::File, io::AsyncWriteExt, sync::watch};
 
-use super::{DownloadIntegrity, Downloaded, Error, Failure, Stage, sdk_error, single_attempt};
+use super::{DownloadIntegrity, Downloaded, Error, Failure, S3Operations, Stage, single_attempt};
 
 pub(super) async fn download(
-    client: &Client,
+    operations: &S3Operations<impl std::borrow::Borrow<aws_sdk_s3::Client>>,
     bucket: &str,
     key: &str,
     target: &DownloadTarget,
@@ -43,7 +42,7 @@ pub(super) async fn download(
     let checksum = ChecksumStatus::default();
     // S3 대기는 즉시 취소하고, 시작한 로컬 쓰기는 정리 전에 끝낸다.
     let mut cancellation = closed.subscribe();
-    let request = client
+    let request = operations.client.borrow()
         .get_object()
         .bucket(bucket)
         .key(key)
@@ -63,7 +62,7 @@ pub(super) async fn download(
         _ = cancellation.wait_for(|closed| *closed) => {
             return Err(Error::at(Stage::GetObject, Failure::Request));
         }
-        result = request => result.map_err(|err| sdk_error(Stage::GetObject, err))?,
+        result = request => result.map_err(|err| operations.sdk_error(Stage::GetObject, err))?,
     };
     let expected = output.content_length().and_then(|n| u64::try_from(n).ok());
     let length = |bytes| Error {

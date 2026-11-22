@@ -3,6 +3,7 @@ import type { VersionedFilesStatus } from "../files/FileBrowser";
 import { ObjectTable } from "./ObjectTable";
 import type { BucketRow, ObjectRow, S3Actions, S3FileSelection, S3Location, S3Session, StorageEditorOpen } from "./s3";
 import { StorageProblem, TransferStatus, type Problem, type Transfer } from "./StorageStatus";
+import type { CompatibleSession } from "./compatible-settings";
 import { bindStorageEditor } from "./storageEditorIpc";
 import { countPreviousFiles } from "./storageIpc";
 import "./storage.css";
@@ -29,6 +30,7 @@ const initial: View = { confirmed: false, loading: false, selectedKey: null, upl
 
 type Props = Readonly<{
   session: S3Session;
+  initialPage?: CompatibleSession["initial"];
   actions: S3Actions;
   onRelogin?: () => void;
   refresh?: number;
@@ -37,14 +39,27 @@ type Props = Readonly<{
   countHistory?: typeof countPreviousFiles;
 }>;
 
-export function S3StoragePanel({ session, actions, onRelogin, refresh = 0, editEnabled = true, onEditFile, countHistory = countPreviousFiles }: Props) {
-  const [views, setViews] = useState(() => new Map<string, View>());
+export function S3StoragePanel({ session, initialPage, actions, onRelogin, refresh = 0, editEnabled = true, onEditFile, countHistory = countPreviousFiles }: Props) {
+  const fixedLocation = initialPage?.kind === "objects" ? initialPage.location : undefined;
+  const [views, setViews] = useState(() => {
+    const initialViews = new Map<string, View>();
+    if (initialPage?.kind === "buckets") {
+      initialViews.set(session.sessionId, { ...initial, listing: { kind: "buckets", ...initialPage.page } });
+    } else if (initialPage?.kind === "objects") {
+      const { location, page } = initialPage;
+      initialViews.set(session.sessionId, {
+        ...initial, input: location, requestedLocation: location, confirmed: true, listing: { kind: "objects", location, ...page },
+      });
+    }
+    return initialViews;
+  });
   const [history, setHistory] = useState<{ request: Parameters<typeof countPreviousFiles>[0]; count: typeof countPreviousFiles; status: VersionedFilesStatus }>();
   const [menuKey, setMenuKey] = useState<string>();
   const editAttempt = useRef<{ sessionId: string } | null>(null);
   const editListener = useRef(onEditFile);
   useLayoutEffect(() => { editListener.current = onEditFile; }, [onEditFile]);
   const { sessionId } = session;
+  const compatible = session.compatible;
   const view = views.get(sessionId) ?? initial;
   const input = view.input ?? session.location ?? { bucket: "", prefix: "", region: session.region };
 
@@ -56,7 +71,7 @@ export function S3StoragePanel({ session, actions, onRelogin, refresh = 0, editE
   }
 
   async function load(location: S3Location | null, token: string | null = null, afterRelogin = false) {
-    if (view.loading) return;
+    if (view.loading || (fixedLocation && (location?.bucket !== fixedLocation.bucket || location.region !== fixedLocation.region))) return;
     editAttempt.current = null;
     update(current => ({
       loading: true, requestedLocation: location, problem: undefined, editError: undefined,
@@ -126,12 +141,12 @@ export function S3StoragePanel({ session, actions, onRelogin, refresh = 0, editE
   const listing = view.listing;
   const location = listing?.kind === "objects" ? listing.location : null;
   const transferring = view.transfer?.state === "selecting" || view.transfer?.state === "running";
-  const expired = view.expired || (view.transfer?.state === "failed" && view.transfer.problem !== "unavailable" && view.transfer.problem.failure.kind === "ssoLoginRequired");
-  const detectedRegion = view.problem && view.problem !== "unavailable" && view.problem.failure.kind === "bucketRegionMismatch" ? view.problem.failure.region : null;
+  const expired = !compatible && (view.expired || (view.transfer?.state === "failed" && view.transfer.problem !== "unavailable" && view.transfer.problem.failure.kind === "ssoLoginRequired"));
+  const detectedRegion = !compatible && view.problem && view.problem !== "unavailable" && view.problem.failure.kind === "bucketRegionMismatch" ? view.problem.failure.region : null;
   const canTransfer = view.confirmed && !view.loading && !transferring && !expired;
   const selectedKey = listing?.kind === "objects" && listing.rows.some(row => row.kind === "object" && row.key === view.selectedKey)
     ? view.selectedKey : null;
-  const canEdit = editEnabled && !!onEditFile && view.confirmed && !view.loading && !expired;
+  const canEdit = !compatible && editEnabled && !!onEditFile && view.confirmed && !view.loading && !expired;
   useLayoutEffect(() => () => { editAttempt.current = null; }, [sessionId, canEdit]);
 
   function approvedRowId(key: string | undefined) {
@@ -167,7 +182,7 @@ export function S3StoragePanel({ session, actions, onRelogin, refresh = 0, editE
       if (editAttempt.current === current) editAttempt.current = null;
     }
   }
-  const historyListing = view.confirmed && !view.loading && !view.problem && !expired && listing?.kind === "objects" ? listing : undefined;
+  const historyListing = !compatible && view.confirmed && !view.loading && !view.problem && !expired && listing?.kind === "objects" ? listing : undefined;
   const historyRequest = useMemo(() => historyListing ? { sessionId, ...historyListing.location } : undefined,
     [historyListing, sessionId]);
 
@@ -236,19 +251,22 @@ export function S3StoragePanel({ session, actions, onRelogin, refresh = 0, editE
     }
   }
 
-  return <section className="s3-storage" aria-label="AWS S3">
+  const title = compatible ? "S3 호환 HTTPS" : "AWS S3";
+  return <section className="s3-storage" aria-label={title}>
     <header className="storage-heading">
-      <h2>AWS S3</h2><span>{session.profile} · {session.region}</span>
+      <h2>{title}</h2><span>{session.profile} · {session.region}{compatible &&
+        ` · ${compatible.serviceId} · ${session.endpoint} · ${compatible.addressing === "path" ? "경로" : "가상 호스트"}`}</span>
     </header>
     <form className="storage-controls" onSubmit={event => { event.preventDefault(); if (input.bucket && input.region && !view.loading && !transferring) open(input); }}>
-      {([["버킷", "bucket"], ["접두어", "prefix"], ["리전", "region"]] as const).map(([label, field]) =>
-        <label key={field}>{label}<input value={input[field]} disabled={view.loading || transferring} onChange={event => {
+      {([["버킷", "bucket"], ["접두어", "prefix"], ["리전", "region"]] as const).filter(([, field]) => !fixedLocation || field === "prefix").map(([label, field]) =>
+        <label key={field}>{field === "region" && compatible ? "서명 리전" : label}<input value={input[field]} readOnly={field === "region" && !!compatible} disabled={view.loading || transferring} onChange={event => {
+          if (field === "region" && compatible) return;
           const value = event.target.value;
           editAttempt.current = null;
           update(() => ({ input: { ...input, [field]: value }, confirmed: false }));
         }} /></label>)}
-      <button type="submit" disabled={!input.bucket || !input.region || view.loading || transferring}>버킷 열기</button>
-      <button type="button" disabled={view.loading || transferring} onClick={() => void load(null)}>버킷 목록</button>
+      <button type="submit" disabled={!input.bucket || !input.region || view.loading || transferring}>{fixedLocation ? "접두어 열기" : "버킷 열기"}</button>
+      {!fixedLocation && <button type="button" disabled={view.loading || transferring} onClick={() => void load(null)}>버킷 목록</button>}
     </form>
     {view.problem && <StorageProblem problem={view.problem} session={session} />}
     {view.editError && <p role="alert">파일 열기 실패: {view.editError}</p>}
@@ -259,7 +277,7 @@ export function S3StoragePanel({ session, actions, onRelogin, refresh = 0, editE
     {view.loading && <p role="status">목록 요청 중</p>}
     {listing?.kind === "buckets" && <ul className="storage-buckets" aria-label="버킷 목록">
       {listing.rows.map(({ name, region }) => <li key={name}>
-        <button type="button" disabled={view.loading || transferring} onClick={() => open({ bucket: name, prefix: "", region })}>{name}</button> <span>{region}</span>
+        <button type="button" disabled={view.loading || transferring} onClick={() => open({ bucket: name, prefix: "", region: compatible ? session.region : region })}>{name}</button> <span>{region}</span>
       </li>)}
     </ul>}
     {listing?.kind === "objects" && <>

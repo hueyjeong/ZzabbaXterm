@@ -13,6 +13,7 @@ import { RdpTab } from "../rdp/RdpTab";
 import { SftpPanel, type SftpPanelActions } from "../sftp/SftpPanel";
 import { sftpError } from "../sftp/sftpIpc";
 import type { SsmTarget } from "../ssm/ssm";
+import { CompatibleStorageTab } from "../storage/CompatibleStorageTab";
 import { StorageTab } from "../storage/StorageTab";
 import { TerminalView } from "../terminal/TerminalView";
 import type { TerminalStatus } from "../terminal/session";
@@ -34,7 +35,11 @@ type Tab = { id: number; label: string } & (
   | { kind: "rdp" }
   | { kind: "vnc" }
 );
-type StorageTarget = { targetId: string; label: string; closeStatus?: CloseStatus };
+const compatibleStorage = { kind: "compatible", targetId: "s3:compatible", label: "S3 호환 HTTPS" } as const;
+type StorageTarget = { closeStatus?: CloseStatus } & (
+  | { kind: "aws"; targetId: string; label: string }
+  | typeof compatibleStorage
+);
 type ProfileLoad = { kind: "loading" | "ready"; profiles?: SavedConnections }
   | { kind: "error"; profiles?: SavedConnections; error: string };
 const connections = createLocalConnectionIpc();
@@ -349,7 +354,7 @@ export function Workspace() {
 
   function openTab(target?: SavedConnections["targets"][number]["profile"]) {
     if (target?.defaultMethod === "s3") {
-      openStorageTarget(target.id, target.displayName);
+      openStorageTarget({ kind: "aws", targetId: target.id, label: target.displayName });
       return;
     }
     const id = nextTab.current++;
@@ -388,10 +393,10 @@ export function Workspace() {
     selectTab(id);
   }
 
-  function openStorageTarget(targetId: string, label: string) {
-    setStorageTargets((current) => current.some((target) => target.targetId === targetId)
-      ? current : [...current, { targetId, label }]);
-    setPinnedStorage(targetId);
+  function openStorageTarget(target: StorageTarget) {
+    setStorageTargets(current => current.some(open => open.targetId === target.targetId)
+      ? current : [...current, target]);
+    setPinnedStorage(target.targetId);
     setShowFiles(true);
   }
 
@@ -544,6 +549,7 @@ export function Workspace() {
       ? { ...tab, sftpSessionId: activeSftp } : tab));
   }, [active, activeSftp, attachedSftp]);
   const selectedStorage = storageTargets.find(target => target.targetId === pinnedStorage);
+  const openAwsStorage = storageTargets.filter(target => target.kind === "aws");
   const savedStorageTargets = profileLoad.profiles?.targets.filter(({ profile }) =>
     (profile.defaultMethod === "s3" || profile.defaultMethod === "ssm") &&
     !storageTargets.some(target => target.targetId === profile.id)) ?? [];
@@ -690,13 +696,18 @@ export function Workspace() {
                 <div className="workspace-file-connections">
                   <select aria-label="파일 연결" value={pinnedStorage} onChange={event => {
                     const targetId = event.target.value;
+                    if (targetId === compatibleStorage.targetId) {
+                      openStorageTarget(compatibleStorage);
+                      return;
+                    }
                     const saved = savedStorageTargets.find(({ profile }) => profile.id === targetId);
-                    if (saved) openStorageTarget(targetId, saved.profile.displayName);
+                    if (saved) openStorageTarget({ kind: "aws", targetId, label: saved.profile.displayName });
                     else setPinnedStorage(targetId);
                   }}>
                     <option value="">활성 SSH 따라가기</option>
-                    {storageTargets.length > 0 && <optgroup label="열린 S3">
-                      {storageTargets.map(({ targetId, label }) => <option key={targetId} value={targetId}>{label}</option>)}
+                    <option value={compatibleStorage.targetId}>{compatibleStorage.label}</option>
+                    {openAwsStorage.length > 0 && <optgroup label="열린 S3">
+                      {openAwsStorage.map(({ targetId, label }) => <option key={targetId} value={targetId}>{label}</option>)}
                     </optgroup>}
                     {savedStorageTargets.length > 0 && <optgroup label="저장된 S3 연결 열기">
                       {savedStorageTargets.map(({ profile }) => <option key={profile.id} value={profile.id}>{profile.displayName}</option>)}
@@ -720,20 +731,21 @@ export function Workspace() {
                       onEditFile={(file, transport, close) => openEditorTab(file, transport, close, "sftp")} />
                   </div>;
                 })}
-                {storageTargets.map(({ targetId, closeStatus }) => {
+                {storageTargets.map(({ kind, targetId, closeStatus }) => {
                   const visible = showFiles && !focused && targetId === pinnedStorage;
+                  const bindClose = (actions: { confirmClose(): Promise<void> } | null) => {
+                    if (actions) storageClosers.current.set(targetId, actions);
+                    else storageClosers.current.delete(targetId);
+                  };
                   return <div className="workspace-storage" key={targetId} hidden={!visible} inert={!visible}>
                     {closeStatus && <p className="workspace-file-status" role={closeStatus === "closing" ? "status" : "alert"}>
                       {closeStatus === "closing" ? "종료 중" : "종료 확인 불가"}
                     </p>}
                     <div inert={!!closeStatus}>
-                      <StorageTab profiles={profileLoad.profiles} targetId={targetId} active={visible} closing={!!closeStatus}
-                        closeRef={(actions) => {
-                          if (actions) storageClosers.current.set(targetId, actions);
-                          else storageClosers.current.delete(targetId);
-                        }}
-                        onRetest={retestStorageTarget}
-                        onEditFile={({ file, transport, close }) => openEditorTab(file, transport, close, "s3")} />
+                      {kind === "compatible" ? <CompatibleStorageTab closing={!!closeStatus} closeRef={bindClose} /> :
+                        <StorageTab profiles={profileLoad.profiles} targetId={targetId} active={visible} closing={!!closeStatus}
+                          closeRef={bindClose} onRetest={retestStorageTarget}
+                          onEditFile={({ file, transport, close }) => openEditorTab(file, transport, close, "s3")} />}
                     </div>
                   </div>;
                 })}
