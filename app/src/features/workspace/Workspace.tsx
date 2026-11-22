@@ -166,26 +166,32 @@ export function Workspace() {
         if (!disposed && focusedElement instanceof HTMLElement && element?.contains(focusedElement)) focusedElement.focus();
       }
       try {
-        setCloseBlock(blocked);
-        approved = !blocked && (!discard.length || window.confirm(
-          `저장되지 않았거나 저장을 확인할 수 없는 파일:\n\n${discard.join("\n")}\n\n편집 내용을 버리고 창을 닫을까요?`,
-        ));
-        if (approved) {
+        if (!blocked) {
+          locked = true;
           closingWindow.current = true;
           if (focusedElement instanceof HTMLElement && element?.contains(focusedElement)) focusedElement.blur();
           element?.setAttribute("inert", "");
           dialog?.setAttribute("inert", "");
           dialog?.addEventListener("cancel", blockCancel, { capture: true });
         }
-        await invoke("workspace_window", { action: "respondToClose", requestId, approved });
-      } catch (error) {
-        if (approved) {
-          closingWindow.current = false;
-          element?.removeAttribute("inert");
-          dialog?.removeAttribute("inert");
-          dialog?.removeEventListener("cancel", blockCancel, { capture: true });
-          if (focusedElement instanceof HTMLElement && element?.contains(focusedElement)) focusedElement.focus();
+        // 포커스를 해제할 때 확정된 입력까지 닫기 판정에 포함한다.
+        const discard: string[] = [];
+        if (!blocked) {
+          for (const tab of liveTabs.current) {
+            if (tab.kind !== "editor") continue;
+            const state = editorActions.current.get(tab.id)?.closeState();
+            if (tab.attaching || !state || state.pending) {
+              blocked = { kind: "editor", id: tab.id, message: `${tab.label}: 편집 작업 중 · 창 닫기 보류` };
+              break;
+            }
+            if (state.dirty || state.uncertain) discard.push(tab.label);
+          }
         }
+        setCloseBlock(blocked);
+        if (blocked) unlock();
+        const decision = blocked ? { kind: "blocked" } : discard.length ? { kind: "discard", files: discard } : { kind: "ready" };
+        destroyQueued = await invoke<boolean>("workspace_window", { action: "respondToClose", requestId, decision });
+      } catch (error) {
         if (answeredId === requestId) {
           if (!disposed) setCloseError(`닫기 실패: ${String(error)}`);
         }
