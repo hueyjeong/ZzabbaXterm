@@ -374,17 +374,21 @@ fn unavailable(stage: Stage) -> Error {
 }
 
 fn verified_selection(directory: &std::path::Path, target_id: &str) -> Result<VerifiedSsoSelection, Error> {
-    let scope = with_saved_method(directory, target_id, |method| match method {
-        MethodRef::Ssm { profile, region, .. } => Ok(Scope::new(profile.to_owned(), region.to_owned())),
+    let (scope, account) = with_saved_method(directory, target_id, |method, account| match method {
+        MethodRef::Ssm { profile, region, .. } => Ok((Scope::new(profile.to_owned(), region.to_owned()), account.map(str::to_owned))),
         MethodRef::Local { .. } => Err("SSO 연결이 아닙니다".into()),
     })
-    .map_err(|_| Error::at(Stage::Profile, Failure::InvalidSsoProfile))?
-    .map_err(|error| Error::at(Stage::Profile, match error {
+    .map_err(|_| Error::at(Stage::Profile, Failure::InvalidSsoProfile))?;
+    let account = account.ok_or_else(|| Error::at(Stage::Profile, Failure::RetestRequired))?;
+    let scope = scope.map_err(|error| Error::at(Stage::Profile, match error {
         CliError::InvalidRegion => Failure::InvalidRegion,
         _ => Failure::InvalidSsoProfile,
     }))?;
     let config = scope.direct_sso_config()
         .map_err(|_| Error::at(Stage::Profile, Failure::InvalidSsoProfile))?;
+    if config.account != account {
+        return Err(Error::at(Stage::Profile, Failure::AccountMismatch));
+    }
     Ok(VerifiedSsoSelection {
         profile: scope.profile().to_owned(),
         region: scope.region().to_owned(),
@@ -768,18 +772,34 @@ mod tests {
         use serde_json::json;
         let directory = root.join("app");
         std::fs::create_dir(&directory).unwrap();
-        std::fs::write(directory.join("connections.json"), serde_json::to_vec(&json!({
+        let group = json!({"id": "team", "displayName": "Team"});
+        let target = json!({
+            "id": "saved-sso", "groupId": "team", "displayName": "SSO", "defaultMethod": "ssm",
+            "ssm": {"profile": "chosen team", "region": "eu-west-1", "instanceId": "i-01234567"}
+        });
+        let file = directory.join("connections.json");
+        std::fs::write(&file, serde_json::to_vec(&json!({
             "version": 1,
-            "groups": [{"revision": 1, "profile": {"id": "team", "displayName": "Team"}}],
-            "targets": [{"revision": 1, "profile": {
-                "id": "saved-sso", "groupId": "team", "displayName": "SSO", "defaultMethod": "ssm",
-                "ssm": {"profile": "chosen team", "region": "eu-west-1", "instanceId": "i-01234567"}
-            }}]
+            "groups": [{"revision": 1, "profile": group}],
+            "targets": [{"revision": 1, "profile": target}]
         })).unwrap()).unwrap();
-        std::fs::write(root.join("config"), concat!(
-            "[profile \"chosen team\"]\nsso_session = fixture\nsso_account_id = 123456789012\nsso_role_name = ReadOnly\n",
+        let config = root.join("config");
+        let write_config = |account| std::fs::write(&config, format!(concat!(
+            "[profile \"chosen team\"]\nsso_session = fixture\nsso_account_id = {}\nsso_role_name = ReadOnly\n",
             "[sso-session fixture]\nsso_region = us-east-1\nsso_start_url = https://fixture.invalid/start\n",
-        )).unwrap();
+        ), account)).unwrap();
+        write_config("123456789012");
+        assert_eq!(verified_selection(&directory, "saved-sso").err().unwrap().failure, Failure::RetestRequired);
+        let input = json!({"version": 1, "groupRevision": 1, "targetRevision": 1, "group": group, "target": target});
+        let mut forged = input.clone();
+        forged["target"]["ssm"]["testedAccountId"] = json!("000000000000");
+        assert!(serde_json::from_value::<crate::connections::profile::Draft>(forged).is_err());
+        crate::connections::probe::save_ssm_fixture(&directory, input, "123456789012");
+        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+        assert_eq!(saved["targets"][0]["tested_account_id"], "123456789012");
+        write_config("000000000000");
+        assert_eq!(verified_selection(&directory, "saved-sso").err().unwrap().failure, Failure::AccountMismatch);
+        write_config("123456789012");
 
         tauri::async_runtime::block_on(async {
             let state = StorageIpc::default();

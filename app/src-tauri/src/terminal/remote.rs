@@ -41,6 +41,10 @@ pub(super) struct Remote {
 }
 
 impl Remote {
+    pub(super) fn account_id(&self) -> &str {
+        self.request.account_id()
+    }
+
     pub(super) fn spawn(&mut self, size: PtySize, cancel: &CancellationToken) -> Result<(PtyPair, Box<dyn Child + Send + Sync>), String> {
         let permit = tauri::async_runtime::block_on(self.cli.authorize_start(&mut self.request, &self.scope, cancel))
             .map_err(start_error)?.ok_or_else(|| start_error(CliError::Cancelled))?;

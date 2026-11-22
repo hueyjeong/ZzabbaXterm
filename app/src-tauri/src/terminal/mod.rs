@@ -283,7 +283,7 @@ impl Event {
             Self::Exited(code) => End::Exited(code).body()?,
             Self::Disconnected(reason) => End::Disconnected(reason).body()?,
             Self::Connecting => End::Connecting.body()?,
-            Self::Ready => End::Ready.body()?,
+            Self::Ready { .. } => End::Ready.body()?,
         })
     }
 }
@@ -294,7 +294,7 @@ enum Event {
     Exited(u32),
     Disconnected(String),
     Connecting,
-    Ready,
+    Ready { account_id: String },
 }
 
 fn validate_working_directory(directory: &std::path::Path) -> Result<(), String> {

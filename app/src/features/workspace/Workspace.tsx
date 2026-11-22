@@ -102,6 +102,20 @@ export function Workspace() {
     });
   }
 
+  function retestStorageTarget(id: string) {
+    if (draftPending.current || wizard) return;
+    const profiles = profileLoad.profiles;
+    const target = profiles?.targets.find(({ profile }) => profile.id === id && profile.defaultMethod === "ssm");
+    const group = profiles?.groups.find(({ profile }) => profile.id === target?.profile.groupId);
+    if (!target || !group) return;
+    setWizard({
+      draftId: crypto.randomUUID(), initialDraft: {
+        version: 1, groupRevision: group.revision, targetRevision: target.revision,
+        group: group.profile, target: target.profile,
+      }
+    });
+  }
+
   function closeWizard(result: ConnectionClose) {
     setWizard(undefined);
     if (result.kind === "saved") reloadProfiles();
@@ -272,7 +286,7 @@ export function Workspace() {
             };
             return <div className="workspace-session" key={id} hidden={id !== active} inert={id !== active || (tab.kind === "storage" && !!tab.closeStatus)}>
               {tab.kind === "storage" ? (
-                <StorageTab profiles={profileLoad.profiles} closing={!!tab.closeStatus} closeRef={bindClose} />
+                <StorageTab profiles={profileLoad.profiles} closing={!!tab.closeStatus} closeRef={bindClose} onRetest={retestStorageTarget} />
               ) : tab.kind === "terminal" ? (
                 <TerminalView active={id === active} focusRequested={id === focusTab} label={label} targetId={tab.targetId}
                   remote={!!tab.ssm} closing={!!tab.closeStatus} closeRef={tab.ssm ? bindClose : undefined}

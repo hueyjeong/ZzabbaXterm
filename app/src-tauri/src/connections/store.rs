@@ -60,6 +60,8 @@ pub(super) struct ProfileFile {
 pub(super) struct Entry<T> {
     pub(super) revision: Revision,
     pub(super) profile: T,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) tested_account_id: Option<String>,
 }
 
 pub(super) struct Store {
@@ -118,21 +120,23 @@ impl Store {
 
     #[cfg(test)]
     pub(super) fn save(&self, draft: ValidatedDraft) -> Result<SaveStatus, StoreError> {
-        self.save_authorized(draft, || Ok(()), || {})
+        self.save_authorized(draft, None, || Ok(()), || {})
     }
 
     pub(super) fn save_authorized(
         &self,
         draft: ValidatedDraft,
+        tested_account_id: Option<String>,
         authorize: impl FnMut() -> Result<(), String>,
         committed: impl FnOnce(),
     ) -> Result<SaveStatus, StoreError> {
-        self.save_with_rename(draft, authorize, committed, |from, to| fs::rename(from, to))
+        self.save_with_rename(draft, tested_account_id, authorize, committed, |from, to| fs::rename(from, to))
     }
 
     fn save_with_rename(
         &self,
         draft: ValidatedDraft,
+        tested_account_id: Option<String>,
         mut authorize: impl FnMut() -> Result<(), String>,
         committed: impl FnOnce(),
         rename: impl FnOnce(&Path, &Path) -> io::Result<()>,
@@ -165,10 +169,14 @@ impl Store {
             Some(_) => {}
             None => file.groups.push(Entry::new(group)),
         }
-        match old_target {
-            Some(entry) => entry.update(target)?,
-            None => file.targets.push(Entry::new(target)),
-        }
+        let entry = match old_target {
+            Some(entry) => { entry.update(target)?; entry }
+            None => {
+                file.targets.push(Entry::new(target));
+                file.targets.last_mut().unwrap()
+            }
+        };
+        entry.tested_account_id = tested_account_id;
 
         self.replace(&file, |from, to| {
             // 이 승인 뒤의 원자 교체는 창을 닫더라도 이미 승인한 작업으로 끝낸다.
@@ -184,7 +192,7 @@ impl Store {
         &self,
         draft: ValidatedDraft,
     ) -> Result<SaveStatus, StoreError> {
-        self.save_with_rename(draft, || Ok(()), || {}, |from, to| {
+        self.save_with_rename(draft, None, || Ok(()), || {}, |from, to| {
             // 일반 파일 아래의 경로에서는 권한과 관계없이 실제 rename이 ENOTDIR로 실패한다.
             fs::rename(from.join("not-a-directory"), to)
         })
@@ -355,7 +363,7 @@ impl ProfileFile {
 
 impl<T> Entry<T> {
     fn new(profile: T) -> Self {
-        Self { revision: Revision::MIN, profile }
+        Self { revision: Revision::MIN, profile, tested_account_id: None }
     }
 
     fn update(&mut self, profile: T) -> Result<(), StoreError> {

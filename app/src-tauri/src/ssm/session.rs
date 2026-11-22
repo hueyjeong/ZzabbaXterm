@@ -218,6 +218,10 @@ impl AwsCli {
 }
 
 impl StartRequest {
+    pub(crate) fn account_id(&self) -> &str {
+        self.owner.splitn(6, ':').nth(4).expect("validated STS caller ARN")
+    }
+
     async fn wait_connected_with(
         &self,
         cancel: &CancellationToken,

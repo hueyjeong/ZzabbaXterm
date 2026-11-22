@@ -9,9 +9,10 @@ type Props = {
   profiles: SavedConnections | undefined;
   closing: boolean;
   closeRef: Ref<{ confirmClose(): Promise<void> }>;
+  onRetest(targetId: string): void;
 };
 
-export function StorageTab({ profiles, closing, closeRef }: Props) {
+export function StorageTab({ profiles, closing, closeRef, onRetest }: Props) {
   const [targetId, setTargetId] = useState("");
   const [session, setSession] = useState<S3Session>();
   const [opening, setOpening] = useState(false);
@@ -50,7 +51,10 @@ export function StorageTab({ profiles, closing, closeRef }: Props) {
   return <section className="s3-storage" aria-label="AWS S3">
     <header className="storage-heading"><h2>AWS S3</h2></header>
     <form className="storage-controls" onSubmit={event => { event.preventDefault(); open(); }}>
-      <label>SSO 프로필<select value={selected ? targetId : ""} disabled={closing || opening} onChange={event => setTargetId(event.target.value)}>
+      <label>SSO 프로필<select value={selected ? targetId : ""} disabled={closing || opening} onChange={event => {
+        setTargetId(event.target.value);
+        setProblem(undefined);
+      }}>
         <option value="">{approved.length ? "프로필 선택" : "저장된 SSO 연결 없음"}</option>
         {approved.map(({ profile }) => profile.defaultMethod === "ssm" && <option key={profile.id} value={profile.id}>
           {profile.ssm.profile} · {profile.ssm.region} · {profile.displayName}
@@ -60,5 +64,8 @@ export function StorageTab({ profiles, closing, closeRef }: Props) {
     </form>
     {opening && <p role="status">SSO 프로필 확인 중</p>}
     {problem && <StorageProblem problem={problem} />}
+    {selected && problem && problem !== "unavailable" &&
+      (problem.failure.kind === "retestRequired" || problem.failure.kind === "accountMismatch") &&
+      <button type="button" onClick={() => onRetest(selected.profile.id)}>연결 재시험</button>}
   </section>;
 }

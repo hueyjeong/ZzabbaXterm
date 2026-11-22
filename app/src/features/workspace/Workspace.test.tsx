@@ -715,6 +715,27 @@ describe("C02 SSM 연결", () => {
     expect(host.querySelector("dialog")).toBeNull();
   });
 
+  it("구 SSO 연결의 스토리지 개설 거부에서 저장된 대상을 재시험할 수 있다", async () => {
+    loadProfiles = async () => ({
+      version: 1,
+      groups: [{ revision: 1, profile: { id: "dev", displayName: "개발" } }],
+      targets: [{ revision: 2, profile: { id: "legacy", groupId: "dev", displayName: "관리 노드", defaultMethod: "ssm", ssm: node } }],
+    });
+    runStorage = async () => ({ ok: false, error: { stage: "profile", failure: { kind: "retestRequired" }, bytes: 0 } });
+    await restartWorkspace();
+    await press("스토리지 탭 추가");
+    const select = find<HTMLSelectElement>('section[aria-label="AWS S3"] select');
+    await act(async () => {
+      select.value = "legacy";
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await press("스토리지 연결");
+    expect(find('section[aria-label="AWS S3"] [role="alert"]').textContent).toContain("다시 시험하고 저장");
+    await press("연결 재시험");
+    expect(find<HTMLInputElement>('dialog input').value).toBe("관리 노드");
+    expect(connectionCalls("connection_save")).toHaveLength(0);
+  });
+
   it("S3 탭은 로컬 파일 편집과 터미널 전환 중에도 다운로드를 계속한다", async () => {
     loadProfiles = async () => ({
       version: 1,

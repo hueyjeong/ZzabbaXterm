@@ -14,7 +14,7 @@ type Stage = "profile" | "identity" | "listBuckets" | "listObjects" | "uploadSou
   "getObject" | "downloadBody" | "downloadWrite" | "downloadCommit";
 type Failure =
   | Readonly<{
-    kind: "invalidSsoProfile" | "accountMismatch" | "invalidRegion" | "invalidBucket" | "invalidResponse" |
+    kind: "invalidSsoProfile" | "retestRequired" | "accountMismatch" | "invalidRegion" | "invalidBucket" | "invalidResponse" |
     "credentials" | "ssoLoginRequired" | "request" | "bodyRead" | "checksum"
   }>
   | Readonly<{ kind: "service"; status: number; code: string | null }>

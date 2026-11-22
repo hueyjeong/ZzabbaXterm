@@ -36,7 +36,7 @@ pub(crate) struct Probe {
 
 #[derive(Default)]
 struct State {
-    result: Option<Result<(), String>>,
+    result: Option<Result<Option<String>, String>>,
     stopped: bool,
 }
 
@@ -63,16 +63,21 @@ impl Probe {
         self.finish(launch.and_then(|launch| self.measure(launch)));
     }
 
-    fn finish(&self, result: Result<(), String>) {
+    fn finish(&self, result: Result<Option<String>, String>) {
         self.state.lock().unwrap().result = Some(if result.is_ok() && Instant::now() >= self.deadline { Err(TIMED_OUT.into()) } else { result });
         self.ready.notify_all();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn finish_ssm_fixture(&self, account: &str) {
+        self.finish(Ok(Some(account.to_owned())));
     }
 
     pub(crate) fn finished(&self) -> bool {
         self.state.lock().unwrap().result.is_some()
     }
 
-    pub(crate) fn wait(&self) -> Result<(), String> {
+    pub(crate) fn wait(&self) -> Result<Option<String>, String> {
         let (state, _) = self.ready.wait_timeout_while(self.state.lock().unwrap(), self.remaining(), |state| {
             state.result.is_none() && !state.stopped
         }).unwrap();
@@ -105,7 +110,7 @@ impl Probe {
         Ok(())
     }
 
-    fn after_cleanup(&self, result: Result<(), String>) -> Result<(), String> {
+    fn after_cleanup(&self, result: Result<Option<String>, String>) -> Result<Option<String>, String> {
         self.wait_finished();
         combine_cleanup(result, self.session.cleanup_result())
     }
@@ -120,7 +125,7 @@ impl Probe {
         self.deadline.saturating_duration_since(Instant::now())
     }
 
-    fn measure(&self, command: Launch) -> Result<(), String> {
+    fn measure(&self, command: Launch) -> Result<Option<String>, String> {
         if self.remaining().is_zero() {
             return Err(TIMED_OUT.into());
         }
@@ -129,6 +134,7 @@ impl Probe {
         let (sender, receiver) = mpsc::sync_channel(1);
         let session = Arc::downgrade(&self.session);
         let output = std::cell::Cell::new((0u64, 0usize));
+        let account = std::cell::RefCell::new(None);
         #[cfg(windows)]
         let cursor_query = std::cell::Cell::new(0usize);
         let launched = self.session.begin_launch(size(24, 80), command, move |event| {
@@ -153,8 +159,15 @@ impl Probe {
                     Ok(())
                 }
                 Event::Connecting => Ok(()),
-                Event::Ready => session.upgrade().ok_or(super::CLOSED.to_owned())?.input(SSM_CHECK),
-                Event::Exited(0) if matched == marker.len() => sender.send(Ok(())).map_err(|err| err.to_string()),
+                Event::Ready { account_id } => {
+                    account.replace(Some(account_id));
+                    session.upgrade().ok_or(super::CLOSED.to_owned())?.input(SSM_CHECK)
+                }
+                Event::Exited(0) if matched == marker.len() => {
+                    let account = account.take();
+                    let done = if ssm && account.is_none() { Err("AWS 시험 신원이 없습니다".into()) } else { Ok(account) };
+                    sender.send(done).map_err(|err| err.to_string())
+                }
                 Event::Exited(23) if !ssm => sender.send(Err("셸이 요청한 작업 디렉터리에서 시작하지 못했습니다".into()))
                     .map_err(|err| err.to_string()),
                 Event::Exited(code) => sender.send(Err(format!("셸 시험 출력 또는 종료 상태가 올바르지 않습니다 (종료 코드 {code})")))
@@ -186,10 +199,10 @@ impl Probe {
     }
 }
 
-fn combine_cleanup(result: Result<(), String>, cleanup: Result<(), String>) -> Result<(), String> {
+fn combine_cleanup<T>(result: Result<T, String>, cleanup: Result<(), String>) -> Result<T, String> {
     match (result, cleanup) {
         (Err(error), Err(cleanup)) if !error.contains(&cleanup) => Err(format!("{error}; {cleanup}")),
-        (Ok(()), Err(cleanup)) => Err(cleanup),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
         (result, _) => result,
     }
 }

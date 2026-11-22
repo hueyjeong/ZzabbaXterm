@@ -185,11 +185,15 @@ pub(super) fn save_confirmed(sessions: &Sessions, owner: &str, document: u64, re
         if !run.confirmed || !run.draft.matches(&draft) {
             return Err(UNTESTED.into());
         }
-        Ok(Arc::clone(&run.draft))
+        Ok((Arc::clone(&run.draft), Arc::clone(&run.probe)))
     })?;
+    let tested_account_id = expected.1.wait()?;
+    if matches!(draft.method(), super::profile::MethodRef::Ssm { .. }) != tested_account_id.is_some() {
+        return Err(UNTESTED.into());
+    }
     let authorize = || sessions.with_probes(owner, document, |runs| {
         let run = runs.get(owner, &key)?;
-        if !run.confirmed || !Arc::ptr_eq(&run.draft, &expected) {
+        if !run.confirmed || !Arc::ptr_eq(&run.draft, &expected.0) {
             return Err(UNTESTED.into());
         }
         Ok(())
@@ -201,7 +205,7 @@ pub(super) fn save_confirmed(sessions: &Sessions, owner: &str, document: u64, re
             Ok(())
         });
     };
-    match store.save_authorized(draft, authorize, committed).map_err(|error| match error {
+    match store.save_authorized(draft, tested_account_id, authorize, committed).map_err(|error| match error {
         StoreError::Authorization(reason) => reason,
         other => format!("프로필 저장: {other:?}"),
     })? {
@@ -209,6 +213,27 @@ pub(super) fn save_confirmed(sessions: &Sessions, owner: &str, document: u64, re
         SaveStatus::TargetConflict => Err("다른 작업이 대상을 변경했습니다".into()),
         SaveStatus::Saved => Ok(()),
     }
+}
+
+#[cfg(test)]
+pub(crate) fn save_ssm_fixture(directory: &std::path::Path, input: serde_json::Value, account: &str) {
+    let sessions = Sessions::default();
+    let key = RunKey { draft_id: "fixture".into(), draft_version: 1, run_id: sessions.next_id() };
+    let draft = Arc::new(serde_json::from_value::<Draft>(input.clone()).unwrap().validate().unwrap());
+    let probe = Arc::new(Probe::for_draft("main", &draft));
+    probe.finish_ssm_fixture(account);
+    sessions.with_probes("main", 0, |runs| {
+        runs.active.entry("main".into()).or_default().insert(key.draft_id.clone(), Run {
+            key: key.clone(), session_id: sessions.next_id(), draft, probe, confirmed: false,
+        });
+        Ok(())
+    }).unwrap();
+    let request = || SaveRequest { run: key.clone(), draft: serde_json::from_value(input.clone()).unwrap() };
+    let store = Store::new(directory);
+    assert!(save_confirmed(&sessions, "main", 0, request(), &store).is_err());
+    wait(&sessions, "main", 0, &key).unwrap();
+    save_confirmed(&sessions, "main", 0, request(), &store).unwrap();
+    assert!(save_confirmed(&sessions, "main", 0, request(), &store).is_err());
 }
 
 #[cfg(test)]

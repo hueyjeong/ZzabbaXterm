@@ -56,6 +56,7 @@ pub(crate) enum Stage {
 )]
 pub(crate) enum Failure {
     InvalidSsoProfile,
+    RetestRequired,
     AccountMismatch,
     InvalidRegion,
     InvalidBucket,
