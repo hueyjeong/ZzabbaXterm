@@ -45,6 +45,9 @@ serde_json = "1"
 [dependencies]
 base64 = "0.23"
 dirs = "7"
+des = { version = "0.8.1", features = ["zeroize"] }
+ironrdp = { version = "=0.17.0", features = ["cliprdr", "connector", "displaycontrol", "dvc", "graphics", "session"] }
+ironrdp-tokio = "0.10"
 getrandom = "0.4"
 tauri = { version = "2", features = [] }
 portable-pty = "0.9"
@@ -73,9 +76,12 @@ ssh-key = { version = "0.6.7", default-features = false, features = ["alloc", "e
 shlex = "2"
 tempfile = "3"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt", "sync", "time"] }
+tokio-native-tls = "0.3.1"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 zeroize = "1"
 uuid = { version = "1", features = ["v4"] }
+x509-cert = "0.2"
 
 [dev-dependencies]
 aws-config = { version = "1", default-features = false, features = ["test-util"] }
@@ -84,6 +90,8 @@ aws-smithy-http-client = { version = "1", features = ["test-util"] }
 aws-types = "1"
 bytes = "1"
 http-body = "1"
+ironrdp = { version = "=0.17.0", features = ["acceptor"] }
+rcgen = "0.14"
 tauri = { version = "2", features = ["test"] }
 
 [target.'cfg(unix)'.dependencies]
@@ -91,9 +99,12 @@ libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
+dbus = { version = "0.9", features = ["vendored"] }
+rustls-native-certs = "0.8"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Controls_Dialogs", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell"] }
+schannel = "0.1"
+windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Security_Authorization", "Win32_Security_Credentials", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Controls_Dialogs", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell"] }
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

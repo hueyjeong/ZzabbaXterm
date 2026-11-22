@@ -17,6 +17,8 @@ fn main() {
         "verify_ssh_host", "commit_ssh_host", "cancel_ssh_host",
         "register_saved_ssh_host",
         "tunnel_tab_open", "tunnel_start", "tunnel_status", "tunnel_share", "tunnel_tab_close",
+        "rdp_prepare", "rdp_connect", "rdp_input", "rdp_ack", "rdp_close",
+        "vnc_create", "vnc_connect", "vnc_input", "vnc_ack", "vnc_close",
         "editor_local_open", "editor_local_save", "editor_local_compare", "editor_local_reload",
         "editor_local_close",
         "editor_local_cli_claim", "editor_local_cli_respond",
