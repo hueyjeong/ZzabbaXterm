@@ -1,11 +1,12 @@
 import { useImperativeHandle, useLayoutEffect, useRef, useState, type Ref } from "react";
 import type { ApprovedEditorFile, ConfirmEditorDiscard, EditorFileHandle, EditorTransport } from "./contract";
-import { connectEditor, type EditorConnection, type EditorState } from "./editor";
+import { connectEditor, type EditorCloseState, type EditorConnection, type EditorState } from "./editor";
 import { createFileModel, editor } from "./monaco";
 import "./editor.css";
 
 export interface EditorTabActions {
   setActive(active: boolean): void;
+  closeState(): EditorCloseState | undefined;
   requestClose(): Promise<void>;
 }
 
@@ -64,6 +65,7 @@ function EditorTabContent({ ref, file, active, focusRequested, transport, confir
 
   useImperativeHandle(ref, () => ({
     setActive(value) { connection.current?.setActive(value); },
+    closeState() { return connection.current?.closeState(); },
     async requestClose() { await connection.current?.requestClose(confirmDiscard, onClose); },
   }), [confirmDiscard, onClose]);
 
