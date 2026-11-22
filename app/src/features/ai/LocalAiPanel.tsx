@@ -19,9 +19,23 @@ export function LocalAiPanel({ profilesVersion }: { profilesVersion: number }) {
   const [modelError, setModelError] = useState("");
   const [targetError, setTargetError] = useState("");
   const [retry, setRetry] = useState(0);
+  const [blocked, setBlocked] = useState<boolean>();
+  const [savingPolicy, setSavingPolicy] = useState(false);
+  const [policyError, setPolicyError] = useState("");
+  const policyPending = useRef(false);
   const [cliCard, setCliCard] = useState<Proposal>();
   const opening = useRef(false);
   const selection = useRef<Promise<boolean>>(Promise.resolve(false));
+
+  useEffect(() => {
+    let current = true;
+    void invoke<boolean>("ai_policy", {}).then((value) => {
+      if (current) setBlocked(value);
+    }, (error: unknown) => {
+      if (current) setPolicyError(String(error));
+    });
+    return () => { current = false; };
+  }, []);
 
   useEffect(() => {
     let current = true;
@@ -90,8 +104,30 @@ export function LocalAiPanel({ profilesVersion }: { profilesVersion: number }) {
     }
   }
 
+  async function updatePolicy(next: boolean) {
+    if (policyPending.current) return;
+    policyPending.current = true;
+    setSavingPolicy(true);
+    setPolicyError("");
+    try {
+      await invoke("ai_set_policy", { blocked: next });
+      setBlocked(next);
+      setCliCard(undefined);
+    } catch (error) {
+      setPolicyError(String(error));
+    } finally {
+      setSavingPolicy(false);
+      policyPending.current = false;
+    }
+  }
+
   return <AiPanel models={models} targets={targets} proposals={cliCard ? [cliCard] : []} onSelectTarget={select}
     onOpenCliReview={openCliReview}
+    policyControl={<>
+      {blocked !== undefined && <label><input type="checkbox" checked={blocked} disabled={savingPolicy}
+        onChange={(event) => void updatePolicy(event.currentTarget.checked)} /> 조회 승인 차단</label>}
+      {policyError && <p role="alert">{policyError}</p>}
+    </>}
     modelError={modelError} targetError={targetError} onRefresh={() => setRetry((value) => value + 1)}
     onSendChat={sendChat} onRequestProposal={propose} onDecideProposal={decide} />;
 }

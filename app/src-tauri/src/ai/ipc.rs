@@ -1,4 +1,4 @@
-use std::{num::NonZeroU64, sync::Mutex};
+use std::{num::NonZeroU64, sync::Mutex, time::{Duration, Instant}};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -11,7 +11,7 @@ use super::ReviewCandidate;
 use super::cli::{Proposal as CliProposal, Query, Rejected};
 use crate::connections::profile::ValidatedDraft;
 
-const POLICY: Policy = Policy { revision: NonZeroU64::MIN, blocked: false };
+const DRAFT_TIMEOUT: Duration = Duration::from_secs(300);
 const STALE: &str = "조회 대상 또는 문서가 바뀌었습니다";
 const INVALID: &str = "AI 요청 형식이 올바르지 않습니다";
 type Result<T, E = String> = std::result::Result<T, E>;
@@ -20,27 +20,35 @@ type Result<T, E = String> = std::result::Result<T, E>;
 pub(crate) struct State(Mutex<ReviewState>);
 
 impl State {
-    pub(super) fn receive_draft(&self, draft: ValidatedDraft) -> Result<String, Rejected> {
+    pub(super) fn receive_draft(&self, draft: ValidatedDraft, deadline: Instant) -> Result<String, Rejected> {
         let mut state = self.0.lock().unwrap();
-        if state.draft.is_some() {
-            return Err(Rejected);
+        let now = Instant::now();
+        if now >= deadline { return Err(Rejected); }
+        if let Some(pending) = state.draft.as_ref().filter(|pending| now < pending.expires_at) {
+            if pending.initial_draft.matches(&draft) {
+                return Ok(pending.draft_id.clone());
+            }
+            if !pending.opened { return Err(Rejected); }
         }
         state.next_draft = state.next_draft.checked_add(1).ok_or(Rejected)?;
         let draft_id = format!("cli-{}", state.next_draft);
-        state.draft = Some(ReceivedDraft { draft_id: draft_id.clone(), initial_draft: draft });
+        state.draft = Some(ReceivedDraft {
+            draft_id: draft_id.clone(), initial_draft: draft, expires_at: now + DRAFT_TIMEOUT, opened: false,
+        });
         Ok(draft_id)
     }
 
-    pub(super) fn receive_proposal(&self, targets: &[SelectedTarget], request: CliProposal) -> Result<String, Rejected> {
+    pub(super) fn receive_proposal(&self, targets: &[SelectedTarget], request: CliProposal, deadline: Instant) -> Result<String, Rejected> {
         let CliProposal { target_id, generation, operation: Query::Uptime } = request;
         let target = TargetRef { target_id, generation };
         let selected = targets.iter().find(|saved| target.matches(saved)).ok_or(Rejected)?;
         let mut state = self.0.lock().unwrap();
-        if let Some(id) = state.reviews.unopened_cli(selected) {
+        if Instant::now() >= deadline { return Err(Rejected); }
+        let policy = state.policy;
+        if let Some(id) = state.reviews.cli_id(selected, policy) {
             return Ok(id.to_string());
         }
-        if state.reviews.at_capacity() { return Err(Rejected); }
-        state.reviews.propose(Candidate::Cli { target_id: &selected.profile_id, operation: UPTIME }, Some(selected), POLICY)
+        state.reviews.propose(Candidate::Cli { target_id: &selected.profile_id, operation: UPTIME }, Some(selected), policy)
             .map(|id| id.to_string()).map_err(|_| Rejected)
     }
 }
@@ -50,6 +58,10 @@ impl State {
 struct ReceivedDraft {
     draft_id: String,
     initial_draft: ValidatedDraft,
+    #[serde(skip)]
+    expires_at: Instant,
+    #[serde(skip)]
+    opened: bool,
 }
 
 #[derive(Default)]
@@ -57,6 +69,7 @@ struct ReviewState {
     selection: Option<Selection>,
     epoch: u64,
     reviews: Reviews,
+    policy: Policy,
     next_draft: u64,
     draft: Option<ReceivedDraft>,
 }
@@ -67,6 +80,24 @@ struct Selection {
 }
 
 impl ReviewState {
+    fn set_policy(&mut self, blocked: bool) -> Result<()> {
+        if self.policy.blocked != blocked {
+            let revision = self.policy.revision.checked_add(1).ok_or(STALE)?;
+            self.epoch = self.epoch.checked_add(1).ok_or(STALE)?;
+            self.policy = Policy { revision, blocked };
+        }
+        Ok(())
+    }
+
+    fn open_draft(&mut self) -> Result<Value> {
+        let Some(draft) = self.draft.as_mut().filter(|draft| !draft.opened && Instant::now() < draft.expires_at) else {
+            return Ok(Value::Null);
+        };
+        let value = serde_json::to_value(&*draft).map_err(|_| INVALID)?;
+        draft.opened = true;
+        Ok(value)
+    }
+
     fn select(&mut self, document: u64, target: Option<SelectedTarget>) -> Result<()> {
         self.epoch = self.epoch.checked_add(1).ok_or(STALE)?;
         self.reviews.clear();
@@ -92,15 +123,15 @@ impl ReviewState {
             return Err(STALE.into());
         }
         let selected = self.selected(document, targets)?;
-        let id = self.reviews.propose(Candidate::Chat(candidate), Some(selected), POLICY).map_err(review_error)?;
-        let card = self.reviews.open(local, id, Some(selected), POLICY).map_err(review_error)?;
+        let id = self.reviews.propose(Candidate::Chat(candidate), Some(selected), self.policy).map_err(review_error)?;
+        let card = self.reviews.open(local, id, Some(selected), self.policy).map_err(review_error)?;
         project_card(id, card)
     }
 
     fn open_cli(&mut self, document: u64, local: &LocalReview, targets: &[SelectedTarget]) -> Result<Option<Proposal>> {
         let selected = self.selected(document, targets)?;
-        let Some(id) = self.reviews.unopened_cli(selected) else { return Ok(None) };
-        let card = self.reviews.open(local, id, Some(selected), POLICY).map_err(review_error)?;
+        let Some(id) = self.reviews.cli_id(selected, self.policy) else { return Ok(None) };
+        let card = self.reviews.open(local, id, Some(selected), self.policy).map_err(review_error)?;
         project_card(id, card).map(Some)
     }
 
@@ -108,9 +139,13 @@ impl ReviewState {
         let selected = self.selected(document, targets)?;
         let request = DecisionRequest {
             proposal_id: request.proposal_id.parse().map_err(|_| INVALID)?,
-            choice: match request.decision { PanelChoice::Approve => Choice::Approve, PanelChoice::Cancel => Choice::Cancel },
+            choice: match request.decision {
+                PanelChoice::Approve => Choice::Approve,
+                PanelChoice::Reject => Choice::Reject,
+                PanelChoice::Cancel => Choice::Cancel,
+            },
         };
-        self.reviews.decide(local, request, Some(selected), POLICY).map_err(review_error)?;
+        self.reviews.decide(local, request, Some(selected), self.policy).map_err(review_error)?;
         Ok(())
     }
 }
@@ -190,7 +225,7 @@ struct Decision {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "lowercase")]
-enum PanelChoice { Approve, Cancel }
+enum PanelChoice { Approve, Reject, Cancel }
 
 #[derive(Serialize)]
 struct Proposal {
@@ -222,7 +257,7 @@ fn project_card(id: u32, card: &Card) -> Result<Proposal> {
 }
 
 pub(crate) fn handles(command: &str) -> bool {
-    matches!(command, "ai_targets" | "ai_models" | "ai_select" | "ai_chat" | "ai_propose" | "ai_decide" | "ai_cli_review" | "ai_cli_draft")
+    matches!(command, "ai_targets" | "ai_models" | "ai_select" | "ai_chat" | "ai_propose" | "ai_decide" | "ai_cli_review" | "ai_cli_draft" | "ai_policy" | "ai_set_policy")
 }
 
 pub(crate) fn dispatch(invoke: Invoke) {
@@ -251,7 +286,13 @@ enum Request {
     Decide(Decision),
     CliReview,
     CliDraft,
+    Policy,
+    SetPolicy(PolicyRequest),
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyRequest { blocked: bool }
 
 fn parse(command: &str, body: &InvokeBody) -> Result<Request> {
     let InvokeBody::Json(value) = body else { return Err(INVALID.into()) };
@@ -266,6 +307,8 @@ fn parse(command: &str, body: &InvokeBody) -> Result<Request> {
         "ai_chat" => ChatRequest::deserialize(value).map(Request::Chat),
         "ai_propose" => ProposalRequest::deserialize(value).map(Request::Propose),
         "ai_decide" => Decision::deserialize(value).map(Request::Decide),
+        "ai_policy" if value.as_object().is_some_and(|fields| fields.is_empty()) => return Ok(Request::Policy),
+        "ai_set_policy" => PolicyRequest::deserialize(value).map(Request::SetPolicy),
         _ => return Err(INVALID.into()),
     }.map_err(|_| INVALID.into())
 }
@@ -336,8 +379,14 @@ async fn handle(caller: Webview, document: u64, local: LocalReview, request: Req
             serde_json::to_value(card).map_err(|_| INVALID.into())
         }).await,
         Request::CliDraft => document_check(&caller, document, || {
-            let draft = caller.state::<State>().0.lock().unwrap().draft.take();
-            serde_json::to_value(draft).map_err(|_| INVALID.into())
+            caller.state::<State>().0.lock().unwrap().open_draft()
+        }),
+        Request::Policy => document_check(&caller, document, || {
+            Ok(json!(caller.state::<State>().0.lock().unwrap().policy.blocked))
+        }),
+        Request::SetPolicy(request) => document_check(&caller, document, || {
+            caller.state::<State>().0.lock().unwrap().set_policy(request.blocked)?;
+            Ok(Value::Null)
         }),
     }
 }

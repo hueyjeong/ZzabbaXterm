@@ -11,7 +11,7 @@ export type Proposal = Readonly<{ id: string; target: TargetRef }> & (
   | Readonly<{ kind: "reviewable"; node: string; displayCommand: "uptime"; interpretation: string }>
   | Readonly<{ kind: "blocked" | "unregistered" }>
 );
-export type ProposalDecision = Readonly<{ proposalId: string; decision: "approve" | "cancel" }>;
+export type ProposalDecision = Readonly<{ proposalId: string; decision: "approve" | "reject" | "cancel" }>;
 
 // Rust resolves targets and revalidates the recorded proposal by ID; a decision is not an execution request.
 export type AiPanelProps = Readonly<{
@@ -23,6 +23,7 @@ export type AiPanelProps = Readonly<{
   targetError?: string;
   onRefresh?: () => void;
   onOpenCliReview?: () => void;
+  policyControl?: React.ReactNode;
   onSendChat: (request: ChatRequest) => Promise<ChatReply>;
   onRequestProposal: (request: ProposalRequest) => Promise<Proposal>;
   onDecideProposal: (decision: ProposalDecision) => Promise<"recorded" | "rejected">;

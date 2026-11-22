@@ -33,6 +33,12 @@ pub struct Policy {
     pub blocked: bool,
 }
 
+impl Default for Policy {
+    fn default() -> Self {
+        Self { revision: NonZeroU64::MIN, blocked: false }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 enum Mode {
@@ -93,6 +99,7 @@ pub enum ReviewError {
     NotReviewed,
     NotApprovable,
     IdExhausted,
+    Capacity,
 }
 
 pub struct LocalReview(u64);
@@ -161,16 +168,12 @@ impl Reviews {
         self.pending.retain(|_, pending| pending.opened_in.is_none());
     }
 
-    pub(super) fn unopened_cli(&mut self, target: &SelectedTarget) -> Option<u32> {
+    pub(super) fn cli_id(&mut self, target: &SelectedTarget, policy: Policy) -> Option<u32> {
         let now = Instant::now();
-        self.pending.retain(|_, pending| pending.expires_at > now);
+        self.pending.retain(|_, pending| pending.expires_at > now && pending.policy == policy);
         self.pending.iter().filter_map(|(&id, pending)| {
-            (pending.card.source == Source::Cli && pending.opened_in.is_none() && &pending.card.target == target).then_some(id)
+            (pending.card.source == Source::Cli && &pending.card.target == target).then_some(id)
         }).min()
-    }
-
-    pub(super) fn at_capacity(&self) -> bool {
-        self.pending.len() >= 32
     }
 
     pub fn propose(
@@ -224,6 +227,9 @@ impl Reviews {
         };
         let now = Instant::now();
         self.pending.retain(|_, proposal| proposal.expires_at > now);
+        if self.pending.len() >= 32 {
+            return Err(ReviewError::Capacity);
+        }
         self.next_id = self
             .next_id
             .checked_add(1)

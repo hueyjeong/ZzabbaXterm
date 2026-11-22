@@ -120,7 +120,7 @@ pub(crate) enum ValidationError {
 pub(crate) struct ValidatedDraft(Draft);
 
 impl ValidatedDraft {
-    pub(super) fn matches(&self, other: &Self) -> bool {
+    pub(crate) fn matches(&self, other: &Self) -> bool {
         self.0 == other.0 && match (self.method(), other.method()) {
             (MethodRef::Local { start_directory: left, .. }, MethodRef::Local { start_directory: right, .. }) => {
                 left.as_os_str() == right.as_os_str()

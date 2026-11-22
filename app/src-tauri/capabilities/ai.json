@@ -12,6 +12,8 @@
     "allow-ai-propose",
     "allow-ai-decide",
     "allow-ai-cli-review",
-    "allow-ai-cli-draft"
+    "allow-ai-cli-draft",
+    "allow-ai-policy",
+    "allow-ai-set-policy"
   ]
 }

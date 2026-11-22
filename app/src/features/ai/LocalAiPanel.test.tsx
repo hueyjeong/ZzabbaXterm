@@ -83,27 +83,29 @@ it("exposes model discovery failure and refreshes target properties after a save
   expect(selects()[1].value).toBe("");
 });
 
-it("opens a CLI card without a model and records only the explicit decision", async () => {
-  invoke.mockImplementation(async (command) => {
-    if (command === "ai_models") throw "설치된 로컬 모델 없음";
-    if (command === "ai_targets") return [{ ...target, label: "관리 노드" }];
-    if (command === "ai_select") return true;
-    if (command === "ai_cli_review") return {
-      id: "9", target, kind: "reviewable", node: "i-0123456789abcdef0",
-      displayCommand: "uptime", interpretation: "가동 시간",
-    };
-    if (command === "ai_decide") return "recorded";
-    throw new Error(command);
+it.each([["승인", "approve", "승인 기록됨"], ["거절", "reject", "거절 기록됨"]])(
+  "opens a CLI card without a model and records %s only after a click", async (label, decision, state) => {
+    invoke.mockImplementation(async (command) => {
+      if (command === "ai_policy") return false;
+      if (command === "ai_models") throw "설치된 로컬 모델 없음";
+      if (command === "ai_targets") return [{ ...target, label: "관리 노드" }];
+      if (command === "ai_select") return true;
+      if (command === "ai_cli_review") return {
+        id: "9", target, kind: "reviewable", node: "i-0123456789abcdef0",
+        displayCommand: "uptime", interpretation: "가동 시간",
+      };
+      if (command === "ai_decide") return "recorded";
+      throw new Error(command);
+    });
+    await render();
+    await select(1, 1);
+    expect(button("승인")).toBeUndefined();
+    await act(async () => button("CLI 제안 열기")?.click());
+    expect(host.querySelector("article")?.textContent).toContain("i-0123456789abcdef0");
+    await act(async () => button(label)?.click());
+    expect(invoke).toHaveBeenCalledWith("ai_decide", { proposalId: "9", decision });
+    expect(host.querySelector("article")?.textContent).toContain(state);
+    expect(invoke.mock.calls.map(([command]) => command)).toEqual([
+      "ai_policy", "ai_models", "ai_targets", "ai_select", "ai_cli_review", "ai_decide",
+    ]);
   });
-  await render();
-  await select(1, 1);
-  expect(button("승인")).toBeUndefined();
-  await act(async () => button("CLI 제안 열기")?.click());
-  expect(host.querySelector("article")?.textContent).toContain("i-0123456789abcdef0");
-  await act(async () => button("승인")?.click());
-  expect(invoke).toHaveBeenCalledWith("ai_decide", { proposalId: "9", decision: "approve" });
-  expect(host.querySelector("article")?.textContent).toContain("승인 기록됨");
-  expect(invoke.mock.calls.map(([command]) => command)).toEqual([
-    "ai_models", "ai_targets", "ai_select", "ai_cli_review", "ai_decide",
-  ]);
-});

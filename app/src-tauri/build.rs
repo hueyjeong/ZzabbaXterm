@@ -7,6 +7,7 @@ fn main() {
         "ai_targets", "ai_models", "ai_select", "ai_chat", "ai_propose", "ai_decide",
         "ssm_discovery",
         "ai_cli_review", "ai_cli_draft",
+        "ai_policy", "ai_set_policy",
     ]);
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(app))
         .expect("failed to build app permissions");

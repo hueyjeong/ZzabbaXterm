@@ -1,28 +1,26 @@
 use std::{
     fmt,
     io::{self, Read, Write},
-    time::Duration,
+    sync::Arc,
     num::NonZeroU64,
 };
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    time::timeout,
+    sync::Semaphore,
+    time::{Instant, timeout, timeout_at},
 };
 
 use crate::{
     connections::{self, profile::{Draft, ValidatedDraft, valid_id}},
-    local_ipc::{Endpoint, Listener, read_frame, write_frame},
+    local_ipc::{self, DEADLINE, Endpoint, Listener, MAX_FRAME, SERVICE, encode_frame, read_frame, write_frame},
 };
 use tauri::{AppHandle, Manager};
 
 use super::ipc::State;
 
-const SERVICE: &str = "app";
-const MAX_FRAME: usize = 16 * 1024;
 const MAX_STDIN: usize = MAX_FRAME - 64;
-const DEADLINE: Duration = Duration::from_secs(3);
 const USAGE: &str = "사용법: zzabba list | zzabba draft | zzabba propose";
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -119,8 +117,8 @@ enum Receipt {
 // 콜백은 조회와 초안·검토 요청 등록만 담당한다. 결정이나 실행 권한은 이 경계 밖에 있다.
 pub(crate) trait Requests {
     fn list(&self) -> Result<Vec<Alias>, Rejected>;
-    fn open_draft(&self, draft: ValidatedDraft) -> Result<String, Rejected>;
-    fn request_review(&self, proposal: Proposal) -> Result<String, Rejected>;
+    fn open_draft(&self, draft: ValidatedDraft, deadline: Instant) -> Result<String, Rejected>;
+    fn request_review(&self, proposal: Proposal, deadline: Instant) -> Result<String, Rejected>;
 }
 
 #[derive(Debug)]
@@ -134,14 +132,14 @@ impl Requests for AppRequests {
         connections::ai_aliases(&directory).map_err(|_| Rejected)
     }
 
-    fn open_draft(&self, draft: ValidatedDraft) -> Result<String, Rejected> {
-        self.0.state::<State>().receive_draft(draft)
+    fn open_draft(&self, draft: ValidatedDraft, deadline: Instant) -> Result<String, Rejected> {
+        self.0.state::<State>().receive_draft(draft, deadline.into_std())
     }
 
-    fn request_review(&self, proposal: Proposal) -> Result<String, Rejected> {
+    fn request_review(&self, proposal: Proposal, deadline: Instant) -> Result<String, Rejected> {
         let directory = self.0.path().app_config_dir().map_err(|_| Rejected)?;
         connections::with_ai_targets(&directory, |targets| {
-            self.0.state::<State>().receive_proposal(&targets, proposal)
+            self.0.state::<State>().receive_proposal(&targets, proposal, deadline.into_std())
         }).map_err(|_| Rejected)?
     }
 }
@@ -162,24 +160,40 @@ pub(crate) fn bind() -> io::Result<Listener> {
     Listener::bind(&Endpoint::for_service(SERVICE)?)
 }
 
-pub(crate) async fn serve(mut listener: Listener, requests: impl Requests) -> io::Result<()> {
-    loop {
-        let mut stream = match listener.accept().await {
-            Ok(stream) => stream,
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => continue,
-            Err(error) => return Err(error),
-        };
-        let _ = serve_connection(&mut stream, &requests).await;
-    }
+pub(crate) async fn serve(listener: Listener, requests: impl Requests + Send + Sync + 'static) -> io::Result<()> {
+    let requests = Arc::new(requests);
+    let blocking = Arc::new(Semaphore::new(4));
+    local_ipc::serve(listener, move |mut stream| {
+        let requests = Arc::clone(&requests);
+        let blocking = Arc::clone(&blocking);
+        async move {
+            let _ = serve_connection(&mut stream, requests, blocking).await;
+        }
+    }).await
 }
 
 async fn serve_connection(
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
-    requests: &impl Requests,
+    requests: Arc<impl Requests + Send + Sync + 'static>,
+    blocking: Arc<Semaphore>,
 ) -> io::Result<()> {
-    let result = timeout(DEADLINE, read_frame(stream, MAX_FRAME)).await?;
+    let deadline = Instant::now() + DEADLINE;
+    let result = timeout_at(deadline, read_frame(stream, MAX_FRAME)).await?;
     let receipt = match result {
-        Ok(bytes) => decode(&bytes).and_then(|request| dispatch(request, requests)),
+        Ok(bytes) => match decode(&bytes) {
+            Ok(request) => match blocking.try_acquire_owned() {
+                Ok(permit) => {
+                    let worker = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        if Instant::now() >= deadline { return Err(Error::Rejected); }
+                        dispatch(request, &*requests, deadline)
+                    });
+                    timeout_at(deadline, worker).await?.unwrap_or(Err(Error::Rejected))
+                }
+                Err(_) => Err(Error::Rejected),
+            },
+            Err(error) => Err(error),
+        },
         Err(error)
             if matches!(
                 error.kind(),
@@ -191,22 +205,23 @@ async fn serve_connection(
         Err(error) => return Err(error),
     }
     .unwrap_or_else(|error| Receipt::Failed { error });
-    let encoded = encode(&receipt)?;
-    timeout(DEADLINE, write_frame(stream, &encoded, MAX_FRAME)).await?
+    let encoded = encode_frame(&receipt, MAX_FRAME)
+        .unwrap_or_else(|_| br#"{"error":"rejected"}"#.to_vec());
+    timeout_at(deadline, write_frame(stream, &encoded, MAX_FRAME)).await?
 }
 
-fn dispatch(request: Request, requests: &impl Requests) -> Result<Receipt> {
+fn dispatch(request: Request, requests: &impl Requests, deadline: Instant) -> Result<Receipt> {
     let result = match request {
         Request::List {} => requests
             .list()
             .map(|connections| Receipt::Listed { connections }),
         Request::Draft { draft } => requests
-            .open_draft(draft.validate().map_err(|_| Error::InvalidRequest)?)
+            .open_draft(draft.validate().map_err(|_| Error::InvalidRequest)?, deadline)
             .map(|draft_id| Receipt::Drafted { draft_id }),
         Request::Propose { proposal } => {
             proposal.validate()?;
             requests
-                .request_review(proposal)
+                .request_review(proposal, deadline)
                 .map(|proposal_id| Receipt::Proposed { proposal_id })
         }
     };
@@ -216,10 +231,6 @@ fn dispatch(request: Request, requests: &impl Requests) -> Result<Receipt> {
 fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     let text = std::str::from_utf8(bytes).map_err(|_| Error::InvalidRequest)?;
     serde_json::from_str(text).map_err(|_| Error::InvalidRequest)
-}
-
-fn encode(value: &impl Serialize) -> io::Result<Vec<u8>> {
-    Ok(serde_json::to_vec(value)?)
 }
 
 fn parse(command: &str, input: impl Read) -> Result<Outbound> {
@@ -250,11 +261,11 @@ fn parse(command: &str, input: impl Read) -> Result<Outbound> {
 }
 
 async fn exchange(endpoint: &Endpoint, request: &Outbound) -> Result<Receipt> {
+    let bytes = encode_frame(request, MAX_FRAME).map_err(|_| Error::InvalidRequest)?;
     let mut stream = timeout(DEADLINE, endpoint.connect())
         .await
         .map_err(|_| Error::Unavailable)?
         .map_err(|_| Error::Unavailable)?;
-    let bytes = encode(request).map_err(|_| Error::InvalidRequest)?;
     let reply = timeout(DEADLINE, async {
         write_frame(&mut stream, &bytes, MAX_FRAME).await?;
         read_frame(&mut stream, MAX_FRAME).await

@@ -4,7 +4,7 @@ import "./ai.css";
 
 type ChatState = { kind: "idle" } | { kind: "sending" } | { kind: "failed"; message: string };
 type ProposalState = { kind: "idle" } | { kind: "requesting" } | { kind: "failed" };
-type DecisionState = "reviewing" | "approved" | "cancelled" | "rejected";
+type DecisionState = "reviewing" | "approved" | "cancelled" | "rejected" | "failed";
 
 function targetKey({ targetId, generation }: ProposalTarget | Proposal["target"]) {
   return JSON.stringify([targetId, generation]);
@@ -34,6 +34,7 @@ export function AiPanel(props: AiPanelProps) {
     <section className="workspace-ai-terminal a01-proposals" aria-labelledby={proposalTitle}>
       <h2 id={proposalTitle}>작업 제안</h2>
       {props.targetError && <p role="alert">{props.targetError}</p>}
+      {props.policyControl}
       <label className="a01-field">조회 대상
         <select value={target ? selected : ""} onChange={(event) => {
           const key = event.target.value;
@@ -155,7 +156,7 @@ function ProposalReview({ model, target, proposals, attempted, onRequestProposal
     }
   }
 
-  async function decide(proposal: Proposal, decision: "approve" | "cancel") {
+  async function decide(proposal: Proposal, decision: "approve" | "reject" | "cancel") {
     if (!mounted.current || attempted.has(proposal.id) || targetKey(proposal.target) !== key ||
       (decision === "approve" && proposal.kind !== "reviewable")) return;
     attempted.add(proposal.id);
@@ -165,9 +166,9 @@ function ProposalReview({ model, target, proposals, attempted, onRequestProposal
     mark("reviewing");
     try {
       const result = await onDecideProposal({ proposalId: proposal.id, decision });
-      mark(result === "recorded" ? (decision === "approve" ? "approved" : "cancelled") : "rejected");
+      mark(result !== "recorded" ? "failed" : decision === "approve" ? "approved" : decision === "reject" ? "rejected" : "cancelled");
     } catch {
-      mark("rejected");
+      mark("failed");
     }
   }
 
@@ -194,9 +195,10 @@ function ProposalReview({ model, target, proposals, attempted, onRequestProposal
         </> : <p>{proposal.kind === "blocked" ? "차단된 조회" : "미등록 조회"}</p>}
         {decision ? <p role="status">{{
           reviewing: "결정 기록 중", approved: "승인 기록됨", cancelled: "취소됨",
-          rejected: "결정 기록 실패", closed: "검토 종료"
+          rejected: "거절 기록됨", failed: "결정 기록 실패", closed: "검토 종료"
         }[decision]}</p> : <div className="a01-actions">
           {proposal.kind === "reviewable" && <button type="button" onClick={() => decide(proposal, "approve")}>승인</button>}
+          <button type="button" onClick={() => decide(proposal, "reject")}>거절</button>
           <button type="button" onClick={() => decide(proposal, "cancel")}>취소</button>
         </div>}
       </article>;
