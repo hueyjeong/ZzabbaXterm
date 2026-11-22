@@ -22,6 +22,7 @@ type View = {
   uploadKey: string;
   transfer?: Transfer;
   invalidUploadPaste?: boolean;
+  requestedLocation?: S3Location | null;
   expired?: boolean;
 };
 const initial: View = { confirmed: false, loading: false, selectedKey: null, uploadKey: "" };
@@ -30,12 +31,13 @@ type Props = Readonly<{
   session: S3Session;
   actions: S3Actions;
   onRelogin?: () => void;
+  refresh?: number;
   editEnabled?: boolean;
   onEditFile?(opened: StorageEditorOpen): false | void;
   countHistory?: typeof countPreviousFiles;
 }>;
 
-export function S3StoragePanel({ session, actions, onRelogin, editEnabled = true, onEditFile, countHistory = countPreviousFiles }: Props) {
+export function S3StoragePanel({ session, actions, onRelogin, refresh = 0, editEnabled = true, onEditFile, countHistory = countPreviousFiles }: Props) {
   const [views, setViews] = useState(() => new Map<string, View>());
   const [history, setHistory] = useState<{ request: Parameters<typeof countPreviousFiles>[0]; count: typeof countPreviousFiles; status: VersionedFilesStatus }>();
   const [menuKey, setMenuKey] = useState<string>();
@@ -53,10 +55,17 @@ export function S3StoragePanel({ session, actions, onRelogin, editEnabled = true
     });
   }
 
-  async function load(location: S3Location | null, token: string | null = null) {
+  async function load(location: S3Location | null, token: string | null = null, afterRelogin = false) {
     if (view.loading) return;
     editAttempt.current = null;
-    update(() => ({ loading: true, problem: undefined, editError: undefined }));
+    update(current => ({
+      loading: true, requestedLocation: location, problem: undefined, editError: undefined,
+      ...(afterRelogin ? {
+        expired: false, confirmed: false,
+        ...(current.transfer?.state === "failed" && current.transfer.problem !== "unavailable" &&
+          current.transfer.problem.failure.kind === "ssoLoginRequired" ? { transfer: undefined } : {}),
+      } : {}),
+    }));
     try {
       let listing: Listing;
       if (location) {
@@ -105,6 +114,13 @@ export function S3StoragePanel({ session, actions, onRelogin, editEnabled = true
     if (!session.location || booted.current === sessionId || views.has(sessionId)) return;
     booted.current = sessionId;
     open(session.location);
+  });
+
+  const refreshed = useRef(refresh);
+  useLayoutEffect(() => {
+    if (refreshed.current === refresh || view.loading) return;
+    refreshed.current = refresh;
+    void load(view.requestedLocation ?? null, null, true);
   });
 
   const listing = view.listing;

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useImperativeHandle, useRef, useState, type Ref } from "react";
+import { useCallback, useEffect, useImperativeHandle, useLayoutEffect, useRef, useState, type Ref } from "react";
 import type { SavedConnections } from "../connections/connectionIpc";
 import { S3StoragePanel } from "./S3StoragePanel";
 import { StorageProblem, type Problem } from "./StorageStatus";
@@ -21,10 +21,16 @@ export function StorageTab({ profiles, targetId: pinnedId, active = true, closin
   const [opening, setOpening] = useState(false);
   const [problem, setProblem] = useState<Problem>();
   const [loggingIn, setLoggingIn] = useState(false);
-  const attempt = useRef<{ id: string; targetId: string; closing: boolean } | null>(null);
+  const [refresh, setRefresh] = useState(0);
+  const attempt = useRef<{ id: string; targetId: string; closing: boolean; needsLogin: boolean } | null>(null);
   const booted = useRef(false);
   const approved = profiles?.targets.filter(({ profile }) => profile.defaultMethod === "ssm" || profile.defaultMethod === "s3") ?? [];
   const selectedId = pinnedId ?? approved.find(({ profile }) => profile.id === targetId)?.profile.id;
+  const loginTarget = useRef<string | undefined>(undefined);
+  useLayoutEffect(() => {
+    loginTarget.current = closing ? undefined : selectedId;
+    return () => { loginTarget.current = undefined; };
+  }, [closing, selectedId]);
 
   useImperativeHandle(closeRef, () => ({
     async confirmClose() {
@@ -39,7 +45,7 @@ export function StorageTab({ profiles, targetId: pinnedId, active = true, closin
   const open = useCallback(async (id: string) => {
     if (closing || opening || loggingIn) return;
     const previous = attempt.current;
-    const current = { id: crypto.randomUUID(), targetId: id, closing: false };
+    const current = { id: crypto.randomUUID(), targetId: id, closing: false, needsLogin: false };
     setOpening(true);
     setProblem(undefined);
     try {
@@ -51,7 +57,8 @@ export function StorageTab({ profiles, targetId: pinnedId, active = true, closin
       if (result.ok) setSession(result.value);
       else {
         setProblem(result.error);
-        if (result.error.failure.kind !== "ssoLoginRequired") attempt.current = null;
+        current.needsLogin = result.error.failure.kind === "ssoLoginRequired";
+        if (!current.needsLogin) attempt.current = null;
       }
     } catch {
       if (!current.closing && !previous?.closing) setProblem("unavailable");
@@ -73,14 +80,12 @@ export function StorageTab({ profiles, targetId: pinnedId, active = true, closin
     setProblem(undefined);
     try {
       const result = await reloginStorage(current.id);
-      if (current.closing || attempt.current !== current) return;
+      if (current.closing || attempt.current !== current || loginTarget.current !== current.targetId) return;
       if (!result.ok) setProblem(result.error);
-      if (session) await closeStorage(current.id);
-      if (current.closing || attempt.current !== current) return;
-      attempt.current = null;
-      setSession(undefined);
+      else if (session) setRefresh(value => value + 1);
+      else attempt.current = null;
     } catch {
-      if (!current.closing) setProblem("unavailable");
+      if (!current.closing && attempt.current === current && loginTarget.current === current.targetId) setProblem("unavailable");
     } finally {
       setLoggingIn(false);
     }
@@ -88,7 +93,7 @@ export function StorageTab({ profiles, targetId: pinnedId, active = true, closin
 
   const reloginStatus = loggingIn && <p role="status">SSO 재로그인 중</p>;
   if (session) return <>
-    <div inert={loggingIn}><S3StoragePanel session={session} actions={storageActions} onRelogin={() => void relogin()}
+    <div inert={loggingIn}><S3StoragePanel session={session} actions={storageActions} refresh={refresh} onRelogin={() => void relogin()}
       editEnabled={active && !closing && !loggingIn} onEditFile={onEditFile && (opened => {
         const current = attempt.current;
         if (!current || current.id !== session.sessionId || current.closing) return false;
@@ -118,7 +123,7 @@ export function StorageTab({ profiles, targetId: pinnedId, active = true, closin
     {opening && <p role="status">SSO 프로필 확인 중</p>}
     {reloginStatus}
     {problem && <StorageProblem problem={problem} />}
-    {selectedId && problem && problem !== "unavailable" && problem.failure.kind === "ssoLoginRequired" &&
+    {selectedId && attempt.current?.targetId === selectedId && attempt.current.needsLogin && !opening &&
       <button type="button" disabled={closing || opening || loggingIn} onClick={() => void relogin()}>SSO 재로그인</button>}
     {selectedId && problem && problem !== "unavailable" &&
       (problem.failure.kind === "retestRequired" || problem.failure.kind === "accountMismatch") &&
