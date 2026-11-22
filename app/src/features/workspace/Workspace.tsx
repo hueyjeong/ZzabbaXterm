@@ -83,16 +83,23 @@ export function Workspace() {
   const liveTabs = useRef(tabs);
   const closingTabs = useRef(new Set<number>());
   const sessionClosers = useRef(new Map<number, { confirmClose(): Promise<void> }>());
+  const [closeBlock, setCloseBlock] = useState<{ kind: "picker" | "cli" | "mount"; message: string }
+    | { kind: "editor"; id: number; message: string }>();
   useLayoutEffect(() => {
     liveTabs.current = tabs;
+    const mountingEditors = pendingEditorMounts.current.size;
     for (const tab of tabs) {
       if (tab.kind !== "editor") continue;
       pendingEditorMounts.current.delete(tab.id);
       if (tab.attaching) cliMounts.current.get(tab.id)?.(editorActions.current.has(tab.id));
     }
+    if (mountingEditors && !pendingEditorMounts.current.size) {
+      setCloseBlock(current => current?.kind === "mount" ? undefined : current);
+    }
   }, [tabs]);
   const [focused, setFocused] = useState(false);
   const [windowError, setWindowError] = useState("");
+  const [closeError, setCloseError] = useState("");
   const [loadVersion, setLoadVersion] = useState(0);
   const [profileLoad, setProfileLoad] = useState<ProfileLoad>({ kind: "loading" });
   const [hostRegistration, setHostRegistration] = useState<{ kind: "status" | "alert"; message: string }>();
@@ -106,6 +113,18 @@ export function Workspace() {
   const sideLimit = Math.min(640, Math.floor(bodyWidth * 0.32));
   const left = Math.min(treeWidth, sideLimit);
   const right = Math.min(aiWidth, sideLimit);
+
+  useEffect(() => {
+    if (closeBlock?.kind !== "editor") return;
+    // 숨은 편집 탭의 처리 상태도 부모 렌더링과 독립적으로 바뀐다.
+    const timer = window.setInterval(() => {
+      const tab = liveTabs.current.find(tab => tab.id === closeBlock.id);
+      if (!tab || (tab.kind === "editor" && !tab.attaching && editorActions.current.get(tab.id)?.closeState()?.pending === false)) {
+        setCloseBlock(current => current === closeBlock ? undefined : current);
+      }
+    }, 100);
+    return () => window.clearInterval(timer);
+  }, [closeBlock]);
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -123,17 +142,17 @@ export function Workspace() {
     async function respond(requestId: string) {
       if (disposed || closingWindow.current || requestId === answeredId) return;
       answeredId = requestId;
-      setWindowError("");
-      let blocked = openingFile.current ? "파일 선택 중 · 창 닫기 보류" :
-        cliMounts.current.size ? "CLI 편집 탭 연결 중 · 창 닫기 보류" :
-        pendingEditorMounts.current.size ? "편집 탭 여는 중 · 창 닫기 보류" : "";
+      setCloseError("");
+      let blocked: typeof closeBlock = openingFile.current ? { kind: "picker", message: "파일 선택 중 · 창 닫기 보류" } :
+        cliMounts.current.size ? { kind: "cli", message: "CLI 편집 탭 연결 중 · 창 닫기 보류" } :
+        pendingEditorMounts.current.size ? { kind: "mount", message: "편집 탭 여는 중 · 창 닫기 보류" } : undefined;
       const discard: string[] = [];
       for (const tab of liveTabs.current) {
         if (blocked) break;
         if (tab.kind !== "editor") continue;
         const state = editorActions.current.get(tab.id)?.closeState();
         if (tab.attaching || !state || state.pending) {
-          blocked = `${tab.label}: 편집 작업 중 · 창 닫기 보류`;
+          blocked = { kind: "editor", id: tab.id, message: `${tab.label}: 편집 작업 중 · 창 닫기 보류` };
           break;
         }
         if (state.dirty || state.uncertain) discard.push(tab.label);
@@ -148,7 +167,7 @@ export function Workspace() {
       };
       let approved = false;
       try {
-        if (blocked) setWindowError(blocked);
+        setCloseBlock(blocked);
         approved = !blocked && (!discard.length || window.confirm(
           `저장되지 않았거나 저장을 확인할 수 없는 파일:\n\n${discard.join("\n")}\n\n편집 내용을 버리고 창을 닫을까요?`,
         ));
@@ -170,12 +189,12 @@ export function Workspace() {
         }
         if (answeredId === requestId) {
           answeredId = undefined;
-          if (!disposed) setWindowError(`닫기 실패: ${String(error)}`);
+          if (!disposed) setCloseError(`닫기 실패: ${String(error)}`);
         }
       }
     }
     void registration.catch((error: unknown) => {
-      if (!disposed) setWindowError(`창 닫기 연결 실패: ${String(error)}`);
+      if (!disposed) setCloseError(`창 닫기 연결 실패: ${String(error)}`);
     });
     return () => {
       disposed = true;
@@ -216,6 +235,7 @@ export function Workspace() {
         throw error;
       } finally {
         cliMounts.current.delete(id);
+        if (!cliMounts.current.size) setCloseBlock(current => current?.kind === "cli" ? undefined : current);
         attachingHandles.delete(file.handle);
         signal.removeEventListener("abort", abort);
       }
@@ -417,6 +437,7 @@ export function Workspace() {
     } finally {
       openingFile.current = false;
       setFilePickerBusy(false);
+      setCloseBlock(current => current?.kind === "picker" ? undefined : current);
     }
   }
 
@@ -726,6 +747,8 @@ export function Workspace() {
             : current?.kind === "rdp" || current?.kind === "vnc"
               ? `${current.label} · 직접 · ${current.kind === "rdp" ? "NLA" : "TLS"}`
               : current ? (current.source === "local" ? "내 PC · 로컬 파일" : current.source === "sftp" ? "SFTP" : "S3") : "연결 없음"}</span>
+        {closeBlock && <span role="status">{closeBlock.message}</span>}
+        {closeError && <span role="alert">{closeError}</span>}
         {windowError && <span role="alert">{windowError}</span>}
         {fileError && <span role="alert">{fileError}</span>}
         {hostRegistration && <span role={hostRegistration.kind}>{hostRegistration.message}</span>}

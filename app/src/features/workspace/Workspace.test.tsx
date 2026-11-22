@@ -281,8 +281,14 @@ describe("작업 공간 창 닫기", () => {
     await act(async () => uncertain.pushEditOperations(null, [{
       range: { startLineNumber: 1, startColumn: 1, endLineNumber: 1, endColumn: 1 }, text: "수정 ",
     }], () => null));
-    saveFile = async () => { throw { kind: "publicationUnconfirmed" }; };
-    await press("저장");
+    const recoveryPath = String.raw`C:\작업 폴더\한글 복구.txt`;
+    saveFile = async () => { throw { kind: "publicationUnconfirmed", recoveryPath }; };
+    const activeEditor = find('.editor-tab[aria-label="저장 미확인.txt"]:not([hidden])');
+    const save = [...activeEditor.querySelectorAll("button")].find(button => button.textContent === "저장");
+    expect(save?.disabled).toBe(false);
+    await act(async () => { save?.click(); });
+    expect(connectionCalls("editor_local_save")).toEqual([["editor_local_save", { handle: "uncertain-file", text: "수정 원본" }]]);
+    expect(activeEditor.querySelector("output")?.textContent).toContain(`저장 결과 미확인: 복구 파일: ${recoveryPath}`);
     await act(async () => uncertain.undo());
     expect(uncertain.getAlternativeVersionId()).toBe(version);
 
@@ -346,6 +352,8 @@ describe("작업 공간 창 닫기", () => {
   it("파일 선택 중에는 확인 없이 닫기를 거절하고 파일 선택은 계속한다", async () => {
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
     const picker = Promise.withResolvers<unknown>();
+    native.invoke.mockRejectedValueOnce("최소화 거부");
+    await press("최소화");
     openFile = () => picker.promise;
     await press("파일 열기");
     await requestWindowClose("picker");
@@ -354,6 +362,8 @@ describe("작업 공간 창 닫기", () => {
     expect(closeReplies()).toEqual([{ action: "respondToClose", requestId: "picker", approved: false }]);
     await act(async () => picker.resolve({ status: "opened", handle: "picked", name: "선택.txt", text: "원본" }));
     expect(button("선택.txt")?.getAttribute("aria-pressed")).toBe("true");
+    expect(status()).not.toContain("창 닫기 보류");
+    expect(status()).toContain("최소화 실패: 최소화 거부");
   });
 });
 
@@ -1483,6 +1493,7 @@ describe("C02 SSM 연결", () => {
     await act(async () => saving.resolve(null));
     expect(model.getValue()).toBe("미저장");
     expect(button("저장")?.disabled).toBe(false);
+    await vi.waitFor(() => expect(status()).not.toContain("창 닫기 보류"));
     await press("시험.txt 닫기");
     expect(confirm).toHaveBeenCalledTimes(1);
     expect(connectionCalls("editor_local_close")).toHaveLength(0);
