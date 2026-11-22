@@ -114,8 +114,9 @@ fn nano_approval_admits_only_the_confirmed_saved_ssh_and_document() {
             Ok(true)
         }, |launch| {
             let command = Launch::Ssh(launch);
-            let (_, session) = sessions.register_document("main", document, &command, true)?;
-            session.finish();
+            let (id, session) = sessions.register_document("main", document, &command, true)?;
+            let registered = sessions.registry.lock().unwrap().sessions.remove(&id).unwrap();
+            assert!(std::sync::Arc::ptr_eq(&registered, &session));
             launch_admissions.set(launch_admissions.get() + 1);
             let Launch::Ssh(launch) = command else { unreachable!() };
             let (_, plan) = launch.into_parts();
@@ -129,7 +130,7 @@ fn nano_approval_admits_only_the_confirmed_saved_ssh_and_document() {
         assert_eq!(result.err().as_deref(), expected, "{change}");
         assert_eq!(confirmations.get(), 1, "{change}");
         assert_eq!(launch_admissions.get(), u8::from(expected.is_none()), "{change}");
-        assert_eq!(sessions.registry.lock().unwrap().sessions.len(), usize::from(u8::from(expected.is_none())), "{change}");
+        assert!(sessions.registry.lock().unwrap().sessions.is_empty(), "{change}");
     }
 }
 
