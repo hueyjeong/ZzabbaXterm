@@ -54,7 +54,8 @@ type Status =
   | { kind: "passed" | "saving"; request: ConnectionRequest; attempt: ConnectionTestDraft }
   | { kind: "testFailed" | "closeFailed"; error: string }
   | { kind: "saveFailed"; request: ConnectionRequest; attempt: ConnectionTestDraft; error: string };
-type State = Readonly<{ step: Step; draft: WizardDraft; status: Status }>;
+type RemoteCleanup = Readonly<{ kind: "cancelling" | "unconfirmed"; target: SsmTarget }>;
+type State = Readonly<{ step: Step; draft: WizardDraft; status: Status; remoteCleanup?: RemoteCleanup }>;
 
 const steps = ["target", "method", "auth", "verify"] as const;
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
@@ -71,6 +72,7 @@ export interface LocalConnectionWizardState {
   test(actions: LocalConnectionActions): Promise<void>;
   save(actions: LocalConnectionActions): Promise<void>;
   close(actions: LocalConnectionActions): Promise<void>;
+  retryCleanup(): void;
   abandon(): void;
 }
 
@@ -80,6 +82,7 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Local
   let draftVersion = 0;
   const listeners = new Set<() => void>();
   const pending = new Map<ConnectionTestDraft, LocalConnectionActions["cancelTest"]>();
+  const remoteCancellations = new Map<ConnectionTestDraft, Promise<void>>();
 
   function update(change: Partial<State>) {
     state = { ...state, ...change };
@@ -155,7 +158,7 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Local
   }
 
   async function test(actions: LocalConnectionActions) {
-    if (locked() || state.step !== "verify" || state.status.kind === "testing") return;
+    if (locked() || state.step !== "verify" || state.status.kind === "testing" || state.remoteCleanup) return;
     const { draft } = state;
     const { target } = draft;
     const complete = target.defaultMethod === "local" ? target : target.ssm && { ...target, ssm: target.ssm };
@@ -174,6 +177,7 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Local
       update({ status: { kind: "passed", request: { run, draft: attempt.draft }, attempt } });
     } catch (error) {
       if (isTesting(attempt)) update({ status: { kind: "testFailed", error: errorText(error) } });
+      else if (attempt.draft.target.defaultMethod === "ssm") return;
       void cancelPending(attempt);
     }
   }
@@ -203,7 +207,27 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Local
   function cancelPending(only?: ConnectionTestDraft) {
     return Promise.allSettled(Array.from(pending, async ([attempt, cancel]) => {
       if (only && only !== attempt) return;
-      await cancel(attempt);
+      if (attempt.draft.target.defaultMethod === "ssm") {
+        let cancellation = remoteCancellations.get(attempt);
+        if (!cancellation) {
+          const target = attempt.draft.target.ssm;
+          update({ remoteCleanup: { kind: "cancelling", target } });
+          cancellation = (async () => {
+            try {
+              await cancel(attempt);
+              pending.delete(attempt);
+              update({ remoteCleanup: undefined });
+            } catch (error) {
+              update({ remoteCleanup: { kind: "unconfirmed", target } });
+              throw error;
+            }
+          })().finally(() => remoteCancellations.delete(attempt));
+          remoteCancellations.set(attempt, cancellation);
+        }
+        await cancellation;
+      } else {
+        await cancel(attempt);
+      }
       pending.delete(attempt);
     }));
   }
@@ -212,13 +236,20 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Local
     if (locked() && state.status.kind !== "closeFailed") return;
     const closing = { kind: "closing" } as const;
     update({ status: closing });
-    const timeout = Promise.withResolvers<null>();
-    const timer = setTimeout(() => timeout.resolve(null), CANCEL_RESPONSE_TIMEOUT);
-    const results = await Promise.race([cancelPending(), timeout.promise]).finally(() => clearTimeout(timer));
+    const hasRemote = [...pending.keys()].some(attempt => attempt.draft.target.defaultMethod === "ssm");
+    const cancellation = cancelPending();
+    let results: Awaited<typeof cancellation> | null;
+    if (hasRemote) {
+      results = await cancellation;
+    } else {
+      const timeout = Promise.withResolvers<null>();
+      const timer = setTimeout(() => timeout.resolve(null), CANCEL_RESPONSE_TIMEOUT);
+      results = await Promise.race([cancellation, timeout.promise]).finally(() => clearTimeout(timer));
+    }
     if (state.status !== closing) return;
     const failures = results?.flatMap(result => result.status === "rejected" ? [errorText(result.reason)] : []) ?? [];
     if (failures.length) {
-      update({ status: { kind: "closeFailed", error: failures.join("\n") } });
+      update({ status: { kind: "closeFailed", error: hasRemote ? "종료 확인 불가" : failures.join("\n") } });
       return;
     }
     update({ status: { kind: "closed" } });
@@ -239,6 +270,9 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Local
     test,
     save,
     close,
+    retryCleanup() {
+      if (state.remoteCleanup?.kind === "unconfirmed" && !locked()) void cancelPending();
+    },
     abandon() {
       if (state.status.kind === "closing") {
         state = { ...state, status: { kind: "closed" } };

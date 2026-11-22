@@ -119,6 +119,7 @@ fn l01_terminal_calculates_12_and_reports_exit_7_after_output() {
             Event::Bytes(_) => {},
             Event::Exited(code) => { assert_eq!(code, 7); break; }
             Event::Disconnected(reason) => panic!("L01: 자연 종료 대신 단절: {reason}"),
+            other => panic!("예상하지 못한 로컬 이벤트: {other:?}"),
         }
     }
     assert!(sessions.input("main", &peer.id, b"x").is_err());
@@ -218,6 +219,7 @@ fn l01_terminal_stalled_output_ack_disconnects_even_below_the_window() {
                 break;
             }
             Event::Exited(code) => panic!("ACK 단절 대신 종료: {code}"),
+            other => panic!("예상하지 못한 로컬 이벤트: {other:?}"),
         }
     }
     assert!((1..WINDOW).contains(&received));
@@ -236,6 +238,7 @@ fn l01_terminal_exit_259_is_not_a_running_process() {
             Event::Bytes(_) => {},
             Event::Exited(code) => { assert_eq!(code, 259); break; }
             Event::Disconnected(reason) => panic!("종료 259 대신 단절: {reason}"),
+            other => panic!("예상하지 못한 로컬 이벤트: {other:?}"),
         }
     }
 }

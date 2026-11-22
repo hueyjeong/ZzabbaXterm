@@ -528,6 +528,40 @@ async fn active_session_is_terminated_once_and_confirmed_by_history() {
     );
 }
 
+#[tokio::test]
+async fn termination_history_can_lag_without_a_second_write() {
+    let mut request = request();
+    let scope = request.scope.clone();
+    let mut terminating = session();
+    terminating["Status"] = json!("Terminating");
+    assert_eq!(check_close(&mut request, &scope, [
+        (HISTORY, Ok(inventory(vec![]))),
+        (ACTIVE, Ok(inventory(vec![active_session()]))),
+        (TERMINATE, Ok(fixture(json!({"SessionId": SESSION_ID})))),
+        (CONFIRM, Ok(inventory(vec![]))),
+        (CONFIRM, Ok(inventory(vec![terminating.clone()]))),
+        (CONFIRM, Ok(inventory(vec![session()]))),
+    ]).await, Ok(()));
+    assert_eq!(check_close(&mut request, &scope, [
+        (CONFIRM, Ok(inventory(vec![terminating]))),
+        (CONFIRM, Ok(inventory(vec![session()]))),
+    ]).await, Ok(()));
+}
+
+#[tokio::test]
+async fn already_terminating_session_uses_only_reads() {
+    let mut request = request();
+    let scope = request.scope.clone();
+    let mut terminating = session();
+    terminating["Status"] = json!("Terminating");
+    assert_eq!(check_close(&mut request, &scope, [
+        (HISTORY, Ok(inventory(vec![]))),
+        (ACTIVE, Ok(inventory(vec![terminating]))),
+        (CONFIRM, Ok(inventory(vec![]))),
+        (CONFIRM, Ok(inventory(vec![session()]))),
+    ]).await, Ok(()));
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn denied_ambiguous_or_unowned_sessions_never_authorize_a_write() {
     use VerificationError::Unconfirmed;
@@ -558,7 +592,6 @@ async fn denied_ambiguous_or_unowned_sessions_never_authorize_a_write() {
     twin["SessionId"] = json!("twin-0123456789abcdef0");
     for active in [
         denied(),
-        inventory(vec![]),
         inventory(vec![active_session(), twin]),
         inventory(vec![session()]),
     ] {

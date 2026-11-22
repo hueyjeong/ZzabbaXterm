@@ -33,6 +33,9 @@ vi.mock("@xterm/xterm", () => ({
       this.field.addEventListener("input", (event) => {
         if (event instanceof InputEvent && event.data) input(event.data);
       });
+      for (const type of ["keydown", "paste"]) {
+        this.field.addEventListener(type, () => input(type));
+      }
       return { dispose() { } };
     }
     write(bytes: Uint8Array, parsed: () => void) {
@@ -53,6 +56,7 @@ const starts = new Map<string, Promise<void>>();
 const emptyStore: SavedConnections = { version: 1, groups: [], targets: [] };
 let loadProfiles: () => Promise<SavedConnections>;
 let runConnectionCommand: (command: string, args: unknown) => Promise<unknown>;
+let closeTerminal: (id: string) => Promise<unknown>;
 let runDiscovery: (args: unknown) => Promise<unknown>;
 
 beforeEach(async () => {
@@ -84,12 +88,14 @@ beforeEach(async () => {
   starts.clear();
   loadProfiles = async () => emptyStore;
   runConnectionCommand = async (command) => { throw new Error(`예상하지 않은 연결 명령: ${command}`); };
+  closeTerminal = async () => null;
   runDiscovery = async () => { throw new Error("예상하지 않은 SSM 검색"); };
   native.invoke.mockImplementation(async (command, args) => {
     if (command === "connections_load") return loadProfiles();
     if (command.startsWith("connection_")) return runConnectionCommand(command, args);
     if (command === "ssm_discovery") return runDiscovery(args);
     if (command === "terminal_start") return starts.get(args.id);
+    if (command === "terminal_close") return closeTerminal(args.id);
     if (command !== "terminal_open") return;
     const id = `pty-${channels.size + 10}`;
     channels.set(id, args.output.receive);
@@ -649,7 +655,54 @@ describe("C02 SSM 연결", () => {
     expect(connectionCalls("connection_save")).toHaveLength(0);
   });
 
-  it("저장된 SSM 행의 문맥 메뉴는 SSM만 제공하고 열기에는 저장 대상 ID만 전달한다", async () => {
+  it("늦은 SSM 시험 ID를 기다리고 종료 미확인에서 동일 실행을 다시 확인한다", async () => {
+    vi.stubGlobal("__ZZABBA_SSM_DOCUMENT__", "test-document");
+    const start = Promise.withResolvers<ConnectionTestRun>();
+    const cancel = Promise.withResolvers<null>();
+    let attempt: ConnectionTestDraft | undefined;
+    let requestId = 0;
+    runDiscovery = async (args) => {
+      const { request } = args as { request: { action: string; operation?: { kind: string } } };
+      if (request.action === "reserve") return String(++requestId);
+      if (request.operation?.kind === "listProfiles") return [node.profile];
+      if (request.operation?.kind === "configuredRegion") return node.region;
+      if (request.operation?.kind === "listOnlineNodes") return [{ instanceId: node.instanceId }];
+      throw new Error("예상하지 않은 요청");
+    };
+    runConnectionCommand = async (command, args) => {
+      if (command === "connection_test_start") {
+        attempt = args as ConnectionTestDraft;
+        return start.promise;
+      }
+      if (command === "connection_test_cancel") return connectionCalls(command).length === 1 ? cancel.promise : null;
+      throw new Error(`예상하지 않은 연결 명령: ${command}`);
+    };
+    await press("연결 추가");
+    await press("다음");
+    await select("접속 방식", "ssm");
+    await press("다음");
+    await select("프로필", node.profile);
+    await select("온라인 노드", node.instanceId);
+    await press("다음");
+    await press("연결 테스트");
+    await press("취소");
+    const reference = `${node.profile} / ${node.region} / ${node.instanceId}`;
+    expect(find("dialog [role=status]").textContent).toBe(`시험 취소 중: ${reference}`);
+    expect(connectionCalls("connection_test_cancel")).toHaveLength(0);
+    if (!attempt) throw new Error("초안이 없습니다");
+    const run = { draftId: attempt.draftId, draftVersion: attempt.draftVersion, runId: "late-trial" };
+    await act(async () => start.resolve(run));
+    expect(connectionCalls("connection_test_wait")).toHaveLength(0);
+    expect(connectionCalls("connection_test_cancel")).toEqual([["connection_test_cancel", { run }]]);
+    await act(async () => cancel.reject("미확인"));
+    expect(find("dialog [role=alert]").textContent).toBe(`종료 확인 불가: ${reference}`);
+    await press("종료 다시 확인");
+    expect(connectionCalls("connection_test_cancel")).toEqual(Array(2).fill(["connection_test_cancel", { run }]));
+    expect(host.querySelector("dialog")).toBeNull();
+  });
+
+  it("SSM 탭은 종료 확인 전 남고 같은 앱 세션 ID로만 다시 확인한다", async () => {
+    const close = Promise.withResolvers<null>();
     loadProfiles = async () => ({
       version: 1,
       groups: [{ revision: 1, profile: { id: "dev", displayName: "개발" } }],
@@ -666,5 +719,47 @@ describe("C02 SSM 연결", () => {
     expect(output).toBeDefined();
     expect(args).toEqual({ targetId: "saved-ssm", cols: 80, rows: 24 });
     expect(status()).toContain("관리 노드 · SSM");
+    const field = find<HTMLTextAreaElement>('section[aria-label="관리 노드"] textarea');
+    const screen = field.parentElement!;
+    const sessionId = [...channels.keys()].slice(-1)[0];
+    const receive = channels.get(sessionId)!;
+    await act(async () => receive({ kind: "connecting" }));
+    expect(status()).toContain("연결 중");
+    expect(screen.hasAttribute("inert")).toBe(true);
+    expect(document.activeElement).not.toBe(field);
+    await key(field, "a");
+    await act(async () => field.dispatchEvent(new Event("paste", { bubbles: true, cancelable: true })));
+    expect(calls("input")).toHaveLength(0);
+    await act(async () => receive({ kind: "ready" }));
+    expect(status()).toContain("연결됨");
+    expect(screen.hasAttribute("inert")).toBe(false);
+    expect(document.activeElement).toBe(field);
+    await key(field, "a");
+    await act(async () => field.dispatchEvent(new Event("paste", { bubbles: true, cancelable: true })));
+    expect(calls("input")).toEqual(["keydown", "paste"].map(text => ({ id: sessionId, bytes: [...new TextEncoder().encode(text)] })));
+    closeTerminal = vi.fn().mockReturnValueOnce(close.promise).mockResolvedValue(null);
+    native.invoke.mockClear();
+    await press("관리 노드 닫기");
+    expect(button("관리 노드")).toBeDefined();
+    expect(button("관리 노드 닫기")?.disabled).toBe(true);
+    expect(find(".workspace-tab [role=status]").textContent?.trim()).toBe("종료 중");
+    const [request] = calls("close");
+    expect(status()).toContain(`${node.profile} / ${node.region} / ${node.instanceId} · ${request.id}`);
+    await act(async () => {
+      receive({ kind: "exited", value: 0 });
+      receive({ kind: "ready" });
+    });
+    expect(button("관리 노드")).toBeDefined();
+    expect(find(".workspace-tab [role=status]").textContent?.trim()).toBe("종료 중");
+    await act(async () => close.reject("미확인"));
+    expect(find(".workspace-tab [role=alert]").textContent?.trim()).toBe("종료 확인 불가");
+    expect(button("관리 노드")).toBeDefined();
+    await press("로컬 1");
+    await press("관리 노드 종료 다시 확인");
+    expect(calls("close")).toEqual([request, request]);
+    expect(button("관리 노드")).toBeUndefined();
+    await act(async () => receive({ kind: "ready" }));
+    expect(button("관리 노드")).toBeUndefined();
+    expect(button("로컬 1")?.getAttribute("aria-pressed")).toBe("true");
   });
 });

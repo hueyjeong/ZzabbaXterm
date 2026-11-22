@@ -92,9 +92,14 @@ impl Probe {
         drop(self.ready.wait_while(self.state.lock().unwrap(), |state| state.result.is_none()).unwrap());
     }
 
-    pub(crate) fn cancel_result(&self) -> Result<(), String> {
+    pub(crate) fn cleanup_unconfirmed(&self) -> bool {
+        self.session.cleanup_result().is_err()
+    }
+
+    pub(crate) fn cancel_result(&self, retry: bool) -> Result<(), String> {
         if self.session.is_ssm() {
             self.wait_finished();
+            if retry { return self.session.recheck_cleanup().warning().map_or(Ok(()), Err); }
             self.session.cleanup_result()?;
         }
         Ok(())
@@ -147,6 +152,8 @@ impl Probe {
                     }
                     Ok(())
                 }
+                Event::Connecting => Ok(()),
+                Event::Ready => session.upgrade().ok_or(super::CLOSED.to_owned())?.input(SSM_CHECK),
                 Event::Exited(0) if matched == marker.len() => sender.send(Ok(())).map_err(|err| err.to_string()),
                 Event::Exited(23) if !ssm => sender.send(Err("셸이 요청한 작업 디렉터리에서 시작하지 못했습니다".into()))
                     .map_err(|err| err.to_string()),
@@ -154,11 +161,10 @@ impl Probe {
                     .map_err(|err| err.to_string()),
                 Event::Disconnected(error) => sender.send(Err(error)).map_err(|err| err.to_string()),
             }
-        }, || {});
+        }, |_| {});
         let result = launched.and_then(|opened| {
             self.receive(&opened)??;
             self.session.start_until(Some(self.deadline))?;
-            if ssm { self.session.input(SSM_CHECK)?; }
             self.receive(&receiver)?
         });
         if result.is_err() {

@@ -2,6 +2,15 @@ use portable_pty::{Child, PtyPair, PtySize};
 
 use crate::ssm::{AwsCli, CancellationToken, CliError, Scope, StartRequest};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum RemoteClose {
+    #[default]
+    NotStarted,
+    Confirmed,
+    Unconfirmed,
+}
+
 pub(super) struct Target {
     scope: Scope,
     instance_id: String,
@@ -40,14 +49,23 @@ impl Remote {
         permit.spawn(size).map_err(|_| "SSM PTY: 시작 실패".into())
     }
 
-    pub(super) fn close(mut self) -> Result<(), String> {
+    pub(super) fn wait_connected(&self, cancel: &CancellationToken) -> Result<(), String> {
+        tauri::async_runtime::block_on(self.cli.wait_connected(&self.request, &self.scope, cancel))
+            .map_err(|_| format!("연결 확인 불가: {}", self.request.target()))
+    }
+
+    pub(super) fn close(&mut self) -> (RemoteClose, Option<String>) {
         if !self.spawn_attempted {
-            return Ok(());
+            return (RemoteClose::NotStarted, None);
         }
         // 문서 취소 토큰은 시작만 중단한다. 종료 조회에는 새 토큰을 사용한다.
         let cancel = CancellationToken::new();
-        tauri::async_runtime::block_on(self.cli.close_session(&mut self.request, &self.scope, &cancel))
-            .map_err(|_| format!("종료 확인 불가: {}", self.request.target()))
+        let confirmed = tauri::async_runtime::block_on(self.cli.close_session(&mut self.request, &self.scope, &cancel)).is_ok();
+        (if confirmed { RemoteClose::Confirmed } else { RemoteClose::Unconfirmed }, Some(self.request.target().into()))
+    }
+
+    pub(super) fn recheck_closed(&self) -> bool {
+        tauri::async_runtime::block_on(self.cli.recheck_closed(&self.request, &self.scope)).is_ok()
     }
 }
 

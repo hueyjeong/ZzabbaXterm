@@ -16,6 +16,33 @@ mod pty_flow_tests;
 pub(crate) mod tests;
 
 use process::{Launch, Session};
+use remote::RemoteClose;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum LocalClose {
+    #[default]
+    NotStarted,
+    CliReaped,
+    Unconfirmed,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct CloseResult {
+    local: LocalClose,
+    remote: RemoteClose,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
+}
+
+impl CloseResult {
+    fn warning(&self) -> Option<String> {
+        if self.remote == RemoteClose::Unconfirmed {
+            return self.target.as_ref().map(|target| format!("종료 확인 불가: {target}"));
+        }
+        (self.local == LocalClose::Unconfirmed).then(|| "로컬 자식 종료 확인 불가".into())
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct Sessions {
@@ -26,6 +53,7 @@ pub(crate) struct Sessions {
 #[derive(Default)]
 struct Registry {
     sessions: HashMap<String, Arc<Session>>,
+    close_results: HashMap<String, Arc<Session>>,
     destroyed: HashSet<String>,
     documents: HashMap<String, u64>,
     probes: Runs,
@@ -53,11 +81,13 @@ impl Sessions {
         use_probes(&mut registry.probes)
     }
 
-    pub(crate) fn probe_completion(&self, run_id: String) -> impl FnOnce() + Send + use<> {
+    pub(crate) fn probe_completion(&self, owner: String, document: u64, run_id: String) -> impl FnOnce() + Send + use<> {
         let registry = Arc::downgrade(&self.registry);
         move || {
             if let Some(registry) = registry.upgrade() {
-                registry.lock().unwrap().probes.reap(&run_id);
+                let mut registry = registry.lock().unwrap();
+                let current = registry.documents.get(&owner).copied().unwrap_or(0) == document && !registry.shutdown;
+                registry.probes.reap(&run_id, current);
             }
         }
     }
@@ -82,8 +112,14 @@ impl Sessions {
         }
         let registry = Arc::clone(&self.registry);
         let worker_id = id.clone();
-        let result = session.launch(size, command, send, move || {
-            registry.lock().unwrap().sessions.remove(&worker_id);
+        let result = session.launch(size, command, send, move |session| {
+            let mut registry = registry.lock().unwrap();
+            if session.is_ssm() && !registry.shutdown
+                && registry.documents.get(&session.owner).copied().unwrap_or(0) == document
+            {
+                registry.close_results.insert(worker_id.clone(), Arc::clone(session));
+            }
+            registry.sessions.remove(&worker_id);
         });
         if let Err(error) = result {
             session.wait_finished();
@@ -119,11 +155,25 @@ impl Sessions {
         self.get(owner, id)?.ack(position)
     }
 
-    fn close(&self, owner: &str, id: &str) -> Result<(), String> {
-        let session = self.get(owner, id)?;
-        session.stop(process::Stop::Closed);
-        session.wait_finished();
-        session.cleanup_result()
+    fn close(&self, owner: &str, id: &str) -> Result<CloseResult, String> {
+        let (session, retired) = {
+            let registry = self.registry.lock().unwrap();
+            if let Some(session) = registry.close_results.get(id) {
+                (Arc::clone(session), true)
+            } else {
+                (registry.sessions.get(id).cloned().ok_or(CLOSED)?, false)
+            }
+        };
+        if session.owner != owner { return Err("다른 창의 세션입니다".into()); }
+        let result = if retired {
+            session.recheck_cleanup()
+        } else {
+            session.stop(process::Stop::Closed);
+            session.wait_finished();
+            session.close_result()
+        };
+        if result.warning().is_none() { self.registry.lock().unwrap().close_results.remove(id); }
+        Ok(result)
     }
 
     pub(crate) fn navigate(&self, owner: &str) {
@@ -137,6 +187,7 @@ impl Sessions {
     fn stop_owner(&self, owner: &str, destroyed: bool) {
         let mut registry = self.registry.lock().unwrap();
         *registry.documents.entry(owner.into()).or_default() += 1;
+        registry.close_results.retain(|_, session| session.owner != owner);
         if destroyed {
             registry.destroyed.insert(owner.into());
         }
@@ -177,8 +228,6 @@ fn size(rows: u16, cols: u16) -> PtySize {
     PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }
 }
 
-type SendEvent = dyn Fn(Event) -> Result<(), String> + Send;
-
 const CHUNK: usize = 16 * 1024;
 const WINDOW: usize = 256 * 1024;
 
@@ -196,6 +245,8 @@ impl Drop for Sessions {
 enum End {
     Exited(u32),
     Disconnected(String),
+    Connecting,
+    Ready,
 }
 
 impl Event {
@@ -205,6 +256,8 @@ impl Event {
             Self::Bytes(bytes) => InvokeResponseBody::Raw(bytes),
             Self::Exited(code) => End::Exited(code).body()?,
             Self::Disconnected(reason) => End::Disconnected(reason).body()?,
+            Self::Connecting => End::Connecting.body()?,
+            Self::Ready => End::Ready.body()?,
         })
     }
 }
@@ -214,6 +267,8 @@ enum Event {
     Bytes(Vec<u8>),
     Exited(u32),
     Disconnected(String),
+    Connecting,
+    Ready,
 }
 
 fn validate_working_directory(directory: &std::path::Path) -> Result<(), String> {

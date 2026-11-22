@@ -42,6 +42,7 @@ struct Run {
 pub(crate) struct Runs {
     active: HashMap<String, HashMap<String, Run>>,
     retiring: Vec<(String, RunKey, Arc<Probe>)>,
+    unconfirmed: HashMap<String, (String, RunKey, Arc<Probe>)>,
 }
 
 impl Runs {
@@ -51,14 +52,20 @@ impl Runs {
     }
 
     fn retire(&mut self, owner: &str, key: RunKey, probe: Arc<Probe>) {
-        if !probe.finished() {
-            probe.stop();
-            self.retiring.push((owner.into(), key, probe));
+        let entry = (owner.into(), key, probe);
+        if !entry.2.finished() {
+            entry.2.stop();
+            self.retiring.push(entry);
+        } else if entry.2.cleanup_unconfirmed() {
+            self.unconfirmed.insert(entry.1.run_id.clone(), entry);
         }
     }
 
-    pub(crate) fn reap(&mut self, run_id: &str) {
-        self.retiring.retain(|(_, key, _)| key.run_id != run_id);
+    pub(crate) fn reap(&mut self, run_id: &str, current_document: bool) {
+        if let Some(index) = self.retiring.iter().position(|(_, key, _)| key.run_id == run_id) {
+            let entry = self.retiring.swap_remove(index);
+            if current_document && entry.2.cleanup_unconfirmed() { self.unconfirmed.insert(run_id.into(), entry); }
+        }
     }
 
     pub(crate) fn stop_owner(&mut self, owner: &str) {
@@ -67,9 +74,11 @@ impl Runs {
                 self.retire(owner, run.key, run.probe);
             }
         }
+        self.unconfirmed.retain(|_, (previous, _, _)| previous != owner);
     }
 
     pub(crate) fn stop_all(&mut self) -> Vec<Arc<Probe>> {
+        self.unconfirmed.clear();
         let mut probes: Vec<_> = self.retiring.drain(..).map(|(_, _, probe)| probe).collect();
         for run in self.active.drain().flat_map(|(_, runs)| runs.into_values()) {
             run.probe.stop();
@@ -98,7 +107,7 @@ pub(super) fn start(sessions: &Sessions, owner: &str, document: u64, draft_id: S
         let probe = Arc::new(Probe::for_draft(owner, &draft));
         let worker = Arc::clone(&probe);
         let tested = Arc::clone(&draft);
-        let completed = sessions.probe_completion(key.run_id.clone());
+        let completed = sessions.probe_completion(owner.into(), document, key.run_id.clone());
         thread::Builder::new().name("connection-probe".into()).spawn(move || {
             worker.run(&tested);
             completed();
@@ -130,10 +139,14 @@ pub(super) fn cancel(sessions: &Sessions, owner: &str, document: u64, key: &RunK
         if let Ok(run) = runs.get(owner, key) {
             let probe = Arc::clone(&run.probe);
             remove_run(runs, owner, key)?;
-            return Ok(Some(probe));
+            return Ok(Some((probe, false)));
+        }
+        if let Some((previous, old, probe)) = runs.unconfirmed.get(&key.run_id) {
+            if previous != owner || old != key { return Err(UNTESTED.into()); }
+            return Ok(Some((Arc::clone(probe), true)));
         }
         if let Some((_, _, probe)) = runs.retiring.iter().find(|(previous, old, _)| previous == owner && old == key) {
-            return Ok(Some(Arc::clone(probe)));
+            return Ok(Some((Arc::clone(probe), false)));
         }
         let belongs_to_other = runs.retiring.iter().any(|(previous_owner, old, _)| {
             previous_owner != owner && old.run_id == key.run_id
@@ -145,7 +158,16 @@ pub(super) fn cancel(sessions: &Sessions, owner: &str, document: u64, key: &RunK
         }
         Ok(None)
     })?;
-    probe.map_or(Ok(()), |probe| probe.cancel_result())
+    if let Some((probe, retry)) = probe {
+        probe.cancel_result(retry)?;
+        if retry {
+            sessions.with_probes(owner, document, |runs| {
+                runs.unconfirmed.remove(&key.run_id);
+                Ok(())
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn remove_run(runs: &mut Runs, owner: &str, key: &RunKey) -> Result<(), String> {
@@ -210,7 +232,7 @@ mod tests {
             });
             Ok(())
         }).unwrap();
-        let completed = sessions.probe_completion(key.run_id.clone());
+        let completed = sessions.probe_completion("main".into(), 0, key.run_id.clone());
         let (tx, rx) = mpsc::channel();
         thread::scope(|scope| {
             let cancellation = || tx.send(cancel(&sessions, "main", 0, &key)).unwrap();

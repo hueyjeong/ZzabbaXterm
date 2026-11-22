@@ -31,7 +31,7 @@ const discovery = createSsmDiscovery();
 
 function Wizard(props: LocalConnectionWizardProps) {
   const [wizard] = useState(() => createLocalConnectionWizard(props.draftId, props.initialDraft));
-  const { step, draft, status } = useSyncExternalStore(wizard.subscribe, wizard.getSnapshot);
+  const { step, draft, status, remoteCleanup } = useSyncExternalStore(wizard.subscribe, wizard.getSnapshot);
   const { target } = draft;
   const ssm = useSsmSelection(discovery, target.defaultMethod === "ssm" &&
     status.kind !== "closing" && status.kind !== "closed" && status.kind !== "closeFailed", wizard.invalidateSsmSelection);
@@ -93,7 +93,7 @@ function Wizard(props: LocalConnectionWizardProps) {
               <div><dt>리전</dt><dd>{target.ssm.region}</dd></div>
               <div><dt>인스턴스 ID</dt><dd>{target.ssm.instanceId}</dd></div>
             </dl>}
-            <button type="button" disabled={status.kind === "testing"} onClick={() => void wizard.test(props)}>연결 테스트</button>
+            <button type="button" disabled={status.kind === "testing" || !!remoteCleanup} onClick={() => void wizard.test(props)}>연결 테스트</button>
             <button type="button" disabled={!canSave} onClick={() => void wizard.save(props)}>저장</button>
           </>
         )}
@@ -102,12 +102,18 @@ function Wizard(props: LocalConnectionWizardProps) {
           disabled={step === "auth" && target.defaultMethod === "ssm" && !ssm.selection}
           onClick={() => wizard.go(1, ssm.selection)}>다음</button>}
       </fieldset>
-      <button type="button" disabled={locked && status.kind !== "closeFailed"} onClick={() => void wizard.close(props)}>취소</button>
+      <button type="button" disabled={locked && status.kind !== "closeFailed"} onClick={() => void wizard.close(props)}>
+        {status.kind === "closeFailed" && remoteCleanup ? "종료 다시 확인" : "취소"}
+      </button>
       {status.kind === "testing" && <div role="status">테스트 중</div>}
       {status.kind === "passed" && <div role="status">테스트 성공</div>}
       {status.kind === "saving" && <div role="status">저장 중</div>}
-      {status.kind === "closing" && <div role="status">취소 중</div>}
-      {"error" in status && <div role="alert">{status.error}</div>}
+      {status.kind === "closing" && !remoteCleanup && <div role="status">취소 중</div>}
+      {remoteCleanup && <div role={remoteCleanup.kind === "cancelling" ? "status" : "alert"}>
+        {remoteCleanup.kind === "cancelling" ? "시험 취소 중" : "종료 확인 불가"}: {remoteCleanup.target.profile} / {remoteCleanup.target.region} / {remoteCleanup.target.instanceId}
+        {remoteCleanup.kind === "unconfirmed" && !locked && <button type="button" onClick={wizard.retryCleanup}>종료 다시 확인</button>}
+      </div>}
+      {"error" in status && !(status.kind === "closeFailed" && remoteCleanup) && <div role="alert">{status.error}</div>}
     </dialog>
   );
 }

@@ -236,10 +236,14 @@ impl CommandSpec {
     }
 
     pub(super) async fn capture(&self, cancel: &CancellationToken) -> Result<Captured, CliError> {
+        self.capture_with_timeout(cancel, LOOKUP_TIMEOUT).await
+    }
+
+    pub(super) async fn capture_with_timeout(&self, cancel: &CancellationToken, timeout: Duration) -> Result<Captured, CliError> {
         if let Some((_, credentials)) = &self.bound {
             credentials.require_current()?;
         }
-        capture(self.command(), self.tool, LOOKUP_TIMEOUT, cancel).await
+        capture(self.command(), self.tool, timeout, cancel).await
     }
 
     pub(super) async fn capture_in(

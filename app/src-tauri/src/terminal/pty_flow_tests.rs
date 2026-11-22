@@ -340,7 +340,12 @@ fn c02_close_before_start_retires_only_the_unstarted_pty() {
         };
         let (first, first_events) = open();
         let (peer, peer_events) = open();
-        sessions.close("main", &first).unwrap();
+        // 마법사나 탭이 닫기를 누르기 전에 네이티브 작업자가 먼저 끝날 수 있다.
+        let retired = sessions.get("main", &first).unwrap();
+        retired.stop(super::process::Stop::Closed);
+        retired.wait_finished();
+        assert!(sessions.close("other", &first).is_err());
+        assert_eq!(sessions.close("main", &first).unwrap(), super::CloseResult::default());
         assert!(matches!(first_events.try_recv(), Err(mpsc::TryRecvError::Disconnected)));
         assert_eq!(sessions.start("main", &first), Err(CLOSED.into()));
         assert!(matches!(peer_events.try_recv(), Err(mpsc::TryRecvError::Empty)));

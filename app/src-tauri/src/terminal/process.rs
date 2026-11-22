@@ -1,6 +1,6 @@
 use super::remote;
 use crate::ssm::CancellationToken;
-use super::{CHUNK, CLOSED, Event, WINDOW, stage};
+use super::{CHUNK, CLOSED, CloseResult, Event, LocalClose, WINDOW, stage};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::{
     io::{self, Read, Write},
@@ -69,7 +69,8 @@ pub(super) struct Session {
     pub(super) owner: String,
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     cancel: Option<CancellationToken>,
-    cleanup_error: Mutex<Option<String>>,
+    close_result: Mutex<CloseResult>,
+    unconfirmed: Mutex<Option<remote::Remote>>,
     writer: Mutex<Option<Box<dyn Write + Send>>>,
     flow: Mutex<Flow>,
     wake: Condvar,
@@ -80,7 +81,8 @@ impl Session {
         Self {
             owner: owner.into(),
             cancel: ssm.then(CancellationToken::new),
-            cleanup_error: Mutex::new(None),
+            close_result: Mutex::new(CloseResult::default()),
+            unconfirmed: Mutex::new(None),
             master: Mutex::new(None),
             writer: Mutex::new(None),
             flow: Mutex::new(Flow::default()),
@@ -97,7 +99,7 @@ impl Session {
         size: PtySize,
         command: Launch,
         send: impl Fn(Event) -> Result<(), String> + Send + 'static,
-        retired: impl FnOnce() + Send + 'static,
+        retired: impl FnOnce(&Arc<Session>) + Send + 'static,
     ) -> Result<(), String> {
         self.begin_launch(size, command, send, retired)?.recv()
             .map_err(|error| stage("open handshake", error))?
@@ -108,7 +110,7 @@ impl Session {
         size: PtySize,
         command: Launch,
         send: impl Fn(Event) -> Result<(), String> + Send + 'static,
-        retired: impl FnOnce() + Send + 'static,
+        retired: impl FnOnce(&Arc<Session>) + Send + 'static,
     ) -> Result<mpsc::Receiver<Result<(), String>>, String> {
         let this = Arc::clone(self);
         let (ready, opened) = mpsc::sync_channel(1);
@@ -122,7 +124,7 @@ impl Session {
                     let _ = ready.send(Err(error));
                 }
             }
-            retired();
+            retired(&this);
             this.finish();
         }) {
             self.finish();
@@ -157,6 +159,7 @@ impl Session {
         if self.flow.lock().unwrap().stop.is_some() {
             return Err(stage("open", CLOSED));
         }
+        if ssm { send(Event::Connecting)?; }
         #[cfg(windows)]
         let job = remote.as_ref().map(|_| process_job::Job::new()).transpose()
             .map_err(|error| stage("SSM Job", error))?;
@@ -169,6 +172,7 @@ impl Session {
             (native_pty_system().openpty(size).map_err(|e| stage("openpty", e))?, None)
         };
         let setup = || {
+            // portable-pty 0.9는 프로세스 생성 시 Job 목록을 받지 않는다.
             #[cfg(windows)]
             if let (Some(job), Some(child)) = (&job, &remote_child) {
                 job.assign(child.as_ref()).map_err(|error| stage("SSM Job", error))?;
@@ -189,6 +193,8 @@ impl Session {
                 return Err(self.after_failed_spawn(error, remote.take()));
             }
         };
+        let send = Mutex::new(send);
+        let send_event = |event| (send.lock().unwrap())(event);
         thread::scope(|scope| {
             let (event_tx, event_rx) = mpsc::sync_channel(1);
             let drain = thread::Builder::new().name("terminal-output".into()).spawn_scoped(scope, move || {
@@ -197,7 +203,7 @@ impl Session {
                         !flow.attached && flow.stop.is_none()
                     }).unwrap());
                 }
-                let end = self.drain(reader, &send);
+                let end = self.drain(reader, &send_event);
                 if let Err(error) = end {
                     self.stop(Stop::Disconnected(error));
                 }
@@ -208,14 +214,14 @@ impl Session {
                         Some(Stop::Disconnected(error)) => Some(Event::Disconnected(error.clone())),
                         None => event,
                     };
-                    if let Some(error) = self.cleanup_error.lock().unwrap().as_ref() {
+                    if let Some(error) = self.close_result().warning() {
                         event = Some(Event::Disconnected(match event {
                             Some(Event::Disconnected(reason)) => format!("{reason}; {error}"),
-                            _ => error.clone(),
+                            _ => error,
                         }));
                     }
                     if let Some(event) = event {
-                        let _ = send(event);
+                        let _ = send_event(event);
                     }
                 }
             });
@@ -246,6 +252,7 @@ impl Session {
                     }
                 }
             };
+            self.close_result.lock().unwrap().local = LocalClose::Unconfirmed;
             drop(pair.slave);
             *self.writer.lock().unwrap() = Some(writer);
             *self.master.lock().unwrap() = Some(pair.master);
@@ -257,7 +264,23 @@ impl Session {
             }
             if !ssm { let _ = ready.send(Ok(())); }
 
-            let event = self.reap(child.as_mut());
+            let event = thread::scope(|scope| {
+                if let Some(remote) = remote.as_ref() {
+                    scope.spawn(move || {
+                        let cancel = self.cancel.as_ref().unwrap();
+                        let result = remote.wait_connected(cancel).and_then(|()| {
+                            if !cancel.is_cancelled() { send_event(Event::Ready)?; }
+                            Ok(())
+                        });
+                        if let Err(error) = result && !cancel.is_cancelled() {
+                            self.stop(Stop::Disconnected(error));
+                        }
+                    });
+                }
+                let event = self.reap(child.as_mut());
+                if let Some(cancel) = &self.cancel { cancel.cancel(); }
+                event
+            });
             #[cfg(windows)]
             drop(job);
             let master = self.master.lock().unwrap().take();
@@ -277,21 +300,40 @@ impl Session {
     }
 
     fn cleanup(&self, remote: Option<remote::Remote>) {
-        if let Some(Err(error)) = remote.map(remote::Remote::close) {
-            *self.cleanup_error.lock().unwrap() = Some(error);
+        if let Some(mut remote) = remote {
+            let (status, target) = remote.close();
+            let mut result = self.close_result.lock().unwrap();
+            result.remote = status;
+            result.target = target;
+            if status == remote::RemoteClose::Unconfirmed {
+                *self.unconfirmed.lock().unwrap() = Some(remote);
+            }
         }
     }
 
     fn after_failed_spawn(&self, error: String, remote: Option<remote::Remote>) -> String {
         self.cleanup(remote);
-        match self.cleanup_result() {
-            Ok(()) => error,
-            Err(cleanup) => format!("{error}; {cleanup}"),
+        match self.close_result().warning() {
+            None => error,
+            Some(cleanup) => format!("{error}; {cleanup}"),
         }
     }
 
+    pub(super) fn close_result(&self) -> CloseResult {
+        self.close_result.lock().unwrap().clone()
+    }
+
     pub(super) fn cleanup_result(&self) -> Result<(), String> {
-        self.cleanup_error.lock().unwrap().clone().map_or(Ok(()), Err)
+        self.close_result().warning().map_or(Ok(()), Err)
+    }
+
+    pub(super) fn recheck_cleanup(&self) -> CloseResult {
+        let mut request = self.unconfirmed.lock().unwrap();
+        if request.as_ref().is_some_and(remote::Remote::recheck_closed) {
+            request.take();
+            self.close_result.lock().unwrap().remote = remote::RemoteClose::Confirmed;
+        }
+        self.close_result()
     }
 
     fn teardown(
@@ -331,7 +373,10 @@ impl Session {
                     self.wake.notify_all();
                     drop(flow);
                     return Some(match child.wait() {
-                        Ok(status) => Event::Exited(status.exit_code()),
+                        Ok(status) => {
+                            self.close_result.lock().unwrap().local = LocalClose::CliReaped;
+                            Event::Exited(status.exit_code())
+                        }
                         Err(error) => Event::Disconnected(stage("wait", error)),
                     });
                 }
@@ -348,6 +393,7 @@ impl Session {
     }
 
     fn terminate(&self, child: &mut dyn Child, _master: Option<&dyn MasterPty>) {
+        self.close_result.lock().unwrap().local = LocalClose::Unconfirmed;
         #[cfg(unix)]
         if let Some(pid) = child.process_id() {
             if let Some(master) = _master {
@@ -360,10 +406,12 @@ impl Session {
         {
             let _ = child.kill();
         }
-        let _ = child.wait();
+        if child.wait().is_ok() {
+            self.close_result.lock().unwrap().local = LocalClose::CliReaped;
+        }
     }
 
-    fn drain(&self, mut reader: Box<dyn Read + Send>, send: &super::SendEvent) -> Result<(), String> {
+    fn drain(&self, mut reader: Box<dyn Read + Send>, send: &impl Fn(Event) -> Result<(), String>) -> Result<(), String> {
         let mut buffer = [0; CHUNK];
         loop {
             let mut flow = self.flow.lock().unwrap();
