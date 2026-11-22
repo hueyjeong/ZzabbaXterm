@@ -385,10 +385,12 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
             .await.map_err(|_| message(Error::Transport))??
             .filter(|(_, ssh)| matches!(ssh.transport, SshTransport::Direct {}))
             .ok_or("저장된 직접 SSH 접속 설정이 없습니다")?;
+        let destination = Destination { host: source.destination.host, port: source.destination.port };
+        window.state::<TunnelTabs>().preflight_desktop(tunnel_epoch, (&source.tab_handle, &source.tunnel_id),
+            &source.target_id, &destination, Protocol::Rdp)?;
         let description = format!("{description}\nSSH 서버: {}:{}\nSSH 계정: {}\nSSH 호스트 키: {}",
             ssh.host, ssh.port, ssh.account, ssh.host_key_fingerprint);
         native::confirm(window.clone(), description, prompt.clone(), approval.clone()).await.map_err(message)?;
-        let destination = Destination { host: source.destination.host, port: source.destination.port };
         let target_name = format!("{dns} (TLS DNS)");
         let caller = window.clone();
         let live = prompt.clone();

@@ -137,6 +137,8 @@ impl Source {
         let service = match auth { Auth::VncPassword => "VNC 비밀번호", Auth::ExplicitNone => "없음" };
         let description = format!("경로: SSH 터널 {tunnel_id}\nSSH 대상: {}@[{}]:{}\nSSH 호스트 키: {}\n원격 VNC 목적지: [{}]:{}\n서비스 인증: {service}",
             ssh.account, ssh.host, ssh.port, ssh.host_key_fingerprint, destination.host, destination.port);
+        app.state::<TunnelTabs>().preflight_desktop(epoch, (&tab_handle, &tunnel_id),
+            &target_id, &destination, Protocol::Vnc)?;
         if !confirm(window, description, life, None).await {
             return Err(CANCELLED.into());
         }
