@@ -1,0 +1,18 @@
+# 로컬 작업 상태
+/.omc/
+.DS_Store
+Thumbs.db
+
+# 로컬 환경 변수
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# React·Vite와 Tauri 빌드 산출물
+node_modules/
+/app/dist/
+/app/coverage/
+/app/src-tauri/target/
+/app/src-tauri/gen/schemas/
+/app/src-tauri/binaries/
