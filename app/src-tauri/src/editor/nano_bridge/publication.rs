@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use tokio::{sync::{mpsc, oneshot}, time::timeout};
 use tokio_util::sync::CancellationToken;
 
@@ -7,7 +5,7 @@ pub(crate) use super::super::nano_wire::publication::Operation as PublicationOpe
 use super::super::nano_wire::publication::{MAX_CONTENT, Observation, Snapshot};
 
 // SFTP 파일 I/O와 같은 시간 한도 안에서 슬롯을 반환한다.
-pub(crate) const PUBLICATION_IO_LIMIT: Duration = Duration::from_secs(10);
+pub(crate) use super::super::nano_wire::publication::PUBLICATION_IO_LIMIT;
 
 pub(crate) struct Publisher {
     open_id: u64,

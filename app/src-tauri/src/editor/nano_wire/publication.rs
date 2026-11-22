@@ -1,7 +1,10 @@
-use super::{MAX_PATH, VERSION, frame, invalid, valid_path, with_id};
+#[cfg(test)]
+use super::VERSION;
+use super::{MAX_PATH, frame, invalid, valid_path, with_id};
 use std::io::{self, Read};
 
 pub(crate) const MAX_CONTENT: usize = 8 * 1024 * 1024;
+pub(crate) const PUBLICATION_IO_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 // Payload prefix: version, kind, request ID; operations add an operation ID (all BE).
 const PREFIX: usize = 2 + 8;

@@ -1,5 +1,5 @@
 use crate::nano_publish::{Error as PublishError, GuardedFile};
-use crate::nano_wire::publication::{ActiveOpen, OpIds, Operation, Outcome, is_operation_kind, read_operation};
+use crate::nano_wire::publication::{ActiveOpen, OpIds, Operation, Outcome, PUBLICATION_IO_LIMIT, is_operation_kind, read_operation};
 use crate::nano_wire::{ADMITTED, ADMIT_NANO, CONFIRM_LEN, Lease, NO_PROOF, PROOF_LEN, REGISTER, Ready, Request, Response, STARTUP_LIMIT, decode_len, startup_frame, valid_session_id};
 use std::env;
 use std::ffi::{CStr, OsStr, OsString};
@@ -358,7 +358,7 @@ fn relay(listener: UnixListener, mut input: impl Read + AsRawFd, mut output: imp
             return Err(io::ErrorKind::NotConnected.into());
         }
         if fds[0].revents != 0 {
-            let deadline = Instant::now() + IO;
+            let deadline = Instant::now() + PUBLICATION_IO_LIMIT;
             let current = active.as_mut().ok_or_else(|| {
                 if fds[0].revents & libc::POLLHUP != 0 {
                     io::Error::from(io::ErrorKind::UnexpectedEof)
