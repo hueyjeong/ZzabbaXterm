@@ -128,7 +128,8 @@ function EditorTabContent({ ref, file, active, focusRequested, transport, confir
         <button type="button" disabled={!active || state.saving || Boolean(state.busy)} onClick={() => void connection.current?.reload(confirmDiscard)}>다시 읽기</button>
         {comparison !== undefined && <button type="button" onClick={() => connection.current?.dismissComparison()}>비교 닫기</button>}
         <output role="status">
-          {[statusText(state), !state.busy && state.needsReload && "다시 읽기 필요"].filter(Boolean).join(" · ")}
+          {[statusText(state), state.saving && state.busy !== "save" && "저장 응답 대기",
+          !state.busy && state.needsReload && "다시 읽기 필요"].filter(Boolean).join(" · ")}
         </output>
       </header>
       <div className="editor-surface" ref={host} hidden={showingDiff} />
