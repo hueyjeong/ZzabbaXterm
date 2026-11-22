@@ -13,6 +13,7 @@ export type RemoteNanoFile = ApprovedEditorFile & NanoOffer & {
 export type NanoMountResult =
   | { readonly kind: "mounted" }
   | { readonly kind: "aborted" }
+  | { readonly kind: "unavailable" }
   // 백엔드가 응답 유실 전에 수락했을 수 있으므로 같은 탭과 핸들을 유지한다.
   | { readonly kind: "unconfirmed"; readonly error: unknown };
 
@@ -50,7 +51,7 @@ export function subscribeRemoteNanoOpen(
     function fail() {
       if (failed) return;
       failed = true;
-      void invoke<void>("editor_remote_nano_failed", { offerId }).catch(() => {});
+      void invoke<unknown>("editor_remote_nano_failed", { offerId }).catch(() => {});
     }
     function abortBeforeMount() {
       if (!acknowledgment) fail();
@@ -73,8 +74,9 @@ export function subscribeRemoteNanoOpen(
         if (signal.aborted || failed) return Promise.resolve({ kind: "aborted" });
         acknowledgment = invoke<void>("editor_remote_nano_mounted", { offerId, handle }).then(
           (): NanoMountResult => ({ kind: "mounted" }),
-          (error: unknown): NanoMountResult => {
-            fail();
+          async (error: unknown): Promise<NanoMountResult> => {
+            const status = await invoke<unknown>("editor_remote_nano_failed", { offerId, handle }).catch(() => undefined);
+            if (status === "mounted" || status === "unavailable") return { kind: status };
             return { kind: "unconfirmed", error };
           },
         );

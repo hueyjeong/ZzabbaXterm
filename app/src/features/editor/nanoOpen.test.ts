@@ -115,12 +115,27 @@ it("부착 전 구독을 해제하면 뒤늦은 부착 보고를 승인하지 �
   expect(unlisten).toHaveBeenCalledTimes(1);
 });
 
-it("mount 응답이 유실되면 이미 수락되었을 가능성을 호출자에게 반환한다", async () => {
-  const error = new Error("응답 유실");
+it.each([
+  { scenario: "백엔드 수락 뒤 응답 유실", status: "mounted", kind: "mounted" },
+  { scenario: "백엔드 거부로 취소 확정", status: "unavailable", kind: "unavailable" },
+  { scenario: "mount와 상태 조회 모두 실패", status: undefined, kind: "unconfirmed" },
+])("$scenario: 정확한 오퍼와 핸들로 한 번만 조회한다", async ({ status, kind }) => {
+  const error = new Error("mount IPC 실패");
   const response = Promise.withResolvers<void>();
-  ipc.mockImplementation(async (command) => command === pending ? [offer] : command === claim ? opened : command === mounted ? response.promise : undefined);
+  ipc.mockImplementation(async (command) => {
+    if (command === pending) return [offer];
+    if (command === claim) return opened;
+    if (command === mounted) return response.promise;
+    if (command === failed) {
+      if (status === undefined) throw new Error("상태 조회 IPC 실패");
+      return status;
+    }
+  });
+  const expected = kind === "unconfirmed" ? { kind, error } : { kind };
   const attach = vi.fn<Attach>(async (_file, acknowledge) => {
-    expect(await acknowledge()).toEqual({ kind: "unconfirmed", error });
+    const first = acknowledge();
+    expect(acknowledge()).toBe(first);
+    expect(await first).toEqual(expected);
   });
   const stop = subscribe(attach);
   await vi.waitFor(() => expect(ipc).toHaveBeenCalledWith(mounted, { offerId, handle }));
@@ -128,7 +143,8 @@ it("mount 응답이 유실되면 이미 수락되었을 가능성을 호출자�
   expect(ipc).not.toHaveBeenCalledWith(failed, expect.anything());
   response.reject(error);
   await attach.mock.results[0].value;
-  expect(ipc.mock.calls).toEqual([[pending], [claim, { offerId }], [mounted, { offerId, handle }], [failed, { offerId }]]);
+  expect(await attach.mock.calls[0][1]()).toEqual(expected);
+  expect(ipc.mock.calls).toEqual([[pending], [claim, { offerId }], [mounted, { offerId, handle }], [failed, { offerId, handle }]]);
 });
 
 it("클레임 중 구독을 해제하면 클레임 응답 뒤 같은 오퍼를 실패 처리한다", async () => {

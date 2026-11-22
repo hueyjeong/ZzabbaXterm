@@ -4,7 +4,7 @@ import { editor, Uri } from "monaco-editor/editor";
 import { act, createElement, createRef } from "react";
 import { createRoot } from "react-dom/client";
 import { describe, expect, it, vi } from "vitest";
-import type { ApprovedEditorFile, EditorFileHandle, EditorReadResult, EditorSaveResult, EditorTransport } from "./contract";
+import type { ApprovedEditorFile, ConfirmEditorDiscard, EditorFileHandle, EditorReadResult, EditorSaveResult, EditorTransport } from "./contract";
 import { connectEditor, type EditorState } from "./editor";
 import { EditorTab, type EditorTabActions } from "./EditorTab";
 import { localEditorTransport } from "./localEditorIpc";
@@ -438,15 +438,19 @@ describe("파일 편집 버퍼", () => {
     }
   });
 
-  it("Ctrl+S는 실제 충돌 메시지를 표시하고 결과 미확인 뒤 재전송을 막는다", async () => {
+  it("읽기 전용 전환은 같은 Monaco 뷰를 유지하며 전송을 막고 대상 탭만 닫는다", async () => {
     const approved = file("shortcut");
     const io = transport(approved);
     const save = vi.fn<EditorTransport["save"]>()
       .mockResolvedValueOnce({ kind: "conflict", message: "원본 읽기 권한 없음" })
       .mockResolvedValueOnce({ kind: "unknown", message: "전송 응답 유실" });
+    const compare = vi.fn(io.compare);
+    const reload = vi.fn(io.reload);
     const host = document.body.appendChild(document.createElement("div"));
     const actions = createRef<EditorTabActions>();
     const root = createRoot(host);
+    const onClose = vi.fn((_handle: EditorFileHandle) => root.render(null));
+    const confirmDiscard = vi.fn<ConfirmEditorDiscard>(async () => true);
     vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
     vi.stubGlobal("CSS", { escape: (value: string) => value.replace(/[^\w-]/g, "\\$&") });
     vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener() {}, removeEventListener() {} }));
@@ -456,18 +460,39 @@ describe("파일 편집 버퍼", () => {
     }) as unknown as CanvasRenderingContext2D);
     try {
       const props = {
-        ref: actions, file: approved, transport: { ...io, save }, confirmDiscard: async () => false, onClose() {},
+        ref: actions, file: approved, transport: { save, compare, reload }, confirmDiscard, onClose,
       };
       await act(async () => root.render(createElement(EditorTab, { ...props, active: true })));
       const section = host.querySelector("section")!;
       const status = section.querySelector('output[role="status"]')!;
       const model = editor.getModel(Uri.from({ scheme: "zzabba-editor", path: "/file", query: approved.handle }))!;
+      const view = editor.getEditors().find((candidate) => candidate.getModel() === model)!;
+      expect(view.getOption(editor.EditorOption.readOnly)).toBe(false);
       await act(async () => model.setValue("미저장"));
       const shortcut = () => act(async () => {
         const event = new KeyboardEvent("keydown", { key: "s", ctrlKey: true, bubbles: true, cancelable: true });
         section.querySelector(".monaco-editor")!.dispatchEvent(event);
         expect(event.defaultPrevented).toBe(true);
       });
+      await act(async () => root.render(createElement(EditorTab, { ...props, active: true, readOnly: true })));
+      expect(view.getOption(editor.EditorOption.readOnly)).toBe(true);
+      expect(view.getModel()).toBe(model);
+      await shortcut();
+      await act(async () => {
+        for (const button of section.querySelectorAll("button")) {
+          expect(button.disabled).toBe(true);
+          button.click();
+        }
+      });
+      expect(save).not.toHaveBeenCalled();
+      expect(compare).not.toHaveBeenCalled();
+      expect(reload).not.toHaveBeenCalled();
+      expect(confirmDiscard).not.toHaveBeenCalled();
+      expect(onClose).not.toHaveBeenCalled();
+      await act(async () => root.render(createElement(EditorTab, { ...props, active: true })));
+      expect(view.getOption(editor.EditorOption.readOnly)).toBe(false);
+      expect(view.getModel()).toBe(model);
+      expect(section.querySelector("button")?.disabled).toBe(false);
       await shortcut();
       expect(status.textContent).toBe("원본 비교 불가: 원본 읽기 권한 없음");
       await shortcut();
@@ -475,10 +500,17 @@ describe("파일 편집 버퍼", () => {
       expect(section.querySelector("button")?.disabled).toBe(true);
       await shortcut();
       expect(save.mock.calls).toEqual([[approved.handle, "미저장"], [approved.handle, "미저장"]]);
-      await act(async () => root.render(createElement(EditorTab, { ...props, active: false })));
+      await act(async () => root.render(createElement(EditorTab, { ...props, active: false, readOnly: true })));
       expect(section.hidden).toBe(true);
       expect(actions.current?.closeState()).toEqual({ dirty: true, uncertain: true, pending: false });
       expect(model.getValue()).toBe("미저장");
+      await act(async () => actions.current?.requestClose());
+      expect(confirmDiscard.mock.calls).toEqual([[{ handle: approved.handle, label: approved.label, reason: "close" }]]);
+      expect(onClose.mock.calls).toEqual([[approved.handle]]);
+      expect(model.isDisposed()).toBe(true);
+      expect(save).toHaveBeenCalledTimes(2);
+      expect(compare).not.toHaveBeenCalled();
+      expect(reload).not.toHaveBeenCalled();
     } finally {
       await act(async () => root.unmount());
       host.remove();
