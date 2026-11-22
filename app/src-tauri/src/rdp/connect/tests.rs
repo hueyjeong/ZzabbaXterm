@@ -18,6 +18,84 @@ use tokio::{io::AsyncWriteExt as _, net::TcpListener, time::timeout};
 use tokio_rustls::{TlsAcceptor, rustls::pki_types::PrivatePkcs8KeyDer};
 
 use super::*;
+use crate::rdp::ipc::Slot;
+
+#[test]
+fn credssp_does_not_resume_write_or_flush_after_revocation() {
+    use std::{cell::Cell, io::{self, Read as _, Write as _}, net, task::{Context, Waker}};
+
+    struct Writer<'a> {
+        socket: net::TcpStream,
+        blocked: &'a Cell<bool>,
+        limit: usize,
+        pending: Vec<u8>,
+        writes: usize,
+        flushes: usize,
+    }
+
+    impl AsyncWrite for Writer<'_> {
+        fn poll_write(mut self: Pin<&mut Self>, _: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> {
+            self.writes += 1;
+            let count = if self.blocked.get() { self.limit.min(bytes.len()) } else { bytes.len() };
+            if count == 0 { return Poll::Pending; }
+            self.limit = self.limit.saturating_sub(count);
+            if count == bytes.len() && self.blocked.get() {
+                self.pending.extend_from_slice(bytes);
+            } else {
+                self.socket.write_all(&bytes[..count])?;
+            }
+            Poll::Ready(Ok(count))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            this.flushes += 1;
+            if this.blocked.get() { return Poll::Pending; }
+            Poll::Ready(this.socket.write_all(&this.pending))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            panic!("철회된 TLS 송신에서 shutdown 호출")
+        }
+    }
+
+    for (routed, close_slot) in [(true, false), (true, true), (false, true)] {
+        for limit in [0, 1, 3] {
+            let (tabs, lease) = crate::tunnels::ipc::rdp_test_lease();
+            let slot = Slot::new(1);
+            let auth = AuthIo::new(&slot, routed.then_some(&lease));
+            let listener = net::TcpListener::bind((net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let socket = net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            socket.set_nonblocking(true).unwrap();
+            let (mut peer, _) = listener.accept().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            let blocked = Cell::new(true);
+            let mut writer = Writer { socket, blocked: &blocked, limit, pending: Vec::new(), writes: 0, flushes: 0 };
+            let mut cx = Context::from_waker(Waker::noop());
+            {
+                let mut send = std::pin::pin!(write_credssp(&mut writer, b"abc", &auth));
+                assert!(send.as_mut().poll(&mut cx).is_pending());
+                let expected = if close_slot {
+                    slot.close();
+                    assert_eq!(lease.while_live(|| ()), Some(()));
+                    Error::Closed
+                } else {
+                    tabs.navigate(false);
+                    Error::Transport
+                };
+                blocked.set(false);
+                assert_eq!(send.as_mut().poll(&mut cx), Poll::Ready(Err(expected)));
+            }
+            assert_eq!(writer.writes, if limit == 1 { 2 } else { 1 });
+            assert_eq!(writer.flushes, usize::from(limit == 3));
+            drop(writer);
+            let mut received = Vec::new();
+            peer.read_to_end(&mut received).unwrap();
+            let expected: &[u8] = if limit == 1 { b"a" } else { b"" };
+            assert_eq!(received.as_slice(), expected);
+        }
+    }
+}
 
 const REMOTE: &str = "rdp.example.test";
 
@@ -120,6 +198,7 @@ async fn exercise(
         }
     };
     let name = ServerName::try_from(target.server_name.clone()).unwrap();
+    let slot = Slot::new(1);
     let client = connect(
         target,
         name,
@@ -133,6 +212,7 @@ async fn exercise(
             })
         },
         ironrdp::displaycontrol::client::DisplayControlClient::new(|_| Ok(Vec::new())),
+        AuthIo::new(&slot, None),
     );
     let client = TEST_PEER_POLICY.scope(policy, client);
     let (result, saw_nla) = timeout(Duration::from_secs(5), async {
@@ -427,6 +507,7 @@ async fn activates_and_delivers_pixels_and_key_input_only_for_the_authenticated_
             true
         };
         let client = async {
+            let slot = Slot::new(1);
             let mut session = TEST_PEER_POLICY.scope(fixture_policy, Session::open_with_tls(
                 fixture_target(&listener, size).await,
                 REMOTE.try_into().unwrap(),
@@ -439,6 +520,7 @@ async fn activates_and_delivers_pixels_and_key_input_only_for_the_authenticated_
                     })
                 },
                 SLOTS.try_acquire().unwrap(),
+                AuthIo::new(&slot, None),
             ))
             .await?;
             let id = session.id();
