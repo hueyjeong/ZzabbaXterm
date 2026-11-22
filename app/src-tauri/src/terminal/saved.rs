@@ -21,18 +21,16 @@ pub(super) fn command(config: &Path, id: &str) -> Result<CommandBuilder, String>
                 .map(|path| path.join("pwsh.exe")).find(|path| path.is_file())
                 .ok_or("PowerShell: pwsh.exe를 찾을 수 없습니다")?;
             let mut command = CommandBuilder::new(executable);
-            command.args(["-NoLogo", "-NoProfile", "-NoExit", "-Command", r#"
+            command.args(["-NoLogo", "-NoProfile", "-NoExit", "-Command"]);
+            command.arg(format!(r#"
                 $directory = $env:ZZABBA_C01_CWD
                 Remove-Item Env:ZZABBA_C01_CWD
-                try {
-                    $expected = [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($directory))
-                    $actual = [IO.Path]::TrimEndingDirectorySeparator([Environment]::CurrentDirectory)
-                    if ([string]::Equals($expected, $actual, [StringComparison]::OrdinalIgnoreCase) -and
-                        [IO.Directory]::Exists($directory)) { return }
-                } catch { [Console]::Error.WriteLine($_.Exception.Message) }
+                try {{
+                    if (({}) -and [IO.Directory]::Exists($directory)) {{ return }}
+                }} catch {{ [Console]::Error.WriteLine($_.Exception.Message) }}
                 [Console]::Error.WriteLine('Could not start in the saved working directory.')
                 exit 23
-            "#]);
+            "#, super::POWERSHELL_CWD_MATCH));
             command
         }
         #[cfg(unix)]

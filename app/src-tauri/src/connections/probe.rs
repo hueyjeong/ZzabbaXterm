@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc, thread};
 use serde::{Deserialize, Serialize};
 
 use crate::terminal::{Sessions, probe::Probe};
-use super::{profile::{Draft, ValidatedDraft}, store::{SaveStatus, Store}};
+use super::{profile::{Draft, ValidatedDraft}, store::{SaveStatus, Store, StoreError}};
 
 const UNTESTED: &str = "이 초안의 현재 시험이 없습니다";
 
@@ -144,18 +144,33 @@ pub(super) fn cancel(sessions: &Sessions, owner: &str, document: u64, key: &RunK
 pub(super) fn save_confirmed(sessions: &Sessions, owner: &str, document: u64, request: SaveRequest, store: &Store) -> Result<(), String> {
     let SaveRequest { run: key, draft } = request;
     let draft = draft.validate().map_err(|error| format!("초안 검증: {error:?}"))?;
-    sessions.with_probes(owner, document, |runs| {
+    let expected = sessions.with_probes(owner, document, |runs| {
         let run = runs.get(owner, &key)?;
         if !run.confirmed || !run.draft.matches(&draft) {
             return Err(UNTESTED.into());
         }
-        match store.save(draft).map_err(|error| format!("프로필 저장: {error:?}"))? {
-            SaveStatus::GroupConflict => Err("다른 작업이 그룹을 변경했습니다".into()),
-            SaveStatus::TargetConflict => Err("다른 작업이 대상을 변경했습니다".into()),
-            SaveStatus::Saved => {
-                runs.active.get_mut(owner).unwrap().remove(&key.draft_id);
-                Ok(())
-            }
+        Ok(Arc::clone(&run.draft))
+    })?;
+    let authorize = || sessions.with_probes(owner, document, |runs| {
+        let run = runs.get(owner, &key)?;
+        if !run.confirmed || !Arc::ptr_eq(&run.draft, &expected) {
+            return Err(UNTESTED.into());
         }
-    })
+        Ok(())
+    });
+    let committed = || {
+        let _ = sessions.with_probes(owner, document, |runs| {
+            runs.get(owner, &key)?;
+            runs.active.get_mut(owner).unwrap().remove(&key.draft_id);
+            Ok(())
+        });
+    };
+    match store.save_authorized(draft, authorize, committed).map_err(|error| match error {
+        StoreError::Authorization(reason) => reason,
+        other => format!("프로필 저장: {other:?}"),
+    })? {
+        SaveStatus::GroupConflict => Err("다른 작업이 그룹을 변경했습니다".into()),
+        SaveStatus::TargetConflict => Err("다른 작업이 대상을 변경했습니다".into()),
+        SaveStatus::Saved => Ok(()),
+    }
 }

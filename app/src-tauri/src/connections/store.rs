@@ -33,6 +33,7 @@ pub(super) enum StoreError {
     MissingGroup,
     RevisionExhausted,
     Replace(io::Error),
+    Authorization(String),
 }
 
 impl From<io::Error> for StoreError {
@@ -63,6 +64,8 @@ pub(super) struct Entry<T> {
 
 pub(super) struct Store {
     directory: PathBuf,
+    #[cfg(test)]
+    on_lock_wait: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl Store {
@@ -74,7 +77,13 @@ impl Store {
             (Some(parent), Some(name)) => parent.join(name),
             _ => directory.into(),
         };
-        Self { directory }
+        Self { directory, #[cfg(test)] on_lock_wait: None }
+    }
+
+    #[cfg(test)]
+    pub(super) fn observe_lock_wait(mut self, on_wait: impl Fn() + Send + Sync + 'static) -> Self {
+        self.on_lock_wait = Some(Box::new(on_wait));
+        self
     }
 
     pub(super) fn load(&self) -> Result<ProfileFile, StoreError> {
@@ -103,17 +112,37 @@ impl Store {
         Ok(file)
     }
 
+    #[cfg(test)]
     pub(super) fn save(&self, draft: ValidatedDraft) -> Result<SaveStatus, StoreError> {
-        self.save_with_rename(draft, |from, to| fs::rename(from, to))
+        self.save_authorized(draft, || Ok(()), || {})
+    }
+
+    pub(super) fn save_authorized(
+        &self,
+        draft: ValidatedDraft,
+        authorize: impl FnMut() -> Result<(), String>,
+        committed: impl FnOnce(),
+    ) -> Result<SaveStatus, StoreError> {
+        self.save_with_rename(draft, authorize, committed, |from, to| fs::rename(from, to))
     }
 
     fn save_with_rename(
         &self,
         draft: ValidatedDraft,
+        mut authorize: impl FnMut() -> Result<(), String>,
+        committed: impl FnOnce(),
         rename: impl FnOnce(&Path, &Path) -> io::Result<()>,
     ) -> Result<SaveStatus, StoreError> {
         let lock = self.open_lock()?;
+        #[cfg(test)]
+        if let Some(on_wait) = &self.on_lock_wait {
+            match lock.try_lock() {
+                Err(fs::TryLockError::WouldBlock) => on_wait(),
+                other => panic!("외부 설정 잠금이 필요합니다: {other:?}"),
+            }
+        }
         lock.lock()?;
+        authorize().map_err(StoreError::Authorization)?;
         let mut file = self.read_file()?;
         let (group, group_revision, target, target_revision) = draft.into_parts();
         let old_group = file.groups.iter_mut().find(|entry| entry.profile.id == group.id);
@@ -137,7 +166,12 @@ impl Store {
             None => file.targets.push(Entry::new(target)),
         }
 
-        self.replace(&file, rename)?;
+        self.replace(&file, |from, to| {
+            // 이 승인 뒤의 원자 교체는 창을 닫더라도 이미 승인한 작업으로 끝낸다.
+            authorize().map_err(StoreError::Authorization)?;
+            rename(from, to).map_err(StoreError::Replace)
+        })?;
+        committed();
         Ok(SaveStatus::Saved)
     }
 
@@ -146,7 +180,7 @@ impl Store {
         &self,
         draft: ValidatedDraft,
     ) -> Result<SaveStatus, StoreError> {
-        self.save_with_rename(draft, |from, to| {
+        self.save_with_rename(draft, || Ok(()), || {}, |from, to| {
             // 일반 파일 아래의 경로에서는 권한과 관계없이 실제 rename이 ENOTDIR로 실패한다.
             fs::rename(from.join("not-a-directory"), to)
         })
@@ -184,7 +218,7 @@ impl Store {
     fn replace(
         &self,
         file: &ProfileFile,
-        rename: impl FnOnce(&Path, &Path) -> io::Result<()>,
+        rename: impl FnOnce(&Path, &Path) -> Result<(), StoreError>,
     ) -> Result<(), StoreError> {
         let destination = self.directory.join("connections.json");
         let temporary = self.directory.join("connections.json.tmp");
@@ -209,7 +243,7 @@ impl Store {
             writer.flush()?;
             writer.get_ref().sync_all()?;
             drop(writer);
-            rename(&temporary, &destination).map_err(StoreError::Replace)
+            rename(&temporary, &destination)
         })();
         if result.is_err() {
             let _ = fs::remove_file(&temporary);

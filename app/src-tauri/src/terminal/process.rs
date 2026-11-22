@@ -76,6 +76,17 @@ impl Session {
         send: impl Fn(Event) -> Result<(), String> + Send + 'static,
         retired: impl FnOnce() + Send + 'static,
     ) -> Result<(), String> {
+        self.begin_launch(size, command, send, retired)?.recv()
+            .map_err(|error| stage("open handshake", error))?
+    }
+
+    pub(super) fn begin_launch(
+        self: &Arc<Self>,
+        size: PtySize,
+        command: CommandBuilder,
+        send: impl Fn(Event) -> Result<(), String> + Send + 'static,
+        retired: impl FnOnce() + Send + 'static,
+    ) -> Result<mpsc::Receiver<Result<(), String>>, String> {
         let this = Arc::clone(self);
         let (ready, opened) = mpsc::sync_channel(1);
         if let Err(error) = thread::Builder::new().name("terminal-pty".into()).spawn(move || {
@@ -89,7 +100,7 @@ impl Session {
             self.finish();
             return Err(stage("PTY worker", error));
         }
-        opened.recv().map_err(|error| stage("open handshake", error))?
+        Ok(opened)
     }
 
     fn run(

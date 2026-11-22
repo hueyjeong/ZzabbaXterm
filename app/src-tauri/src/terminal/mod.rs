@@ -12,7 +12,7 @@ mod saved;
 #[cfg(all(test, any(windows, unix)))]
 mod pty_flow_tests;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use process::Session;
 
@@ -205,6 +205,14 @@ enum Event {
     Exited(u32),
     Disconnected(String),
 }
+
+#[cfg(windows)]
+const POWERSHELL_CWD_MATCH: &str = concat!(
+    "[string]::Equals(",
+    "[IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($directory)), ",
+    "[IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath([Environment]::CurrentDirectory)), ",
+    "[StringComparison]::OrdinalIgnoreCase)",
+);
 
 fn shell() -> CommandBuilder {
     #[cfg(windows)]

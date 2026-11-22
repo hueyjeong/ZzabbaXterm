@@ -81,6 +81,13 @@ impl<'a> Peer<'a> {
     }
 }
 
+pub(crate) fn assert_live_shell_progress(sessions: &Sessions) {
+    let mut peer = Peer::open(sessions);
+    peer.send(COMPUTE);
+    assert_eq!(peer.number(0), 12);
+    sessions.ack("main", &peer.id, peer.bytes.len() as u64).unwrap();
+}
+
 impl Drop for Peer<'_> {
     fn drop(&mut self) { let _ = self.sessions.close("main", &self.id); }
 }

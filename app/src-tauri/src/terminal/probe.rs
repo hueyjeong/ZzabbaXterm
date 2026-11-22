@@ -3,13 +3,14 @@ use portable_pty::CommandBuilder;
 use std::{
     fs,
     sync::{Arc, Condvar, Mutex, mpsc},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use super::{Event, process::{Session, Stop}, size, stage};
 
 const MARKER: &[u8] = b"ZZABBA-C01:314159";
 const TIMEOUT: Duration = Duration::from_secs(8);
+const TIMED_OUT: &str = "연결 시험 시간이 초과되었습니다";
 
 fn scan(needle: &[u8], matched: &mut usize, bytes: &[u8]) -> bool {
     for &byte in bytes {
@@ -25,18 +26,27 @@ fn scan(needle: &[u8], matched: &mut usize, bytes: &[u8]) -> bool {
 
 pub(crate) struct Probe {
     session: Arc<Session>,
+    deadline: Instant,
     result: Mutex<Option<Result<(), String>>>,
     ready: Condvar,
 }
 
 impl Probe {
     pub(crate) fn new(owner: &str) -> Self {
-        Self { session: Arc::new(Session::new(owner)), result: Mutex::new(None), ready: Condvar::new() }
+        Self::with_timeout(owner, TIMEOUT)
+    }
+
+    fn with_timeout(owner: &str, timeout: Duration) -> Self {
+        Self { session: Arc::new(Session::new(owner)), deadline: Instant::now() + timeout, result: Mutex::new(None), ready: Condvar::new() }
     }
 
     pub(crate) fn run(&self, draft: &ValidatedDraft) {
-        let result = command(draft).and_then(|command| self.measure(command, TIMEOUT));
-        *self.result.lock().unwrap() = Some(result);
+        self.finish(command(draft).and_then(|command| self.measure(command)));
+    }
+
+    fn finish(&self, result: Result<(), String>) {
+        let mut completed = self.result.lock().unwrap();
+        *completed = Some(if Instant::now() >= self.deadline { Err(TIMED_OUT.into()) } else { result });
         self.ready.notify_all();
     }
 
@@ -45,7 +55,13 @@ impl Probe {
     }
 
     pub(crate) fn wait(&self) -> Result<(), String> {
-        self.ready.wait_while(self.result.lock().unwrap(), |result| result.is_none()).unwrap().as_ref().unwrap().clone()
+        let (result, _) = self.ready.wait_timeout_while(self.result.lock().unwrap(), self.remaining(), |result| result.is_none()).unwrap();
+        if let Some(result) = result.as_ref() {
+            return result.clone();
+        }
+        drop(result);
+        self.stop();
+        Err(TIMED_OUT.into())
     }
 
     pub(crate) fn wait_finished(&self) {
@@ -56,13 +72,20 @@ impl Probe {
         self.session.stop(Stop::Closed);
     }
 
-    fn measure(&self, command: CommandBuilder, timeout: Duration) -> Result<(), String> {
+    fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+
+    fn measure(&self, command: CommandBuilder) -> Result<(), String> {
+        if self.remaining().is_zero() {
+            return Err(TIMED_OUT.into());
+        }
         let (sender, receiver) = mpsc::sync_channel(1);
         let session = Arc::downgrade(&self.session);
         let output = std::cell::Cell::new((0u64, 0usize));
         #[cfg(windows)]
         let cursor_query = std::cell::Cell::new(0usize);
-        let launched = self.session.launch(size(24, 80), command, move |event| {
+        let launched = self.session.begin_launch(size(24, 80), command, move |event| {
             let (position, mut matched) = output.get();
             match event {
                 Event::Bytes(bytes) => {
@@ -91,19 +114,27 @@ impl Probe {
                 Event::Disconnected(error) => sender.send(Err(error)).map_err(|err| err.to_string()),
             }
         }, || {});
-        let result = launched.and_then(|()| {
+        let result = launched.and_then(|opened| {
+            self.receive(&opened)??;
             self.session.start()?;
-            match receiver.recv_timeout(timeout) {
-                Ok(result) => result,
-                Err(mpsc::RecvTimeoutError::Timeout) => Err("연결 시험 시간이 초과되었습니다".into()),
-                Err(mpsc::RecvTimeoutError::Disconnected) => Err("연결 시험이 취소되었습니다".into()),
-            }
+            self.receive(&receiver)?
         });
         if result.is_err() {
             self.stop();
         }
         self.session.wait_finished();
         result
+    }
+
+    fn receive<T>(&self, receiver: &mpsc::Receiver<T>) -> Result<T, String> {
+        let remaining = self.remaining();
+        if remaining.is_zero() {
+            return Err(TIMED_OUT.into());
+        }
+        receiver.recv_timeout(remaining).map_err(|error| match error {
+            mpsc::RecvTimeoutError::Timeout => TIMED_OUT.into(),
+            mpsc::RecvTimeoutError::Disconnected => "연결 시험이 취소되었습니다".into(),
+        })
     }
 }
 
@@ -121,8 +152,11 @@ fn command(draft: &ValidatedDraft) -> Result<CommandBuilder, String> {
                 .map(|path| path.join("pwsh.exe")).find(|path| path.is_file())
                 .ok_or("PowerShell: pwsh.exe를 찾을 수 없습니다")?;
             let mut command = CommandBuilder::new(executable);
-            command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
-                "if (-not [string]::Equals([IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($env:ZZABBA_C01_CWD)), [IO.Path]::TrimEndingDirectorySeparator([Environment]::CurrentDirectory), [StringComparison]::OrdinalIgnoreCase)) { exit 23 }; [Console]::WriteLine(('ZZABBA-C01:{0}' -f (314000+159))); exit 0"]);
+            command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]);
+            command.arg(format!(
+                "$directory = $env:ZZABBA_C01_CWD; if (-not ({})) {{ exit 23 }}; [Console]::WriteLine(('ZZABBA-C01:{{0}}' -f (314000+159))); exit 0",
+                super::POWERSHELL_CWD_MATCH,
+            ));
             command
         }
         #[cfg(unix)]
@@ -152,7 +186,16 @@ mod tests {
         command.args(["-NonInteractive", "-Command", "[Console]::WriteLine('ZZABBA-C01:314159'); Start-Sleep 60"]);
         #[cfg(unix)]
         command.args(["-c", "builtin printf 'ZZABBA-C01:314159\\n'; read -rt 60"]);
-        let probe = Probe::new("timeout");
-        assert_eq!(probe.measure(command, Duration::from_secs(1)), Err("연결 시험 시간이 초과되었습니다".into()));
+        let probe = Probe::with_timeout("timeout", Duration::from_secs(1));
+        assert_eq!(probe.measure(command), Err(TIMED_OUT.into()));
+    }
+
+    #[test]
+    fn c01_probe_counts_time_before_the_open_handshake() {
+        let probe = Probe::with_timeout("startup", Duration::from_millis(50));
+        let (ready, opened) = mpsc::sync_channel(1);
+        assert_eq!(probe.receive(&opened), Err(TIMED_OUT.into()));
+        ready.send(()).unwrap();
+        assert_eq!(probe.receive(&opened), Err(TIMED_OUT.into()));
     }
 }

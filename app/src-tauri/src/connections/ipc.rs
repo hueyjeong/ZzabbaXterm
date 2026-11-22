@@ -1,4 +1,5 @@
 use serde::{Serialize, de::DeserializeOwned};
+use std::{fs, path::Path};
 use tauri::{Manager, Webview, ipc::{CommandArg, CommandItem, Invoke, InvokeError}};
 
 use crate::terminal::Sessions;
@@ -30,9 +31,12 @@ pub(crate) fn handle(invoke: Invoke, other: fn(Invoke) -> bool) -> bool {
         }),
         "connections_load" => dispatch(invoke, "connections_load", |_| {
             Ok(|caller: Webview, document| {
-                caller.state::<Sessions>().with_probes(caller.label(), document, |_| {
-                    store(&caller)?.load().map_err(|error| format!("프로필 읽기: {error:?}"))
-                })
+                let sessions = caller.state::<Sessions>();
+                let check = || sessions.with_probes(caller.label(), document, |_| Ok(()));
+                check()?;
+                let result = store(&caller)?.load();
+                check()?;
+                result.map_err(|error| format!("프로필 읽기: {error:?}"))
             })
         }),
         _ => return other(invoke),
@@ -75,5 +79,30 @@ where
 
 fn store(caller: &Webview) -> Result<Store, String> {
     let directory = caller.path().app_config_dir().map_err(|error| format!("앱 설정 디렉터리: {error}"))?;
-    Ok(Store::new(&directory))
+    store_at(&directory)
+}
+
+fn store_at(directory: &Path) -> Result<Store, String> {
+    let parent = directory.parent().filter(|_| directory.is_absolute() && directory.file_name().is_some())
+        .ok_or("앱 설정 디렉터리 경로가 올바르지 않습니다")?;
+    // 설정 경로는 Tauri가 결정한다. 앱 디렉터리 자체는 Store가 생성하고 검사한다.
+    fs::create_dir_all(parent).map_err(|error| format!("사용자 설정 디렉터리: {error}"))?;
+    Ok(Store::new(directory))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connections::tests::TestDir;
+
+    #[test]
+    fn c01_first_load_initializes_only_the_config_parent_before_store_runs() {
+        let temp = TestDir::new();
+        let directory = temp.path().join("missing").join("config").join("dev.zzabbaxterm.desktop");
+        let store = store_at(&directory).unwrap();
+        assert!(directory.parent().unwrap().is_dir());
+        assert!(!directory.exists());
+        assert!(store.load().unwrap().targets.is_empty());
+        assert!(directory.is_dir());
+    }
 }

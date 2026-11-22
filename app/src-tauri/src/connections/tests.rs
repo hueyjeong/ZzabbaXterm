@@ -10,10 +10,10 @@ use serde_json::{Value, json};
 
 use super::{profile::Draft, store::{SaveStatus, Store, StoreError}};
 
-struct TestDir(PathBuf);
+pub(super) struct TestDir(PathBuf);
 
 impl TestDir {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
             "zzabbaxterm-c01-{}-{}-{}",
@@ -23,6 +23,10 @@ impl TestDir {
         ));
         fs::create_dir(&path).unwrap();
         Self(path)
+    }
+
+    pub(super) fn path(&self) -> &Path {
+        &self.0
     }
 
     fn file(&self) -> PathBuf {
@@ -158,6 +162,58 @@ mod local_probe {
             serde_json::from_value(input.clone()).unwrap()).is_err());
         wait(&sessions, "other", 0, &other).unwrap();
         save_at(&sessions, "other", &other, input, &store).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn c01_probe_accepts_a_directory_ending_in_dot() {
+        let dir = TestDir::new();
+        let mut path = dir.0.as_os_str().to_owned();
+        path.push(r"\.");
+        let sessions = Sessions::default();
+        let run = start_at(&sessions, Path::new(&path), 1);
+        wait(&sessions, "main", 0, &run).unwrap();
+    }
+
+    #[test]
+    fn c01_probe_save_wait_keeps_pty_live_and_rejects_a_retired_document() {
+        use std::{sync::mpsc, time::Duration};
+
+        let dir = TestDir::new();
+        let sessions = Sessions::default();
+        let settings = dir.0.join("settings");
+        let seed = Store::new(&settings);
+        seed.load().unwrap();
+        let lock = fs::File::options().read(true).write(true).open(settings.join("connections.lock")).unwrap();
+        lock.lock().unwrap();
+        let (blocked_tx, blocked_rx) = mpsc::channel();
+        let store = Store::new(&settings).observe_lock_wait(move || blocked_tx.send(()).unwrap());
+        let input = draft(&dir.0, "work", "first");
+        let run = start(&sessions, "profile", 0, "draft".into(), 1,
+            serde_json::from_value(input.clone()).unwrap()).unwrap();
+        wait(&sessions, "profile", 0, &run).unwrap();
+        let unrelated = start_at(&sessions, &dir.0, 1);
+        thread::scope(|scope| {
+            let saving = scope.spawn(|| save_at(&sessions, "profile", &run, input, &store));
+            let blocked = blocked_rx.recv_timeout(Duration::from_secs(5));
+            let (progress_tx, progress_rx) = mpsc::channel();
+            if blocked.is_ok() {
+                let sessions = &sessions;
+                scope.spawn(move || {
+                    crate::terminal::tests::assert_live_shell_progress(sessions);
+                    cancel(sessions, "main", 0, &unrelated).unwrap();
+                    sessions.navigate("profile");
+                    let _ = progress_tx.send(());
+                });
+            }
+            let progress = progress_rx.recv_timeout(Duration::from_secs(10));
+            drop(lock);
+            blocked.expect("저장 작업이 실제 설정 파일 잠금을 기다려야 합니다");
+            progress.expect("설정 파일이 잠겨 있어도 PTY 입출력·취소·문서 이동이 끝나야 합니다");
+            assert_eq!(saving.join().unwrap(), Err("문서가 바뀌었습니다".into()));
+        });
+        assert!(!settings.join("connections.json").exists());
+        assert!(!settings.join("connections.json.tmp").exists());
     }
 }
 
