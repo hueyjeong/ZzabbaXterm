@@ -87,9 +87,13 @@ impl Store {
     }
 
     pub(super) fn load(&self) -> Result<ProfileFile, StoreError> {
+        self.with_loaded(|file| file)
+    }
+
+    pub(super) fn with_loaded<T>(&self, read: impl FnOnce(ProfileFile) -> T) -> Result<T, StoreError> {
         let lock = self.open_lock()?;
         lock.lock_shared()?;
-        self.read_file()
+        self.read_file().map(read)
     }
 
     fn read_file(&self) -> Result<ProfileFile, StoreError> {

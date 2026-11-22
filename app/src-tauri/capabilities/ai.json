@@ -1,0 +1,19 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "local-ai-review",
+  "description": "Local model chat and review records for the bundled main webview",
+  "local": true,
+  "webviews": ["main"],
+  "permissions": [
+    "allow-ai-targets",
+    "allow-ai-models",
+    "allow-ai-select",
+    "allow-ai-chat",
+    "allow-ai-propose",
+    "allow-ai-decide",
+    "allow-ai-cli-review",
+    "allow-ai-cli-draft",
+    "allow-ai-policy",
+    "allow-ai-set-policy"
+  ]
+}

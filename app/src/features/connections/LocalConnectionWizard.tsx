@@ -6,13 +6,13 @@ import { createSsmDiscovery } from "../ssm/ssmDiscovery";
 import {
   createLocalConnectionWizard,
   type LocalConnectionActions,
-  type LocalProfileDraft,
+  type ConnectionProfileDraft,
 } from "./profiles";
 
 export type LocalConnectionWizardProps = LocalConnectionActions & Readonly<{
   draftId: string;
-  // 호출자가 현재 OS의 지원 셸을 initialDraft.target.local.shell에 넣는다.
-  initialDraft: LocalProfileDraft;
+  initialDraft: ConnectionProfileDraft;
+  received?: boolean;
   groups: SavedConnections["groups"];
 }>;
 
@@ -34,6 +34,7 @@ function Wizard(props: LocalConnectionWizardProps) {
   const { step, draft, status, remoteCleanup } = useSyncExternalStore(wizard.subscribe, wizard.getSnapshot);
   const { target } = draft;
   const ssm = useSsmSelection(discovery, target.defaultMethod === "ssm" &&
+    (!props.received || step === "auth" || step === "verify") &&
     status.kind !== "closing" && status.kind !== "closed" && status.kind !== "closeFailed", wizard.invalidateSsmSelection);
   const dialog = useRef<HTMLDialogElement>(null);
   useLayoutEffect(() => {
