@@ -21,6 +21,7 @@ const failures = {
   accountMismatch: "SSO 프로필의 승인 계정과 AWS 신원이 다릅니다",
   invalidResponse: "잘못된 서비스 응답", credentials: "SSO 자격 증명 오류", ssoLoginRequired: "같은 SSO 프로필로 다시 로그인 필요",
   request: "요청 실패", timedOut: "응답 시간 초과", loginFailed: "SSO 재로그인 실패", bodyRead: "본문 읽기 실패", checksum: "체크섬 검증 실패",
+  destination: "승인한 HTTPS 주소 방식과 요청 주소가 다릅니다", tls: "HTTPS 인증서 검증 실패",
 };
 
 export function StorageProblem({ problem, session }: { problem: Problem; session?: S3Session }) {
@@ -30,13 +31,17 @@ export function StorageProblem({ problem, session }: { problem: Problem; session
     const { failure, stage, bytes } = problem;
     let message: string;
     switch (failure.kind) {
+      case "redirect": message = `리디렉션 차단 (${failure.status}${failure.code ? ` ${failure.code}` : ""})`; break;
+      case "signingRegion": message = `서명 리전 오류 (${failure.status} ${failure.code})`; break;
       case "service": {
         const { status, code } = failure;
-        const category = code === "ExpiredToken" || code === "ExpiredTokenException" ? "AWS 임시 자격 증명 만료" :
+        const expired = code === "ExpiredToken" || code === "ExpiredTokenException";
+        const category = expired ? (session?.compatible ? "호환 서비스 자격 증명 만료" : "AWS 임시 자격 증명 만료") :
           code === "AccessDenied" || code === "AccessDeniedException" || (code === null && status === 403) ? "권한 거부" : "서비스 오류";
         message = `${category} (${status}${code ? ` ${code}` : ""})`;
         break;
       }
+      case "credentials": message = session?.compatible ? "호환 서비스 자격 증명 오류" : failures.credentials; break;
       case "localIo": message = `로컬 파일 오류 (${failure.errorKind})`; break;
       case "recoveryUnconfirmed":
         message = "복구 확인 실패";

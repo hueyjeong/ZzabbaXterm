@@ -22,10 +22,12 @@
 
 3. **번들 생성:** 각 OS의 [빌드 사전 요구 사항](../00-start/01-bootstrap.md#준비물)을 갖추고 `app/`에서 `npm ci` 후 `npm run bundle`을 실행한다. 스크립트는 `cargo metadata --locked --no-deps`의 `target_directory`와 `rustc --print host-tuple`을 사용한다. 같은 네이티브 타깃에서 `--locked`로 두 CLI를 빌드해 `src-tauri/binaries/<이름>-<타깃 트리플>`(Windows는 `.exe` 포함)에 복사한 뒤 Windows NSIS 또는 Ubuntu deb를 생성한다. 기본 Tauri 설정은 sidecar 준비 없이 개발할 수 있다. `release/bundle/` 아래 설치 파일의 경로·버전·아키텍처와 SHA-256(Windows `Get-FileHash -Algorithm SHA256`, Ubuntu `sha256sum`)을 기록한다.
 
-   설치 전에 Windows `7z l <설치 파일.exe>` 또는 Ubuntu `dpkg-deb -c <설치 파일.deb>`로 `zzabba`와 `zzabba-edit`가 포함되고 제외한 헬퍼가 없는지 확인한다. 번들 생성과 설치 후 실행은 별도로 판정한다.
+   설치 전에는 Windows `7z l <설치 파일.exe>` 또는 Bandizip `bz l -list:v <설치 파일.exe>`, Ubuntu `dpkg-deb -c <설치 파일.deb>`로 GUI·`zzabba`·`zzabba-edit`가 포함되고 제외한 헬퍼가 없는지 확인한다. 번들 생성·추출 실행과 실제 설치는 별도로 판정한다.
 4. **실제 설치:** 승인된 시험 PC/계정에 같은 해시의 설치 파일을 전달한다. Windows는 생성된 설치 파일, Ubuntu는 생성된 `.deb`와 패키지 관리자를 사용한다. 서명이나 조직 정책이 설치를 막으면 배포 담당자에게 서명된 시험본을 요청하고 `미실행(설치 정책)`으로 기록한다. 설치 후 시작 메뉴·앱 목록에서 실행해 위 세 시나리오를 시연한다.
 
    개발 소스가 없는 시험 계정에서 GUI를 연 뒤 Windows PowerShell은 `& '<설치 폴더>\zzabba.exe' list`, Ubuntu는 `/usr/bin/zzabba list`를 실행한다. Windows의 `zzabba.exe`는 설치한 GUI 실행 파일 옆에 있다. 파일 경로·SHA-256과 목록 응답(빈 목록 포함)을 기록한다. 전역 PATH 변경 없이 설치한 CLI가 설치본 GUI에 연결되는 것이 통과 기준이다.
+
+   같은 설치본의 `zzabba-edit --wait`에 시험 파일을 지정한다. 추가 확인 없이 가운데 탭이 열리고, 해당 편집 탭을 닫은 뒤에만 성공으로 반환하는지 기록한다.
 5. **최종 판정:** 같은 빌드의 [제품 인수 기준](../../ops-shell-blueprint.md#검증)으로 두 OS에서 T1–T8을 종합한다. 해당 티켓에서 수집한 **동일 빌드·동일 환경**의 근거는 링크로 재사용한다. 빌드·실행 경로·정책이 달라진 항목은 설치본으로 재현한다. 상태는 `통과`, `실패(단계·실제값)`, `미실행(사유)`으로 분리한다. T2는 8칸, T1은 4칸, T5는 서버별, T6는 엔드포인트별 결과를 유지한다. T7은 [A03의 인수표](../06-ai/03-shared.md#검증과-완료-증거)에 따라 OS·정책별로 지정 세션 ID·세대, 승인 ID, 포커스 및 거부·중지 증거를 기록한다. 외부 도구 미설치는 미실행이지 기능 통과가 아니다.
 
 **완료 증거:** 두 설치 파일의 식별자·해시, 설치/기동 기록, T1–T8 증거 링크, 재현에 필요한 도구 목록. 필수 조합의 실패·미실행이 남으면 만든 설치본과 사유를 인계하되 Windows·Linux 인수 완료 판정은 보류한다. Mac 장비가 준비되면 [M01](02-macos.md)로 간다.
