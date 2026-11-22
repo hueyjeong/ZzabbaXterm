@@ -10,11 +10,11 @@ export type ObjectRow =
   | Readonly<{ kind: "object"; key: string; bytes: number | null }>;
 
 type Page<T> = Readonly<{ rows: readonly T[]; nextToken: string | null }>;
-type Stage = "profile" | "listBuckets" | "listObjects" | "uploadSource" | "putObject" |
+type Stage = "profile" | "identity" | "listBuckets" | "listObjects" | "uploadSource" | "putObject" |
   "getObject" | "downloadBody" | "downloadWrite" | "downloadCommit";
 type Failure =
   | Readonly<{
-    kind: "invalidSsoProfile" | "invalidRegion" | "invalidBucket" | "invalidResponse" |
+    kind: "invalidSsoProfile" | "accountMismatch" | "invalidRegion" | "invalidBucket" | "invalidResponse" |
     "credentials" | "ssoLoginRequired" | "request" | "bodyRead" | "checksum"
   }>
   | Readonly<{ kind: "service"; status: number; code: string | null }>

@@ -28,7 +28,7 @@ impl DirectSsoConfig {
         config
     }
 
-    pub(super) fn cache_key(&self) -> &str {
+    pub(crate) fn cache_key(&self) -> &str {
         self.session.as_deref().unwrap_or(&self.start_url)
     }
 }

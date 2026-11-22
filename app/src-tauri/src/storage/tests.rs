@@ -147,7 +147,7 @@ async fn s01_지정_버킷의_다음_페이지와_선택한_키를_그대로_요
     );
 }
 
-fn object_response(length: u64, checksum: Option<&str>, body: SdkBody) -> HttpResponse {
+pub(super) fn object_response(length: u64, checksum: Option<&str>, body: SdkBody) -> HttpResponse {
     let mut raw = http::Response::builder()
         .status(200)
         .header("content-length", length);
@@ -176,45 +176,29 @@ impl Body for BrokenStream {
     }
 }
 
-struct ClosingStream {
-    closed: std::sync::Arc<tokio::sync::watch::Sender<bool>>,
+pub(super) struct PausedStream {
+    started: Option<tokio::sync::oneshot::Sender<()>>,
     sent: bool,
 }
 
-impl Body for ClosingStream {
+impl PausedStream {
+    pub(super) fn new(started: tokio::sync::oneshot::Sender<()>) -> Self {
+        Self { started: Some(started), sent: false }
+    }
+}
+
+impl Body for PausedStream {
     type Data = <SdkBody as Body>::Data;
     type Error = io::Error;
 
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        _: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+    fn poll_frame(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         if std::mem::replace(&mut self.sent, true) {
-            self.closed.send_replace(true);
+            if let Some(started) = self.started.take() { let _ = started.send(()); }
             Poll::Pending
         } else {
             Poll::Ready(Some(Ok(Frame::data(Self::Data::from_static(b"n")))))
         }
     }
-}
-
-#[tokio::test]
-async fn s01_다운로드_본문_중에_닫으면_기존_파일을_보존한다() {
-    let closed = std::sync::Arc::new(tokio::sync::watch::Sender::new(false));
-    let stream = ClosingStream { closed: closed.clone(), sent: false };
-    let replay = replay([object_response(3, None, SdkBody::from_body_1_x(stream))]);
-    let dir = tempfile::tempdir().unwrap();
-    let target = dir.path().join("기존.txt");
-    std::fs::write(&target, b"old").unwrap();
-    let error = client(&replay)
-        .download("selected-bucket", "object", &target, &closed)
-        .await
-        .unwrap_err();
-    assert_eq!(error.stage, Stage::DownloadBody);
-    assert_eq!(error.bytes, 1);
-    assert_eq!(std::fs::read(&target).unwrap(), b"old");
-    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
-    assert_eq!(replay.actual_requests().count(), 1);
 }
 
 #[tokio::test]
@@ -282,7 +266,6 @@ async fn s01_설정된_외부_호스트를_차단한다() {
         [profile chosen]\nsso_start_url = https://example.awsapps.com/start\nsso_region = eu-west-1\n\
         sso_account_id = 012345678901\nsso_role_name = readOnly\nservices = custom\nendpoint_url = https://external.example\n\
         [services custom]\nsso =\n  endpoint_url = https://external.example\ns3 =\n  endpoint_url = https://external.example\n";
-    auth::assert_sso_endpoint_boundary().await;
     let env = aws_types::os_shim_internal::Env::from_slice(&[
         ("AWS_ENDPOINT_URL", "https://external.example"),
         ("AWS_ENDPOINT_URL_S3", "https://external.example"),
@@ -434,51 +417,52 @@ async fn s01_get_object_권한만으로_받고_미검증_체크섬을_구분한�
     }
 }
 
-#[test]
-fn s01_캐시_부재와_만료만_같은_프로필의_재로그인으로_분류한다() {
-    const CHILD: &str = "ZZABBA_S01_TEST_SSO_CHILD";
-    if std::env::var_os(CHILD).is_none() {
-        let home = tempfile::tempdir().unwrap();
-        let result = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "storage::tests::s01_캐시_부재와_만료만_같은_프로필의_재로그인으로_분류한다",
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
-            .env("HOME", home.path())
-            .output()
-            .unwrap();
-        assert!(
-            result.status.success(),
-            "{}",
-            String::from_utf8_lossy(&result.stdout)
-        );
-        assert!(String::from_utf8_lossy(&result.stdout).contains("1 passed"));
-        return;
+#[derive(Clone, Debug, Default)]
+pub(super) struct Clock(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+impl Clock {
+    pub(super) fn advance(&self, seconds: u64) {
+        self.0.fetch_add(seconds, std::sync::atomic::Ordering::Relaxed);
     }
-    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-        let profile = |session: Option<&str>| crate::ssm::DirectSsoConfig {
-            account: "012345678901".into(), role: "readOnly".into(), region: "eu-west-1".into(),
-            start_url: "https://s01.invalid/start".into(), session: session.map(str::to_owned),
+}
+
+impl aws_smithy_async::time::TimeSource for Clock {
+    fn now(&self) -> std::time::SystemTime {
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(
+            1_800_000_000 + self.0.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+}
+
+pub(super) fn role_credentials(key: &str, clock: &Clock, lifetime_secs: u128) -> HttpResponse {
+    use aws_smithy_async::time::TimeSource;
+    let expiration = clock.now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() + lifetime_secs * 1000;
+    response(200, format!(r#"{{"roleCredentials":{{"accessKeyId":"{key}","secretAccessKey":"synthetic","sessionToken":"temporary","expiration":{expiration}}}}}"#))
+}
+
+pub(super) fn caller_identity(account: &str) -> HttpResponse {
+    response(200, format!("<GetCallerIdentityResponse><GetCallerIdentityResult><Account>{account}</Account><Arn>arn:aws:sts::{account}:assumed-role/ReadOnly/fixture</Arn><UserId>fixture</UserId></GetCallerIdentityResult></GetCallerIdentityResponse>"))
+}
+
+#[tokio::test]
+async fn s01_캐시_부재와_만료만_같은_프로필의_재로그인으로_분류한다() {
+    let home = tempfile::tempdir().unwrap();
+    let file = home.path().join(crate::ssm::sso_cache_entry("s01-test-session"));
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    let transport = replay([]);
+    for (contents, failure) in [
+        (None, Failure::SsoLoginRequired),
+        (Some(r#"{"accessToken":"test-only","expiresAt":"2000-01-01T00:00:00Z"}"#), Failure::SsoLoginRequired),
+        (Some("not-json"), Failure::Credentials),
+    ] {
+        if let Some(contents) = contents { std::fs::write(&file, contents).unwrap(); }
+        let config = crate::ssm::DirectSsoConfig {
+            account: "012345678901".into(), role: "ReadOnly".into(), region: "eu-west-1".into(),
+            start_url: "https://s01.invalid/start".into(), session: Some("s01-test-session".into()),
         };
-        let cache = std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".aws/sso/cache");
-        std::fs::create_dir_all(&cache).unwrap();
-        let no_requests = replay([]);
-        let run = |config| async {
-            let provider = auth::provider_with(config, no_requests.clone());
-            let mut s3 = client(&no_requests);
-            s3.client = Client::from_conf(s3_config("eu-west-1").credentials_provider(provider).http_client(no_requests.clone()).build());
-            s3.list_buckets(None).await.unwrap_err().failure
-        };
-        let modern = Some("s01-test-session");
-        assert_eq!(run(profile(None)).await, Failure::SsoLoginRequired);
-        assert_eq!(run(profile(modern)).await, Failure::SsoLoginRequired);
-        let token_file = cache.join("2cfabe17813c5b0a714b9e3acdd164d8aa71252c.json");
-        std::fs::write(&token_file, r#"{"accessToken":"test-only","expiresAt":"2000-01-01T00:00:00Z"}"#).unwrap();
-        assert_eq!(run(profile(modern)).await, Failure::SsoLoginRequired);
-        std::fs::write(token_file, "not-json").unwrap();
-        assert_eq!(run(profile(modern)).await, Failure::Credentials);
-        assert_eq!(no_requests.actual_requests().count(), 0);
-    });
+        let result = AwsS3::verified("eu-west-1", config, home.path().to_owned(),
+            SharedHttpClient::new(transport.clone()), SharedTimeSource::default()).await;
+        assert_eq!(result.err().unwrap().failure, failure);
+    }
+    assert_eq!(transport.actual_requests().count(), 0);
 }

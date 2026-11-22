@@ -89,6 +89,15 @@ impl StorageIpc {
         request: OpenRequest,
         directory: PathBuf,
     ) -> Result<Session, Error> {
+        self.open_with(document, request, directory, |region, config| async move {
+            AwsS3::for_sso_profile(&region, config).await
+        }).await
+    }
+
+    async fn open_with<F: Future<Output = Result<AwsS3, Error>>>(
+        &self, document: Document, request: OpenRequest, directory: PathBuf,
+        verify: impl FnOnce(String, crate::ssm::DirectSsoConfig) -> F,
+    ) -> Result<Session, Error> {
         if !self.0.lock().unwrap().active(&document) {
             return Err(unavailable(Stage::Profile));
         }
@@ -98,7 +107,7 @@ impl StorageIpc {
         .await
         .map_err(|_| unavailable(Stage::Profile))??;
         let VerifiedSsoSelection { profile, region, config } = selection;
-        let client = AwsS3::for_sso_profile(&region, config);
+        let client = verify(region.clone(), config).await?;
         self.insert(document, profile, region, client)
             .ok_or_else(|| unavailable(Stage::Profile))
     }
@@ -478,7 +487,7 @@ impl<T> From<Result<T, Error>> for S3Result<T> {
 }
 
 async fn select_file(
-    webview: tauri::Webview,
+    webview: tauri::Webview<impl tauri::Runtime>,
     document: &Document,
     request: FileSelection,
 ) -> LocalFileApproval {
@@ -493,22 +502,66 @@ async fn select_file(
     let Some(id) = state.begin_selection(document, target, direction) else {
         return LocalFileApproval::Denied;
     };
-    let dialog = rfd::AsyncFileDialog::new()
-        .set_parent(&webview.window())
-        .set_title(title);
-    let selected = match direction {
-        Direction::Upload => dialog.pick_file().await,
-        Direction::Download => dialog.save_file().await,
+    let Ok((_, closed)) = state.client(document, &session_id, Stage::Profile) else {
+        return LocalFileApproval::Denied;
     };
-    state.finish_selection(
-        document,
-        &session_id,
-        id,
-        selected.map(|file| file.path().to_owned()),
-    )
+    let selected = pick_local_file(webview.window(), title, direction, closed).await;
+    state.finish_selection(document, &session_id, id, selected)
 }
 
-pub(crate) fn dispatch(invoke: Invoke) -> bool {
+#[cfg(not(target_os = "linux"))]
+async fn pick_local_file<R: tauri::Runtime>(window: tauri::Window<R>, title: String, direction: Direction, _: watch::Receiver<bool>) -> Option<PathBuf> {
+    let dialog = rfd::AsyncFileDialog::new().set_parent(&window).set_title(title);
+    match direction {
+        Direction::Upload => dialog.pick_file().await,
+        Direction::Download => dialog.save_file().await,
+    }.map(|file| file.path().to_owned())
+}
+
+#[cfg(target_os = "linux")]
+async fn pick_local_file<R: tauri::Runtime>(window: tauri::Window<R>, title: String, direction: Direction, mut closed: watch::Receiver<bool>) -> Option<PathBuf> {
+    use gtk::{ButtonsType, DialogFlags, FileChooserAction, FileChooserDialog, MessageDialog, MessageType, ResponseType, prelude::*};
+    let (answer, selected) = tokio::sync::oneshot::channel();
+    let owner = window.clone();
+    window.run_on_main_thread(move || {
+        let Ok(parent) = owner.gtk_window() else { return; };
+        gtk::glib::MainContext::default().spawn_local(async move {
+            // 소유 창에 대상을 표시하고 GTK가 반환한 PathBuf를 그대로 사용한다.
+            let confirmation = MessageDialog::new(Some(&parent), DialogFlags::MODAL | DialogFlags::DESTROY_WITH_PARENT,
+                MessageType::Question, ButtonsType::None, &title);
+            confirmation.add_button("취소", ResponseType::Cancel);
+            confirmation.add_button("파일 선택", ResponseType::Accept);
+            let confirmed = tokio::select! {
+                biased;
+                _ = closed.wait_for(|closed| *closed) => false,
+                answer = confirmation.run_future() => answer == ResponseType::Accept,
+            };
+            confirmation.close();
+            if !confirmed { return; }
+
+            let (action, label) = match direction {
+                Direction::Upload => (FileChooserAction::Open, "열기"),
+                Direction::Download => (FileChooserAction::Save, "저장"),
+            };
+            let picker = FileChooserDialog::with_buttons(Some(&title), Some(&parent), action,
+                &[("취소", ResponseType::Cancel), (label, ResponseType::Accept)]);
+            picker.set_modal(true);
+            picker.set_destroy_with_parent(true);
+            picker.set_local_only(true);
+            if direction == Direction::Download { picker.set_do_overwrite_confirmation(true); }
+            let path = tokio::select! {
+                biased;
+                _ = closed.wait_for(|closed| *closed) => None,
+                answer = picker.run_future() => (answer == ResponseType::Accept).then(|| picker.filename()).flatten(),
+            };
+            picker.close();
+            let _ = answer.send(path);
+        });
+    }).ok()?;
+    selected.await.ok().flatten()
+}
+
+pub(crate) fn dispatch<R: tauri::Runtime>(invoke: Invoke<R>) -> bool {
     let Invoke {
         message,
         resolver,
@@ -544,7 +597,7 @@ pub(crate) fn dispatch(invoke: Invoke) -> bool {
         "storage_open" => handle!(
             "storage_open",
             OpenRequest,
-            async |webview: tauri::Webview, document, request| {
+            async |webview: tauri::Webview<R>, document, request| {
                 let result = match webview.path().app_config_dir() {
                     Ok(directory) => webview.state::<StorageIpc>().open(document, request, directory).await,
                     Err(_) => Err(unavailable(Stage::Profile)),
@@ -555,7 +608,7 @@ pub(crate) fn dispatch(invoke: Invoke) -> bool {
         "storage_list_buckets" => handle!(
             "storage_list_buckets",
             BucketPageRequest,
-            async |webview: tauri::Webview, document, request| {
+            async |webview: tauri::Webview<R>, document, request| {
                 Ok(S3Result::from(
                     webview
                         .state::<StorageIpc>()
@@ -567,7 +620,7 @@ pub(crate) fn dispatch(invoke: Invoke) -> bool {
         "storage_list_objects" => handle!(
             "storage_list_objects",
             ObjectPageRequest,
-            async |webview: tauri::Webview, document, request| {
+            async |webview: tauri::Webview<R>, document, request| {
                 Ok(S3Result::from(
                     webview
                         .state::<StorageIpc>()
@@ -586,7 +639,7 @@ pub(crate) fn dispatch(invoke: Invoke) -> bool {
         "storage_upload" => handle!(
             "storage_upload",
             ApprovedTransfer,
-            async |webview: tauri::Webview, document, request| {
+            async |webview: tauri::Webview<R>, document, request| {
                 Ok(S3Result::from(
                     webview
                         .state::<StorageIpc>()
@@ -598,7 +651,7 @@ pub(crate) fn dispatch(invoke: Invoke) -> bool {
         "storage_download" => handle!(
             "storage_download",
             ApprovedTransfer,
-            async |webview: tauri::Webview, document, request| {
+            async |webview: tauri::Webview<R>, document, request| {
                 Ok(S3Result::from(
                     webview
                         .state::<StorageIpc>()
@@ -610,7 +663,7 @@ pub(crate) fn dispatch(invoke: Invoke) -> bool {
         "storage_close" => handle!(
             "storage_close",
             TabId,
-            async |webview: tauri::Webview, document, request: TabId| {
+            async |webview: tauri::Webview<R>, document, request: TabId| {
                 Ok(webview
                     .state::<StorageIpc>()
                     .close(&document, &request.session_id))
@@ -619,7 +672,7 @@ pub(crate) fn dispatch(invoke: Invoke) -> bool {
         "storage_cancel_approval" => handle!(
             "storage_cancel_approval",
             ApprovalId,
-            async |webview: tauri::Webview, document, request: ApprovalId| {
+            async |webview: tauri::Webview<R>, document, request: ApprovalId| {
                 Ok(webview
                     .state::<StorageIpc>()
                     .cancel_approval(&document, &request))
@@ -649,6 +702,53 @@ mod tests {
     }
 
     #[test]
+    fn storage_close_ipc_stops_inflight_download_without_replacing_file() {
+        use serde_json::json;
+        use tauri::{ipc::{CallbackFn, InvokeBody, InvokeResponse}, test, utils::acl::ExecutionContext, webview::InvokeRequest};
+        use super::super::tests::{PausedStream, object_response};
+
+        let mut context = test::mock_context(test::noop_assets());
+        for command in ["storage_download", "storage_close"] {
+            context.runtime_authority_mut().__allow_command(command.into(), ExecutionContext::Local);
+        }
+        let app = test::mock_builder().manage(StorageIpc::default()).invoke_handler(dispatch).build(context).unwrap();
+        let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
+        let request = |command: &str, request| InvokeRequest {
+            cmd: command.into(), callback: CallbackFn(0), error: CallbackFn(1),
+            url: if cfg!(windows) { "http://tauri.localhost" } else { "tauri://localhost" }.parse().unwrap(),
+            body: InvokeBody::Json(json!({ "request": request })), headers: Default::default(),
+            invoke_key: test::INVOKE_KEY.into(),
+        };
+        let (started, paused) = tokio::sync::oneshot::channel();
+        let replay = replay([object_response(3, None, SdkBody::from_body_1_x(PausedStream::new(started)))]);
+        let state = app.state::<StorageIpc>();
+        let document = state.document("main");
+        let session = state.insert(document.clone(), "fixture".into(), "eu-west-1".into(), client(&replay)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let name = if cfg!(windows) { " 한글.txt" } else { " 한글\n.txt " };
+        let path = dir.path().join(name);
+        std::fs::write(&path, b"original").unwrap();
+        let approval = state.begin_selection(&document, target(&session), Direction::Download).unwrap();
+        state.finish_selection(&document, &session.session_id, approval.clone(), Some(path.clone()));
+        let (send, received) = std::sync::mpsc::channel();
+        let webview: &tauri::Webview<test::MockRuntime> = window.as_ref();
+        webview.clone().on_message(request("storage_download", json!({
+            "sessionId": session.session_id, "bucket": "selected-bucket", "key": KEY, "approvalId": approval,
+        })), Box::new(move |_, _, reply, _, _| { send.send(reply).unwrap(); }));
+        let timeout = std::time::Duration::from_secs(5);
+        tauri::async_runtime::block_on(async { tokio::time::timeout(timeout, paused).await.unwrap().unwrap(); });
+        let close = || request("storage_close", json!({ "sessionId": session.session_id }));
+        assert!(test::get_ipc_response(&window, close()).unwrap().deserialize::<bool>().unwrap());
+        let InvokeResponse::Ok(body) = received.recv_timeout(timeout).unwrap() else { panic!("다운로드 IPC 오류"); };
+        assert_eq!(body.deserialize::<serde_json::Value>().unwrap(), json!({
+            "ok": false, "error": { "stage": "downloadBody", "failure": { "kind": "request" }, "bytes": 1 }
+        }));
+        assert!(!test::get_ipc_response(&window, close()).unwrap().deserialize::<bool>().unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
     fn storage_open_uses_only_current_saved_direct_sso() {
         const CHILD: &str = "ZZABBA_S01_OPEN_FIXTURE";
         let Some(root) = std::env::var_os(CHILD).map(PathBuf::from) else {
@@ -656,6 +756,8 @@ mod tests {
             let result = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "storage::ipc::tests::storage_open_uses_only_current_saved_direct_sso"])
                 .env(CHILD, root.path())
+                .env("HOME", root.path().join("home"))
+                .env("USERPROFILE", root.path().join("profile"))
                 .env("AWS_CONFIG_FILE", root.path().join("config"))
                 .env("AWS_SHARED_CREDENTIALS_FILE", root.path().join("credentials"))
                 .output().unwrap();
@@ -683,7 +785,50 @@ mod tests {
             let state = StorageIpc::default();
             let document = state.document("main");
             let request = |id: &str| OpenRequest { target_id: id.to_owned() };
-            let session = state.open(document.clone(), request("saved-sso"), directory.clone()).await.unwrap();
+            let home = crate::ssm::user_home().unwrap();
+            assert_eq!(home, root.join(if cfg!(windows) { "profile" } else { "home" }));
+            let token = home.join(crate::ssm::sso_cache_entry("fixture"));
+            std::fs::create_dir_all(token.parent().unwrap()).unwrap();
+            std::fs::write(&token, r#"{"accessToken":"fixture-token","expiresAt":"2099-01-01T00:00:00Z"}"#).unwrap();
+            let clock = super::super::tests::Clock::default();
+            let replay = replay([
+                super::super::tests::role_credentials("WRONG", &clock, 60),
+                super::super::tests::caller_identity("000000000000"),
+                super::super::tests::role_credentials("FIRST", &clock, 60),
+                super::super::tests::caller_identity("123456789012"),
+                response(200, "<ListAllMyBucketsResult><Buckets/></ListAllMyBucketsResult>"),
+                super::super::tests::role_credentials("SECOND", &clock, 120),
+                response(200, "<ListAllMyBucketsResult><Buckets/></ListAllMyBucketsResult>"),
+            ]);
+            let open = || state.open_with(document.clone(), request("saved-sso"), directory.clone(), |region, config| {
+                let transport = super::super::SharedHttpClient::new(replay.clone());
+                let clock = super::super::SharedTimeSource::new(clock.clone());
+                async move { AwsS3::verified(&region, config, crate::ssm::user_home().unwrap(), transport, clock).await }
+            });
+            assert_eq!(open().await.err().unwrap().failure, Failure::AccountMismatch);
+            assert!(state.0.lock().unwrap().tabs.is_empty());
+            let session = open().await.unwrap();
+            for elapsed in [0, 61] {
+                clock.advance(elapsed);
+                state.list_buckets(&document, BucketPageRequest { session_id: session.session_id.clone(), token: None }).await.unwrap();
+            }
+            let requests: Vec<_> = replay.actual_requests().collect();
+            assert_eq!(requests.len(), 7);
+            for index in [0, 2, 5] {
+                let uri: http::Uri = requests[index].uri().parse().unwrap();
+                assert_eq!(uri.host(), Some("portal.sso.us-east-1.amazonaws.com"));
+                assert_eq!(uri.path(), "/federation/credentials");
+                let mut pairs: Vec<_> = uri.query().unwrap().split('&').collect();
+                pairs.sort_unstable();
+                assert_eq!(pairs, ["account_id=123456789012", "role_name=ReadOnly"]);
+                assert_eq!(requests[index].headers().get("x-amz-sso_bearer_token"), Some("fixture-token"));
+            }
+            for (index, scheme, region, key) in [(1, "sts", "eu-west-1", "WRONG"), (3, "sts", "eu-west-1", "FIRST"),
+                (4, "s3", "eu-west-1", "FIRST"), (6, "s3", "eu-west-1", "SECOND")] {
+                assert!(requests[index].uri().starts_with(&format!("https://{scheme}.{region}.amazonaws.com/")));
+                assert!(requests[index].headers().get("authorization").unwrap().contains(&format!("Credential={key}/")));
+            }
+            assert_eq!(std::fs::read_to_string(&token).unwrap(), r#"{"accessToken":"fixture-token","expiresAt":"2099-01-01T00:00:00Z"}"#);
             assert!(Uuid::parse_str(&session.session_id).is_ok());
             assert_eq!(serde_json::to_value(&session).unwrap(), json!({
                 "sessionId": session.session_id, "profile": "chosen team", "region": "eu-west-1",

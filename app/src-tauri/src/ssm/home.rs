@@ -59,8 +59,7 @@ impl CliHome {
 
     pub(super) fn import_sso_token(&self, source_home: &Path, key: &str) -> Result<(), CliError> {
         // Botocore는 sso-session 이름(레거시는 시작 URL)의 SHA-1을 파일 이름으로 쓴다.
-        let name = format!("{:x}.json", Sha1::digest(key.as_bytes()));
-        let relative = Path::new(".aws/sso/cache").join(name);
+        let relative = sso_cache_entry(key);
         let source = source_home.join(&relative);
         match fs::symlink_metadata(&source) {
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
@@ -112,7 +111,12 @@ impl Drop for CliHome {
     }
 }
 
-pub(super) fn user_home() -> Result<std::path::PathBuf, CliError> {
+pub(crate) fn sso_cache_entry(key: &str) -> std::path::PathBuf {
+    let name = format!("{:x}.json", Sha1::digest(key.as_bytes()));
+    Path::new(".aws/sso/cache").join(name)
+}
+
+pub(crate) fn user_home() -> Result<std::path::PathBuf, CliError> {
     // Python은 POSIX에서 HOME, Windows에서 USERPROFILE을 우선한다.
     let value = if cfg!(windows) {
         std::env::var_os("USERPROFILE").or_else(|| {

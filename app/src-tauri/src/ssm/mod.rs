@@ -10,6 +10,7 @@ mod session;
 mod windows_acl;
 
 pub use cli::{CliError, CommandSpec};
+pub(crate) use home::{sso_cache_entry, user_home};
 pub(crate) use profile::DirectSsoConfig;
 pub use session::{SessionLookup, StartPermit, StartRequest, VerificationError, VerifiedSession};
 pub use tokio_util::sync::CancellationToken;

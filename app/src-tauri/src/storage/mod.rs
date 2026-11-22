@@ -6,7 +6,7 @@ mod tests;
 
 use std::{error::Error as StdError, path::Path};
 
-use aws_credential_types::provider::error::CredentialsError;
+use aws_credential_types::provider::{SharedCredentialsProvider, error::CredentialsError};
 use aws_sdk_s3::{
     Client,
     config::Region,
@@ -16,6 +16,8 @@ use aws_sdk_s3::{
 };
 use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 use percent_encoding::percent_decode_str;
+use aws_smithy_async::time::SharedTimeSource;
+use aws_smithy_runtime_api::client::http::SharedHttpClient;
 
 #[derive(Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -35,6 +37,7 @@ pub(crate) enum ObjectRow {
 #[serde(rename_all = "camelCase")]
 pub(crate) enum Stage {
     Profile,
+    Identity,
     ListBuckets,
     ListObjects,
     UploadSource,
@@ -53,6 +56,7 @@ pub(crate) enum Stage {
 )]
 pub(crate) enum Failure {
     InvalidSsoProfile,
+    AccountMismatch,
     InvalidRegion,
     InvalidBucket,
     InvalidResponse,
@@ -109,13 +113,37 @@ pub(crate) struct AwsS3 {
 }
 
 impl AwsS3 {
-    fn for_sso_profile(region: &str, config: crate::ssm::DirectSsoConfig) -> Self {
-        let provider = auth::provider(config);
-        let client = Client::from_conf(s3_config(region).credentials_provider(provider).build());
-        Self {
-            client,
-            endpoint: format!("https://s3.{region}.{}", dns_suffix(region)),
+    async fn for_sso_profile(region: &str, config: crate::ssm::DirectSsoConfig) -> Result<Self, Error> {
+        let home = crate::ssm::user_home().map_err(|_| Error::at(Stage::Profile, Failure::InvalidSsoProfile))?;
+        let transport = aws_smithy_http_client::Builder::new()
+            .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
+                aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
+            )).build_https();
+        Self::verified(region, config, home, SharedHttpClient::new(transport), SharedTimeSource::default()).await
+    }
+
+    async fn verified(region: &str, config: crate::ssm::DirectSsoConfig, home: std::path::PathBuf,
+        transport: SharedHttpClient, clock: SharedTimeSource) -> Result<Self, Error> {
+        let expected = config.account.clone();
+        let provider = SharedCredentialsProvider::new(auth::Provider::new(config, home, transport.clone(), clock.clone()));
+        let sts = aws_sdk_sts::Client::from_conf(aws_sdk_sts::Config::builder()
+            .behavior_version_latest().region(Region::new(region.to_owned()))
+            .endpoint_url(format!("https://sts.{region}.{}", dns_suffix(region)))
+            .http_client(transport.clone()).time_source(clock.clone())
+            .identity_cache(aws_sdk_sts::config::IdentityCache::no_cache())
+            .credentials_provider(provider.clone()).build());
+        let identity = sts.get_caller_identity().send().await.map_err(|error| sdk_error(Stage::Identity, error))?;
+        let account = identity.account().ok_or_else(|| Error::at(Stage::Identity, Failure::InvalidResponse))?;
+        if account != expected {
+            return Err(Error::at(Stage::Identity, Failure::AccountMismatch));
         }
+        if identity.arn().and_then(|arn| arn.split(':').nth(4)) != Some(account) {
+            return Err(Error::at(Stage::Identity, Failure::InvalidResponse));
+        }
+        let client = Client::from_conf(s3_config(region).http_client(transport).time_source(clock)
+            .identity_cache(aws_sdk_s3::config::IdentityCache::no_cache())
+            .credentials_provider(provider).build());
+        Ok(Self { client, endpoint: format!("https://s3.{region}.{}", dns_suffix(region)) })
     }
 
     pub(crate) fn endpoint(&self) -> &str {
@@ -325,7 +353,7 @@ fn sdk_error<E: ProvideErrorMetadata + StdError + 'static>(
                     >>()
                     .and_then(SdkError::as_service_error)
                     .is_some_and(|err| err.is_unauthorized_exception())
-                    || (failure == Failure::Credentials && auth::sso_cache_needs_login(source))
+                    || source.is::<auth::LoginRequired>()
                 {
                     failure = Failure::SsoLoginRequired;
                     break;
