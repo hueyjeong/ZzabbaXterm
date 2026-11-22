@@ -22,6 +22,7 @@ export function Workspace() {
   const nextTab = useRef(2);
   const [tabs, setTabs] = useState<Tab[]>([{ id: 1, status: { kind: "opening" } }]);
   const [active, setActive] = useState(1);
+  const [focusTab, setFocusTab] = useState<number | null>(1);
   const [focused, setFocused] = useState(false);
   const [draft, setDraft] = useState("");
   const [windowError, setWindowError] = useState("");
@@ -31,6 +32,9 @@ export function Workspace() {
   const [area, setArea] = useState({ width: 1200, height: 600 });
   const body = useRef<HTMLDivElement>(null);
   const activeButton = useRef<HTMLButtonElement>(null);
+  const sideLimit = Math.min(640, Math.floor(area.width * 0.32));
+  const left = Math.min(treeWidth, sideLimit);
+  const right = Math.min(aiWidth, sideLimit);
 
   useLayoutEffect(() => {
     const element = body.current!;
@@ -48,21 +52,33 @@ export function Workspace() {
     const button = activeButton.current;
     const list = button?.closest("nav");
     if (!button || !list) return;
-    const { left, right } = button.parentElement!.getBoundingClientRect();
-    const bounds = list.getBoundingClientRect();
-    if (left < bounds.left) list.scrollLeft += left - bounds.left;
-    else if (right > bounds.right) list.scrollLeft += right - bounds.right;
-  }, [active]);
+    const reveal = () => {
+      const bounds = list.getBoundingClientRect();
+      const tab = button.parentElement!.getBoundingClientRect();
+      const selected = tab.width <= bounds.width ? tab : button.getBoundingClientRect();
+      if (selected.left < bounds.left) list.scrollLeft += selected.left - bounds.left;
+      else if (selected.right > bounds.right) list.scrollLeft += selected.right - bounds.right;
+    };
+    reveal();
+    const observer = new ResizeObserver(reveal);
+    observer.observe(list);
+    return () => observer.disconnect();
+  }, [active, left, focused]);
 
   function openTab() {
     const id = nextTab.current++;
     setTabs((current) => [...current, { id, status: { kind: "opening" } }]);
+    selectTab(id);
+  }
+
+  function selectTab(id: number) {
     setActive(id);
+    setFocusTab(id);
   }
 
   function closeTab(id: number) {
     const index = tabs.findIndex((tab) => tab.id === id);
-    if (id === active) setActive(tabs[index + 1]?.id ?? tabs[index - 1]?.id ?? 0);
+    if (id === active) selectTab(tabs[index + 1]?.id ?? tabs[index - 1]?.id ?? 0);
     setTabs((current) => current.filter((tab) => tab.id !== id));
   }
 
@@ -72,18 +88,16 @@ export function Workspace() {
       : tab) : current);
   }
 
-  const sideLimit = Math.floor(area.width * 0.32);
-  const left = Math.min(treeWidth, sideLimit);
-  const right = Math.min(aiWidth, sideLimit);
   const current = tabs.find((tab) => tab.id === active);
   const layout = { "--tree-width": `${left}px`, "--ai-width": `${right}px`, "--chat-height": `${chatHeight}%` } as CSSProperties;
 
   return (
-    <main className={`workspace${macTitleBar ? " workspace-mac" : ""}${focused ? " workspace-focused" : ""}`} style={layout}>
+    <main className={`workspace${macTitleBar ? " workspace-mac" : ""}${focused ? " workspace-focused" : ""}`} style={layout}
+      onFocusCapture={(event) => { if (!event.target.closest(".terminal-screen")) setFocusTab(null); }}>
       <TitleBar focused={focused} onToggle={() => setFocused(!focused)} onWindowError={setWindowError}>
         {tabs.map(({ id }) => (
           <div className="workspace-tab" key={id}>
-            <button ref={id === active ? activeButton : undefined} aria-pressed={id === active} onClick={() => setActive(id)}>로컬 {id}</button>
+            <button ref={id === active ? activeButton : undefined} aria-pressed={id === active} onClick={() => selectTab(id)}>로컬 {id}</button>
             <button aria-label={`로컬 ${id} 닫기`} onClick={() => closeTab(id)}>×</button>
           </div>
         ))}
@@ -95,7 +109,8 @@ export function Workspace() {
         <div className="workspace-center">
           {tabs.map(({ id }) => (
             <div className="workspace-session" key={id} hidden={id !== active} inert={id !== active}>
-              <TerminalView active={id === active} label={`로컬 ${id}`} onStatus={(status, sessionId) => updateStatus(id, status, sessionId)} />
+              <TerminalView active={id === active} focusRequested={id === focusTab} label={`로컬 ${id}`}
+                onStatus={(status, sessionId) => updateStatus(id, status, sessionId)} />
             </div>
           ))}
         </div>
@@ -108,12 +123,12 @@ export function Workspace() {
             <h2>AI 터미널 / 전용 셸</h2>
             <span>대기</span>
           </section>
-          <Splitter edge="chat" label="AI 채팅 높이" value={chatHeight} preferred={chatHeight}
+          <Splitter edge="chat" label="AI 채팅 높이" value={chatHeight}
             min={20} max={80} units={100 / Math.max(1, area.height)} onChange={setChatHeight} />
         </aside>
         {!focused && <>
-          <Splitter edge="left" label="트리 너비" value={left} preferred={treeWidth} min={160} max={640} units={1} onChange={setTreeWidth} />
-          <Splitter edge="right" label="AI 열 너비" value={right} preferred={aiWidth} min={200} max={640} units={1} onChange={setAiWidth} />
+          <Splitter edge="left" label="트리 너비" value={left} min={Math.min(160, sideLimit)} max={sideLimit} units={1} onChange={setTreeWidth} />
+          <Splitter edge="right" label="AI 열 너비" value={right} min={Math.min(200, sideLimit)} max={sideLimit} units={1} onChange={setAiWidth} />
         </>}
       </div>
       <footer className="workspace-status">

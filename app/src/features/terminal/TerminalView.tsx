@@ -7,6 +7,7 @@ import "./terminal.css";
 
 export interface TerminalViewProps {
   readonly active: boolean;
+  readonly focusRequested: boolean;
   readonly label: string;
   readonly onStatus?: (status: TerminalStatus, sessionId?: string) => void;
 }
@@ -22,9 +23,9 @@ function text(status: TerminalStatus) {
 }
 
 // Keep the component mounted with a stable tab key; only unmount closes the session.
-export function TerminalView({ active, label, onStatus }: TerminalViewProps) {
+export function TerminalView({ active, focusRequested, label, onStatus }: TerminalViewProps) {
   const host = useRef<HTMLDivElement>(null);
-  const refresh = useRef<((focus: boolean) => void) | null>(null);
+  const refresh = useRef<((visible: boolean, ready: boolean, requested: boolean) => void) | null>(null);
   const [status, setStatus] = useState<TerminalStatus>({ kind: "opening" });
   const statusListener = useRef(onStatus);
   useLayoutEffect(() => { statusListener.current = onStatus; }, [onStatus]);
@@ -58,10 +59,10 @@ export function TerminalView({ active, label, onStatus }: TerminalViewProps) {
     };
     const observer = new ResizeObserver(layout);
     observer.observe(element);
-    refresh.current = (focus) => {
-      layout();
-      if (focus) term.focus();
-      else term.blur();
+    refresh.current = (visible, ready, requested) => {
+      if (visible) layout();
+      if (!visible || !ready) term.blur();
+      else if (requested) term.focus();
     };
     return () => {
       refresh.current = null;
@@ -73,8 +74,8 @@ export function TerminalView({ active, label, onStatus }: TerminalViewProps) {
   }, []);
 
   useLayoutEffect(() => {
-    refresh.current?.(active && status.kind === "running");
-  }, [active, status.kind]);
+    refresh.current?.(active, status.kind === "running", focusRequested);
+  }, [active, status.kind, focusRequested]);
 
   const message = text(status);
   return (

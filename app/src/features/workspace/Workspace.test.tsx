@@ -6,9 +6,6 @@ import App from "../../App";
 
 const native = vi.hoisted(() => ({
   invoke: vi.fn(),
-  minimize: vi.fn(),
-  toggleMaximize: vi.fn(),
-  close: vi.fn(),
   fit: vi.fn(),
 }));
 vi.mock("@tauri-apps/api/core", () => ({
@@ -16,7 +13,6 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: native.invoke,
   Channel: class { constructor(readonly receive: (message: unknown) => void) { } },
 }));
-vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => native }));
 vi.mock("@xterm/addon-fit", () => ({ FitAddon: class { fit = native.fit; } }));
 vi.mock("@xterm/xterm", () => ({
   Terminal: class {
@@ -49,6 +45,7 @@ let host: HTMLDivElement;
 let root: Root;
 let viewportWidth: number;
 let observeWorkspace: () => void;
+let observeTabs: () => void;
 const channels = new Map<string, (message: unknown) => void>();
 const starts = new Map<string, Promise<void>>();
 
@@ -59,6 +56,7 @@ beforeEach(async () => {
     constructor(private readonly callback: () => void) { }
     observe(element: HTMLElement) {
       if (element.classList.contains("workspace-body")) observeWorkspace = this.callback;
+      if (element.matches(".workspace-tabs")) observeTabs = this.callback;
     }
     disconnect() { }
   });
@@ -153,6 +151,56 @@ describe("L02", () => {
     expect(calls("input")).toEqual([{ id: "pty-11", bytes: Array.from(new TextEncoder().encode("READY")) }]);
   });
 
+  it.each(['.workspace-chat textarea', '.window-control.minimize', '.splitter-left'])
+    ("셸을 여는 동안 %s에 옮긴 포커스는 준비 후에도 그대로다", async (selector) => {
+      const start = Promise.withResolvers<void>();
+      starts.set("pty-11", start.promise);
+      await openSecond();
+      const control = find(selector);
+      await act(async () => { control.focus(); });
+      await act(async () => { start.resolve(); });
+      expect(status()).toContain("pty-11 · 연결됨");
+      expect(document.activeElement).toBe(control);
+      await press("로컬 2");
+      expect(document.activeElement).toBe(find('section[aria-label="로컬 2"] textarea'));
+    });
+
+  it("창 축소와 집중 보기 복귀에서 선택 탭을 노출한다", async () => {
+    await openSecond();
+    const list = find(".workspace-tabs");
+    const selected = find('button[aria-pressed="true"]').parentElement!;
+    let listWidth = 200;
+    vi.spyOn(list, "getBoundingClientRect").mockImplementation(() => new DOMRect(0, 0, listWidth, 38));
+    vi.spyOn(selected, "getBoundingClientRect").mockImplementation(() => new DOMRect(90 - list.scrollLeft, 0, 90, 38));
+    listWidth = 130;
+    observeTabs();
+    expect(list.scrollLeft).toBe(50);
+    listWidth = 200;
+    await press("집중 보기");
+    list.scrollLeft = 0;
+    listWidth = 110;
+    await press("기본 보기");
+    expect(list.scrollLeft).toBe(70);
+    expect(status()).toContain("pty-11");
+  });
+
+  it("사용자가 넓힌 폭은 조절 시점의 실제 상한까지만 저장한다", async () => {
+    await act(async () => { viewportWidth = 660; observeWorkspace(); });
+    const left = find('.splitter-left');
+    const right = find('.splitter-right');
+    await key(left, "Home");
+    await key(left, "End");
+    right.setPointerCapture = vi.fn();
+    await key(right, "Home");
+    await act(async () => {
+      right.dispatchEvent(new PointerEvent("pointerdown", { pointerId: 1, clientX: 460, bubbles: true }));
+      right.dispatchEvent(new PointerEvent("pointermove", { pointerId: 1, clientX: 300, bubbles: true }));
+      right.dispatchEvent(new PointerEvent("lostpointercapture", { pointerId: 1, bubbles: true }));
+    });
+    await act(async () => { viewportWidth = 1200; observeWorkspace(); });
+    expect([left, right].map((part) => part.getAttribute("aria-valuenow"))).toEqual(["211", "211"]);
+  });
+
   it("집중 보기와 탭 왕복은 두 PTY와 패널 선호값, 미제출 입력, 채팅 초안을 유지한다", async () => {
     expect(status()).toContain("pty-10");
     await openSecond();
@@ -197,7 +245,7 @@ describe("L02", () => {
     expect(calls("open")).toHaveLength(2);
     expect(calls("close")).toHaveLength(0);
     expect(calls("input")).toEqual([{ id: "pty-11", bytes: Array.from(new TextEncoder().encode("echo B_READY")) }]);
-    expect(native.toggleMaximize).not.toHaveBeenCalled();
+    expect(native.invoke).not.toHaveBeenCalledWith("workspace_window", expect.anything());
   });
 
   it("숨은 탭의 출력과 종료는 활성 탭의 입력, 포커스, 상태를 바꾸지 않는다", async () => {
@@ -231,19 +279,39 @@ describe("L02", () => {
   });
 
   it("창 버튼은 키보드로 도달할 수 있고 닫기 오류가 나면 탭을 그대로 둔다", async () => {
-    native.close.mockRejectedValueOnce("거부됨");
+    native.invoke.mockImplementationOnce(async () => { throw "거부됨"; });
+    await press("닫기");
+    expect(status()).toContain("닫기 실패: 거부됨");
+    native.invoke.mockClear();
     const controls = [...find("header").querySelectorAll("button")].slice(-4);
     expect(controls.map((item) => item.getAttribute("aria-label"))).toEqual(["집중 보기", "최소화", "최대화/복원", "닫기"]);
     expect(controls.map((item) => item.tabIndex)).toEqual([0, 0, 0, 0]);
     for (const name of ["최소화", "최대화/복원", "닫기"]) await press(name);
-    expect(native.minimize).toHaveBeenCalledOnce();
-    expect(native.toggleMaximize).toHaveBeenCalledOnce();
-    expect(native.close).toHaveBeenCalledOnce();
-    expect(status()).toContain("닫기 실패: 거부됨");
+    expect(native.invoke.mock.calls).toEqual(["minimize", "toggleMaximize", "close"].map((action) => ["workspace_window", { action }]));
     expect(status()).toContain("pty-10");
     expect(calls("close")).toHaveLength(0);
-    const drag = [...host.querySelectorAll("[data-tauri-drag-region]")];
-    expect(drag).toHaveLength(2);
-    expect(drag.every((region) => !region.querySelector("button"))).toBe(true);
+  });
+
+  it("창 이동은 핸들과 여백에서만 시작하며 오류를 표시한다", async () => {
+    native.invoke.mockClear();
+    for (const selector of ['.workspace-tab button', '.workspace-mode', '.window-control.close']) {
+      await act(async () => {
+        find(selector).dispatchEvent(new MouseEvent("mousedown", { bubbles: true, detail: 1 }));
+      });
+    }
+    expect(native.invoke).not.toHaveBeenCalled();
+    native.invoke.mockImplementationOnce(async () => { throw "거부됨"; });
+    await act(async () => {
+      find('.workspace-handle').dispatchEvent(new MouseEvent("mousedown", { bubbles: true, detail: 1 }));
+    });
+    expect(status()).toContain("창 이동 실패: 거부됨");
+    await act(async () => {
+      find('.workspace-drag-gap').dispatchEvent(new MouseEvent("mousedown", { bubbles: true, detail: 2 }));
+      find('.workspace-drag-gap').dispatchEvent(new MouseEvent("dblclick", { bubbles: true, detail: 2 }));
+    });
+    expect(native.invoke.mock.calls).toEqual([
+      ["workspace_window", { action: "drag" }],
+      ["workspace_window", { action: "toggleMaximize" }],
+    ]);
   });
 });

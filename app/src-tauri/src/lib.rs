@@ -1,12 +1,15 @@
 mod terminal;
+mod workspace_window;
 
 use tauri::Manager;
 use terminal::{Sessions, ipc::*};
+use workspace_window::workspace_window;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let other_commands: fn(tauri::ipc::Invoke) -> bool = tauri::generate_handler![
         terminal_start, terminal_input, terminal_resize, terminal_ack, terminal_close,
+        workspace_window,
     ];
     tauri::Builder::default()
         .manage(Sessions::default())
