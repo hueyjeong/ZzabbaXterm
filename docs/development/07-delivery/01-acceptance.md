@@ -16,13 +16,13 @@
 
 1. **Red:** 개발 명령을 실행할 수 없는 새 시험 계정에서 무엇이 없는지 적는다. 빌드 식별자를 결정하고 [작업판의 T1–T8](../README.md#통과-지점)을 열어 필수 증거 중 없는 칸을 찾는다. 콘솔이 아닌 GUI 런처에서 실행할 것이므로 PATH가 다를 수 있다.
 2. **Green:** 각 네이티브 OS에서 같은 소스와 잠금 파일을 사용한다. `app/`에서 `npm ci`, `npm test`, `cargo test --locked --manifest-path src-tauri/Cargo.toml`을 실행한다. `src-tauri/tauri.conf.json`의 앱 식별자·버전과 `frontendDist`를 확인하고, 원격 페이지 권한이나 개발 서버 URL을 출시 자산에 추가하지 않는다. 제품이 소유한 로컬 CLI 및 helper는 각 티켓에서 정한 실행 파일 이름·경로로 패키징한다. 사용자가 선택해 설치하는 원격 헬퍼, AWS CLI/플러그인, SSH Agent, AI CLI는 구별한다. 실험용 프로필·토큰·사설 키는 번들에 포함하지 않는다.
-   **보조 실행 파일:** 배포 전용 `src-tauri/tauri.bundle.conf.json`의 `bundle.externalBin`에는 `binaries/zzabba`만 둔다. 아직 통합되지 않은 `zzabba-edit`와 askpass는 제외한다. `zzabba`는 Cargo의 기본 `local-cli` 기능으로 빌드하고, Tauri 배포 빌드에서는 기본 기능을 꺼서 같은 파일을 Cargo 타깃과 sidecar로 중복 포장하는 일을 피한다. GUI는 `package.default-run`으로 유지한다.
+   **보조 실행 파일:** 배포 전용 `src-tauri/tauri.bundle.conf.json`의 `bundle.externalBin`에 `binaries/zzabba`와 `binaries/zzabba-edit`를 둔다. 두 CLI는 Cargo의 기본 `local-cli` 기능으로 빌드하고, Tauri 배포 빌드에서는 기본 기능을 꺼서 Cargo 타깃과 sidecar로 중복 포장하지 않는다. GUI는 `package.default-run`으로 유지하며 askpass는 제외한다.
 
    **Linux 노드 전용:** 운영자는 노드와 같은 아키텍처의 Linux 빌드 환경에서 `app/`을 열고 `cargo build --release --locked --manifest-path src-tauri/Cargo.toml --no-default-features --features ai-control --bin zzabba-ai-control --target "$(rustc --print host-tuple)"`로 헬퍼를 빌드한다. 배포 위치는 [A02의 노드 준비 절차](../06-ai/02-dedicated.md#구현-순서)를 따른다. 이 타깃은 기본 Cargo·Tauri 빌드와 데스크톱 번들에서 제외한다.
 
-3. **번들 생성:** 각 OS의 [빌드 사전 요구 사항](../00-start/01-bootstrap.md#준비물)을 갖추고 `app/`에서 `npm ci` 후 `npm run bundle`을 실행한다. 스크립트는 `cargo metadata --locked --no-deps`의 `target_directory`와 `rustc --print host-tuple`을 사용한다. 같은 네이티브 타깃에서 `--locked`로 `zzabba`를 빌드해 `src-tauri/binaries/zzabba-<타깃 트리플>`(Windows는 `.exe` 포함)에 복사한 뒤 서명 없이 Windows NSIS 또는 Ubuntu deb를 생성한다. 기본 Tauri 설정에는 sidecar 경로가 없어 깨끗한 작업트리에서 별도 준비 없이 개발할 수 있다. Tauri가 출력한 `release/bundle/` 아래 설치 파일의 경로·버전·아키텍처와 SHA-256(Windows `Get-FileHash -Algorithm SHA256`, Ubuntu `sha256sum`)을 기록한다.
+3. **번들 생성:** 각 OS의 [빌드 사전 요구 사항](../00-start/01-bootstrap.md#준비물)을 갖추고 `app/`에서 `npm ci` 후 `npm run bundle`을 실행한다. 스크립트는 `cargo metadata --locked --no-deps`의 `target_directory`와 `rustc --print host-tuple`을 사용한다. 같은 네이티브 타깃에서 `--locked`로 두 CLI를 빌드해 `src-tauri/binaries/<이름>-<타깃 트리플>`(Windows는 `.exe` 포함)에 복사한 뒤 Windows NSIS 또는 Ubuntu deb를 생성한다. 기본 Tauri 설정은 sidecar 준비 없이 개발할 수 있다. `release/bundle/` 아래 설치 파일의 경로·버전·아키텍처와 SHA-256(Windows `Get-FileHash -Algorithm SHA256`, Ubuntu `sha256sum`)을 기록한다.
 
-   설치 전에 Windows는 7-Zip이 있으면 `7z l <설치 파일.exe>`로 `zzabba.exe`를, Ubuntu는 `dpkg-deb -c <설치 파일.deb>`로 `./usr/bin/zzabba`를 확인한다. 두 목록에서 제외한 헬퍼가 없는지 확인한다. 번들 생성과 설치 후 실행은 별도로 판정한다.
+   설치 전에 Windows `7z l <설치 파일.exe>` 또는 Ubuntu `dpkg-deb -c <설치 파일.deb>`로 `zzabba`와 `zzabba-edit`가 포함되고 제외한 헬퍼가 없는지 확인한다. 번들 생성과 설치 후 실행은 별도로 판정한다.
 4. **실제 설치:** 승인된 시험 PC/계정에 같은 해시의 설치 파일을 전달한다. Windows는 생성된 설치 파일, Ubuntu는 생성된 `.deb`와 패키지 관리자를 사용한다. 서명이나 조직 정책이 설치를 막으면 배포 담당자에게 서명된 시험본을 요청하고 `미실행(설치 정책)`으로 기록한다. 설치 후 시작 메뉴·앱 목록에서 실행해 위 세 시나리오를 시연한다.
 
    개발 소스가 없는 시험 계정에서 GUI를 연 뒤 Windows PowerShell은 `& '<설치 폴더>\zzabba.exe' list`, Ubuntu는 `/usr/bin/zzabba list`를 실행한다. Windows의 `zzabba.exe`는 설치한 GUI 실행 파일 옆에 있다. 파일 경로·SHA-256과 목록 응답(빈 목록 포함)을 기록한다. 전역 PATH 변경 없이 설치한 CLI가 설치본 GUI에 연결되는 것이 통과 기준이다.
