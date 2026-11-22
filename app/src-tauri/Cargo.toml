@@ -21,6 +21,10 @@ tauri = { version = "2", features = [] }
 portable-pty = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+getrandom = "0.4"
+shlex = "2"
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "time"] }
+tokio-util = "0.7"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

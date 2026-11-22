@@ -21,6 +21,25 @@
 5. **자동 검증 후 T3를 시연한다.** 모든 명령은 후속 구현 시 실행한다. `app/`에서 `npx vitest run src/features/ssm/ssm.test.ts`, `cargo test --manifest-path src-tauri/Cargo.toml ssm`의 실제 시험 건수를 기록하고 `npm run tauri dev`로 앱을 연다. 각 OS의 일반 터미널에서 4단계 기준선 명령의 꺾쇠 값을 시험 값으로 치환해 `whoami` 결과를 확인하고 `exit`한다. 앱 마법사와 두 탭에서 같은 노드로 반복한다. 한 탭을 닫은 뒤 `aws ssm describe-sessions --state History --filters key=SessionId,value=<종료한-AWS-ID> --profile <profile> --region <region>`의 `Terminated`와 남은 탭의 새 `whoami` 응답을 대조한다. 실패 조건은 각각 준비한 시험 환경에서 재현하며 다른 사용자의 캐시·권한·Agent를 바꾸지 않는다.
 6. **T1 원격을 별도로 판정한다.** 각 OS의 실제 SSM 탭에서 앞에 `A`를 입력한 뒤 물리 두벌식 키로 `ㅎ → ㅏ → ㄴ → Backspace`를 눌러 `한 → 하`를 본다. `ㄴ`과 공백으로 확정해 `A한 `이 되고, Backspace 두 번으로 `A`만 남아야 한다. 입력은 제출하지 말고 취소한다. 앱 내부 합성 이벤트나 로컬 PTY 결과로 대체하지 않는다.
 
+### 검색 IPC 통합
+
+Tauri 빌더는 `ssm::ipc::lifecycle()`을 플러그인으로 등록한다. 앱 호출 처리기는 `ssm::ipc::COMMAND`를 받으면 `ssm::ipc::dispatch(invoke)`를 동기적으로 호출하고 `true`를 반환한다. 빌드의 `AppManifest`는 `ssm_discovery`를 등록하며, `allow-ssm-discovery`는 로컬 `main` 웹뷰에만 부여한다. 수명 플러그인에는 별도 호출 명령이 없다.
+
+JS는 문서에서 `window.__ZZABBA_SSM_DOCUMENT__`를 읽는다. 아직 값이 없으면 `zzabba:ssm-document`를 기다린 뒤 읽고, 대기 중 취소되면 호출하지 않는다. 호출 형식은 `invoke("ssm_discovery", { document, request })`이며, 하나의 작업에는 시작 시 읽은 문서 값을 끝까지 사용한다.
+
+| `request` | 성공 값 |
+|---|---|
+| `{ action: "reserve" }` | 문자열 `requestId` |
+| `{ action: "run", requestId, operation: { kind: "listProfiles" } }` | SSO 후보 `string[]` |
+| `{ action: "run", requestId, operation: { kind: "configuredRegion", profile } }` | `string \| null` |
+| `{ action: "run", requestId, operation: { kind: "listOnlineNodes", profile, region } }` | `{ instanceId: string }[]` |
+| `{ action: "relogin", requestId }` | `null` |
+| `{ action: "cancel", requestId }` | `null` |
+
+명령 실패는 `{ code }`로 거부된다. `SsoLoginRequired`를 반환한 노드 조회만 해당 ID로 한 번 재로그인할 수 있다. 사용자가 재로그인을 고르면 같은 ID를 보내고, 성공하면 새 ID로 같은 프로필·리전을 조회한다. 취소가 ID 발급보다 먼저 오면 발급 직후 `cancel`만 호출한다. 프로필·리전 전환 또는 마법사 닫기에서는 대기 중인 요청과 미사용 만료 ID를 `cancel`로 정리한다. 문서 전환·창 종료에서는 Rust가 해당 문서의 요청을 취소한다.
+
+격리 시험: `cargo test --manifest-path app/src-tauri/Cargo.toml ssm::ipc::tests`.
+
 **완료 증거:** `Windows SSM T1 / Ubuntu SSM T1 / Windows T3 / Ubuntu T3` 네 결과에 OS·WebView·입력기·CLI/플러그인 버전과 실제 관찰을 적는다. T3에는 실패별 화면 상태와 마법사 시험·탭별 세션 정리 근거를 포함한다. 계정·노드·세션 ID는 일관된 별칭으로 가리고 토큰·로그인 URL은 제외한다. 접근할 수 없는 조합은 `미실행(사유)`, macOS는 후속 실기기 검증이다.
 
 참고: [Session Manager 시작](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-sessions-start.html) · [세션 상태 조회](https://docs.aws.amazon.com/cli/latest/reference/ssm/describe-sessions.html)
