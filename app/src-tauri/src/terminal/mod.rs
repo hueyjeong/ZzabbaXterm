@@ -6,6 +6,8 @@ use std::{
 
 pub(crate) mod ipc;
 mod process;
+#[cfg(all(test, any(windows, unix)))]
+mod pty_flow_tests;
 #[cfg(test)]
 mod tests;
 
