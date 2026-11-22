@@ -1,4 +1,6 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties, type MouseEvent, type SyntheticEvent } from "react";
+import { invoke, isTauri } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { LocalAiPanel } from "../ai/LocalAiPanel";
 import { createLocalConnectionIpc, type SavedConnections } from "../connections/connectionIpc";
 import { LocalConnectionWizard } from "../connections/LocalConnectionWizard";
@@ -72,6 +74,8 @@ export function Workspace() {
   const sftpPanels = useRef(new Map<string, SftpPanelActions>());
   const editorActions = useRef(new Map<number, EditorTabActions>());
   const cliMounts = useRef(new Map<number, (mounted: boolean) => void>());
+  const pendingEditorMounts = useRef(new Set<number>());
+  const closingWindow = useRef(false);
   const openingFile = useRef(false);
   const [filePickerBusy, setFilePickerBusy] = useState(false);
   const [fileError, setFileError] = useState("");
@@ -82,7 +86,9 @@ export function Workspace() {
   useLayoutEffect(() => {
     liveTabs.current = tabs;
     for (const tab of tabs) {
-      if (tab.kind === "editor" && tab.attaching) cliMounts.current.get(tab.id)?.(editorActions.current.has(tab.id));
+      if (tab.kind !== "editor") continue;
+      pendingEditorMounts.current.delete(tab.id);
+      if (tab.attaching) cliMounts.current.get(tab.id)?.(editorActions.current.has(tab.id));
     }
   }, [tabs]);
   const [focused, setFocused] = useState(false);
@@ -94,6 +100,7 @@ export function Workspace() {
   const [treeWidth, setTreeWidth] = useState(280);
   const [aiWidth, setAiWidth] = useState(360);
   const [bodyWidth, setBodyWidth] = useState(1200);
+  const workspace = useRef<HTMLElement>(null);
   const body = useRef<HTMLDivElement>(null);
   const activeButton = useRef<HTMLButtonElement>(null);
   const sideLimit = Math.min(640, Math.floor(bodyWidth * 0.32));
@@ -101,10 +108,86 @@ export function Workspace() {
   const right = Math.min(aiWidth, sideLimit);
 
   useEffect(() => {
+    if (!isTauri()) return;
+    let disposed = false;
+    let answeredId: string | undefined;
+    const target = { kind: "Webview", label: "main" } as const;
+    const registration = Promise.resolve().then(() => {
+      if (disposed) return;
+      return listen<{ requestId: string }>("workspace-close-requested", ({ payload }) => {
+        const requestId = payload?.requestId;
+        if (typeof requestId === "string" && requestId) void respond(requestId);
+      }, { target });
+    });
+
+    async function respond(requestId: string) {
+      if (disposed || closingWindow.current || requestId === answeredId) return;
+      answeredId = requestId;
+      setWindowError("");
+      let blocked = openingFile.current ? "파일 선택 중 · 창 닫기 보류" :
+        cliMounts.current.size ? "CLI 편집 탭 연결 중 · 창 닫기 보류" :
+        pendingEditorMounts.current.size ? "편집 탭 여는 중 · 창 닫기 보류" : "";
+      const discard: string[] = [];
+      for (const tab of liveTabs.current) {
+        if (blocked) break;
+        if (tab.kind !== "editor") continue;
+        const state = editorActions.current.get(tab.id)?.closeState();
+        if (tab.attaching || !state || state.pending) {
+          blocked = `${tab.label}: 편집 작업 중 · 창 닫기 보류`;
+          break;
+        }
+        if (state.dirty || state.uncertain) discard.push(tab.label);
+      }
+      const element = workspace.current;
+      // showModal()로 열린 대화상자는 상위 요소의 inert를 상속하지 않는다.
+      const dialog = element?.querySelector<HTMLDialogElement>("dialog[open]:not([inert])");
+      const focusedElement = document.activeElement;
+      const blockCancel = (event: Event) => {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      };
+      let approved = false;
+      try {
+        if (blocked) setWindowError(blocked);
+        approved = !blocked && (!discard.length || window.confirm(
+          `저장되지 않았거나 저장을 확인할 수 없는 파일:\n\n${discard.join("\n")}\n\n편집 내용을 버리고 창을 닫을까요?`,
+        ));
+        if (approved) {
+          closingWindow.current = true;
+          element?.setAttribute("inert", "");
+          dialog?.setAttribute("inert", "");
+          dialog?.addEventListener("cancel", blockCancel, { capture: true });
+          if (focusedElement instanceof HTMLElement && element?.contains(focusedElement)) focusedElement.blur();
+        }
+        await invoke("workspace_window", { action: "respondToClose", requestId, approved });
+      } catch (error) {
+        if (approved) {
+          closingWindow.current = false;
+          element?.removeAttribute("inert");
+          dialog?.removeAttribute("inert");
+          dialog?.removeEventListener("cancel", blockCancel, { capture: true });
+          if (focusedElement instanceof HTMLElement && element?.contains(focusedElement)) focusedElement.focus();
+        }
+        if (answeredId === requestId) {
+          answeredId = undefined;
+          if (!disposed) setWindowError(`닫기 실패: ${String(error)}`);
+        }
+      }
+    }
+    void registration.catch((error: unknown) => {
+      if (!disposed) setWindowError(`창 닫기 연결 실패: ${String(error)}`);
+    });
+    return () => {
+      disposed = true;
+      void registration.then(unlisten => unlisten?.(), () => {});
+    };
+  }, []);
+
+  useEffect(() => {
     const attachingHandles = new Set<ApprovedEditorFile["handle"]>();
     const report = (error: unknown) => setFileError(`CLI 파일 열기 실패: ${localEditorError(error).message}`);
     const unsubscribe = subscribeLocalCliOpen(async (file, respond, signal) => {
-      if (signal.aborted || attachingHandles.has(file.handle) || liveTabs.current.some(tab =>
+      if (closingWindow.current || signal.aborted || attachingHandles.has(file.handle) || liveTabs.current.some(tab =>
         tab.kind === "editor" && tab.source === "local" && tab.file.handle === file.handle)) return;
       attachingHandles.add(file.handle);
       const id = nextTab.current++;
@@ -301,14 +384,27 @@ export function Workspace() {
     }
   }
 
+  function releaseEditorFile(source: EditorSource, close: () => Promise<void>) {
+    void close().catch((error: unknown) => {
+      const message = source === "local" ? localEditorError(error).message : source === "sftp" ? sftpError(error).message
+        : error instanceof Error ? error.message : String(error);
+      setFileError(`파일 닫기 실패: ${message}`);
+    });
+  }
+
   function openEditorTab(file: ApprovedEditorFile, transport: EditorTransport, close: () => Promise<void>, source: EditorSource) {
+    if (closingWindow.current) {
+      releaseEditorFile(source, close);
+      return;
+    }
     const id = nextTab.current++;
+    pendingEditorMounts.current.add(id);
     setTabs((current) => [...current, { id, label: file.label, kind: "editor", file, transport, close, source }]);
     selectTab(id);
   }
 
   async function openEditor() {
-    if (openingFile.current) return;
+    if (openingFile.current || closingWindow.current) return;
     openingFile.current = true;
     setFilePickerBusy(true);
     setFileError("");
@@ -425,8 +521,16 @@ export function Workspace() {
     "--center-left": `${splitPosition}fr`, "--center-right": `${100 - splitPosition}fr`,
   } as CSSProperties;
 
+  function blockClosingInput(event: SyntheticEvent) {
+    if (!closingWindow.current) return;
+    event.preventDefault();
+    event.stopPropagation();
+  }
+
   return (
-    <main className={`workspace${macTitleBar ? " workspace-mac" : ""}${focused ? " workspace-focused" : ""}`} style={layout}
+    <main ref={workspace} className={`workspace${macTitleBar ? " workspace-mac" : ""}${focused ? " workspace-focused" : ""}`} style={layout}
+      onClickCapture={blockClosingInput} onMouseDownCapture={blockClosingInput}
+      onKeyDownCapture={blockClosingInput} onPointerMoveCapture={blockClosingInput}
       onFocusCapture={(event) => { if (!event.target.closest(".terminal-screen, .monaco-editor")) setFocusTab(null); }}>
       <TitleBar focused={focused} onToggle={() => setFocused(!focused)} onWindowError={setWindowError}
         onOpenRdp={() => openDesktop("rdp")} onOpenVnc={() => openDesktop("vnc")}>
@@ -539,11 +643,7 @@ export function Workspace() {
                   onClose={(handle) => {
                     if (tab.attaching || handle !== tab.file.handle) return;
                     void closeTab(id);
-                    void tab.close().catch((error: unknown) => {
-                      const message = tab.source === "local" ? localEditorError(error).message : tab.source === "sftp" ? sftpError(error).message
-                        : error instanceof Error ? error.message : String(error);
-                      setFileError(`파일 닫기 실패: ${message}`);
-                    });
+                    releaseEditorFile(tab.source, tab.close);
                   }} />
               )}
             </div>;

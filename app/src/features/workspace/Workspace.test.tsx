@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import type { EventCallback } from "@tauri-apps/api/event";
-import { act } from "react";
+import { act, StrictMode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../../App";
@@ -72,6 +72,8 @@ let runStorage: (command: string, args: unknown) => Promise<unknown>;
 let runSftp: (command: string, args: unknown) => Promise<unknown>;
 let runTunnel: (command: string, args: unknown) => Promise<unknown>;
 let receiveCliOpen: EventCallback<{ requestId: string }> | undefined;
+let receiveWindowClose: EventCallback<{ requestId: string }> | undefined;
+let respondToWindowClose: () => Promise<void>;
 let runCliEditor: (command: string, args: { attached?: boolean }) => Promise<unknown>;
 let openFile: () => Promise<unknown>;
 let saveFile: () => Promise<unknown>;
@@ -117,9 +119,18 @@ beforeEach(async () => {
   runSftp = async command => { throw new Error(`예상하지 않은 SFTP 명령: ${command}`); };
   runTunnel = async command => { throw new Error(`예상하지 않은 터널 명령: ${command}`); };
   receiveCliOpen = undefined;
+  receiveWindowClose = undefined;
+  respondToWindowClose = async () => {};
   native.listen.mockImplementation(async (event, receive) => {
-    if (event === "editor-local-cli-open") receiveCliOpen = receive;
-    return () => { receiveCliOpen = undefined; };
+    if (event === "editor-local-cli-open") {
+      receiveCliOpen = receive;
+      return () => { receiveCliOpen = undefined; };
+    }
+    if (event === "workspace-close-requested") {
+      receiveWindowClose = receive;
+      return () => { receiveWindowClose = undefined; };
+    }
+    return () => {};
   });
   runCliEditor = async command => { throw new Error(`예상하지 않은 CLI 편집 명령: ${command}`); };
   openFile = async () => ({ status: "cancelled" });
@@ -137,6 +148,7 @@ beforeEach(async () => {
     if (command.startsWith("editor_local_cli_")) return runCliEditor(command, args);
     if (command === "editor_local_open") return openFile();
     if (command === "editor_local_save") return saveFile();
+    if (command === "workspace_window" && args.action === "respondToClose") return respondToWindowClose();
     if (command === "terminal_start") return starts.get(args.id);
     if (command === "terminal_close") return closeTerminal(args.id);
     if (command !== "terminal_open") return;
@@ -217,6 +229,14 @@ async function restartWorkspace() {
   await act(async () => { root.render(<App />); });
 }
 
+async function requestWindowClose(requestId: string) {
+  expect(receiveWindowClose).toBeDefined();
+  await act(async () => { void receiveWindowClose?.({ event: "workspace-close-requested", id: 1, payload: { requestId } }); });
+}
+
+const closeReplies = () => connectionCalls("workspace_window").map(([, args]) => args)
+  .filter(args => args.action === "respondToClose");
+
 const status = () => find("footer").textContent;
 const tree = () => find('[role="tree"]');
 async function openSecond() {
@@ -226,6 +246,116 @@ async function openSecond() {
   expect(document.activeElement).toBe(find('[role="treeitem"]:not([aria-expanded])'));
   await key(document.activeElement as HTMLElement, "Enter");
 }
+
+describe("작업 공간 창 닫기", () => {
+  it("제목줄은 네이티브 닫기만 요청하고 깨끗한 창은 모달 없이 승인한다", async () => {
+    await act(async () => { root.unmount(); });
+    native.listen.mockClear();
+    root = createRoot(host);
+    await act(async () => { root.render(<StrictMode><App /></StrictMode>); });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    await press("닫기");
+    expect(connectionCalls("workspace_window")).toEqual([["workspace_window", { action: "close" }]]);
+    expect(find("main").hasAttribute("inert")).toBe(false);
+    await requestWindowClose("clean");
+    await requestWindowClose("clean");
+    expect(native.listen.mock.calls.filter(([event]) => event === "workspace-close-requested")).toEqual([
+      ["workspace-close-requested", expect.any(Function), { target: { kind: "Webview", label: "main" } }],
+    ]);
+    expect(confirm).not.toHaveBeenCalled();
+    expect(closeReplies()).toEqual([{ action: "respondToClose", requestId: "clean", approved: true }]);
+    expect(find("main").hasAttribute("inert")).toBe(true);
+  });
+
+  it("숨은 미저장 파일과 저장 결과가 불확실한 파일을 한 번에 확인하고 취소하면 편집을 유지한다", async () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    openFile = async () => ({ status: "opened", handle: "dirty-file", name: "미저장.txt", text: "원본" });
+    await press("파일 열기");
+    const dirty = editor.getModels().find(model => model.uri.query === "dirty-file")!;
+    await act(async () => dirty.setValue("편집본"));
+    openFile = async () => ({ status: "opened", handle: "uncertain-file", name: "저장 미확인.txt", text: "원본" });
+    await press("파일 열기");
+    expect(confirm).not.toHaveBeenCalled();
+    const uncertain = editor.getModels().find(model => model.uri.query === "uncertain-file")!;
+    const version = uncertain.getAlternativeVersionId();
+    await act(async () => uncertain.pushEditOperations(null, [{
+      range: { startLineNumber: 1, startColumn: 1, endLineNumber: 1, endColumn: 1 }, text: "수정 ",
+    }], () => null));
+    saveFile = async () => { throw { kind: "publicationUnconfirmed" }; };
+    await press("저장");
+    await act(async () => uncertain.undo());
+    expect(uncertain.getAlternativeVersionId()).toBe(version);
+
+    await requestWindowClose("discard");
+    await requestWindowClose("discard");
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("미저장.txt\n저장 미확인.txt"));
+    expect(closeReplies()).toEqual([{ action: "respondToClose", requestId: "discard", approved: false }]);
+    expect(button("저장 미확인.txt")?.getAttribute("aria-pressed")).toBe("true");
+    expect(dirty.getValue()).toBe("편집본");
+    expect(uncertain.getValue()).toBe("원본");
+    expect(find("main").hasAttribute("inert")).toBe(false);
+    expect(connectionCalls("editor_local_close")).toEqual([]);
+  });
+
+  it("승인 뒤 조작을 막고 네이티브 닫기 실패 시 편집과 포커스를 되살린다", async () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const response = Promise.withResolvers<void>();
+    respondToWindowClose = () => response.promise;
+    openFile = async () => ({ status: "opened", handle: "keep-file", name: "유지.txt", text: "원본" });
+    await press("파일 열기");
+    const model = editor.getModels().find(item => item.uri.query === "keep-file")!;
+    await act(async () => model.setValue("편집본"));
+    const previousFocus = document.activeElement;
+    await requestWindowClose("approve");
+    expect(find("main").hasAttribute("inert")).toBe(true);
+    await press("파일 열기");
+    await press("유지.txt 닫기");
+    expect(connectionCalls("editor_local_open")).toHaveLength(1);
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(button("유지.txt")).toBeDefined();
+
+    await act(async () => response.reject("종료 확인 불가"));
+    expect(status()).toContain("닫기 실패: 종료 확인 불가");
+    expect(find("main").hasAttribute("inert")).toBe(false);
+    expect(document.activeElement).toBe(previousFocus);
+    expect(model.getValue()).toBe("편집본");
+    await press("저장");
+    expect(connectionCalls("editor_local_save")).toEqual([["editor_local_save", { handle: "keep-file", text: "편집본" }]]);
+    respondToWindowClose = async () => {};
+    await requestWindowClose("retry");
+    expect(closeReplies().map(({ requestId, approved }) => [requestId, approved])).toEqual([["approve", true], ["retry", true]]);
+    expect(confirm).toHaveBeenCalledTimes(1);
+  });
+
+  it("열린 연결 추가 모달도 승인 중에는 잠기고 닫기 실패 후 다시 조작할 수 있다", async () => {
+    const response = Promise.withResolvers<void>();
+    respondToWindowClose = () => response.promise;
+    await press("연결 추가");
+    const dialog = find<HTMLDialogElement>('dialog[aria-label="연결 추가"]');
+    await requestWindowClose("wizard-open");
+    expect(dialog.hasAttribute("inert")).toBe(true);
+    await act(async () => { dialog.dispatchEvent(new Event("cancel", { cancelable: true })); });
+    expect(dialog.open).toBe(true);
+    await act(async () => response.reject("종료 실패"));
+    expect(dialog.hasAttribute("inert")).toBe(false);
+    await press("취소");
+    expect(host.querySelector('dialog[aria-label="연결 추가"]')).toBeNull();
+  });
+
+  it("파일 선택 중에는 확인 없이 닫기를 거절하고 파일 선택은 계속한다", async () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const picker = Promise.withResolvers<unknown>();
+    openFile = () => picker.promise;
+    await press("파일 열기");
+    await requestWindowClose("picker");
+    expect(status()).toContain("파일 선택 중 · 창 닫기 보류");
+    expect(confirm).not.toHaveBeenCalled();
+    expect(closeReplies()).toEqual([{ action: "respondToClose", requestId: "picker", approved: false }]);
+    await act(async () => picker.resolve({ status: "opened", handle: "picked", name: "선택.txt", text: "원본" }));
+    expect(button("선택.txt")?.getAttribute("aria-pressed")).toBe("true");
+  });
+});
 
 describe("중앙 원격 화면", () => {
   function dispatchTrusted(target: HTMLElement, event: Event) {
@@ -398,6 +528,18 @@ describe("CLI 로컬 파일 열기", () => {
     await act(async () => receiveCliOpen!({ event: "editor-local-cli-open", id: 1, payload: { requestId } }));
   }
 
+  it("승인된 창 닫기 중에 도착한 CLI 파일은 부착하지 않는다", async () => {
+    const response = Promise.withResolvers<void>();
+    respondToWindowClose = () => response.promise;
+    await requestWindowClose("before-cli");
+    await openFromCli(() => { throw new Error("부착이 차단되지 않았습니다"); });
+    expect(connectionCalls("editor_local_cli_respond")).toEqual([
+      ["editor_local_cli_respond", { requestId, handle, attached: false }],
+    ]);
+    expect(button(file.name)).toBeUndefined();
+    await act(async () => response.resolve());
+  });
+
   it("마운트한 편집 탭의 정확한 핸들을 부착하고 해당 탭을 닫을 때만 파일을 닫는다", async () => {
     const attached = Promise.withResolvers<void>();
     let textAtAttach: string | undefined;
@@ -412,6 +554,9 @@ describe("CLI 로컬 파일 열기", () => {
     expect(connectionCalls("editor_local_cli_respond")).toEqual([
       ["editor_local_cli_respond", { requestId, handle, attached: true }],
     ]);
+    await requestWindowClose("cli-mount");
+    expect(status()).toContain("CLI 편집 탭 연결 중 · 창 닫기 보류");
+    expect(closeReplies()).toEqual([{ action: "respondToClose", requestId: "cli-mount", approved: false }]);
     expect(find(preview).hidden).toBe(true);
     expect(button("로컬 1")?.getAttribute("aria-pressed")).toBe("true");
     await press("로컬 2");
@@ -1320,6 +1465,11 @@ describe("C02 SSM 연결", () => {
     expect(model.getValue()).toBe("첫 편집");
     await press("저장");
     expect(connectionCalls("editor_local_save")).toEqual([["editor_local_save", { handle: "selected-file", text: "첫 편집" }]]);
+    await press("로컬 1");
+    await requestWindowClose("save-pending");
+    expect(status()).toContain("시험.txt: 편집 작업 중 · 창 닫기 보류");
+    expect(closeReplies()).toEqual([{ action: "respondToClose", requestId: "save-pending", approved: false }]);
+    await press("시험.txt");
     const confirm = vi.spyOn(window, "confirm").mockReturnValueOnce(false).mockReturnValueOnce(true);
     await press("시험.txt 닫기");
     expect(confirm).not.toHaveBeenCalled();
@@ -1849,6 +1999,57 @@ describe("현재 SSH 세션의 SFTP", () => {
     expect(calls("open").slice(openBaseline)).toHaveLength(2);
     expect(calls("close").slice(closeBaseline)).toEqual([{ id: first.id }, { id: first.id }]);
     expect(calls("input")).toEqual([{ id: second.id, bytes: Array.from(new TextEncoder().encode("READY")) }]);
+  });
+
+  it("창 닫기를 승인한 뒤 도착한 SFTP와 S3 편집 핸들을 각각 반납한다", async () => {
+    const sftpOpen = Promise.withResolvers<unknown>();
+    const storageOpen = Promise.withResolvers<unknown>();
+    const response = Promise.withResolvers<void>();
+    respondToWindowClose = () => response.promise;
+    runSftp = async command => {
+      if (command === "editor_sftp_attach") return { entries: [{ entryId: "remote", name: "원격.txt", isDirectory: false }], parentEntryId: null };
+      if (command === "editor_sftp_open") return sftpOpen.promise;
+      if (command === "editor_sftp_close" || command === "editor_sftp_detach") return;
+      throw new Error(command);
+    };
+    const location = { bucket: "bucket-0", prefix: "saved-0/", region: "ap-northeast-2" };
+    let storageId = "";
+    runStorage = async (command, args) => {
+      if (command === "storage_open") {
+        const request = args && typeof args === "object" && "request" in args ? args.request : undefined;
+        if (!request || typeof request !== "object" || !("id" in request) || typeof request.id !== "string") throw new Error("개설 ID 없음");
+        storageId = request.id;
+        return { ok: true, value: { sessionId: storageId, profile: "dev", endpoint: "https://s3.example.invalid", region: location.region, location } };
+      }
+      if (command === "storage_list_objects") return { ok: true, value: {
+        rows: [{ kind: "object", key: "saved-0/객체.txt", rowId: "object", bytes: 3 }], nextToken: null,
+      } };
+      if (command === "storage_count_previous_files") return { ok: true, value: 0 };
+      if (command === "storage_edit_open") return storageOpen.promise;
+      if (command === "storage_edit_close" || command === "storage_close") return true;
+      throw new Error(command);
+    };
+    const ssh = await openSsh("서버 A");
+    await press("파일");
+    await key(button("원격.txt")!, "ContextMenu");
+    await press("편집");
+    await openTarget("개발 버킷");
+    await key(button("saved-0/객체.txt")!, "ContextMenu");
+    await press("편집");
+    expect(connectionCalls("editor_sftp_open")).toHaveLength(1);
+    expect(connectionCalls("storage_edit_open")).toHaveLength(1);
+
+    await requestWindowClose("late-files");
+    expect(closeReplies()).toEqual([{ action: "respondToClose", requestId: "late-files", approved: true }]);
+    await act(async () => {
+      sftpOpen.resolve({ handle: "late-sftp", name: "늦은 원격.txt", text: "원본" });
+      storageOpen.resolve({ handle: "late-s3", label: "늦은 객체.txt", text: "원본" });
+    });
+    expect(button("늦은 원격.txt")).toBeUndefined();
+    expect(button("늦은 객체.txt")).toBeUndefined();
+    expect(connectionCalls("editor_sftp_close")).toEqual([["editor_sftp_close", { sessionId: ssh.id, handle: "late-sftp" }]]);
+    expect(connectionCalls("storage_edit_close")).toEqual([["storage_edit_close", { request: { sessionId: storageId, handle: "late-s3" } }]]);
+    await act(async () => response.resolve());
   });
 
   it("SFTP 종료 확인 뒤 해당 SSH만 닫고 원격 편집 버퍼와 파일별 닫기 흐름을 유지한다", async () => {
