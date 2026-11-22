@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     connections::{profile::{MethodRef, Ssh, SshAuth, SshTransport}, with_saved_method, with_saved_ssh},
     ssh::registration::confirm_tunnel,
+    workspace_window::EXPIRED,
 };
 
 use super::{Destination, Owner, Route, State, TunnelId, Tunnels, View,
@@ -19,6 +20,8 @@ const STATUS: &str = "tunnel_status";
 const SHARE: &str = "tunnel_share";
 const CLOSE: &str = "tunnel_tab_close";
 const STALE: &str = "터널 탭이 닫혔습니다";
+const CLOSING: &str = "창을 닫는 중입니다";
+const APPROVAL_PENDING: &str = "열려 있는 SSH 터널 승인 창을 먼저 닫으세요";
 const LIMIT: usize = 32;
 
 #[derive(Default)]
@@ -29,9 +32,17 @@ struct Document {
     epoch: u64,
     destroyed: bool,
     approving: bool,
+    close_request: Option<String>,
     tabs: HashMap<String, Tab>,
     entries: HashMap<TunnelId, Entry>,
     tunnels: Tunnels<SshChild>,
+}
+
+impl Document {
+    fn ensure_not_closing(&self) -> Result<(), &'static str> {
+        if self.close_request.is_some() { return Err(CLOSING); }
+        Ok(())
+    }
 }
 
 struct Tab {
@@ -291,12 +302,25 @@ fn desktop_listener(route: &Route, target: &str, expected: &Destination) -> Resu
 impl TunnelTabs {
     pub(crate) fn epoch(&self) -> u64 { self.0.lock().unwrap().epoch }
 
-    /// 현재 기본 창을 실제로 닫기 직전에 그래픽 전용 전달의 자식 종료를 확인한다.
-    pub(crate) fn confirm_desktop_cleanup(&self, epoch: u64) -> Result<(), String> {
-        let mut doc = self.document(epoch)?;
+    /// 작업자에서만 실행한다. 성공한 게이트는 창이 파괴될 때까지 유지한다.
+    /// 실패한 닫기 요청은 입력을 복원하기 전에 같은 ID로 게이트를 해제한다.
+    pub(crate) fn confirm_desktop_cleanup(&self, epoch: u64, request_id: &str, revoked: &CancellationToken) -> Result<(), String> {
+        let mut doc = self.document(epoch).map_err(|_| EXPIRED)?;
+        if revoked.is_cancelled() { return Err(EXPIRED.into()); }
+        doc.ensure_not_closing()?;
+        if doc.approving { return Err(APPROVAL_PENDING.into()); }
+        doc.close_request = Some(request_id.into());
         let Document { entries, tunnels, .. } = &mut *doc;
         tunnels.confirm_desktop_cleanup(&epoch.to_string(), |id| { entries.remove(&id); })
             .map_err(|error| format!("SSH 터널 종료 확인 불가: {error}"))
+    }
+
+    pub(crate) fn release_desktop_close_gate(&self, epoch: u64, request_id: &str) {
+        if let Ok(mut doc) = self.document(epoch)
+            && doc.close_request.as_deref() == Some(request_id)
+        {
+            doc.close_request = None;
+        }
     }
 
     pub(crate) fn navigate(&self, destroyed: bool) {
@@ -305,6 +329,7 @@ impl TunnelTabs {
         let window = doc.epoch.to_string();
         doc.epoch += 1;
         doc.destroyed = destroyed;
+        doc.close_request = None;
         doc.tabs.clear();
         doc.entries.clear();
         doc.tunnels.revoke_desktops();
@@ -317,9 +342,15 @@ impl TunnelTabs {
         }
     }
 
-    fn document(&self, epoch: u64) -> Result<std::sync::MutexGuard<'_, Document>, String> {
+    fn document(&self, epoch: u64) -> Result<std::sync::MutexGuard<'_, Document>, &'static str> {
         let doc = self.0.lock().unwrap();
-        if doc.epoch != epoch || doc.destroyed { return Err(STALE.into()); }
+        if doc.epoch != epoch || doc.destroyed { return Err(STALE); }
+        Ok(doc)
+    }
+
+    fn writable_document(&self, epoch: u64) -> Result<std::sync::MutexGuard<'_, Document>, &'static str> {
+        let doc = self.document(epoch)?;
+        doc.ensure_not_closing()?;
         Ok(doc)
     }
 
@@ -332,7 +363,7 @@ impl TunnelTabs {
                 _ => Err("저장된 SSH 또는 SSM 대상이 필요합니다".into()),
             })?,
         };
-        let mut doc = self.document(epoch)?;
+        let mut doc = self.writable_document(epoch)?;
         if doc.tabs.len() >= LIMIT { return Err("열 수 있는 터널 탭 수를 초과했습니다".into()); }
         let mut nonce = [0; 16];
         getrandom::fill(&mut nonce).map_err(|_| "터널 탭 ID를 발급할 수 없습니다")?;
@@ -348,7 +379,7 @@ impl TunnelTabs {
             return Err(request.ssm_error());
         }
         let (target, owner, approved) = {
-            let doc = self.document(epoch)?;
+            let doc = self.writable_document(epoch)?;
             let tab = doc.tabs.get(handle).filter(|tab| doc.tunnels.is_open(&tab.owner)).ok_or(STALE)?;
             (tab.target.clone(), tab.owner.clone(), tab.ssh.clone())
         };
@@ -372,9 +403,9 @@ impl TunnelTabs {
         };
         let service = match protocol { Some(Protocol::Rdp) => "\n서비스: RDP", Some(Protocol::Vnc) => "\n서비스: VNC", None => "" };
         {
-            let mut doc = self.document(epoch)?;
+            let mut doc = self.writable_document(epoch)?;
             if !doc.tunnels.is_open(&owner) { return Err(STALE.into()); }
-            if doc.approving { return Err("열려 있는 SSH 터널 승인 창을 먼저 닫으세요".into()); }
+            if doc.approving { return Err(APPROVAL_PENDING.into()); }
             if doc.entries.len() >= LIMIT { return Err("열 수 있는 터널 수를 초과했습니다".into()); }
             doc.approving = true;
         }
@@ -382,6 +413,7 @@ impl TunnelTabs {
         let mut doc = self.0.lock().unwrap();
         doc.approving = false;
         if doc.destroyed || doc.epoch != epoch || !doc.tunnels.is_open(&owner) { return Err(STALE.into()); }
+        doc.ensure_not_closing()?;
         if !accepted? { return Ok(None); }
         let start = doc.tunnels.begin_ssh(owner, directory, route.clone(), &route, &approved, policy)?;
         // 생성과 핸들 등록을 같은 잠금에서 완료해 문서 종료 뒤 살아남는 자식을 막는다.
@@ -397,7 +429,7 @@ impl TunnelTabs {
                                     destination: &Destination, protocol: Protocol) -> Result<(), String> {
         let (handle, id) = source;
         let id = TunnelId(id.parse().map_err(|_| "터널 ID가 올바르지 않습니다")?);
-        let doc = self.document(epoch)?;
+        let doc = self.writable_document(epoch)?;
         let tab = doc.tabs.get(handle).filter(|tab| doc.tunnels.is_open(&tab.owner)).ok_or(STALE)?;
         if tab.ssh.is_none() || tab.target != target { return Err("승인된 SSH 대상이 일치하지 않습니다".into()); }
         if !tab.ids.contains(&id) { return Err("이 탭이 소유한 터널이 아닙니다".into()); }
@@ -419,7 +451,7 @@ impl TunnelTabs {
                                confirmed_ssh: (NonZeroU64, &Ssh)) -> Result<DesktopLease, String> {
         let (handle, id) = source;
         let id = TunnelId(id.parse().map_err(|_| "터널 ID가 올바르지 않습니다")?);
-        let mut doc = self.document(epoch)?;
+        let mut doc = self.writable_document(epoch)?;
         let Document { tabs, entries, tunnels, .. } = &mut *doc;
         let tab = tabs.get(handle).filter(|tab| tunnels.is_open(&tab.owner)).ok_or(STALE)?;
         let approved = tab.ssh.as_ref().filter(|_| tab.target == target).ok_or("승인된 SSH 대상이 일치하지 않습니다")?;
@@ -465,7 +497,7 @@ impl TunnelTabs {
     }
 
     fn share(&self, epoch: u64, handle: &str, to: &str, id: TunnelId) -> Result<(), String> {
-        let mut doc = self.document(epoch)?;
+        let mut doc = self.writable_document(epoch)?;
         let from = doc.tabs.get(handle).ok_or(STALE)?;
         let recipient = doc.tabs.get(to).ok_or(STALE)?;
         if from.target != recipient.target || from.ssh != recipient.ssh { return Err("같은 저장 대상의 탭에만 터널을 공유할 수 있습니다".into()); }
@@ -477,7 +509,7 @@ impl TunnelTabs {
     }
 
     fn close(&self, epoch: u64, handle: &str) -> Result<(), String> {
-        let mut doc = self.document(epoch)?;
+        let mut doc = self.writable_document(epoch)?;
         let Some(tab) = doc.tabs.get(handle) else { return Ok(()) };
         let owner = tab.owner.clone();
         let ids = tab.ids.clone();

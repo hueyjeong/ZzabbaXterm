@@ -67,10 +67,15 @@ fn cancelled_or_stale_native_approval_does_not_start_a_tunnel() {
         assert!(description.contains("SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
         assert!(description.contains("-D 127.0.0.1:1080 → SOCKS"));
         assert!(description.contains("PermitOpen"));
+        assert_eq!(tabs.confirm_desktop_cleanup(0, "close", &CancellationToken::new()).unwrap_err(), APPROVAL_PENDING);
+        let doc = tabs.document(0).unwrap();
+        assert!(doc.approving);
+        assert!(doc.close_request.is_none());
         Ok(false)
     });
     assert_eq!(cancelled.unwrap(), None);
     assert!(tabs.snapshot(0, &handle).unwrap().is_empty());
+    assert!(!tabs.document(0).unwrap().approving);
 
     let stale = tabs.start(0, dir.path(), &handle, request(), |_| {
         tabs.navigate(false);
@@ -300,13 +305,17 @@ pub(crate) fn rdp_test_lease() -> (TunnelTabs, DesktopLease) {
 }
 
 fn test_lease(protocol: Protocol) -> (TunnelTabs, DesktopLease) {
-    let tabs = TunnelTabs::default();
     let dir = tempfile::tempdir().unwrap();
+    test_lease_at(dir.path(), protocol)
+}
+
+fn test_lease_at(directory: &Path, protocol: Protocol) -> (TunnelTabs, DesktopLease) {
+    let tabs = TunnelTabs::default();
     let target = "ssh-server";
-    let profile = crate::connections::tests::ssh_draft(dir.path());
+    let profile = crate::connections::tests::ssh_draft(directory);
     let draft = serde_json::from_value::<crate::connections::profile::Draft>(profile).unwrap().validate().unwrap();
-    crate::connections::save_test_profile(dir.path(), draft);
-    let handle = tabs.open(0, dir.path(), target.into(), "시험 터널".into()).unwrap();
+    crate::connections::save_test_profile(directory, draft);
+    let handle = tabs.open(0, directory, target.into(), "시험 터널".into()).unwrap();
     let destination = Destination { host: "127.0.0.1".into(), port: 5900 };
     let lease = {
         let mut doc = tabs.document(0).unwrap();
@@ -385,10 +394,20 @@ fn cleanup_ticket_and_hard_close_reject_retired_document() {
     tabs.close(0, &source).unwrap();
     inject_desktop_cleanup_failure(&mut tabs.document(0).unwrap(), lease.id);
     let mut error = lease.release().unwrap_err();
+    let revoked = CancellationToken::new();
+    tabs.confirm_desktop_cleanup(0, "old", &revoked).unwrap();
+    revoked.cancel();
+    assert_eq!(tabs.close(0, &source).unwrap_err(), CLOSING);
     tabs.navigate(false);
     assert_eq!(error.retry().unwrap_err(), STALE);
-    assert_eq!(tabs.confirm_desktop_cleanup(0).unwrap_err(), STALE);
-    assert!(tabs.confirm_desktop_cleanup(tabs.epoch()).is_ok());
+    let current = CancellationToken::new();
+    assert_eq!(tabs.confirm_desktop_cleanup(0, "old", &current).unwrap_err(), EXPIRED);
+    tabs.confirm_desktop_cleanup(1, "new", &current).unwrap();
+    tabs.release_desktop_close_gate(0, "new");
+    tabs.release_desktop_close_gate(1, "old");
+    assert_eq!(tabs.close(1, &source).unwrap_err(), CLOSING);
+    tabs.release_desktop_close_gate(1, "new");
+    tabs.close(1, &source).unwrap();
 }
 
 fn inject_desktop_cleanup_failure(doc: &mut Document, id: TunnelId) {
@@ -423,7 +442,8 @@ fn explicit_release_returns_a_ticket_and_drop_keeps_pending_cleanup_visible() {
         } else {
             drop(lease);
             assert_eq!(tabs.document(0).unwrap().tunnels.desktop_cleanup_error(id, "0"), Some("close failed"));
-            tabs.confirm_desktop_cleanup(0).unwrap();
+            let revoked = CancellationToken::new();
+            tabs.confirm_desktop_cleanup(0, "close", &revoked).unwrap();
         }
         assert!(loss.is_cancelled());
         assert_eq!(tabs.document(0).unwrap().tunnels.desktop_cleanup_error(id, "0"), None);
@@ -431,17 +451,72 @@ fn explicit_release_returns_a_ticket_and_drop_keeps_pending_cleanup_visible() {
 }
 
 #[test]
-fn hard_close_revokes_only_graphics_without_a_tunnel_tab() {
+fn cancelled_or_pending_close_preserves_the_desktop_only_lease() {
     let (tabs, lease) = test_lease(Protocol::Rdp);
     let loss = lease.loss();
-    tabs.confirm_desktop_cleanup(0).unwrap();
-    assert!(!loss.is_cancelled());
+    let revoked = CancellationToken::new();
     let source = tabs.document(0).unwrap().tabs.keys().next().unwrap().clone();
     tabs.close(0, &source).unwrap();
-    tabs.confirm_desktop_cleanup(0).unwrap();
+    revoked.cancel();
+    assert_eq!(tabs.confirm_desktop_cleanup(0, "expired", &revoked).unwrap_err(), EXPIRED);
+    assert_eq!(lease.while_live(|| 7), Some(7));
+    assert!(tabs.document(0).unwrap().close_request.is_none());
+    tabs.document(0).unwrap().approving = true;
+    assert_eq!(tabs.confirm_desktop_cleanup(0, "waiting", &CancellationToken::new()).unwrap_err(), APPROVAL_PENDING);
+    assert_eq!(lease.while_live(|| 7), Some(7));
+    assert!({
+        let doc = tabs.document(0).unwrap();
+        doc.approving && doc.close_request.is_none()
+    });
+    tabs.document(0).unwrap().approving = false;
+    tabs.confirm_desktop_cleanup(0, "current", &CancellationToken::new()).unwrap();
     assert!(loss.is_cancelled());
     assert_eq!(lease.while_live(|| 7), None);
     assert!(lease.release().is_ok());
+}
+
+#[test]
+fn confirmed_close_blocks_mutations_but_not_status_or_shared_desktop_release() {
+    let dir = tempfile::tempdir().unwrap();
+    let (tabs, lease) = test_lease_at(dir.path(), Protocol::Vnc);
+    let id = lease.id;
+    let selector = id.0.to_string();
+    let source = {
+        let mut doc = tabs.document(0).unwrap();
+        let source = doc.tabs.keys().next().unwrap().clone();
+        doc.tabs.get_mut(&source).unwrap().ids.push(id);
+        doc.entries.insert(id, Entry { endpoint: String::new(), protocol: Some(Protocol::Vnc) });
+        source
+    };
+    let target = lease.target();
+    let recipient = tabs.open(0, dir.path(), target.into(), "공유받는 탭".into()).unwrap();
+    let revoked = CancellationToken::new();
+    tabs.confirm_desktop_cleanup(0, "close", &revoked).unwrap();
+    assert_eq!(tabs.confirm_desktop_cleanup(0, "competing", &revoked).unwrap_err(), CLOSING);
+    assert_eq!(tabs.open(0, dir.path(), target.into(), "새 터널".into()).unwrap_err(), CLOSING);
+    assert_eq!(tabs.share(0, &source, &recipient, id).unwrap_err(), CLOSING);
+    assert_eq!(tabs.close(0, &source).unwrap_err(), CLOSING);
+    assert_eq!(tabs.start(0, dir.path(), &source, PortRequest::Dynamic { listen: 1080 },
+        |_| panic!("창을 닫는 중에 SSH 승인을 요청했습니다")).unwrap_err(), CLOSING);
+    assert_eq!(tabs.preflight_desktop(0, (&source, &selector), target, lease.destination(), Protocol::Vnc).unwrap_err(), CLOSING);
+    assert_eq!(tabs.open_desktop(0, dir.path(), (&source, &selector), target, lease.destination(), Protocol::Vnc,
+        lease.ssh()).err().unwrap(), CLOSING);
+
+    assert_eq!(tabs.snapshot(0, &source).unwrap().len(), 1);
+    assert_eq!(lease.while_live(|| 7), Some(7));
+    lease.release().unwrap();
+    assert_eq!(tabs.snapshot(0, &source).unwrap().len(), 1);
+    tabs.release_desktop_close_gate(0, "competing");
+    assert_eq!(tabs.close(0, &source).unwrap_err(), CLOSING);
+    tabs.release_desktop_close_gate(0, "close");
+    tabs.share(0, &source, &recipient, id).unwrap();
+    tabs.close(0, &source).unwrap();
+    assert_eq!(tabs.snapshot(0, &recipient).unwrap().len(), 1);
+
+    tabs.confirm_desktop_cleanup(0, "destroy", &revoked).unwrap();
+    assert_eq!(tabs.close(0, &recipient).unwrap_err(), CLOSING);
+    tabs.navigate(true);
+    assert_eq!(tabs.close(0, &recipient).unwrap_err(), STALE);
 }
 
 #[test]
