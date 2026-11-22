@@ -1,18 +1,37 @@
 use super::{Sessions, shell, size, stage};
-use tauri::{Manager, WebviewWindow, ipc::{Channel, InvokeResponseBody}};
+use tauri::{Manager, WebviewWindow, ipc::{Channel, CommandArg, CommandItem, Invoke, InvokeResponseBody}};
 
 async fn blocking<T: Send + 'static>(job: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
     tauri::async_runtime::spawn_blocking(job).await.map_err(|error| stage("worker", error))?
 }
 
-#[tauri::command]
-pub(crate) async fn terminal_open(webview: WebviewWindow, rows: u16, cols: u16, output: Channel<InvokeResponseBody>) -> Result<String, String> {
-    let document = webview.state::<Sessions>().document(webview.label());
-    blocking(move || {
-        webview.state::<Sessions>().open_document(webview.label(), document, size(rows, cols), shell(), move |event| {
-            event.send(&output).map_err(|error| error.to_string())
-        })
-    }).await
+pub(crate) fn terminal_open(invoke: Invoke) {
+    const COMMAND: &str = "terminal_open";
+    let Invoke { message, resolver, acl } = invoke;
+    // The generated async wrapper calls its command only after spawning the future.
+    // Capture the generation in the synchronous, ACL-checked invoke handler instead.
+    let caller = message.webview_ref();
+    let document = caller.state::<Sessions>().document(caller.label());
+    let argument = |key| CommandItem { name: COMMAND, key, plugin: None, message: &message, acl: &acl };
+    let parse = || {
+        Ok((
+            WebviewWindow::from_command(argument("webview"))?,
+            u16::from_command(argument("rows"))?,
+            u16::from_command(argument("cols"))?,
+            Channel::<InvokeResponseBody>::from_command(argument("output"))?,
+        ))
+    };
+    let (webview, rows, cols, output) = match parse() {
+        Ok(args) => args,
+        Err(error) => { resolver.invoke_error(error); return; }
+    };
+    resolver.respond_async(async move {
+        blocking(move || {
+            webview.state::<Sessions>().open_document(webview.label(), document, size(rows, cols), shell(), move |event| {
+                event.send(&output).map_err(|error| error.to_string())
+            })
+        }).await.map_err(Into::into)
+    });
 }
 
 #[tauri::command]

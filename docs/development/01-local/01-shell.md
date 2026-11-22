@@ -33,6 +33,8 @@ L02 상태줄은 `onStatus(status, sessionId?)`에서 현재 탭의 `TerminalSta
 
 Rust는 `terminal_open`에서 초기 행·열과 채널을 받고 호출 창에 묶인 ID를 발급한다. ID를 받은 뒤 `terminal_start`로 출력을 시작한다. `terminal_input`·`terminal_resize`·`terminal_ack`·`terminal_close`는 같은 ID를 받는다. 채널은 최대 16 KiB의 생 바이트와 JSON 종료·단절 상태를 같은 순서로 전달한다. 파서 완료 위치를 누적 ACK로 돌려주면 세션별 256 KiB 읽기 한도가 열린다. 정상 탭 닫기는 종료 코드를 표시하는 자연 종료와 별개다.
 
+Rust는 열기 요청을 받는 즉시 호출 문서 세대를 기록한다. PTY 작업이 시작되기 전에 문서가 교체되면 이전 요청을 거부한다. 열린 세션에 `terminal_start`가 5초 내 도착하지 않으면 그 세션만 회수한다.
+
 WebView가 새 문서를 로드하면 이전 문서의 세션을 닫고 새 문서의 열기를 받는다. 보낸 바이트가 남아 있는데 누적 ACK가 15초 동안 전진하지 않으면 해당 세션을 단절로 정리한다. 확인할 출력이 없는 유휴 세션에는 이 시한을 적용하지 않는다.
 
 ## 자동 검증과 실기기 시연

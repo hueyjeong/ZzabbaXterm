@@ -157,9 +157,10 @@ fn l01_terminal_navigation_retires_old_document_and_accepts_new_document() {
     let sessions = Sessions::default();
     let old = Peer::open(&sessions);
     let document = sessions.document("main");
+    let delayed_open = || sessions.open_document("main", document, SIZE, shell(), |_| Ok(()));
     sessions.navigate("main");
     assert!(sessions.input("main", &old.id, b"x").is_err());
-    assert!(sessions.open_document("main", document, SIZE, shell(), |_| Ok(())).is_err());
+    assert_eq!(delayed_open().unwrap_err(), "open: 문서가 바뀌었습니다");
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         match old.rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
@@ -171,6 +172,27 @@ fn l01_terminal_navigation_retires_old_document_and_accepts_new_document() {
     let mut new = Peer::open(&sessions);
     new.send(COMPUTE);
     assert_eq!(new.number(0), 12);
+}
+
+#[test]
+fn l01_terminal_missing_start_reaps_only_the_unstarted_session() {
+    let sessions = Sessions::default();
+    let mut active = Peer::open(&sessions);
+    active.send(COMPUTE);
+    assert_eq!(active.number(0), 12);
+
+    let (tx, rx) = mpsc::channel();
+    let orphan = sessions.open("main", SIZE, shell(), move |event| tx.send(event).map_err(|e| e.to_string())).unwrap();
+    match rx.recv_timeout(Duration::from_secs(12)) {
+        Ok(Event::Disconnected(reason)) => assert!(reason.starts_with("start:"), "{reason}"),
+        other => panic!("미시작 세션 회수: {other:?}"),
+    }
+    assert!(matches!(rx.recv_timeout(Duration::from_secs(2)), Err(mpsc::RecvTimeoutError::Disconnected)));
+    assert!(sessions.start("main", &orphan).is_err());
+
+    let from = active.bytes.len();
+    active.send(COMPUTE);
+    assert_eq!(active.number(from), 12);
 }
 
 #[test]

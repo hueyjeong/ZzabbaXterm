@@ -8,6 +8,7 @@ use std::{
 };
 
 const POLL: Duration = Duration::from_millis(10);
+const START_TIMEOUT: Duration = Duration::from_secs(5);
 const ACK_TIMEOUT: Duration = Duration::from_secs(15);
 const ACK_STALLED: &str = "ack: 출력 처리 확인 시간이 초과되었습니다";
 
@@ -19,6 +20,7 @@ pub(super) enum Stop {
 #[derive(Default)]
 struct Flow {
     started: bool,
+    start_deadline: Option<std::time::Instant>,
     child_exited: bool,
     finished: bool,
     stop: Option<Stop>,
@@ -28,6 +30,12 @@ struct Flow {
 }
 
 impl Flow {
+    fn expire_start(&mut self) {
+        if self.stop.is_none() && self.start_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            self.stop = Some(Stop::Disconnected("start: 시작 요청 시간이 초과되었습니다".into()));
+        }
+    }
+
     fn expire_ack(&mut self) {
         if self.stop.is_none() && self.ack_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
             self.stop = Some(Stop::Disconnected(ACK_STALLED.into()));
@@ -130,6 +138,7 @@ impl Session {
             drop(pair.slave);
             *self.writer.lock().unwrap() = Some(writer);
             *self.master.lock().unwrap() = Some(pair.master);
+            self.flow.lock().unwrap().start_deadline = Some(std::time::Instant::now() + START_TIMEOUT);
             let _ = ready.send(Ok(()));
 
             let event = self.reap(child.as_mut());
@@ -165,12 +174,19 @@ impl Session {
     fn reap(&self, child: &mut dyn Child) -> Option<Event> {
         loop {
             let mut flow = self.flow.lock().unwrap();
+            flow.expire_start();
             flow.expire_ack();
             if flow.stop.is_some() {
                 self.wake.notify_all();
                 drop(flow);
                 self.terminate(child);
                 return None;
+            }
+            if let Some(deadline) = flow.start_deadline {
+                // Keep the ConPTY reader ready to drain on start or timeout.
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                drop(self.wake.wait_timeout(flow, remaining).unwrap());
+                continue;
             }
             match child_ready(child) {
                 Ok(true) => {
@@ -287,8 +303,13 @@ impl Session {
 
     pub(super) fn start(&self) -> Result<(), String> {
         let mut flow = self.flow.lock().unwrap();
-        if flow.stop.is_some() || flow.finished { return Err(CLOSED.into()); }
+        flow.expire_start();
+        if flow.stop.is_some() || flow.finished || (!flow.started && flow.start_deadline.is_none()) {
+            self.wake.notify_all();
+            return Err(CLOSED.into());
+        }
         flow.started = true;
+        flow.start_deadline = None;
         self.wake.notify_all();
         Ok(())
     }
