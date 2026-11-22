@@ -60,6 +60,20 @@ fn save(store: &Store, input: Value) -> Result<SaveStatus, StoreError> {
     store.save(draft.validate().unwrap())
 }
 
+#[cfg(any(windows, unix))]
+pub(crate) fn with_saved_pty_targets(run: impl FnOnce(&Path, &Path)) {
+    let root = TestDir::new();
+    let store = Store::new(&root.0);
+    let dirs = ["first", "second"].map(|id| {
+        let directory = root.0.join(format!("{id} directory"));
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("cwd-marker"), id).unwrap();
+        assert_eq!(save(&store, draft(&directory, id, id)).unwrap(), SaveStatus::Saved);
+        directory
+    });
+    run(&root.0, &dirs[1]);
+}
+
 mod local_probe {
     use super::*;
     use crate::terminal::Sessions;

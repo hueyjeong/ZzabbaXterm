@@ -70,6 +70,10 @@ impl<'a> Pty<'a> {
             #[cfg(unix)]
             command.args(["-c", script]);
         }
+        Self::open_with(sessions, command)
+    }
+
+    fn open_with(sessions: &'a Sessions, command: portable_pty::CommandBuilder) -> Self {
         let (tx, events) = mpsc::channel();
         let id = sessions
             .open("main", size(24, 120), command, move |event| {
@@ -267,4 +271,53 @@ fn l03_pty_ctrl_c_during_credit_stall_keeps_shell_reusable() {
         pty.until_bytes(b"L03-AFTER:81;", resumed, true);
         sessions.close("main", &pty.id).unwrap();
     });
+}
+
+#[test]
+fn c01_saved_pty_selects_exact_id_and_keeps_sessions_after_open_errors() {
+    bounded(|| crate::connections::tests::with_saved_pty_targets(|config, removed| {
+        #[cfg(windows)]
+        const READ_CWD: &[u8] = b"[Console]::WriteLine(('C01-' + 'CWD:' + [IO.File]::ReadAllText('cwd-marker') + ';'))\r";
+        #[cfg(unix)]
+        const READ_CWD: &[u8] = b"IFS= read -r marker < cwd-marker; printf 'C01-%s:%s;\\n' CWD \"$marker\"\r";
+
+        let sessions = Sessions::default();
+        let open = |id| Pty::open_with(&sessions, super::saved::command(config, id).unwrap());
+        let mut first = open("first");
+        let mut second = open("second");
+        let read = |pty: &mut Pty<'_>, expected: &[u8]| {
+            let from = pty.output.len();
+            pty.input(READ_CWD);
+            pty.until_bytes(expected, from, true);
+            pty.ack(pty.output.len());
+        };
+        read(&mut first, b"C01-CWD:first;");
+        read(&mut second, b"C01-CWD:second;");
+        sessions.close("main", &second.id).unwrap();
+
+        let delayed = super::saved::command(config, "second").unwrap();
+        std::fs::remove_dir_all(removed).unwrap();
+        for (id, expected) in [("FIRST", "저장된 연결 대상을 찾을 수 없습니다"), ("second", "작업 디렉터리:")] {
+            let result = super::saved::command(config, id).and_then(|command| {
+                sessions.open_document("main", sessions.document("main"), size(24, 120), command, |_| Ok(()))
+            });
+            let error = result.unwrap_err();
+            assert!(error.starts_with(expected), "{id}: {error}");
+        }
+        // 경로 검사와 PTY 실행 사이에 경로가 사라져도 홈 셸이 열린 채 남지 않아야 한다.
+        let mut late = Pty::open_with(&sessions, delayed);
+        late.until_bytes(b"Could not start in the saved working directory.", 0, true);
+        late.ack(late.output.len());
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            match late.next(deadline) {
+                Event::Bytes(_) => late.ack(late.output.len()),
+                Event::Exited(23) => break,
+                event => panic!("작업 디렉터리가 사라진 셸의 종료 상태: {event:?}"),
+            }
+        }
+
+        read(&mut first, b"C01-CWD:first;");
+        sessions.close("main", &first.id).unwrap();
+    }));
 }

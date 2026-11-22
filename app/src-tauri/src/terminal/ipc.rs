@@ -1,4 +1,4 @@
-use super::{Sessions, shell, size, stage};
+use super::{Sessions, saved, shell, size, stage};
 use tauri::{Manager, WebviewWindow, ipc::{Channel, CommandArg, CommandItem, Invoke, InvokeResponseBody}};
 
 async fn blocking<T: Send + 'static>(job: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
@@ -19,15 +19,27 @@ pub(crate) fn terminal_open(invoke: Invoke) {
             u16::from_command(argument("rows"))?,
             u16::from_command(argument("cols"))?,
             Channel::<InvokeResponseBody>::from_command(argument("output"))?,
+            Option::<String>::from_command(argument("targetId"))?,
         ))
     };
-    let (webview, rows, cols, output) = match parse() {
+    let (webview, rows, cols, output, target_id) = match parse() {
         Ok(args) => args,
         Err(error) => { resolver.invoke_error(error); return; }
     };
+    if target_id.is_some() && (caller.label() != "main" || caller.window_ref().label() != "main" || acl.is_none()) {
+        resolver.reject("앱의 로컬 기본 창에서만 저장된 연결을 열 수 있습니다");
+        return;
+    }
     resolver.respond_async(async move {
         blocking(move || {
-            webview.state::<Sessions>().open_document(webview.label(), document, size(rows, cols), shell(), move |event| {
+            let command = match target_id {
+                Some(id) => {
+                    let directory = webview.path().app_config_dir().map_err(|error| stage("앱 설정 디렉터리", error))?;
+                    saved::command(&directory, &id)?
+                }
+                None => shell(),
+            };
+            webview.state::<Sessions>().open_document(webview.label(), document, size(rows, cols), command, move |event| {
                 event.send(&output).map_err(|error| error.to_string())
             })
         }).await.map_err(Into::into)
