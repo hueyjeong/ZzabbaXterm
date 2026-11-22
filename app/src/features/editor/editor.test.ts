@@ -399,6 +399,38 @@ describe("파일 편집 버퍼", () => {
     expect(saved).toStrictEqual(result);
   });
 
+  it("로컬 저장 결과 미확인 시 복구 경로와 버퍼를 유지하고 다시 읽기 전까지 저장을 막는다", async () => {
+    const approved = file("local-publication-unconfirmed");
+    const recoveryPath = String.raw`C:\작업 폴더\한글 복구.txt`;
+    const ipc = vi.mocked(invoke).mockClear();
+    ipc.mockRejectedValueOnce({ kind: "publicationUnconfirmed", recoveryPath });
+    const tab = open(approved, localEditorTransport);
+    try {
+      tab.model.setValue("미저장");
+      await tab.session.save();
+      expect(tab.state).toMatchObject({
+        dirty: true, needsReload: true, status: { kind: "unknown", message: `복구 파일: ${recoveryPath}` },
+      });
+      await tab.session.save();
+      expect(tab.text()).toBe("미저장");
+      expect(ipc.mock.calls).toEqual([["editor_local_save", { handle: approved.handle, text: "미저장" }]]);
+
+      ipc.mockResolvedValueOnce("디스크 원본");
+      await tab.session.reload(async () => true);
+      expect(ipc).toHaveBeenLastCalledWith("editor_local_reload", { handle: approved.handle });
+      expect(tab.text()).toBe("디스크 원본");
+      expect(tab.state).toMatchObject({ dirty: false, needsReload: false, status: { kind: "ready" } });
+
+      ipc.mockResolvedValueOnce(undefined);
+      tab.model.setValue("다시 읽은 뒤 편집");
+      await tab.session.save();
+      expect(ipc).toHaveBeenLastCalledWith("editor_local_save", { handle: approved.handle, text: "다시 읽은 뒤 편집" });
+      expect(tab.state).toMatchObject({ dirty: false, status: { kind: "saved" } });
+    } finally {
+      tab.close();
+    }
+  });
+
   it("Ctrl+S는 실제 충돌 메시지를 표시하고 결과 미확인 뒤 재전송을 막는다", async () => {
     const approved = file("shortcut");
     const io = transport(approved);
