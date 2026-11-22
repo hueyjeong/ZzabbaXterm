@@ -1,5 +1,20 @@
+use std::{cell::Cell, io};
+
+use super::super::{Observation, Transport};
 use super::*;
 use serde_json::json;
+
+struct Probe<'a> { signal: Observation, closes: &'a Cell<usize>, close_failures: usize }
+
+impl Transport for Probe<'_> {
+    fn observe(&mut self) -> Observation { std::mem::replace(&mut self.signal, Observation::Pending) }
+    fn close(&mut self) -> io::Result<()> {
+        let attempts = self.closes.get() + 1;
+        self.closes.set(attempts);
+        if attempts <= self.close_failures { return Err(io::Error::other(format!("close failed {attempts}"))); }
+        Ok(())
+    }
+}
 
 #[test]
 fn tunnels_ipc_rejects_raw_destinations_and_unsupported_transports() {
@@ -148,18 +163,6 @@ fn desktop_requires_exact_same_host_loopback_destination() {
 
 #[test]
 fn desktop_route_survives_source_close_and_cleans_up_on_last_owner() {
-    use super::super::{Observation, Transport};
-    use std::cell::Cell;
-
-    struct Probe<'a> { signal: Observation, closes: &'a Cell<usize> }
-    impl Transport for Probe<'_> {
-        fn observe(&mut self) -> Observation { std::mem::replace(&mut self.signal, Observation::Pending) }
-        fn close(&mut self) -> std::io::Result<()> {
-            self.closes.set(self.closes.get() + 1);
-            Ok(())
-        }
-    }
-
     for end in ["release", "child exit", "navigation"] {
         let closes = Cell::new(0);
         let mut tunnels = Tunnels::default();
@@ -168,7 +171,7 @@ fn desktop_route_survives_source_close_and_cleans_up_on_last_owner() {
             server: "ssh-server".into(), listen: ([127, 0, 0, 1], 3390).into(),
             destination: Destination { host: "127.0.0.1".into(), port: 3389 },
         }).unwrap();
-        tunnels.finish_start(id, Ok(Probe { signal: Observation::Listening, closes: &closes })).unwrap();
+        tunnels.finish_start(id, Ok(Probe { signal: Observation::Listening, closes: &closes, close_failures: 0 })).unwrap();
         assert!(matches!(tunnels.observe(id, &source).unwrap().state, State::Ready));
         let owner = tunnels.retain_desktop(id, &source).unwrap();
         let other_desktop = tunnels.retain_desktop(id, &source).unwrap();
@@ -201,7 +204,102 @@ fn desktop_route_survives_source_close_and_cleans_up_on_last_owner() {
 }
 
 #[test]
-fn desktop_live_gate_rejects_removed_owner_and_retired_document() {
+fn last_desktop_release_reports_active_or_observed_child_failure_and_retries_only_that_child() {
+    for observed in [false, true] {
+        let closes = Cell::new(0);
+        let unrelated_closes = Cell::new(0);
+        let mut tunnels = Tunnels::default();
+        let source = tunnels.open_tab("0", "source").unwrap();
+        let route = Route::SshLocal { server: "saved".into(), listen: ([127, 0, 0, 1], 3390).into(),
+            destination: Destination { host: "127.0.0.1".into(), port: 3389 } };
+        let id = tunnels.begin(source.clone(), route.clone()).unwrap();
+        tunnels.finish_start(id, Ok(Probe { signal: Observation::Listening, closes: &closes, close_failures: 2 })).unwrap();
+        assert!(matches!(tunnels.observe(id, &source).unwrap().state, State::Ready));
+        let owner = tunnels.retain_desktop(id, &source).unwrap();
+        let other_desktop = tunnels.retain_desktop(id, &source).unwrap();
+        let loss = tunnels.entries.get_mut(&id).unwrap().desktop_loss.get_or_insert_with(CancellationToken::new).child_token();
+
+        let unrelated = tunnels.open_tab("0", "unrelated").unwrap();
+        let other_id = tunnels.begin(unrelated, route).unwrap();
+        tunnels.finish_start(other_id, Ok(Probe { signal: Observation::Listening, closes: &unrelated_closes, close_failures: 0 })).unwrap();
+        assert!(tunnels.close_tab(&source).is_empty());
+        if observed {
+            tunnels.entries.get_mut(&id).unwrap().transport.as_mut().unwrap().signal = Observation::Ended("exit unconfirmed".into());
+            assert!(matches!(tunnels.observe_route(id).unwrap().state, State::Disconnected(_)));
+        }
+        assert!(tunnels.release(id, &other_desktop).unwrap());
+        assert_eq!(closes.get(), usize::from(observed));
+        assert_eq!(tunnels.release(id, &owner).unwrap_err().to_string(), "close failed 1");
+        assert!(loss.is_cancelled());
+        assert!(!tunnels.entries.contains_key(&id));
+        assert_eq!(tunnels.desktop_cleanup_error(id, "0"), Some("close failed 1"));
+        assert!(tunnels.confirm_desktop_cleanup("1", |_| panic!("다른 문서 전달 철회")).is_ok());
+        tunnels.retry_desktop_cleanup(id, "1").unwrap();
+        tunnels.retry_desktop_cleanup(other_id, "0").unwrap();
+        assert_eq!(closes.get(), 1);
+        assert_eq!(tunnels.retry_desktop_cleanup(id, "0").unwrap_err().to_string(), "close failed 2");
+        assert_eq!(tunnels.desktop_cleanup_error(id, "0"), Some("close failed 2"));
+        tunnels.retry_desktop_cleanup(id, "0").unwrap();
+        tunnels.retry_desktop_cleanup(id, "0").unwrap();
+        assert_eq!(tunnels.desktop_cleanup_error(id, "0"), None);
+        assert_eq!(closes.get(), 3);
+        assert_eq!(unrelated_closes.get(), 0);
+    }
+}
+
+#[test]
+fn same_document_hard_close_reports_new_failure_and_retries_only_desktop_owned_children() {
+    let closes = Cell::new(0);
+    let shared_closes = Cell::new(0);
+    let other_document_closes = Cell::new(0);
+    let detached_closes = Cell::new(0);
+    let mut tunnels = Tunnels::default();
+    fn issue<'a>(tunnels: &mut Tunnels<Probe<'a>>, window: &str, name: &str, closes: &'a Cell<usize>,
+                 close_failures: usize, source_open: bool) -> (TunnelId, Owner, CancellationToken) {
+        let source = tunnels.open_tab(window, name).unwrap();
+        let id = tunnels.begin(source.clone(), Route::SshLocal {
+            server: "saved".into(), listen: ([127, 0, 0, 1], 3390).into(),
+            destination: Destination { host: "127.0.0.1".into(), port: 3389 },
+        }).unwrap();
+        tunnels.finish_start(id, Ok(Probe { signal: Observation::Listening, closes, close_failures })).unwrap();
+        assert!(matches!(tunnels.observe(id, &source).unwrap().state, State::Ready));
+        let owner = tunnels.retain_desktop(id, &source).unwrap();
+        let loss = tunnels.entries.get_mut(&id).unwrap().desktop_loss.get_or_insert_with(CancellationToken::new).child_token();
+        if !source_open { assert!(tunnels.close_tab(&source).is_empty()); }
+        (id, owner, loss)
+    }
+    let (id, owner, loss) = issue(&mut tunnels, "0", "source", &closes, 1, false);
+    let (_, _, shared_loss) = issue(&mut tunnels, "0", "shared", &shared_closes, 0, true);
+    let (_, _, other_loss) = issue(&mut tunnels, "1", "other", &other_document_closes, 0, false);
+
+    let detached_source = tunnels.open_tab("0", "detached").unwrap();
+    let detached_id = tunnels.begin(detached_source.clone(), Route::SshLocal {
+        server: "saved".into(), listen: ([127, 0, 0, 1], 3391).into(),
+        destination: Destination { host: "127.0.0.1".into(), port: 3389 },
+    }).unwrap();
+    tunnels.finish_start(detached_id, Ok(Probe { signal: Observation::Listening, closes: &detached_closes, close_failures: 1 })).unwrap();
+    assert_eq!(tunnels.close_tab(&detached_source).len(), 1);
+
+    assert_eq!(tunnels.confirm_desktop_cleanup("0", |removed| assert_eq!(removed, id)).unwrap_err().to_string(), "close failed 1");
+    assert_eq!(closes.get(), 1);
+    assert!(loss.is_cancelled());
+    assert!(!tunnels.release(id, &owner).unwrap());
+    assert_eq!(tunnels.desktop_cleanup_error(id, "0"), Some("close failed 1"));
+    assert!(tunnels.confirm_desktop_cleanup("0", |_| panic!("이미 철회한 전달")).is_ok());
+    assert_eq!(closes.get(), 2);
+    assert_eq!(tunnels.desktop_cleanup_error(id, "0"), None);
+    assert_eq!(shared_closes.get(), 0);
+    assert_eq!(other_document_closes.get(), 0);
+    assert!(!shared_loss.is_cancelled());
+    assert!(!other_loss.is_cancelled());
+    assert_eq!(detached_closes.get(), 1);
+}
+
+pub(crate) fn rdp_test_lease() -> (TunnelTabs, DesktopLease) {
+    test_lease(Protocol::Rdp)
+}
+
+fn test_lease(protocol: Protocol) -> (TunnelTabs, DesktopLease) {
     let tabs = TunnelTabs::default();
     let dir = tempfile::tempdir().unwrap();
     let target = "ssh-server";
@@ -221,19 +319,91 @@ fn desktop_live_gate_rejects_removed_owner_and_retired_document() {
         tunnel.state = State::Ready;
         let loss = tunnel.desktop_loss.get_or_insert_with(CancellationToken::new).child_token();
         let owner = doc.tunnels.retain_desktop(id, &source).unwrap();
-        DesktopLease { document: Arc::downgrade(&tabs.0), epoch: 0, id, owner, target: target.into(), ssh,
-            destination, protocol: Protocol::Vnc, stream: None, loss }
+        DesktopLease { document: Arc::downgrade(&tabs.0), epoch: 0, id, owner: Some(owner), target: target.into(), ssh,
+            destination, protocol, stream: None, loss }
     };
+    (tabs, lease)
+}
+
+#[test]
+fn desktop_live_gate_rejects_removed_owner_and_retired_document() {
+    let (tabs, lease) = test_lease(Protocol::Vnc);
     assert_eq!(lease.while_live(|| 7), Some(7));
     {
         let mut doc = tabs.document(0).unwrap();
         let tunnel = doc.tunnels.entries.get_mut(&lease.id).unwrap();
-        assert!(tunnel.owners.remove(&lease.owner));
+        assert!(tunnel.owners.remove(lease.owner.as_ref().unwrap()));
     }
     assert!(!lease.loss.is_cancelled());
     assert_eq!(lease.while_live(|| panic!("소유권 해제 후 쓰기")), None::<()>);
     tabs.navigate(false);
     assert_eq!(lease.while_live(|| panic!("문서 이동 후 쓰기")), None::<()>);
+}
+
+#[test]
+fn cleanup_ticket_and_hard_close_reject_retired_document() {
+    let (tabs, lease) = test_lease(Protocol::Rdp);
+    let source = tabs.document(0).unwrap().tabs.keys().next().unwrap().clone();
+    tabs.close(0, &source).unwrap();
+    inject_desktop_cleanup_failure(&mut tabs.document(0).unwrap(), lease.id);
+    let mut error = lease.release().unwrap_err();
+    tabs.navigate(false);
+    assert_eq!(error.retry().unwrap_err(), STALE);
+    assert_eq!(tabs.confirm_desktop_cleanup(0).unwrap_err(), STALE);
+    assert!(tabs.confirm_desktop_cleanup(tabs.epoch()).is_ok());
+}
+
+fn inject_desktop_cleanup_failure(doc: &mut Document, id: TunnelId) {
+    assert!(doc.tunnels.entries[&id].transport.is_none());
+    let window = doc.tunnels.entries[&id].owners.iter().next().unwrap().window.clone();
+    doc.tunnels.cleanup.insert(id, super::super::Cleanup {
+        transports: Vec::new(),
+        observed_windows: [window].into(),
+        desktop: None,
+    });
+    doc.tunnels.entries.get_mut(&id).unwrap().state = State::Disconnected(super::super::End {
+        reason: "시험 전달 종료".into(), cleanup_error: Some(io::Error::other("close failed")),
+    });
+}
+
+#[test]
+fn explicit_release_returns_a_ticket_and_drop_keeps_pending_cleanup_visible() {
+    for release in [true, false] {
+        let (tabs, lease) = test_lease(Protocol::Rdp);
+        let id = lease.id;
+        let loss = lease.loss();
+        let source = tabs.document(0).unwrap().tabs.keys().next().unwrap().clone();
+        tabs.close(0, &source).unwrap();
+        inject_desktop_cleanup_failure(&mut tabs.document(0).unwrap(), id);
+
+        if release {
+            let mut error = lease.release().unwrap_err();
+            assert_eq!(error.to_string(), "SSH 터널 종료 확인 불가: close failed");
+            assert_eq!(tabs.document(0).unwrap().tunnels.desktop_cleanup_error(id, "0"), Some("close failed"));
+            error.retry().unwrap();
+            error.retry().unwrap();
+        } else {
+            drop(lease);
+            assert_eq!(tabs.document(0).unwrap().tunnels.desktop_cleanup_error(id, "0"), Some("close failed"));
+            tabs.confirm_desktop_cleanup(0).unwrap();
+        }
+        assert!(loss.is_cancelled());
+        assert_eq!(tabs.document(0).unwrap().tunnels.desktop_cleanup_error(id, "0"), None);
+    }
+}
+
+#[test]
+fn hard_close_revokes_only_graphics_without_a_tunnel_tab() {
+    let (tabs, lease) = test_lease(Protocol::Rdp);
+    let loss = lease.loss();
+    tabs.confirm_desktop_cleanup(0).unwrap();
+    assert!(!loss.is_cancelled());
+    let source = tabs.document(0).unwrap().tabs.keys().next().unwrap().clone();
+    tabs.close(0, &source).unwrap();
+    tabs.confirm_desktop_cleanup(0).unwrap();
+    assert!(loss.is_cancelled());
+    assert_eq!(lease.while_live(|| 7), None);
+    assert!(lease.release().is_ok());
 }
 
 #[test]
@@ -320,7 +490,8 @@ fn isolated_openssh_desktop_lease_outlives_source_tab() {
     assert_eq!(&marker, b"RDP2");
     assert!(!loss.is_cancelled());
 
-    drop(lease);
+    drop(client);
+    lease.release().unwrap();
     assert!(loss.is_cancelled());
     let error = TcpStream::connect_timeout(&listen, timeout).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::ConnectionRefused, "마지막 소유자가 닫힌 뒤 SSH 수신 포트");

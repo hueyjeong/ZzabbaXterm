@@ -152,7 +152,7 @@ pub(crate) struct DesktopLease {
     document: Weak<Mutex<Document>>,
     epoch: u64,
     id: TunnelId,
-    owner: Owner,
+    owner: Option<Owner>,
     target: String,
     ssh: Arc<SavedSsh>,
     destination: Destination,
@@ -177,7 +177,7 @@ impl DesktopLease {
             return None;
         }
         let route = doc.tunnels.entries.get(&self.id)?;
-        if !matches!(route.state, State::Ready) || !route.owners.contains(&self.owner) {
+        if !matches!(route.state, State::Ready) || !route.owners.contains(self.owner.as_ref()?) {
             return None;
         }
         let result = f();
@@ -189,21 +189,73 @@ impl DesktopLease {
         if self.loss.is_cancelled() { return Err(STALE.into()); }
         self.stream.take().ok_or_else(|| "터널 소켓을 이미 인계했습니다".into())
     }
+
+    /// 그래픽 세션이 인계받은 소켓을 닫은 뒤 차단 작업에서 호출한다.
+    pub(crate) fn release(mut self) -> Result<(), DesktopCleanupError> {
+        self.release_inner().map_err(|(owner, reason)| DesktopCleanupError {
+            document: self.document.clone(), epoch: self.epoch, id: self.id, window: owner.window, reason,
+        })
+    }
+
+    fn release_inner(&mut self) -> Result<(), (Owner, String)> {
+        let Some(owner) = self.owner.take() else { return Ok(()) };
+        let document = self.document.upgrade();
+        let doc = document.as_ref().map(|document| document.lock().unwrap());
+        self.loss.cancel();
+        drop(self.stream.take());
+        let Some(mut doc) = doc.filter(|doc| !doc.destroyed && doc.epoch == self.epoch) else { return Ok(()) };
+        let result = doc.tunnels.release(self.id, &owner);
+        if !doc.tunnels.entries.contains_key(&self.id) {
+            doc.entries.remove(&self.id);
+        }
+        let reason = match result {
+            Err(error) => error.to_string(),
+            // 창 닫기 확인이 먼저 임대를 철회했더라도 같은 자식의 종료 오류를 돌려준다.
+            Ok(false) => match doc.tunnels.desktop_cleanup_error(self.id, &owner.window) {
+                Some(error) => error.into(),
+                None => return Ok(()),
+            },
+            Ok(true) => return Ok(()),
+        };
+        Err((owner, reason))
+    }
+}
+
+/// 같은 그래픽 탭에만 보관하는 종료 재확인 권한. 전송 경로나 프로세스를 새로 찾지 않는다.
+#[derive(Debug)]
+pub(crate) struct DesktopCleanupError {
+    document: Weak<Mutex<Document>>,
+    epoch: u64,
+    id: TunnelId,
+    window: String,
+    reason: String,
+}
+
+impl std::fmt::Display for DesktopCleanupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SSH 터널 종료 확인 불가: {}", self.reason)
+    }
+}
+
+impl DesktopCleanupError {
+    /// 현재 문서의 같은 핸들만 재확인한다. 실패하면 같은 오류 값을 보관한다.
+    pub(crate) fn retry(&mut self) -> Result<(), String> {
+        let document = self.document.upgrade().ok_or(STALE)?;
+        let mut doc = document.lock().unwrap();
+        if doc.destroyed || doc.epoch != self.epoch { return Err(STALE.into()); }
+        if let Err(error) = doc.tunnels.retry_desktop_cleanup(self.id, &self.window) {
+            self.reason = error.to_string();
+            return Err(self.to_string());
+        }
+        Ok(())
+    }
 }
 
 impl Drop for DesktopLease {
     fn drop(&mut self) {
-        self.loss.cancel();
-        drop(self.stream.take());
-        let Some(document) = self.document.upgrade() else { return; };
-        let mut doc = document.lock().unwrap();
-        if doc.epoch != self.epoch { return; }
-        let _ = doc.tunnels.release(self.id, &self.owner);
-        if !doc.tunnels.entries.contains_key(&self.id) {
-            doc.entries.remove(&self.id);
-            if let Err(error) = doc.tunnels.retry_cleanup(self.id) {
-                eprintln!("SSH 터널 종료 확인 불가: {error}");
-            }
+        if let Err((_, reason)) = self.release_inner() {
+            // 작업이 사라져도 실패한 자식은 문서의 종료 확인 대상에 남는다.
+            eprintln!("SSH 터널 종료 확인 불가: {reason}");
         }
     }
 }
@@ -238,6 +290,14 @@ fn desktop_listener(route: &Route, target: &str, expected: &Destination) -> Resu
 
 impl TunnelTabs {
     pub(crate) fn epoch(&self) -> u64 { self.0.lock().unwrap().epoch }
+
+    /// 현재 기본 창을 실제로 닫기 직전에 그래픽 전용 전달의 자식 종료를 확인한다.
+    pub(crate) fn confirm_desktop_cleanup(&self, epoch: u64) -> Result<(), String> {
+        let mut doc = self.document(epoch)?;
+        let Document { entries, tunnels, .. } = &mut *doc;
+        tunnels.confirm_desktop_cleanup(&epoch.to_string(), |id| { entries.remove(&id); })
+            .map_err(|error| format!("SSH 터널 종료 확인 불가: {error}"))
+    }
 
     pub(crate) fn navigate(&self, destroyed: bool) {
         let mut doc = self.0.lock().unwrap();
@@ -366,7 +426,7 @@ impl TunnelTabs {
             }
             let loss = route.desktop_loss.as_ref().unwrap().child_token();
             let owner = tunnels.retain_desktop(id, &tab.owner).ok_or(STALE)?;
-            Ok(DesktopLease { document, epoch, id, owner, target: target.into(), ssh: approved.clone(),
+            Ok(DesktopLease { document, epoch, id, owner: Some(owner), target: target.into(), ssh: approved.clone(),
                 destination: destination.clone(), protocol, stream: Some(stream), loss })
         })?
     }
@@ -407,7 +467,9 @@ impl TunnelTabs {
         }
         for id in ids {
             if !doc.tunnels.entries.contains_key(&id) {
-                doc.tunnels.retry_cleanup(id).map_err(|error| format!("터널 종료 확인 불가: {error}"))?;
+                if doc.tunnels.desktop_cleanup_error(id, &owner.window).is_none() {
+                    doc.tunnels.retry_cleanup(id).map_err(|error| format!("터널 종료 확인 불가: {error}"))?;
+                }
                 doc.entries.remove(&id);
             }
         }
@@ -500,3 +562,6 @@ pub(crate) fn dispatch(invoke: Invoke) {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) use tests::rdp_test_lease;

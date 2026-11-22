@@ -103,6 +103,12 @@ fn next_id() -> u64 {
 struct Cleanup<T> {
     transports: Vec<T>,
     observed_windows: HashSet<String>,
+    desktop: Option<DesktopCleanup>,
+}
+
+struct DesktopCleanup {
+    window: String,
+    error: String,
 }
 
 fn close_owned<T: Transport>(
@@ -116,10 +122,37 @@ fn close_owned<T: Transport>(
             cleanup.entry(id).or_insert_with(|| Cleanup {
                 transports: Vec::new(),
                 observed_windows: HashSet::new(),
+                desktop: None,
             }).transports.push(transport);
             Err(error)
         }
     }
+}
+
+fn close_released<T: Transport>(
+    cleanup: &mut HashMap<TunnelId, Cleanup<T>>,
+    id: TunnelId,
+    tunnel: Tunnel<T>,
+    window: &str,
+    desktop: bool,
+) -> io::Result<()> {
+    tunnel.revoke_desktops();
+    let result = match tunnel.transport {
+        Some(transport) => close_owned(cleanup, id, transport),
+        None => match tunnel.state {
+            State::Failed(end) | State::Disconnected(end) if desktop => end.cleanup_error.map_or(Ok(()), Err),
+            _ => Ok(()),
+        },
+    };
+    if let Err(error) = &result {
+        let pending = cleanup.get_mut(&id).unwrap();
+        if desktop {
+            pending.desktop = Some(DesktopCleanup { window: window.into(), error: error.to_string() });
+        } else {
+            pending.observed_windows.insert(window.into());
+        }
+    }
+    result
 }
 
 pub(crate) struct Tunnels<T: Transport> {
@@ -261,19 +294,45 @@ impl<T: Transport> Tunnels<T> {
         }
         if tunnel.owners.is_empty() {
             let tunnel = self.entries.remove(&id).unwrap();
-            tunnel.revoke_desktops();
-            if let Some(transport) = tunnel.transport
-                && let Err(error) = close_owned(&mut self.cleanup, id, transport)
-            {
-                self.cleanup.get_mut(&id).unwrap().observed_windows.insert(owner.window.clone());
-                return Err(error);
-            }
+            close_released(&mut self.cleanup, id, tunnel, &owner.window, owner.tab.is_empty())?;
         } else if !tunnel.owners.iter().any(|owner| owner.tab.is_empty())
             && let Some(loss) = tunnel.desktop_loss.take()
         {
             loss.cancel();
         }
         Ok(true)
+    }
+
+    fn desktop_cleanup_error(&self, id: TunnelId, window: &str) -> Option<&str> {
+        let pending = self.cleanup.get(&id)?.desktop.as_ref()?;
+        (pending.window == window).then_some(pending.error.as_str())
+    }
+
+    fn retry_desktop_cleanup(&mut self, id: TunnelId, window: &str) -> io::Result<()> {
+        if self.desktop_cleanup_error(id, window).is_none() { return Ok(()); }
+        self.retry_cleanup(id).map(|_| ())
+    }
+
+    fn confirm_desktop_cleanup(&mut self, window: &str, mut forget: impl FnMut(TunnelId)) -> io::Result<()> {
+        let mut pending: Vec<_> = self.cleanup.iter().filter_map(|(id, pending)| {
+            pending.desktop.as_ref().filter(|desktop| desktop.window == window).map(|_| *id)
+        }).collect();
+        let mut failure = None;
+        // 터널 탭이 없는 전달만 이 문서의 그래픽 소유자와 함께 철회한다.
+        for (id, tunnel) in self.entries.extract_if(|_, tunnel| {
+            tunnel.owners.iter().all(|owner| owner.window == window && owner.tab.is_empty())
+        }) {
+            forget(id);
+            let already_pending = self.cleanup.contains_key(&id);
+            if let Err(error) = close_released(&mut self.cleanup, id, tunnel, window, true) {
+                if already_pending { pending.push(id); }
+                else { failure = Some(error); }
+            }
+        }
+        for id in pending {
+            if let Err(error) = self.retry_desktop_cleanup(id, window) { failure = Some(error); }
+        }
+        failure.map_or(Ok(()), Err)
     }
 
     pub(crate) fn close_tab(&mut self, owner: &Owner) -> Vec<(TunnelId, io::Error)> {
@@ -288,7 +347,8 @@ impl<T: Transport> Tunnels<T> {
         self.closed_windows.insert(window.into());
         self.open_tabs.remove(window);
         let observed: Vec<_> = self.cleanup.iter()
-            .filter(|(_, pending)| pending.observed_windows.contains(window))
+            .filter(|(_, pending)| pending.observed_windows.contains(window)
+                || pending.desktop.as_ref().is_some_and(|desktop| desktop.window == window))
             .map(|(id, _)| *id)
             .collect();
         let mut errors = self.detach(|owner| owner.window == window);
@@ -330,6 +390,7 @@ impl<T: Transport> Tunnels<T> {
             }
         });
         if let Some(error) = failure {
+            if let Some(desktop) = &mut pending.desktop { desktop.error = error.to_string(); }
             return Err(error);
         }
         self.cleanup.remove(&id);
