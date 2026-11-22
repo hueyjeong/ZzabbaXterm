@@ -194,13 +194,32 @@ fn f01_two_saved_ssh_launches_reap_only_the_owned_plan_and_child() {
         let (mut second, second_plan) = open();
         assert_ne!(first.id, second.id);
         assert_ne!(first_plan, second_plan);
+        assert!(matches!(tauri::async_runtime::block_on(sessions.connect_sftp("other", &first.id)),
+            Err(crate::editor::sftp::Error::Terminal(error)) if error == "다른 창의 세션입니다"));
+        let (first_context, first_cancel, first_worker) = sessions.get("main", &first.id).unwrap().sftp_context().unwrap();
+        let (same_context, _, same_worker) = sessions.get("main", &first.id).unwrap().sftp_context().unwrap();
+        let (second_context, second_cancel, second_worker) = sessions.get("main", &second.id).unwrap().sftp_context().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first_context, &same_context));
+        assert!(!std::sync::Arc::ptr_eq(&first_context, &second_context));
+        assert_eq!(first_context.invocation(crate::ssh::Client::Sftp).args[4], first_plan.as_os_str());
+        assert_eq!(second_context.invocation(crate::ssh::Client::Sftp).args[4], second_plan.as_os_str());
+        drop((first_context, same_context, second_context, same_worker, second_worker));
+        let cancelled = first_cancel.clone();
+        let worker = thread::spawn(move || {
+            tauri::async_runtime::block_on(cancelled.cancelled());
+            drop(first_worker);
+        });
         assert!(sessions.close("other", &first.id).is_err());
         assert!(sessions.close("main", &first.id).unwrap().warning().is_none());
+        worker.join().unwrap();
+        assert!(first_cancel.is_cancelled());
+        assert!(!second_cancel.is_cancelled());
         assert!(!first_plan.exists());
         assert!(second_plan.exists());
         second.input(b"fixture-input\r");
         second.until_bytes(b"F01-INPUT-OK", 0, true);
         assert!(sessions.close("main", &second.id).unwrap().warning().is_none());
+        assert!(second_cancel.is_cancelled());
         assert!(!second_plan.exists());
         assert_eq!(std::fs::read_dir(config.join("ssh-trust")).unwrap().count(), 1);
     });

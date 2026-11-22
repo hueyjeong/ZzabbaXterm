@@ -9,6 +9,7 @@ use std::{
     thread,
     time::Duration,
 };
+use tokio_util::task::{TaskTracker, task_tracker::TaskTrackerToken};
 
 const POLL: Duration = Duration::from_millis(10);
 const START_TIMEOUT: Duration = Duration::from_secs(5);
@@ -29,9 +30,16 @@ struct Flow {
     child_exited: bool,
     finished: bool,
     stop: Option<Stop>,
+    sftp: Option<SftpOwner>,
     sent: u64,
     acked: u64,
     ack_deadline: Option<std::time::Instant>,
+}
+
+struct SftpOwner {
+    plan: Arc<ConnectionPlan>,
+    cancel: CancellationToken,
+    workers: Option<TaskTracker>,
 }
 
 impl Flow {
@@ -81,7 +89,7 @@ pub(super) struct Session {
 
 struct OwnedSsh {
     child: Box<dyn Child + Send + Sync>,
-    _plan: ConnectionPlan,
+    _plan: Arc<ConnectionPlan>,
 }
 
 impl Session {
@@ -101,6 +109,14 @@ impl Session {
 
     pub(super) fn is_ssm(&self) -> bool {
         self.cancel.is_some()
+    }
+
+    pub(super) fn sftp_context(&self) -> Option<(Arc<ConnectionPlan>, CancellationToken, TaskTrackerToken)> {
+        let mut flow = self.flow.lock().unwrap();
+        flow.live().ok()?;
+        let sftp = flow.sftp.as_mut()?;
+        let worker = sftp.workers.get_or_insert_with(TaskTracker::new).token();
+        Some((Arc::clone(&sftp.plan), sftp.cancel.child_token(), worker))
     }
 
     pub(super) fn launch(
@@ -292,6 +308,13 @@ impl Session {
             {
                 let mut flow = self.flow.lock().unwrap();
                 flow.attached = true;
+                if flow.stop.is_none() {
+                    flow.sftp = ssh_plan.as_ref().map(|plan| SftpOwner {
+                        plan: Arc::clone(plan),
+                        cancel: CancellationToken::new(),
+                        workers: None,
+                    });
+                }
                 if !ssm { flow.start_deadline = Some(std::time::Instant::now() + START_TIMEOUT); }
                 self.wake.notify_all();
             }
@@ -319,6 +342,16 @@ impl Session {
                 if let Some(cancel) = &self.cancel { cancel.cancel(); }
                 event
             });
+            let sftp = self.flow.lock().unwrap().sftp.take();
+            if let Some(SftpOwner { cancel, workers, .. }) = sftp {
+                cancel.cancel();
+                if let Some(workers) = workers {
+                    workers.close();
+                    if !workers.is_empty() {
+                        tauri::async_runtime::block_on(workers.wait());
+                    }
+                }
+            }
             if let Some(plan) = ssh_plan
                 && self.close_result().local == LocalClose::Unconfirmed
             {
@@ -683,6 +716,7 @@ impl Session {
     pub(super) fn stop(&self, reason: Stop) {
         if let Some(cancel) = &self.cancel { cancel.cancel(); }
         let mut flow = self.flow.lock().unwrap();
+        if let Some(sftp) = &flow.sftp { sftp.cancel.cancel(); }
         if flow.stop.is_none() || matches!(reason, Stop::Closed) {
             flow.stop = Some(reason);
         }

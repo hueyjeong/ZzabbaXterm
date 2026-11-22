@@ -213,12 +213,12 @@ fn f01_ssh_and_sftp_use_one_pinned_config_with_exclusive_authentication() {
         let ssh = plan.invocation(Client::Ssh);
         let sftp = plan.invocation(Client::Sftp);
         assert!(ssh.program.is_absolute() && ssh.program.is_file());
-        assert!(sftp.program.is_absolute() && sftp.program.is_file());
-        assert_eq!(sftp.program.file_stem().unwrap(), "sftp");
+        assert_eq!(sftp.program, ssh.program);
         assert_eq!(ssh.program.file_stem().unwrap(), "ssh");
         assert_eq!(ssh.args, [OsStr::new("-F"), plan.config.as_os_str(), OsStr::new("--"), OsStr::new("zzabba-target")]);
-        assert_eq!(sftp.args[..2], [OsStr::new("-S"), ssh.program.as_os_str()]);
-        assert_eq!(sftp.args[2..], ssh.args);
+        assert_eq!(sftp.args[..3], ["-T", "-oBatchMode=yes", "-s"].map(OsStr::new));
+        assert_eq!(sftp.args[3..7], ssh.args);
+        assert_eq!(sftp.args[7], "sftp");
         assert_eq!(sftp.environment, ssh.environment);
         assert_eq!(ssh.environment, [("SSH_ASKPASS", None), ("SSH_ASKPASS_REQUIRE", Some("never"))]);
 

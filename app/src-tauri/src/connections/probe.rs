@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc, thread};
 use serde::{Deserialize, Serialize};
 
 use crate::terminal::{Sessions, probe::Probe};
-use super::{profile::{Draft, Method, ValidatedDraft}, store::{SaveStatus, Store, StoreError}};
+use super::{profile::{Draft, Method, MethodRef, ValidatedDraft}, store::{SaveStatus, Store, StoreError}};
 
 const UNTESTED: &str = "이 초안의 현재 시험이 없습니다";
 
@@ -20,7 +20,7 @@ pub(crate) struct RunKey {
 pub(crate) struct Passed {
     #[serde(flatten)]
     run: RunKey,
-    pub(super) session_id: String,
+    pub(super) session_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -32,7 +32,7 @@ pub(crate) struct SaveRequest {
 
 struct Run {
     key: RunKey,
-    session_id: String,
+    session_id: Option<String>,
     draft: Arc<ValidatedDraft>,
     probe: Arc<Probe>,
     confirmed: bool,
@@ -54,7 +54,7 @@ impl Runs {
     }
 
     pub(crate) fn attached_probe(&self, owner: &str, id: &str) -> Option<&Probe> {
-        self.active.get(owner)?.values().find(|run| run.session_id == id).map(|run| run.probe.as_ref())
+        self.active.get(owner)?.values().find(|run| run.session_id.as_deref() == Some(id)).map(|run| run.probe.as_ref())
     }
 
     fn retire(&mut self, owner: &str, document: u64, key: RunKey, probe: Arc<Probe>) {
@@ -120,7 +120,7 @@ pub(super) fn start(sessions: &Sessions, owner: &str, document: u64, draft_id: S
         }
         let draft = Arc::new(draft.validate().map_err(|error| format!("초안 검증: {error:?}"))?);
         let key = RunKey { draft_id, draft_version, run_id: sessions.next_id() };
-        let session_id = sessions.next_id();
+        let session_id = (!matches!(draft.method(), MethodRef::S3 { .. })).then(|| sessions.next_id());
         let probe = Arc::new(Probe::for_draft(owner, &draft));
         let worker = Arc::clone(&probe);
         let tested = Arc::clone(&draft);
@@ -142,7 +142,7 @@ pub(super) fn attach(sessions: &Sessions, owner: &str, document: u64, key: &RunK
         let run = runs.get(owner, key)?;
         let size = crate::terminal::probe_size(rows, cols)?;
         run.probe.attach(size, output)?;
-        Ok((Arc::clone(&run.probe), run.session_id.clone()))
+        Ok((Arc::clone(&run.probe), run.session_id.clone().ok_or(UNTESTED)?))
     })?;
     probe.wait_open()?;
     sessions.with_probes(owner, document, |runs| { runs.get(owner, key)?; Ok(id) })
@@ -217,7 +217,7 @@ pub(super) fn save_confirmed(sessions: &Sessions, owner: &str, document: u64, re
         Ok((Arc::clone(&run.draft), Arc::clone(&run.probe)))
     })?;
     let tested_account_id = expected.1.wait()?;
-    if matches!(draft.method(), super::profile::MethodRef::Ssm { .. }) != tested_account_id.is_some() {
+    if draft.method().uses_tested_account() != tested_account_id.is_some() {
         return Err(UNTESTED.into());
     }
     let authorize = || sessions.with_probes(owner, document, |runs| {
@@ -253,7 +253,7 @@ pub(crate) fn save_ssm_fixture(directory: &std::path::Path, input: serde_json::V
     probe.finish_ssm_fixture(account);
     sessions.with_probes("main", 0, |runs| {
         runs.active.entry("main".into()).or_default().insert(key.draft_id.clone(), Run {
-            key: key.clone(), session_id: sessions.next_id(), draft, probe, confirmed: false,
+            key: key.clone(), session_id: Some(sessions.next_id()), draft, probe, confirmed: false,
         });
         Ok(())
     }).unwrap();
@@ -270,6 +270,45 @@ mod tests {
     use super::*;
     use crate::connections::tests::{TestDir, draft};
     use std::{sync::mpsc, time::Duration};
+
+    #[test]
+    fn s3_confirmation_authorizes_only_the_same_run_and_exact_prefix() {
+        use serde_json::json;
+
+        let dir = TestDir::new();
+        let sessions = Sessions::default();
+        let store = Store::new(dir.path());
+        let key = RunKey { draft_id: "s3-draft".into(), draft_version: 1, run_id: sessions.next_id() };
+        let mut input = draft(dir.path(), "work", "s3-bucket");
+        input["target"] = json!({
+            "id": "s3-bucket", "groupId": "work", "displayName": "버킷", "defaultMethod": "s3",
+            "s3": {"profile": "company-sso", "region": "eu-west-1", "bucket": "selected-bucket", "prefix": "한글//"}
+        });
+        let validate = |value| serde_json::from_value::<Draft>(value).unwrap();
+        let tested = Arc::new(validate(input.clone()).validate().unwrap());
+        let probe = Arc::new(Probe::for_draft("main", &tested));
+        let account = "012345678901";
+        probe.finish_ssm_fixture(account);
+        sessions.with_probes("main", 0, |runs| {
+            runs.active.entry("main".into()).or_default().insert(key.draft_id.clone(), Run {
+                key: key.clone(), session_id: None, draft: tested, probe, confirmed: false,
+            });
+            Ok(())
+        }).unwrap();
+        let request = || SaveRequest { run: key.clone(), draft: validate(input.clone()) };
+        assert!(save_confirmed(&sessions, "main", 0, request(), &store).is_err());
+        assert!(wait(&sessions, "main", 0, &key).unwrap().session_id.is_none());
+        let mut changed = input.clone();
+        changed["target"]["s3"]["prefix"] = json!("한글/");
+        let changed = SaveRequest { run: key.clone(), draft: validate(changed) };
+        assert!(save_confirmed(&sessions, "main", 0, changed, &store).is_err());
+        let mut wrong_run = request();
+        wrong_run.run.run_id = sessions.next_id();
+        assert!(save_confirmed(&sessions, "main", 0, wrong_run, &store).is_err());
+        save_confirmed(&sessions, "main", 0, request(), &store).unwrap();
+        assert_eq!(store.load().unwrap().targets[0].tested_account_id.as_deref(), Some(account));
+        assert!(save_confirmed(&sessions, "main", 0, request(), &store).is_err());
+    }
 
     #[test]
     fn f01_interactive_trial_requires_the_exact_live_run() {
@@ -386,7 +425,7 @@ mod tests {
             assert!(save_confirmed(&sessions, "main", 0, request(), &store).is_err());
             sessions.start("main", &id).unwrap();
             terminal(b"fixture-password\r", &id, rx, None);
-            assert_eq!(wait(&sessions, "main", 0, &run).unwrap().session_id, id);
+            assert_eq!(wait(&sessions, "main", 0, &run).unwrap().session_id.as_deref(), Some(id.as_str()));
             save_confirmed(&sessions, "main", 0, request(), &store).unwrap();
             assert_eq!(serde_json::to_value(store.load().unwrap()).unwrap()["targets"][0]["profile"], input["target"]);
             if index == 0 {
@@ -420,7 +459,7 @@ mod tests {
         let probe = Arc::new(Probe::new("main"));
         sessions.with_probes("main", 0, |runs| {
             runs.active.entry("main".into()).or_default().insert(key.draft_id.clone(), Run {
-                key: key.clone(), session_id: sessions.next_id(), draft: Arc::clone(&draft),
+                key: key.clone(), session_id: Some(sessions.next_id()), draft: Arc::clone(&draft),
                 probe: Arc::clone(&probe), confirmed: false,
             });
             Ok(())

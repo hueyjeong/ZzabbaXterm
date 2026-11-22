@@ -48,12 +48,20 @@ pub(super) enum Method {
     Local { local: Local },
     Ssm { ssm: Ssm },
     Ssh { ssh: Ssh },
+    S3 { s3: S3 },
 }
 
 pub(crate) enum MethodRef<'a> {
     Local { shell: Shell, start_directory: &'a Path },
     Ssm { profile: &'a str, region: &'a str, instance_id: &'a str },
     Ssh { ssh: &'a Ssh },
+    S3 { s3: &'a S3 },
+}
+
+impl MethodRef<'_> {
+    pub(crate) fn uses_tested_account(&self) -> bool {
+        matches!(self, Self::Ssm { .. } | Self::S3 { .. })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -87,6 +95,41 @@ impl Ssm {
         }
         if !valid_instance_id(&self.instance_id) {
             return Err(ValidationError::SsmInstanceId);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct S3 {
+    pub(crate) profile: String,
+    pub(crate) region: String,
+    pub(crate) bucket: String,
+    pub(crate) prefix: String,
+}
+
+impl S3 {
+    fn validate(&self) -> Result<(), ValidationError> {
+        crate::ssm::validate_profile(&self.profile).map_err(|_| ValidationError::S3Profile)?;
+        if !crate::ssm::valid_region(&self.region) {
+            return Err(ValidationError::S3Region);
+        }
+        let label = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+        if !(3..=63).contains(&self.bucket.len())
+            || !self.bucket.split('.').all(|part| {
+                part.bytes().next().is_some_and(label)
+                    && part.bytes().last().is_some_and(label)
+                    && part.bytes().all(|byte| label(byte) || byte == b'-')
+            })
+            || self.bucket.parse::<std::net::Ipv4Addr>().is_ok()
+            || ["xn--", "sthree-", "amzn-s3-demo-"].iter().any(|prefix| self.bucket.starts_with(prefix))
+            || ["--x-s3", "--table-s3", "-s3alias", "--ol-s3", ".mrap"].iter().any(|suffix| self.bucket.ends_with(suffix))
+        {
+            return Err(ValidationError::S3Bucket);
+        }
+        if self.prefix.len() > 1024 {
+            return Err(ValidationError::S3Prefix);
         }
         Ok(())
     }
@@ -190,6 +233,10 @@ pub(crate) enum ValidationError {
     SshHostKeyFingerprint,
     SshKeyPath,
     SshItemId,
+    S3Profile,
+    S3Region,
+    S3Bucket,
+    S3Prefix,
 }
 
 // 구조 검증과 실제 연결 시험은 별개다.
@@ -264,6 +311,7 @@ impl Target {
             Method::Local { local } => MethodRef::Local { shell: local.shell, start_directory: &local.start_directory },
             Method::Ssm { ssm } => MethodRef::Ssm { profile: &ssm.profile, region: &ssm.region, instance_id: &ssm.instance_id },
             Method::Ssh { ssh } => MethodRef::Ssh { ssh },
+            Method::S3 { s3 } => MethodRef::S3 { s3 },
         }
     }
 
@@ -288,6 +336,7 @@ impl Target {
             }
             Method::Ssm { ssm } => ssm.validate(),
             Method::Ssh { ssh } => ssh.validate(),
+            Method::S3 { s3 } => s3.validate(),
         }
     }
 }

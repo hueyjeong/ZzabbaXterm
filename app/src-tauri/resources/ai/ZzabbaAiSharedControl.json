@@ -1,0 +1,16 @@
+{
+  "schemaVersion": "1.0",
+  "description": "ZzabbaXterm shared Bash Linux control session",
+  "sessionType": "Standard_Stream",
+  "inputs": {
+    "s3EncryptionEnabled": true,
+    "cloudWatchEncryptionEnabled": true,
+    "cloudWatchStreamingEnabled": false,
+    "runAsEnabled": true,
+    "runAsDefaultUser": "zzabba-ai-control",
+    "shellProfile": {
+      "linux": "exec /usr/local/libexec/zzabba-ai-control --shared-control",
+      "windows": "exit 1"
+    }
+  }
+}

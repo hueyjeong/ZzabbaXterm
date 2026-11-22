@@ -20,8 +20,12 @@ use crate::{
 };
 
 use super::{
-    AwsS3, BucketRow, Downloaded, Error, Failure, ObjectRow, Page, Stage, VerifiedSsoSelection, check_bucket,
+    AwsS3, BucketRow, Downloaded, Error, Failure, Page, Stage, VerifiedSsoSelection, check_bucket,
 };
+
+#[path = "edit_ipc.rs"]
+mod edit_ipc;
+use edit_ipc::{EditOpenRequest, EditRequest, EditSaveRequest, Edits, ListedRow};
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct Document {
@@ -36,6 +40,21 @@ pub(crate) struct Session {
     profile: String,
     region: String,
     endpoint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    location: Option<SavedLocation>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize)]
+struct SavedLocation {
+    bucket: String,
+    prefix: String,
+    region: String,
+}
+
+#[derive(PartialEq, Eq)]
+struct VerifiedStorageSelection {
+    sso: VerifiedSsoSelection,
+    location: Option<SavedLocation>,
 }
 
 struct Tab {
@@ -45,14 +64,16 @@ struct Tab {
     selection: Option<Selection>,
     binding: Option<LoginBinding>,
     expired: bool,
+    logging_in: bool,
     listing: bool,
     verified_bucket: Option<(String, String)>,
+    edits: Edits,
 }
 
 #[derive(Clone)]
 struct LoginBinding {
     target_id: String,
-    selection: Arc<VerifiedSsoSelection>,
+    selection: Arc<VerifiedStorageSelection>,
 }
 
 struct Opening {
@@ -135,7 +156,14 @@ impl StorageIpc {
         let operation = async {
             let selection = tauri::async_runtime::spawn_blocking(move || verified_selection(&directory, &check_id))
                 .await.map_err(|_| unavailable(Stage::Profile))??;
-            let result = verify(selection.scope.region().to_owned(), selection.config.clone()).await;
+            let result = async {
+                let client = verify(selection.sso.scope.region().to_owned(), selection.sso.config.clone()).await?;
+                if let Some(location) = &selection.location {
+                    client.check_bucket_region(&location.bucket).await?;
+                    client.list_objects(&location.bucket, &location.prefix, None).await?;
+                }
+                Ok::<_, Error>(client)
+            }.await;
             Ok::<_, Error>((selection, result))
         };
         let result = tokio::select! {
@@ -154,8 +182,8 @@ impl StorageIpc {
         let binding = LoginBinding { target_id, selection: Arc::new(selection) };
         match result {
             Ok(client) => {
-                let profile = binding.selection.scope.profile().into();
-                let region = binding.selection.scope.region().into();
+                let profile = binding.selection.sso.scope.profile().into();
+                let region = binding.selection.sso.scope.region().into();
                 Ok(Self::insert_tab(&mut registry, id.to_string(), document, profile, region, client, Some(binding)))
             }
             Err(error) => {
@@ -191,6 +219,7 @@ impl StorageIpc {
         #[cfg(not(test))]
         let verified_bucket = None;
         let endpoint = client.endpoint().into();
+        let location = binding.as_ref().and_then(|binding| binding.selection.location.clone());
         registry.tabs.insert(
             session_id.clone(),
             Tab {
@@ -200,8 +229,10 @@ impl StorageIpc {
                 selection: None,
                 binding,
                 expired: false,
+                logging_in: false,
                 listing: false,
                 verified_bucket,
+                edits: Edits::default(),
             },
         );
         Session {
@@ -209,6 +240,7 @@ impl StorageIpc {
             profile,
             region,
             endpoint,
+            location,
         }
     }
 
@@ -375,15 +407,17 @@ impl StorageIpc {
         &self,
         document: &Document,
         request: ObjectPageRequest,
-    ) -> Result<Page<ObjectRow>, Error> {
+    ) -> Result<Page<ListedRow>, Error> {
         let stage = Stage::ListObjects;
         let (client, closed) = {
             let mut registry = self.0.lock().unwrap();
             let tab = registry.tab(document, &request.session_id).ok_or_else(|| unavailable(stage))?;
-            if tab.listing || tab.expired { return Err(unavailable(stage)); }
+            if tab.listing || tab.logging_in { return Err(unavailable(stage)); }
+            if tab.expired { return Err(Error::at(stage, Failure::SsoLoginRequired)); }
             if request.token.is_none() {
                 tab.verified_bucket = None;
                 tab.selection = None;
+                tab.edits.clear_rows();
             } else if !tab.verified_bucket.as_ref().is_some_and(|(bucket, region)| *bucket == request.bucket && *region == request.region) {
                 return Err(unavailable(stage));
             }
@@ -400,9 +434,10 @@ impl StorageIpc {
         tab.listing = false;
         mark_expired(tab, &result);
         if result.is_ok() && request.token.is_none() && !tab.expired {
-            tab.verified_bucket = Some((request.bucket, request.region));
+            tab.verified_bucket = Some((request.bucket.clone(), request.region.clone()));
         }
-        result
+        if tab.expired && result.is_ok() { return Err(unavailable(stage)); }
+        result.map(|page| tab.edits.listed(page, &request.bucket, &request.region))
     }
 
     async fn count_previous_files(
@@ -459,17 +494,18 @@ impl StorageIpc {
                 (binding, opening.cancel.clone(), None)
             } else {
                 let tab = registry.tab(document, &id.to_string()).ok_or_else(|| unavailable(Stage::Profile))?;
-                let binding = tab.binding.as_ref().filter(|_| tab.expired && !tab.listing).ok_or_else(|| unavailable(Stage::Profile))?.clone();
-                tab.expired = false;
-                tab.verified_bucket = None;
+                let binding = tab.binding.as_ref().filter(|_| tab.expired && !tab.listing && !tab.logging_in)
+                    .ok_or_else(|| unavailable(Stage::Profile))?.clone();
+                tab.logging_in = true;
                 (binding, Arc::new(CancellationToken::new()), Some(tab.closed.subscribe()))
             }
         };
         let operation = async {
-            let current = tauri::async_runtime::spawn_blocking(move || verified_selection(&directory, &binding.target_id))
+            let target_id = binding.target_id.clone();
+            let current = tauri::async_runtime::spawn_blocking(move || verified_selection(&directory, &target_id))
                 .await.map_err(|_| unavailable(Stage::Profile))??;
             if current != *binding.selection { return Err(Error::at(Stage::Profile, Failure::AccountMismatch)); }
-            login(current, (*cancel).clone()).await.map_err(|error| Error::at(Stage::Profile, match error {
+            login(current.sso, (*cancel).clone()).await.map_err(|error| Error::at(Stage::Profile, match error {
                 CliError::CallerChanged => Failure::AccountMismatch,
                 CliError::TimedOut => Failure::TimedOut,
                 _ => Failure::LoginFailed,
@@ -477,7 +513,19 @@ impl StorageIpc {
         };
         if let Some(closed) = closed {
             let _cancel_on_drop = (*cancel).clone().drop_guard();
-            until_closed(&closed, Stage::Profile, operation).await
+            let result = until_closed(&closed, Stage::Profile, operation).await;
+            let mut registry = self.0.lock().unwrap();
+            let tab = registry.tab(document, &id.to_string())
+                .filter(|tab| closed.same_channel(&tab.closed.subscribe()))
+                .ok_or_else(|| unavailable(Stage::Profile))?;
+            tab.logging_in = false;
+            if result.is_ok() {
+                tab.expired = false;
+                tab.verified_bucket = None;
+                tab.selection = None;
+                tab.edits.clear_rows();
+            }
+            result
         } else {
             let result = tokio::select! {
                 biased;
@@ -485,10 +533,15 @@ impl StorageIpc {
                 result = operation => result,
             };
             let mut registry = self.0.lock().unwrap();
-            if !registry.active(document) || !registry.openings.get(&id).is_some_and(|entry| Arc::ptr_eq(&entry.cancel, &cancel)) {
-                return Err(unavailable(Stage::Profile));
+            if !registry.active(document) { return Err(unavailable(Stage::Profile)); }
+            let opening = registry.openings.get_mut(&id)
+                .filter(|entry| entry.document == *document && Arc::ptr_eq(&entry.cancel, &cancel))
+                .ok_or_else(|| unavailable(Stage::Profile))?;
+            if result.is_ok() {
+                registry.openings.remove(&id);
+            } else {
+                opening.expired = Some(binding);
             }
-            registry.openings.remove(&id);
             result
         }
     }
@@ -503,6 +556,7 @@ impl StorageIpc {
         let tab = registry
             .tab(document, session_id)
             .ok_or_else(|| unavailable(stage))?;
+        if tab.logging_in { return Err(unavailable(stage)); }
         Ok((tab.client.clone(), tab.closed.subscribe()))
     }
 
@@ -543,6 +597,7 @@ fn mark_expired<T>(tab: &mut Tab, result: &Result<T, Error>) {
     if is_login_required(result) {
         tab.expired = true;
         tab.selection = None;
+        tab.edits.clear_rows();
     }
 }
 
@@ -575,10 +630,16 @@ fn unavailable(stage: Stage) -> Error {
     Error::at(stage, Failure::Request)
 }
 
-fn verified_selection(directory: &std::path::Path, target_id: &str) -> Result<VerifiedSsoSelection, Error> {
-    let (scope, account) = with_saved_method(directory, target_id, |method, account| match method {
-        MethodRef::Ssm { profile, region, .. } => Ok((Scope::new(profile.to_owned(), region.to_owned()), account.map(str::to_owned))),
-        MethodRef::Local { .. } | MethodRef::Ssh { .. } => Err("SSO 연결이 아닙니다".into()),
+fn verified_selection(directory: &std::path::Path, target_id: &str) -> Result<VerifiedStorageSelection, Error> {
+    let (scope, account, location) = with_saved_method(directory, target_id, |method, account| {
+        let (profile, region, location) = match method {
+            MethodRef::Ssm { profile, region, .. } => (profile, region, None),
+            MethodRef::S3 { s3 } => (s3.profile.as_str(), s3.region.as_str(), Some(SavedLocation {
+                bucket: s3.bucket.clone(), prefix: s3.prefix.clone(), region: s3.region.clone(),
+            })),
+            MethodRef::Local { .. } | MethodRef::Ssh { .. } => return Err("SSO 연결이 아닙니다".into()),
+        };
+        Ok((Scope::new(profile.to_owned(), region.to_owned()), account.map(str::to_owned), location))
     })
     .map_err(|_| Error::at(Stage::Profile, Failure::InvalidSsoProfile))?;
     let account = account.ok_or_else(|| Error::at(Stage::Profile, Failure::RetestRequired))?;
@@ -591,7 +652,7 @@ fn verified_selection(directory: &std::path::Path, target_id: &str) -> Result<Ve
     if config.account != account {
         return Err(Error::at(Stage::Profile, Failure::AccountMismatch));
     }
-    Ok(VerifiedSsoSelection { scope, config })
+    Ok(VerifiedStorageSelection { sso: VerifiedSsoSelection { scope, config }, location })
 }
 
 #[derive(Deserialize, PartialEq, Eq)]
@@ -978,6 +1039,36 @@ pub(crate) fn dispatch<R: tauri::Runtime>(invoke: Invoke<R>) -> bool {
                 ))
             }
         ),
+        "storage_edit_open" => handle!(
+            "storage_edit_open", EditOpenRequest,
+            async |webview: tauri::Webview<R>, document, request| {
+                Ok(webview.state::<StorageIpc>().edit_open(&document, request).await)
+            }
+        ),
+        "storage_edit_compare" => handle!(
+            "storage_edit_compare", EditRequest,
+            async |webview: tauri::Webview<R>, document, request| {
+                Ok(webview.state::<StorageIpc>().edit_compare(&document, request).await)
+            }
+        ),
+        "storage_edit_reload" => handle!(
+            "storage_edit_reload", EditRequest,
+            async |webview: tauri::Webview<R>, document, request| {
+                Ok(webview.state::<StorageIpc>().edit_reload(&document, request).await)
+            }
+        ),
+        "storage_edit_save" => handle!(
+            "storage_edit_save", EditSaveRequest,
+            async |webview: tauri::Webview<R>, document, request| {
+                Ok(webview.state::<StorageIpc>().edit_save(&document, request).await)
+            }
+        ),
+        "storage_edit_close" => handle!(
+            "storage_edit_close", EditRequest,
+            async |webview: tauri::Webview<R>, document, request| {
+                Ok(webview.state::<StorageIpc>().edit_close(&document, request))
+            }
+        ),
         "storage_count_previous_files" => handle!(
             "storage_count_previous_files",
             PreviousFilesRequest,
@@ -1328,6 +1419,13 @@ mod tests {
             let session_id = Uuid::parse_str(&session.session_id).unwrap();
             let unexpected = |_, _| async { panic!("재로그인 권한 없음"); };
             assert!(state.relogin_with(&state.document("other"), session_id, directory.clone(), unexpected).await.is_err());
+            let failed = state.relogin_with(&document, session_id, directory.clone(), |_, _| async {
+                assert!(state.relogin_with(&document, session_id, directory.clone(), unexpected).await.is_err());
+                assert!(state.begin_selection(&document, regional(), Direction::Upload).is_none());
+                assert!(objects("us-west-2").await.is_err());
+                Err(CliError::TimedOut)
+            }).await.unwrap_err();
+            assert_eq!(failed.failure, Failure::TimedOut);
             state.relogin_with(&document, session_id, directory.clone(), |current, _| async move {
                 assert_eq!(current.scope.profile(), "chosen team");
                 assert_eq!(current.config.account, "123456789012");
@@ -1342,15 +1440,82 @@ mod tests {
             write_config("000000000000");
             assert_eq!(state.relogin_with(&document, expired_id, directory.clone(), unexpected).await.unwrap_err().failure, Failure::AccountMismatch);
             write_config("123456789012");
+            state.relogin_with(&document, expired_id, directory.clone(), |_, _| async {
+                assert!(state.relogin_with(&document, expired_id, directory.clone(), unexpected).await.is_err());
+                Ok(())
+            }).await.unwrap();
             assert!(state.relogin_with(&document, expired_id, directory.clone(), unexpected).await.is_err());
             assert_eq!(replay.actual_requests().count(), 13);
 
+            let mut stored: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.join("connections.json")).unwrap()).unwrap();
+            stored["targets"][0]["profile"] = json!({
+                "id": "saved-s3", "groupId": "team", "displayName": "S3", "defaultMethod": "s3",
+                "s3": {"profile": "chosen team", "region": "eu-west-1", "bucket": "selected-bucket", "prefix": "실험//"},
+            });
+            std::fs::write(directory.join("connections.json"), serde_json::to_vec(&stored).unwrap()).unwrap();
+            let s3_replay = super::super::tests::replay([
+                head(301, "us-west-2"),
+                head(200, "eu-west-1"),
+                response(200, "<ListBucketResult><EncodingType>url</EncodingType><IsTruncated>false</IsTruncated></ListBucketResult>"),
+                head(200, "eu-west-1"),
+                response(200, "<ListBucketResult><EncodingType>url</EncodingType><IsTruncated>false</IsTruncated></ListBucketResult>"),
+            ]);
+            let open_s3 = || {
+                let opening = request("saved-s3");
+                let cancel = state.reserve_open(&document, opening.id).unwrap();
+                state.open_with(document.clone(), opening, directory.clone(), cancel, |region, config| {
+                    assert_eq!(region, "eu-west-1");
+                    assert_eq!(config.account, "123456789012");
+                    std::future::ready(Ok(client(&s3_replay)))
+                })
+            };
+            assert_eq!(open_s3().await.err().unwrap().failure, Failure::BucketRegionMismatch { region: "us-west-2".into() });
+            let saved_s3 = open_s3().await.unwrap();
+            assert_eq!(serde_json::to_value(&saved_s3).unwrap()["location"], json!({
+                "bucket": "selected-bucket", "prefix": "실험//", "region": "eu-west-1"
+            }));
+            assert!(s3_replay.actual_requests().nth(2).unwrap().uri().contains("prefix=%EC%8B%A4%ED%97%98%2F%2F"));
+            let saved_s3_id = Uuid::parse_str(&saved_s3.session_id).unwrap();
+            let saved_target = self::target(&saved_s3);
+            {
+                let mut registry = state.0.lock().unwrap();
+                let tab = registry.tab(&document, &saved_s3.session_id).unwrap();
+                tab.expired = true;
+                tab.verified_bucket = Some((saved_target.bucket.clone(), saved_target.region.clone()));
+            }
+            state.relogin_with(&document, saved_s3_id, directory.clone(), |_, _| async { Ok(()) }).await.unwrap();
+            assert!(state.begin_selection(&document, self::target(&saved_s3), Direction::Upload).is_none());
+            state.list_objects(&document, ObjectPageRequest {
+                session_id: saved_s3.session_id.clone(), bucket: saved_target.bucket.clone(),
+                region: saved_target.region.clone(), prefix: "실험//".into(), token: None,
+            }).await.unwrap();
+            assert!(state.begin_selection(&document, saved_target, Direction::Upload).is_some());
+            let expired_s3 = request("saved-s3");
+            let expired_s3_id = expired_s3.id;
+            let cancel = state.reserve_open(&document, expired_s3_id).unwrap();
+            let expired_result = state.open_with(document.clone(), expired_s3, directory.clone(), cancel, |_, _| async {
+                Err(Error::at(Stage::Identity, Failure::SsoLoginRequired))
+            }).await;
+            assert_eq!(expired_result.err().unwrap().failure, Failure::SsoLoginRequired);
+            stored["targets"][0]["profile"]["s3"]["prefix"] = json!("바뀐 접두어/");
+            std::fs::write(directory.join("connections.json"), serde_json::to_vec(&stored).unwrap()).unwrap();
+            assert_eq!(state.relogin_with(&document, expired_s3_id, directory.clone(), unexpected).await.unwrap_err().failure, Failure::AccountMismatch);
+            stored["targets"][0]["profile"]["s3"]["prefix"] = json!("실험//");
+            std::fs::write(directory.join("connections.json"), serde_json::to_vec(&stored).unwrap()).unwrap();
             std::fs::write(root.join("credentials"), "[chosen team]\naws_access_key_id=fixture\n").unwrap();
-            let changed = open(request("saved-sso")).await.err().unwrap();
+            let changed = open(request("saved-s3")).await.err().unwrap();
             assert_eq!(changed.failure, Failure::InvalidSsoProfile);
-            state.navigate("main");
-            assert!(!state.close(&state.document("main"), &session.session_id));
+            std::fs::remove_file(root.join("credentials")).unwrap();
+            state.0.lock().unwrap().tab(&document, &saved_s3.session_id).unwrap().expired = true;
+            let interrupted = state.relogin_with(&document, saved_s3_id, directory.clone(), |_, _| async {
+                state.navigate("main");
+                Ok(())
+            }).await.unwrap_err();
+            assert_eq!(interrupted.failure, Failure::Request);
             assert!(state.reserve_open(&document, Uuid::new_v4()).is_err());
+            assert!(!state.0.lock().unwrap().tabs.contains_key(&saved_s3.session_id));
+            assert!(state.0.lock().unwrap().openings.is_empty());
+            assert!(!state.close(&state.document("main"), &session.session_id));
         });
     }
 

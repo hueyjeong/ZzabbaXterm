@@ -2,7 +2,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { AiPanel } from "./AiPanel";
+import { AiPanel, type AiTopTabs } from "./AiPanel";
 import type { AiPanelProps, ChatReply, Proposal } from "./contracts";
 
 const alpha = { targetId: "a", generation: "1", label: "개발" };
@@ -24,7 +24,7 @@ function setup() {
   };
 }
 
-async function render(props: AiPanelProps) {
+async function render(props: AiPanelProps & { topTabs?: AiTopTabs }) {
   await act(async () => { root.render(<><textarea aria-label="터미널 입력" /><AiPanel {...props} /></>); });
 }
 
@@ -139,6 +139,82 @@ describe("일반 대화", () => {
     expect(props.onRequestProposal).not.toHaveBeenCalled();
     expect(props.onDecideProposal).not.toHaveBeenCalled();
   });
+});
+
+it("오른쪽 탭을 전환해도 채팅 초안, SFTP 입력과 제안 검토 상태를 유지한다", async () => {
+  const props = setup();
+  await render(props);
+  const chat = host.querySelector<HTMLElement>(".workspace-chat")!;
+  const review = host.querySelector<HTMLElement>(".a01-proposals")!;
+  expect(chat.contains(review)).toBe(true);
+  expect(chat.querySelector("h2")?.textContent).toBe("AI 채팅");
+  expect(host.querySelector('[role="tablist"]')).toBeNull();
+  await select("Ollama 모델", "local:latest");
+  await select("조회 대상", "개발 (a)");
+  await type("채팅 초안");
+  const draft = input();
+
+  const onSelect = vi.fn<AiTopTabs["onSelect"]>();
+  const item = { id: "ssh-1", label: "SFTP", content: <input aria-label="원격 경로" /> };
+  const show = (selectedId: string | null) => render({ ...props, topTabs: { item, selectedId, onSelect } });
+  await show("다른 세션");
+  const chatTab = button("AI 채팅")!;
+  const sftpTab = button("SFTP")!;
+  const sftp = document.getElementById(sftpTab.getAttribute("aria-controls")!)!;
+  const path = sftp.querySelector("input")!;
+  expect(chatTab.closest('[role="tablist"]')).toBe(sftpTab.parentElement);
+  expect(chat.getAttribute("role")).toBe("tabpanel");
+  expect(chat.id).toBe(chatTab.getAttribute("aria-controls"));
+  expect(chat.getAttribute("aria-labelledby")).toBe(chatTab.id);
+  expect(sftp.getAttribute("aria-labelledby")).toBe(sftpTab.id);
+  expect(chatTab.getAttribute("aria-selected")).toBe("true");
+  expect(chatTab.tabIndex).toBe(0);
+  expect(sftpTab.tabIndex).toBe(-1);
+  expect(sftp.hidden && sftp.hasAttribute("inert")).toBe(true);
+
+  await click("SFTP");
+  expect(onSelect).toHaveBeenLastCalledWith(item.id);
+  expect(document.activeElement).toBe(sftpTab);
+  await show(item.id);
+  expect(sftpTab.getAttribute("aria-selected")).toBe("true");
+  expect(sftpTab.tabIndex).toBe(0);
+  expect(chatTab.tabIndex).toBe(-1);
+  expect(chat.hidden && chat.hasAttribute("inert")).toBe(true);
+  expect(sftp.hidden || sftp.hasAttribute("inert")).toBe(false);
+  path.value = "/home/dev";
+
+  const key = (tab: HTMLButtonElement, name: string) => act(async () => {
+    tab.dispatchEvent(new KeyboardEvent("keydown", { key: name, bubbles: true, cancelable: true }));
+  });
+  await key(sftpTab, "ArrowRight");
+  expect(onSelect).toHaveBeenLastCalledWith(null);
+  expect(document.activeElement).toBe(chatTab);
+  await show(null);
+  expect(chat.hidden || chat.hasAttribute("inert")).toBe(false);
+  expect(input()).toBe(draft);
+  expect(draft.value).toBe("채팅 초안");
+  expect(button("전송")?.disabled).toBe(false);
+  expect(chat.querySelector(".a01-proposals")).toBe(review);
+  expect(review.querySelector("select")?.selectedOptions[0].textContent?.trim()).toBe("개발 (a)");
+  const proposal = Promise.withResolvers<Proposal>();
+  props.onRequestProposal.mockReturnValueOnce(proposal.promise);
+  await click("가동 시간 조회 제안");
+  expect(review.querySelector('[role="status"]')?.textContent).toBe("제안 요청 중");
+
+  await key(chatTab, "End");
+  expect(onSelect).toHaveBeenLastCalledWith(item.id);
+  await show(item.id);
+  expect(sftp.querySelector("input")).toBe(path);
+  expect(path.value).toBe("/home/dev");
+  await act(async () => { proposal.resolve(card); });
+  expect(review.closest("[inert]")).toBe(chat);
+  expect(sftp.querySelector(".a01-proposals")).toBeNull();
+  await click("AI 채팅");
+  await show(null);
+  expect(button("승인")?.closest(".a01-proposals")).toBe(review);
+  expect(props.onSendChat).not.toHaveBeenCalled();
+  expect(props.onRequestProposal).toHaveBeenCalledTimes(1);
+  expect(props.onDecideProposal).not.toHaveBeenCalled();
 });
 
 describe("제안 검토", () => {

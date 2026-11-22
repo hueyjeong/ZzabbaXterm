@@ -33,8 +33,10 @@ export const localEditorTransport: EditorTransport = {
     } catch (error) {
       if (!error || typeof error !== "object" || !("kind" in error)) throw error;
       if (error.kind === "conflict" && "conflict" in error) {
-        const { diskText } = error.conflict as { diskText?: string };
-        return { kind: "conflict", current: diskText ?? null };
+        const { reason, diskText } = error.conflict as { reason: string; diskText?: string | null };
+        if (reason === "missing") return { kind: "conflict", current: null };
+        if (typeof diskText === "string") return { kind: "conflict", current: diskText };
+        return { kind: "conflict", message: reason };
       }
       return localEditorError(error);
     }

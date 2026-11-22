@@ -30,6 +30,8 @@ const titles = {
 } as const;
 
 const discovery = createSsmDiscovery();
+const s3Fields = [["profile", "IAM Identity Center 프로필"], ["region", "버킷 리전"],
+  ["bucket", "버킷"], ["prefix", "접두어 (선택)"]] as const;
 
 function Wizard(props: LocalConnectionWizardProps) {
   const [wizard] = useState(() => createLocalConnectionWizard(props.draftId, props.initialDraft));
@@ -53,9 +55,11 @@ function Wizard(props: LocalConnectionWizardProps) {
   const locked = status.kind === "saving" || status.kind === "closing" || status.kind === "closeFailed";
   const canSave = status.kind === "passed" || status.kind === "saveFailed";
   const ssh = target.defaultMethod === "ssh" ? target.ssh : null;
+  const s3 = target.defaultMethod === "s3" ? target.s3 : null;
+  const retestingS3 = props.initialDraft.targetRevision !== null && props.initialDraft.target.defaultMethod === "s3";
 
   return (
-    <dialog ref={dialog} className="connection-wizard" aria-label="연결 추가" onCancel={(event) => {
+    <dialog ref={dialog} className="connection-wizard" aria-label={retestingS3 ? "S3 연결 재시험" : "연결 추가"} onCancel={(event) => {
       event.preventDefault();
       void wizard.close(props);
     }}>
@@ -79,13 +83,14 @@ function Wizard(props: LocalConnectionWizardProps) {
         )}
         {step === "method" && (
           <>
-            <div><label>접속 방식 <select value={target.defaultMethod} onChange={(event) => {
+            <div><label>접속 방식 <select value={target.defaultMethod} disabled={retestingS3} onChange={(event) => {
               const method = event.currentTarget.value;
-              if (method === "local" || method === "ssm" || method === "ssh") wizard.selectMethod(method);
+              if (method === "local" || method === "ssm" || method === "ssh" || method === "s3") wizard.selectMethod(method);
             }}>
               <option value="local">로컬</option>
               <option value="ssm">AWS Systems Manager</option>
               <option value="ssh">SSH</option>
+              <option value="s3">S3</option>
             </select></label></div>
             {target.defaultMethod === "local" && <>
               <div>셸: {target.local.shell === "powerShell" ? "PowerShell" : "Bash"}</div>
@@ -98,6 +103,9 @@ function Wizard(props: LocalConnectionWizardProps) {
           {target.defaultMethod === "local" && <div>현재 사용자</div>}
           {useSsm && <SsmSelectionView state={ssm} />}
           {ssh && <SshAuthFields ssh={ssh} edit={wizard.editSsh} />}
+          {s3 && s3Fields.map(([field, label]) => <div key={field}><label>{label} <input
+            value={s3[field]} onChange={event => wizard.editS3(field, event.currentTarget.value)}
+          /></label></div>)}
         </>}
         {step === "verify" && (
           <>
@@ -107,6 +115,9 @@ function Wizard(props: LocalConnectionWizardProps) {
               <div><dt>SSO 프로필</dt><dd>{target.ssm.profile}</dd></div>
               <div><dt>리전</dt><dd>{target.ssm.region}</dd></div>
               <div><dt>인스턴스 ID</dt><dd>{target.ssm.instanceId}</dd></div>
+            </dl>}
+            {s3 && <dl aria-label="S3 연결 대상">
+              {s3Fields.map(([field, label]) => <div key={field}><dt>{label}</dt><dd>{s3[field]}</dd></div>)}
             </dl>}
             {ssh && <>
               <SshReview ssh={ssh} />
@@ -128,7 +139,7 @@ function Wizard(props: LocalConnectionWizardProps) {
         )}
         {step !== "target" && <button type="button" disabled={sshPin.kind === "checking"} onClick={() => wizard.go(-1)}>이전</button>}
         {step !== "verify" && <button type="button"
-          disabled={step === "auth" && ((useSsm && !ssm.selection) || (!!ssh && !wizard.canReviewSsh(ssm.selection)))}
+          disabled={step === "auth" && ((useSsm && !ssm.selection) || (!!ssh && !wizard.canReviewSsh(ssm.selection)) || (!!s3 && !wizard.canReviewS3()))}
           onClick={() => wizard.go(1, ssm.selection)}>다음</button>}
       </fieldset>
       <button type="button" disabled={locked && status.kind !== "closeFailed"} onClick={() => void wizard.close(props)}>

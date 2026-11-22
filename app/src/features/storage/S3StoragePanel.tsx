@@ -1,26 +1,28 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { VersionedFilesStatus } from "../files/FileBrowser";
 import { ObjectTable } from "./ObjectTable";
-import type { BucketRow, ObjectRow, S3Actions, S3FileSelection, S3Session } from "./s3";
+import type { BucketRow, ObjectRow, S3Actions, S3FileSelection, S3Location, S3Session, StorageEditorOpen } from "./s3";
 import { StorageProblem, TransferStatus, type Problem, type Transfer } from "./StorageStatus";
+import { bindStorageEditor } from "./storageEditorIpc";
 import { countPreviousFiles } from "./storageIpc";
 import "./storage.css";
 
-type Location = { bucket: string; prefix: string; region: string };
 type Listing = { nextToken: string | null } & (
   | { kind: "buckets"; rows: readonly BucketRow[] }
-  | { kind: "objects"; location: Location; rows: readonly ObjectRow[] }
+  | { kind: "objects"; location: S3Location; rows: readonly ObjectRow[] }
 );
 type View = {
-  input?: Location;
+  input?: S3Location;
   confirmed: boolean;
   listing?: Listing;
   loading: boolean;
   problem?: Problem;
+  editError?: string;
   selectedKey: string | null;
   uploadKey: string;
   transfer?: Transfer;
   invalidUploadPaste?: boolean;
+  requestedLocation?: S3Location | null;
   expired?: boolean;
 };
 const initial: View = { confirmed: false, loading: false, selectedKey: null, uploadKey: "" };
@@ -29,15 +31,22 @@ type Props = Readonly<{
   session: S3Session;
   actions: S3Actions;
   onRelogin?: () => void;
+  refresh?: number;
+  editEnabled?: boolean;
+  onEditFile?(opened: StorageEditorOpen): false | void;
   countHistory?: typeof countPreviousFiles;
 }>;
 
-export function S3StoragePanel({ session, actions, onRelogin, countHistory = countPreviousFiles }: Props) {
+export function S3StoragePanel({ session, actions, onRelogin, refresh = 0, editEnabled = true, onEditFile, countHistory = countPreviousFiles }: Props) {
   const [views, setViews] = useState(() => new Map<string, View>());
   const [history, setHistory] = useState<{ request: Parameters<typeof countPreviousFiles>[0]; count: typeof countPreviousFiles; status: VersionedFilesStatus }>();
+  const [menuKey, setMenuKey] = useState<string>();
+  const editAttempt = useRef<{ sessionId: string } | null>(null);
+  const editListener = useRef(onEditFile);
+  useLayoutEffect(() => { editListener.current = onEditFile; }, [onEditFile]);
   const { sessionId } = session;
   const view = views.get(sessionId) ?? initial;
-  const input = view.input ?? { bucket: "", prefix: "", region: session.region };
+  const input = view.input ?? session.location ?? { bucket: "", prefix: "", region: session.region };
 
   function update(change: (current: View) => Partial<View>) {
     setViews(current => {
@@ -46,9 +55,17 @@ export function S3StoragePanel({ session, actions, onRelogin, countHistory = cou
     });
   }
 
-  async function load(location: Location | null, token: string | null = null) {
+  async function load(location: S3Location | null, token: string | null = null, afterRelogin = false) {
     if (view.loading) return;
-    update(() => ({ loading: true, problem: undefined }));
+    editAttempt.current = null;
+    update(current => ({
+      loading: true, requestedLocation: location, problem: undefined, editError: undefined,
+      ...(afterRelogin ? {
+        expired: false, confirmed: false,
+        ...(current.transfer?.state === "failed" && current.transfer.problem !== "unavailable" &&
+          current.transfer.problem.failure.kind === "ssoLoginRequired" ? { transfer: undefined } : {}),
+      } : {}),
+    }));
     try {
       let listing: Listing;
       if (location) {
@@ -87,10 +104,24 @@ export function S3StoragePanel({ session, actions, onRelogin, countHistory = cou
     }
   }
 
-  function open(location: Location) {
+  function open(location: S3Location) {
     update(() => ({ input: location, confirmed: false }));
     void load(location);
   }
+
+  const booted = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (!session.location || booted.current === sessionId || views.has(sessionId)) return;
+    booted.current = sessionId;
+    open(session.location);
+  });
+
+  const refreshed = useRef(refresh);
+  useLayoutEffect(() => {
+    if (refreshed.current === refresh || view.loading) return;
+    refreshed.current = refresh;
+    void load(view.requestedLocation ?? null, null, true);
+  });
 
   const listing = view.listing;
   const location = listing?.kind === "objects" ? listing.location : null;
@@ -100,6 +131,42 @@ export function S3StoragePanel({ session, actions, onRelogin, countHistory = cou
   const canTransfer = view.confirmed && !view.loading && !transferring && !expired;
   const selectedKey = listing?.kind === "objects" && listing.rows.some(row => row.kind === "object" && row.key === view.selectedKey)
     ? view.selectedKey : null;
+  const canEdit = editEnabled && !!onEditFile && view.confirmed && !view.loading && !expired;
+  useLayoutEffect(() => () => { editAttempt.current = null; }, [sessionId, canEdit]);
+
+  function approvedRowId(key: string | undefined) {
+    const row = listing?.kind === "objects" ? listing.rows.find(row => row.kind === "object" && row.key === key) : undefined;
+    return row?.kind === "object" && typeof row.rowId === "string" && row.rowId.length ? row.rowId : undefined;
+  }
+
+  async function edit(key: string) {
+    if (!canEdit || editAttempt.current) return;
+    const rowId = approvedRowId(key);
+    if (!rowId) return;
+    const current = { sessionId };
+    editAttempt.current = current;
+    const editor = bindStorageEditor(sessionId);
+    update(() => ({ editError: undefined }));
+    try {
+      const file = await editor.open(rowId);
+      const close = () => editor.close(file.handle);
+      let handedOff = false;
+      try {
+        const listener = editListener.current;
+        if (editAttempt.current === current && listener) {
+          handedOff = listener({ file, transport: editor.transport, close }) !== false;
+        }
+      } finally {
+        if (!handedOff) await close();
+      }
+    } catch (error) {
+      if (editAttempt.current === current) {
+        update(() => ({ editError: error instanceof Error ? error.message : "네이티브 요청 결과 수신 실패" }));
+      }
+    } finally {
+      if (editAttempt.current === current) editAttempt.current = null;
+    }
+  }
   const historyListing = view.confirmed && !view.loading && !view.problem && !expired && listing?.kind === "objects" ? listing : undefined;
   const historyRequest = useMemo(() => historyListing ? { sessionId, ...historyListing.location } : undefined,
     [historyListing, sessionId]);
@@ -145,6 +212,9 @@ export function S3StoragePanel({ session, actions, onRelogin, countHistory = cou
       update(() => ({ transfer: { ...display, state: "running" } }));
       if (direction === "upload") {
         const result = await actions.upload(request);
+        if (!result.ok && result.error.failure.kind === "ssoLoginRequired" && editAttempt.current?.sessionId === sessionId) {
+          editAttempt.current = null;
+        }
         update(() => ({
           transfer: result.ok
             ? { ...display, state: "uploaded", bytes: result.value }
@@ -152,6 +222,9 @@ export function S3StoragePanel({ session, actions, onRelogin, countHistory = cou
         }));
       } else {
         const result = await actions.download(request);
+        if (!result.ok && result.error.failure.kind === "ssoLoginRequired" && editAttempt.current?.sessionId === sessionId) {
+          editAttempt.current = null;
+        }
         update(() => ({
           transfer: result.ok
             ? { ...display, state: "downloaded", result: result.value }
@@ -171,13 +244,16 @@ export function S3StoragePanel({ session, actions, onRelogin, countHistory = cou
       {([["버킷", "bucket"], ["접두어", "prefix"], ["리전", "region"]] as const).map(([label, field]) =>
         <label key={field}>{label}<input value={input[field]} disabled={view.loading || transferring} onChange={event => {
           const value = event.target.value;
+          editAttempt.current = null;
           update(() => ({ input: { ...input, [field]: value }, confirmed: false }));
         }} /></label>)}
       <button type="submit" disabled={!input.bucket || !input.region || view.loading || transferring}>버킷 열기</button>
       <button type="button" disabled={view.loading || transferring} onClick={() => void load(null)}>버킷 목록</button>
     </form>
     {view.problem && <StorageProblem problem={view.problem} session={session} />}
+    {view.editError && <p role="alert">파일 열기 실패: {view.editError}</p>}
     {detectedRegion && <button type="button" disabled={view.loading || transferring} onClick={() => {
+      editAttempt.current = null;
       update(() => ({ input: { ...input, region: detectedRegion }, confirmed: false, problem: undefined }));
     }}>{detectedRegion} 선택</button>}
     {view.loading && <p role="status">목록 요청 중</p>}
@@ -188,9 +264,22 @@ export function S3StoragePanel({ session, actions, onRelogin, countHistory = cou
     </ul>}
     {listing?.kind === "objects" && <>
       <div className="storage-location"><strong>{listing.location.bucket}</strong> / <code>{listing.location.prefix}</code> · {listing.location.region}</div>
-      <ObjectTable rows={listing.rows} selectedKey={selectedKey} versionedFiles={versionedFiles} onOpenPrefix={prefix => {
-        if (!view.loading && !transferring) open({ ...listing.location, prefix });
-      }} onSelectObject={key => update(() => ({ selectedKey: key }))} />
+      {/* ObjectTable의 공통 메뉴는 항목별 콜백 대신 현재 메뉴의 편집 가능 여부를 받는다. */}
+      <div onContextMenuCapture={event => {
+        const target = event.target;
+        if (!(target instanceof Element)) return;
+        const row = target.closest("tr, li");
+        if (row) setMenuKey(row.querySelector<HTMLButtonElement>(".file-browser-entry")?.title);
+      }} onKeyDownCapture={event => {
+        if (event.key !== "ContextMenu" && !(event.key === "F10" && event.shiftKey)) return;
+        const target = event.target;
+        if (target instanceof HTMLButtonElement && target.matches(".file-browser-entry")) setMenuKey(target.title);
+      }}>
+        <ObjectTable rows={listing.rows} selectedKey={selectedKey} versionedFiles={versionedFiles} onOpenPrefix={prefix => {
+          if (!view.loading && !transferring) open({ ...listing.location, prefix });
+        }} onSelectObject={key => update(() => ({ selectedKey: key }))}
+          onEditObject={canEdit && approvedRowId(menuKey) ? key => void edit(key) : undefined} />
+      </div>
     </>}
     {listing?.rows.length === 0 && <p>목록이 비어 있습니다.</p>}
     {listing && listing.nextToken !== null && <button type="button" disabled={view.loading || transferring || (!!location && !view.confirmed)} onClick={() => void load(location, listing.nextToken)}>다음 페이지</button>}

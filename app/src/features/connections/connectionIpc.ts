@@ -8,7 +8,7 @@ export type SavedConnections = Readonly<{
   targets: readonly SavedEntry<ConnectionProfileDraft["target"]>[];
 }>;
 
-type WaitReply = ConnectionTestRun & Readonly<{ sessionId: string }>;
+type WaitReply = ConnectionTestRun & Readonly<{ sessionId: string | null }>;
 type Execution = {
   started: Promise<ConnectionTestRun>;
   cancelled: boolean;
@@ -72,8 +72,9 @@ export function createLocalConnectionIpc(): Omit<LocalConnectionActions, "onClos
       }
       const reply = await invoke<WaitReply>("connection_test_wait", { run });
       if (execution.cancelled || attempts.get(attempt) !== execution) throw new Error("연결 테스트가 취소되었습니다");
-      if (reply.runId !== runId || reply.draftId !== draftId || reply.draftVersion !== draftVersion ||
-        typeof reply.sessionId !== "string" || !reply.sessionId) {
+      const validSession = attempt.draft.target.defaultMethod === "s3" ? reply.sessionId === null
+        : typeof reply.sessionId === "string" && !!reply.sessionId;
+      if (reply.runId !== runId || reply.draftId !== draftId || reply.draftVersion !== draftVersion || !validSession) {
         throw new Error("시험 결과가 요청한 실행과 일치하지 않습니다");
       }
       tested.set(run, { attempt, execution });

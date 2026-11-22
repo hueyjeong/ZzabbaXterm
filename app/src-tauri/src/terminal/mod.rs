@@ -196,6 +196,21 @@ impl Sessions {
         Ok(session)
     }
 
+    #[allow(dead_code, reason = "SFTP IPC 연결 전 내부 경계")]
+    pub(crate) async fn connect_sftp(&self, owner: &str, id: &str) -> Result<crate::editor::sftp::Session, crate::editor::sftp::Error> {
+        use crate::editor::sftp::{Error, Session};
+        let (plan, cancel, worker) = {
+            let registry = self.registry.lock().unwrap();
+            // 연결 시험 세션은 등록된 작업 탭이 아니다.
+            let session = registry.sessions.get(id).ok_or_else(|| Error::Terminal(CLOSED.into()))?;
+            if session.owner != owner {
+                return Err(Error::Terminal("다른 창의 세션입니다".into()));
+            }
+            session.sftp_context().ok_or(Error::Unavailable)?
+        };
+        Session::connect(plan, cancel, worker).await
+    }
+
     pub(crate) fn start(&self, owner: &str, id: &str) -> Result<(), String> {
         self.get(owner, id)?.start()
     }

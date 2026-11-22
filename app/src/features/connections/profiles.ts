@@ -17,9 +17,12 @@ type LocalMethod = Readonly<{
   local: Readonly<{ shell: LocalShell; startDirectory: string }>;
   ssm?: never;
   ssh?: never;
+  s3?: never;
 }>;
-type SsmMethod<T = SsmTarget> = Readonly<{ defaultMethod: "ssm"; ssm: T; local?: never; ssh?: never }>;
-type SshMethod<T = SshSettings> = Readonly<{ defaultMethod: "ssh"; ssh: T; local?: never; ssm?: never }>;
+type SsmMethod<T = SsmTarget> = Readonly<{ defaultMethod: "ssm"; ssm: T; local?: never; ssh?: never; s3?: never }>;
+type SshMethod<T = SshSettings> = Readonly<{ defaultMethod: "ssh"; ssh: T; local?: never; ssm?: never; s3?: never }>;
+type S3Method = Readonly<{ defaultMethod: "s3"; s3: S3Settings; local?: never; ssm?: never; ssh?: never }>;
+type S3Settings = Readonly<{ profile: string; region: string; bucket: string; prefix: string }>;
 
 export type SshTransport = Readonly<{ kind: "direct" }> | (Readonly<{ kind: "ssm" }> & SsmTarget);
 export type SshAuth =
@@ -41,9 +44,9 @@ export type SshInput = Omit<SshSettings, "port" | "transport" | "auth"> & Readon
   transport: SshTransport | Readonly<{ kind: "ssm"; profile?: never; region?: never; instanceId?: never }>;
 }>;
 export type LocalProfileDraft = ProfileDraft<TargetIdentity & LocalMethod>;
-export type InitialWizardDraft = ProfileDraft<TargetIdentity & (LocalMethod | SsmMethod)>;
-export type ConnectionProfileDraft = ProfileDraft<TargetIdentity & (LocalMethod | SsmMethod | SshMethod)>;
-type WizardDraft = ProfileDraft<TargetIdentity & (LocalMethod | SsmMethod<SsmTarget | null> | SshMethod<SshInput>)>;
+export type InitialWizardDraft = ProfileDraft<TargetIdentity & (LocalMethod | SsmMethod | S3Method)>;
+export type ConnectionProfileDraft = ProfileDraft<TargetIdentity & (LocalMethod | SsmMethod | SshMethod | S3Method)>;
+type WizardDraft = ProfileDraft<TargetIdentity & (LocalMethod | SsmMethod<SsmTarget | null> | SshMethod<SshInput> | S3Method)>;
 export type SshHostApproval = Readonly<{
   host: string;
   port: number;
@@ -99,6 +102,10 @@ function completeSsh(input: SshInput): SshSettings | null {
   return { host, port, account, hostKeyFingerprint, transport, auth };
 }
 
+function completeS3({ profile, region, bucket }: S3Settings) {
+  return !!(profile.trim() && region.trim() && bucket.trim());
+}
+
 const steps = ["target", "method", "auth", "verify"] as const;
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 const CANCEL_RESPONSE_TIMEOUT = 2_000;
@@ -111,6 +118,8 @@ export interface LocalConnectionWizardState {
   selectMethod(method: WizardDraft["target"]["defaultMethod"]): void;
   canReviewSsh(selection: SsmTarget | null): boolean;
   editSsh(change: Partial<SshInput>): void;
+  canReviewS3(): boolean;
+  editS3(field: keyof S3Settings, value: string): void;
   verifySshHost(actions: LocalConnectionActions): Promise<void>;
   invalidateSsmSelection(): void;
   selectGroup(group: LocalProfileDraft["group"], revision: number | null): void;
@@ -173,10 +182,11 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Initi
         updateDraft({ ...draft, target: { ...draft.target, ssh: next } });
       }
     }
+    if (delta === 1 && state.step === "auth" && draft.target.defaultMethod === "s3" && !completeS3(draft.target.s3)) return;
     const step = steps[steps.indexOf(state.step) + delta];
     if (step) {
       pinCheck?.abort();
-      if (state.step === "verify" && draft.target.defaultMethod === "ssh") {
+      if (state.step === "verify" && (draft.target.defaultMethod === "ssh" || draft.target.defaultMethod === "s3")) {
         update({ status: { kind: "idle" } });
         void cancelPending();
       }
@@ -207,15 +217,17 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Initi
   function selectMethod(defaultMethod: WizardDraft["target"]["defaultMethod"]) {
     const { draft } = state;
     if (locked() || state.step !== "method" || draft.target.defaultMethod === defaultMethod) return;
+    if (initialDraft.targetRevision !== null && initialDraft.target.defaultMethod === "s3") return;
     const { id, groupId, displayName } = draft.target;
-    const method: LocalMethod | SsmMethod<null> | SshMethod<SshInput> = defaultMethod === "local" ? { defaultMethod, local }
+    const method: LocalMethod | SsmMethod<null> | SshMethod<SshInput> | S3Method = defaultMethod === "local" ? { defaultMethod, local }
       : defaultMethod === "ssm" ? { defaultMethod, ssm: null }
-        : {
-          defaultMethod, ssh: {
-            host: "", port: "22", account: "", hostKeyFingerprint: "",
-            transport: { kind: "direct" }, auth: null,
-          }
-        };
+        : defaultMethod === "s3" ? { defaultMethod, s3: { profile: "", region: "", bucket: "", prefix: "" } }
+          : {
+            defaultMethod, ssh: {
+              host: "", port: "22", account: "", hostKeyFingerprint: "",
+              transport: { kind: "direct" }, auth: null,
+            }
+          };
     updateDraft({ ...draft, target: { id, groupId, displayName, ...method } });
   }
 
@@ -223,6 +235,13 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Initi
     const { draft, step } = state;
     if (locked() || draft.target.defaultMethod !== "ssh" || (step !== "method" && step !== "auth")) return;
     updateDraft({ ...draft, target: { ...draft.target, ssh: { ...draft.target.ssh, ...change } } });
+  }
+
+  function editS3(field: keyof S3Settings, value: string) {
+    const { draft, step } = state;
+    const { target } = draft;
+    if (locked() || step !== "auth" || target.defaultMethod !== "s3" || target.s3[field] === value) return;
+    updateDraft({ ...draft, target: { ...target, s3: { ...target.s3, [field]: value } } });
   }
 
   async function verifySshHost(actions: LocalConnectionActions) {
@@ -286,7 +305,8 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Initi
     const ssh = target.defaultMethod === "ssh" && state.sshPin.kind === "verified" ? completeSsh(target.ssh) : null;
     const complete = target.defaultMethod === "local" ? target
       : target.defaultMethod === "ssm" ? target.ssm && { ...target, ssm: target.ssm }
-        : ssh && { ...target, ssh };
+        : target.defaultMethod === "s3" ? completeS3(target.s3) && target
+          : ssh && { ...target, ssh };
     if (!complete) return;
     const attempt: ConnectionTestDraft = { draftId, draftVersion, draft: { ...draft, target: complete } };
     void cancelPending();
@@ -400,6 +420,11 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Initi
         && completeSsh(sshWithSelection(target.ssh, selection)) !== null;
     },
     editSsh,
+    canReviewS3() {
+      const { target } = state.draft;
+      return target.defaultMethod === "s3" && completeS3(target.s3);
+    },
+    editS3,
     verifySshHost,
     invalidateSsmSelection,
     selectGroup,

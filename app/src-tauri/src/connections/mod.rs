@@ -58,7 +58,7 @@ pub(crate) fn with_ai_targets<T>(
                 let (ssm_profile, region, node_id) = match entry.profile.method() {
                     profile::MethodRef::Local { .. } => (None, String::new(), "내 PC".into()),
                     profile::MethodRef::Ssm { profile, region, instance_id } => (Some(profile.into()), region.into(), instance_id.into()),
-                    profile::MethodRef::Ssh { .. } => return None,
+                    profile::MethodRef::Ssh { .. } | profile::MethodRef::S3 { .. } => return None,
                 };
                 Some(crate::ai::SelectedTarget {
                     profile_id: entry.profile.id.as_str().to_owned(),
@@ -82,7 +82,7 @@ pub(crate) fn ai_aliases(directory: &Path) -> Result<Vec<crate::ai::cli::Alias>,
         let method = match entry.profile.method() {
             profile::MethodRef::Local { .. } => "local",
             profile::MethodRef::Ssm { .. } => "ssm",
-            profile::MethodRef::Ssh { .. } => return None,
+            profile::MethodRef::Ssh { .. } | profile::MethodRef::S3 { .. } => return None,
         };
         Some(crate::ai::cli::Alias {
             id: entry.profile.id.as_str().into(),

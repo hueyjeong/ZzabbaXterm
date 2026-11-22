@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState } from "react";
-import { AiPanel } from "./AiPanel";
+import { AiPanel, type AiTopTabs } from "./AiPanel";
 import type { AiPanelProps, ChatReply, DecisionRecord, Proposal, ProposalTarget, RecordedDecision, TargetRef } from "./contracts";
 
 const sendChat: AiPanelProps["onSendChat"] = async (request) => {
@@ -13,7 +13,7 @@ const sendChat: AiPanelProps["onSendChat"] = async (request) => {
 
 let nextRequestId = 0;
 
-export function LocalAiPanel({ profilesVersion }: { profilesVersion: number }) {
+export function LocalAiPanel({ profilesVersion, topTabs }: { profilesVersion: number; topTabs?: AiTopTabs }) {
   const [models, setModels] = useState<readonly string[]>([]);
   const [history, setHistory] = useState<readonly DecisionRecord[]>([]);
   const [policyVersion, setPolicyVersion] = useState(0);
@@ -166,7 +166,7 @@ export function LocalAiPanel({ profilesVersion }: { profilesVersion: number }) {
 
   return <AiPanel models={models} targets={targets} proposals={cliCard ? [cliCard] : []} onSelectTarget={select}
     history={history} policyVersion={policyVersion} onReadDecision={readDecision}
-    onOpenCliReview={openCliReview}
+    onOpenCliReview={openCliReview} topTabs={topTabs}
     policyControl={<>
       {blocked !== undefined && <label><input type="checkbox" checked={blocked} disabled={savingPolicy}
         onChange={(event) => void updatePolicy(event.currentTarget.checked)} /> 조회 승인 차단</label>}

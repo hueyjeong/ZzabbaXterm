@@ -20,12 +20,14 @@ export interface EditorTabProps {
   readonly onClose: (handle: EditorFileHandle) => void;
 }
 
-function statusText({ busy, dirty, status, needsReload: stateNeedsReload }: EditorState) {
+function statusText({ busy, dirty, status }: EditorState) {
   if (busy === "save") return "저장 중 · 저장 응답 후 탭 닫기 가능";
   if (busy) return "읽는 중";
-  if (stateNeedsReload) return "다시 읽기 필요";
   switch (status.kind) {
-    case "conflict": return status.originalExists ? "원본 변경" : "원본 없음";
+    case "conflict": {
+      const label = status.originalExists === undefined ? "원본 비교 불가" : status.originalExists ? "원본 변경" : "원본 없음";
+      return status.message ? `${label}: ${status.message}` : label;
+    }
     case "unknown": return `저장 결과 미확인: ${status.message}`;
     case "disconnected": return `연결 끊김: ${status.message}`;
     case "denied": return `파일 접근 거부: ${status.message}`;
@@ -114,14 +116,22 @@ function EditorTabContent({ ref, file, active, focusRequested, transport, confir
   }, [active, focusRequested, showingDiff]);
 
   return (
-    <section className="editor-tab" aria-label={file.label} hidden={!active}>
+    <section className="editor-tab" aria-label={file.label} hidden={!active} onKeyDownCapture={(event) => {
+      if (!active || event.nativeEvent.isComposing || !(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey || event.key.toLowerCase() !== "s") return;
+      event.preventDefault();
+      event.stopPropagation();
+      void connection.current?.save();
+    }}>
       <header className="editor-toolbar">
         <span className="editor-label">{file.label}{state.dirty ? " •" : ""}</span>
         <button type="button" disabled={!active || state.saving || Boolean(state.busy) || !state.dirty || state.needsReload} onClick={() => void connection.current?.save()}>저장</button>
         <button type="button" disabled={!active || Boolean(state.busy)} onClick={() => void connection.current?.compare()}>원본과 비교</button>
         <button type="button" disabled={!active || state.saving || Boolean(state.busy)} onClick={() => void connection.current?.reload(confirmDiscard)}>다시 읽기</button>
         {comparison !== undefined && <button type="button" onClick={() => connection.current?.dismissComparison()}>비교 닫기</button>}
-        <output role="status">{statusText(state)}{state.saving && state.busy !== "save" && " · 저장 응답 후 탭 닫기 가능"}</output>
+        <output role="status">
+          {[statusText(state), !state.busy && state.needsReload && "다시 읽기 필요",
+            state.saving && state.busy !== "save" && "저장 응답 후 탭 닫기 가능"].filter(Boolean).join(" · ")}
+        </output>
       </header>
       <div className="editor-surface" ref={host} hidden={showingDiff} />
       {showingDiff && <>

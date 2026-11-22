@@ -2,7 +2,6 @@ pub mod ai;
 mod connections;
 mod editor;
 mod local_ipc;
-#[allow(dead_code, reason = "SFTP는 별도 통합 경계")]
 mod ssh;
 pub mod ssm;
 mod storage;
@@ -10,6 +9,7 @@ mod terminal;
 mod workspace_window;
 
 use editor::registry::LocalEditors;
+use editor::sftp_ipc::SftpIpc;
 use storage::ipc::{self as storage_ipc, StorageIpc};
 use tauri::Manager;
 use terminal::{Sessions, ipc::*};
@@ -24,6 +24,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(Sessions::default())
         .manage(LocalEditors::default())
+        .manage(SftpIpc::default())
         .manage(StorageIpc::default())
         .manage(ai::ipc::State::default())
         .plugin(ssm::ipc::lifecycle())
@@ -39,7 +40,9 @@ pub fn run() {
                 if let Some(registration) = webview.try_state::<ssh::registration::Registration>() {
                     registration.document_changed(webview.label());
                 }
-                webview.state::<Sessions>().navigate(webview.label());
+                let sessions = webview.state::<Sessions>();
+                sessions.navigate(webview.label());
+                webview.state::<SftpIpc>().navigate(webview.label(), sessions.document(webview.label()));
                 webview.state::<LocalEditors>().navigate(webview.label());
                 webview.state::<StorageIpc>().navigate(webview.label());
             }
@@ -54,6 +57,8 @@ pub fn run() {
             } else if invoke.message.command() == ssm::ipc::COMMAND {
                 ssm::ipc::dispatch(invoke);
                 true
+            } else if invoke.message.command().starts_with("editor_sftp_") {
+                editor::sftp_ipc::dispatch(invoke)
             } else if invoke.message.command().starts_with("storage_") {
                 storage_ipc::dispatch(invoke)
             } else {
@@ -81,10 +86,12 @@ pub fn run() {
                     registration.document_changed(&label);
                 }
                 app.state::<Sessions>().destroy(&label);
+                app.state::<SftpIpc>().destroy(&label);
                 app.state::<LocalEditors>().destroy(&label);
                 app.state::<StorageIpc>().navigate(&label);
             }
             tauri::RunEvent::Exit => {
+                app.state::<SftpIpc>().shutdown();
                 app.state::<StorageIpc>().shutdown();
                 app.state::<Sessions>().shutdown();
             }

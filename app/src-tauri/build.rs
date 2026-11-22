@@ -18,6 +18,8 @@ fn main() {
         "register_saved_ssh_host",
         "editor_local_open", "editor_local_save", "editor_local_compare", "editor_local_reload",
         "editor_local_close",
+        "editor_sftp_attach", "editor_sftp_list", "editor_sftp_open", "editor_sftp_compare",
+        "editor_sftp_reload", "editor_sftp_save", "editor_sftp_close", "editor_sftp_detach",
         "ai_targets", "ai_models", "ai_select", "ai_chat", "ai_propose", "ai_decide",
         "ai_cancel_proposal",
         "ai_decisions",
@@ -26,6 +28,8 @@ fn main() {
         "storage_count_previous_files",
         "storage_upload", "storage_download", "storage_cancel_approval", "storage_close",
         "storage_relogin",
+        "storage_edit_open", "storage_edit_compare", "storage_edit_reload", "storage_edit_save",
+        "storage_edit_close",
         "ai_cli_review",
         "ai_policy", "ai_set_policy",
     ]);

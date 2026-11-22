@@ -23,7 +23,7 @@ fn f01_probe_retry_reaps_only_the_original_child_and_releases_its_plan() {
     let failure = terminate_ssh(&mut child).unwrap_err();
     session.set_ssh_error(failure);
     let stdin = child.child.0.stdin.take().unwrap();
-    *session.ssh_pending.lock().unwrap() = Some(OwnedSsh { child: Box::new(child), _plan: plan });
+    *session.ssh_pending.lock().unwrap() = Some(OwnedSsh { child: Box::new(child), _plan: Arc::new(plan) });
     probe.finish(Err("취소".into()));
 
     assert!(probe.cancel_result(false).is_err());

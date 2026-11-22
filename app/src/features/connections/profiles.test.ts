@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { createLocalConnectionIpc } from "./connectionIpc";
-import { createLocalConnectionWizard, type ConnectionClose, type ConnectionTestRun, type LocalConnectionWizardState, type LocalProfileDraft } from "./profiles";
+import { createLocalConnectionWizard, type ConnectionClose, type ConnectionTestRun, type InitialWizardDraft, type LocalConnectionWizardState, type LocalProfileDraft } from "./profiles";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const ipc = vi.mocked(invoke);
@@ -267,5 +267,79 @@ describe("F01 SSH 마법사", () => {
       },
     }]]);
     expect(wizard.getSnapshot().status).toEqual({ kind: "testFailed", error: "SSH 연결 시험을 실행할 수 없습니다" });
+  });
+});
+
+describe("저장 S3 연결", () => {
+  const s3 = { profile: "company", region: "ap-northeast-2", bucket: "company-dev", prefix: "" };
+
+  it("신규 S3 연결에는 프로필, 버킷 리전과 버킷이 필요하며 빈 접두어는 허용한다", () => {
+    const wizard = createLocalConnectionWizard("work-draft", draft);
+    wizard.go(1);
+    wizard.selectMethod("s3");
+    wizard.go(1);
+    wizard.go(1);
+    expect(wizard.getSnapshot().step).toBe("auth");
+    wizard.editS3("profile", s3.profile);
+    wizard.editS3("region", s3.region);
+    wizard.editS3("bucket", s3.bucket);
+    wizard.go(1);
+    const { step, draft: { target } } = wizard.getSnapshot();
+    expect(step).toBe("verify");
+    expect(target).toEqual({ id: draft.target.id, groupId: draft.target.groupId, displayName: draft.target.displayName, defaultMethod: "s3", s3 });
+  });
+
+  it("S3 시험 응답의 PTY 세션 ID로는 저장을 승인할 수 없다", async () => {
+    const peer = nativePeer();
+    const wizard = createLocalConnectionWizard("work-draft", {
+      ...draft,
+      target: { id: draft.target.id, groupId: draft.target.groupId, displayName: draft.target.displayName, defaultMethod: "s3", s3 },
+    });
+    ipc.mockResolvedValueOnce(firstRun).mockResolvedValueOnce({ ...firstRun, sessionId: "unexpected-pty" }).mockResolvedValueOnce(null);
+    finishSteps(wizard);
+    await wizard.test(peer);
+    expect(wizard.getSnapshot().status).toEqual({ kind: "testFailed", error: "시험 결과가 요청한 실행과 일치하지 않습니다" });
+    await wizard.save(peer);
+    expect(ipc).not.toHaveBeenCalledWith("connection_save", expect.anything());
+  });
+
+  it("기존 S3 연결의 늦은 시험 결과는 편집 후 저장 권한을 주지 않는다", async () => {
+    const peer = nativePeer();
+    const initial: InitialWizardDraft = {
+      ...draft, groupRevision: 2, targetRevision: 3,
+      target: { id: draft.target.id, groupId: draft.target.groupId, displayName: draft.target.displayName, defaultMethod: "s3", s3 },
+    };
+    const previousWait = Promise.withResolvers<ConnectionTestRun & { sessionId: null }>();
+    ipc.mockImplementation(async (command, args) => {
+      if (command === "connection_test_start") return args && "draftVersion" in args && args.draftVersion === 0 ? firstRun : secondRun;
+      if (command === "connection_test_wait") return args && "run" in args && (args.run as ConnectionTestRun).runId === firstRun.runId
+        ? previousWait.promise : { ...secondRun, sessionId: null };
+      if (command === "connection_test_cancel" || command === "connection_save") return null;
+      throw new Error(`예상하지 못한 IPC: ${command}`);
+    });
+
+    const wizard = createLocalConnectionWizard("work-draft", initial);
+    wizard.go(1);
+    wizard.selectMethod("local");
+    expect(wizard.getSnapshot().draft.target).toEqual(initial.target);
+    wizard.go(1);
+    wizard.go(1);
+    const previousTest = wizard.test(peer);
+    await vi.waitFor(() => expect(ipc).toHaveBeenCalledWith("connection_test_wait", { run: firstRun }));
+    wizard.go(-1);
+    const prefix = " 한글// ";
+    wizard.editS3("prefix", prefix);
+    wizard.go(1);
+    previousWait.resolve({ ...firstRun, sessionId: null });
+    await previousTest;
+    await wizard.save(peer);
+    expect(ipc).not.toHaveBeenCalledWith("connection_save", expect.anything());
+
+    await wizard.test(peer);
+    await wizard.save(peer);
+    expect(ipc).toHaveBeenCalledWith("connection_save", { request: {
+      run: secondRun, draft: { ...initial, target: { ...initial.target, s3: { ...s3, prefix } } },
+    } });
+    expect(peer.onClose).toHaveBeenCalledExactlyOnceWith({ kind: "saved", draftId: "work-draft", targetId: draft.target.id });
   });
 });

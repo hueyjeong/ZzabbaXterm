@@ -14,7 +14,7 @@ interface EditorBuffer {
 
 export type EditorStatus =
   | { readonly kind: "ready" | "saved" | "compare" }
-  | { readonly kind: "conflict"; readonly originalExists: boolean }
+  | { readonly kind: "conflict"; readonly originalExists: boolean | undefined; readonly message?: string | undefined }
   | { readonly kind: "unknown"; readonly message: string }
   | EditorFileError;
 
@@ -24,7 +24,7 @@ export interface EditorState {
   readonly saving: boolean;
   readonly busy: "save" | "compare" | "reload" | null;
   readonly status: EditorStatus;
-  /** 비교 화면 데이터. null은 비교할 원본이 없음을 뜻한다. */
+  /** null은 삭제 확인, undefined는 비교 화면을 표시할 원본이 없음을 뜻한다. */
   readonly comparison: string | null | undefined;
 }
 
@@ -61,7 +61,9 @@ export function connectEditor(
   let disposed = false;
   let generation = 0;
   const dirty = () => uncertain || savedVersion !== model.getAlternativeVersionId();
-  const update = () => { if (active && !disposed) publish({ dirty: dirty(), saving, busy, status, comparison, needsReload }); };
+  const update = () => {
+    if (active && !disposed) publish({ dirty: dirty(), saving, busy, status, comparison, needsReload: needsReload || uncertain });
+  };
   const content = model.onDidChangeContent((event) => {
     lineEndings.change(event, model.getAlternativeVersionId());
     update();
@@ -72,7 +74,7 @@ export function connectEditor(
     comparison = undefined;
     status = { kind: uncertain ? "unknown" : "disconnected", message };
     generation++;
-    busy = null;
+    if (busy !== "reload") busy = null;
     update();
   });
   const current = (id: number) => active && !disposed && generation === id;
@@ -116,7 +118,7 @@ export function connectEditor(
       update();
     },
     async save() {
-      if (!active || disposed || busy || saving || closing || needsReload || !dirty()) return;
+      if (!active || disposed || busy || saving || closing || needsReload || uncertain || !dirty()) return;
       const version = model.getAlternativeVersionId();
       let text: string;
       try {
@@ -139,7 +141,11 @@ export function connectEditor(
           status = { kind: "saved" };
         } else if (result.kind === "conflict") {
           comparison = result.current;
-          status = { kind: "conflict", originalExists: result.current !== null };
+          status = {
+            kind: "conflict",
+            originalExists: result.current === undefined ? undefined : result.current !== null,
+            message: result.message,
+          };
         } else {
           comparison = undefined;
           uncertain ||= result.kind === "unknown";
@@ -194,7 +200,9 @@ export function connectEditor(
         comparison = undefined;
         const result = await transport.reload(file.handle);
         if (!current(id) || model.getVersionId() !== version) {
-          status = { kind: "failed", message: "다시 읽기가 필요합니다" };
+          if (status.kind !== "unknown" && status.kind !== "disconnected") {
+            status = { kind: "failed", message: "다시 읽기가 필요합니다" };
+          }
           return;
         }
         if (result.kind !== "read") {

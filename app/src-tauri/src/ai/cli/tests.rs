@@ -114,6 +114,28 @@ fn register_saves_supported_remote_settings_without_keys_or_host_trust() {
 }
 
 #[test]
+fn register_s3_keeps_the_profile_untested_and_outside_ai_targets() {
+    let root = connections::tests::TestDir::new();
+    let directory = root.path().join("config");
+    let mut input = connections::tests::s3_draft(root.path());
+    input["target"]["s3"]["profile"] = serde_json::json!("missing-profile");
+    let Command::Register(draft) = parse("register", input.to_string().as_bytes()).unwrap() else {
+        panic!("등록 명령이 필요합니다");
+    };
+    let output = register(&directory, draft).unwrap();
+    assert_eq!(serde_json::to_value(output).unwrap(), serde_json::json!({"id": "s3-bucket", "generation": "1"}));
+    connections::with_saved_method(&directory, "s3-bucket", |method, account| {
+        assert!(matches!(method, MethodRef::S3 { s3 } if s3.profile == "missing-profile"));
+        assert_eq!(account, None);
+        Ok(())
+    }).unwrap();
+    assert!(connections::ai_aliases(&directory).unwrap().is_empty());
+
+    input["target"]["s3"]["testedAccountId"] = serde_json::json!("012345678901");
+    assert_eq!(parse("register", input.to_string().as_bytes()).err(), Some(Error::InvalidRequest));
+}
+
+#[test]
 fn register_rejects_unsupported_ssh_settings_before_save() {
     use serde_json::json;
 

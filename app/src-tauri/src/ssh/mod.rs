@@ -72,7 +72,6 @@ const NO_ASKPASS: [(&str, Option<&str>); 2] = [
 /// 설정, 신뢰 스냅샷, Agent 공개 키의 수명은 이 계획에 묶인다.
 pub(crate) struct ConnectionPlan {
     ssh: PathBuf,
-    sftp: PathBuf,
     config: PathBuf,
     _files: SessionFiles,
     _root: trust::RootGuard,
@@ -110,7 +109,6 @@ impl ConnectionPlan {
 
         let programs = openssh_directory()?;
         let ssh = programs.join(if cfg!(windows) { "ssh.exe" } else { "ssh" });
-        let sftp = programs.join(if cfg!(windows) { "sftp.exe" } else { "sftp" });
         let files = session_files(&store.root)?;
         let known_hosts = files.path().join("known_hosts");
         let known_hosts_value = config_path(&known_hosts)?;
@@ -178,21 +176,19 @@ impl ConnectionPlan {
                 trust_windows::pin(&files.path().join("agent.pub"))?;
             }
         }
-        Ok(Self { ssh, sftp, config, _files: files, _root: root })
+        Ok(Self { ssh, config, _files: files, _root: root })
     }
 
     /// argv는 셸 문자열로 조합하지 않고, 자식 환경에 지정한 항목을 모두 적용한다.
     pub(crate) fn invocation(&self, client: Client) -> Invocation<'_> {
         let config = self.config.as_os_str();
         let tail = [OsStr::new("-F"), config, OsStr::new("--"), OsStr::new(DESTINATION)];
-        let (program, args) = match client {
-            Client::Ssh => (&self.ssh, tail.to_vec()),
-            Client::Sftp => (
-                &self.sftp,
-                [OsStr::new("-S"), self.ssh.as_os_str()].into_iter().chain(tail).collect(),
-            ),
+        let args = match client {
+            Client::Ssh => tail.to_vec(),
+            Client::Sftp => ["-T", "-oBatchMode=yes", "-s"].map(OsStr::new)
+                .into_iter().chain(tail).chain([OsStr::new("sftp")]).collect(),
         };
-        Invocation { program, args, environment: &NO_ASKPASS }
+        Invocation { program: &self.ssh, args, environment: &NO_ASKPASS }
     }
 }
 
