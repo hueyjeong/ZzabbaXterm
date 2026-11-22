@@ -1,6 +1,7 @@
 use std::{
     fmt,
     io::{self, Read, Write},
+    path::Path,
     sync::Arc,
     num::NonZeroU64,
 };
@@ -21,7 +22,7 @@ use tauri::{AppHandle, Manager};
 use super::ipc::State;
 
 const MAX_STDIN: usize = MAX_FRAME - 64;
-const USAGE: &str = "사용법: zzabba list | zzabba draft | zzabba propose";
+const USAGE: &str = "사용법: zzabba list | zzabba register | zzabba propose";
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -33,6 +34,12 @@ pub(crate) enum Error {
     Unavailable,
     InvalidResponse,
     Rejected,
+    #[serde(skip)]
+    StoreUnavailable,
+    #[serde(skip)]
+    GroupConflict,
+    #[serde(skip)]
+    TargetConflict,
 }
 
 impl fmt::Display for Error {
@@ -43,6 +50,9 @@ impl fmt::Display for Error {
             Self::Unavailable => "ZzabbaXterm 앱에 연결할 수 없습니다.",
             Self::InvalidResponse => "ZzabbaXterm 앱의 응답이 올바르지 않습니다.",
             Self::Rejected => "ZzabbaXterm 앱이 요청을 거부했습니다.",
+            Self::StoreUnavailable => "저장된 연결 설정에 접근할 수 없습니다.",
+            Self::GroupConflict => "저장된 연결 그룹이 입력과 일치하지 않습니다.",
+            Self::TargetConflict => "새 대상 ID와 비어 있는 대상 개정이 필요합니다.",
         })
     }
 }
@@ -74,7 +84,6 @@ impl Proposal {
 #[serde(tag = "method", rename_all = "camelCase", deny_unknown_fields)]
 enum Request {
     List {},
-    Draft { draft: Draft },
     Propose { proposal: Proposal },
 }
 
@@ -82,8 +91,25 @@ enum Request {
 #[serde(tag = "method", rename_all = "camelCase")]
 enum Outbound {
     List,
-    Draft { draft: ValidatedDraft },
     Propose { proposal: Proposal },
+}
+
+enum Command {
+    Register(ValidatedDraft),
+    Request(Outbound),
+}
+
+#[derive(Serialize)]
+struct Registration {
+    id: String,
+    generation: String,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum Output {
+    Registered(Registration),
+    Reply(Receipt),
 }
 
 #[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -101,10 +127,6 @@ enum Receipt {
     Listed {
         connections: Vec<Alias>,
     },
-    Drafted {
-        #[serde(rename = "draftId")]
-        draft_id: String,
-    },
     Proposed {
         #[serde(rename = "proposalId")]
         proposal_id: String,
@@ -114,10 +136,9 @@ enum Receipt {
     },
 }
 
-// 콜백은 조회와 초안·검토 요청 등록만 담당한다. 결정이나 실행 권한은 이 경계 밖에 있다.
+// 리스너는 조회와 제안 접수만 담당한다. 저장·결정·실행은 이 경계 밖이다.
 pub(crate) trait Requests {
     fn list(&self) -> Result<Vec<Alias>, Rejected>;
-    fn open_draft(&self, draft: ValidatedDraft, deadline: Instant) -> Result<String, Rejected>;
     fn request_review(&self, proposal: Proposal, deadline: Instant) -> Result<String, Rejected>;
 }
 
@@ -130,10 +151,6 @@ impl Requests for AppRequests {
     fn list(&self) -> Result<Vec<Alias>, Rejected> {
         let directory = self.0.path().app_config_dir().map_err(|_| Rejected)?;
         connections::ai_aliases(&directory).map_err(|_| Rejected)
-    }
-
-    fn open_draft(&self, draft: ValidatedDraft, deadline: Instant) -> Result<String, Rejected> {
-        self.0.state::<State>().receive_draft(draft, deadline.into_std())
     }
 
     fn request_review(&self, proposal: Proposal, deadline: Instant) -> Result<String, Rejected> {
@@ -215,9 +232,6 @@ fn dispatch(request: Request, requests: &impl Requests, deadline: Instant) -> Re
         Request::List {} => requests
             .list()
             .map(|connections| Receipt::Listed { connections }),
-        Request::Draft { draft } => requests
-            .open_draft(validate_draft(draft)?, deadline)
-            .map(|draft_id| Receipt::Drafted { draft_id }),
         Request::Propose { proposal } => {
             proposal.validate()?;
             requests
@@ -228,24 +242,16 @@ fn dispatch(request: Request, requests: &impl Requests, deadline: Instant) -> Re
     result.map_err(|_| Error::Rejected)
 }
 
-fn validate_draft(draft: Draft) -> Result<ValidatedDraft> {
-    let draft = draft.validate().map_err(|_| Error::InvalidRequest)?;
-    if matches!(draft.method(), connections::profile::MethodRef::Ssh { .. }) {
-        return Err(Error::InvalidRequest);
-    }
-    Ok(draft)
-}
-
 fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     let text = std::str::from_utf8(bytes).map_err(|_| Error::InvalidRequest)?;
     serde_json::from_str(text).map_err(|_| Error::InvalidRequest)
 }
 
-fn parse(command: &str, input: impl Read) -> Result<Outbound> {
+fn parse(command: &str, input: impl Read) -> Result<Command> {
     if command == "list" {
-        return Ok(Outbound::List);
+        return Ok(Command::Request(Outbound::List));
     }
-    if !matches!(command, "draft" | "propose") {
+    if !matches!(command, "register" | "propose") {
         return Err(Error::Usage);
     }
     let mut bytes = Vec::new();
@@ -256,15 +262,13 @@ fn parse(command: &str, input: impl Read) -> Result<Outbound> {
     if bytes.len() > MAX_STDIN {
         return Err(Error::InvalidRequest);
     }
-    if command == "draft" {
+    if command == "register" {
         let draft: Draft = decode(&bytes)?;
-        Ok(Outbound::Draft {
-            draft: validate_draft(draft)?,
-        })
+        Ok(Command::Register(draft.validate().map_err(|_| Error::InvalidRequest)?))
     } else {
         let proposal: Proposal = decode(&bytes)?;
         proposal.validate()?;
-        Ok(Outbound::Propose { proposal })
+        Ok(Command::Request(Outbound::Propose { proposal }))
     }
 }
 
@@ -292,7 +296,6 @@ async fn exchange(endpoint: &Endpoint, request: &Outbound) -> Result<Receipt> {
     })?;
     match (request, decode(&reply).map_err(|_| Error::InvalidResponse)?) {
         (Outbound::List, receipt @ Receipt::Listed { .. }) => Ok(receipt),
-        (Outbound::Draft { .. }, receipt @ Receipt::Drafted { .. }) => Ok(receipt),
         (Outbound::Propose { .. }, receipt @ Receipt::Proposed { .. }) => Ok(receipt),
         (
             _,
@@ -304,6 +307,11 @@ async fn exchange(endpoint: &Endpoint, request: &Outbound) -> Result<Receipt> {
     }
 }
 
+fn register(directory: &Path, draft: ValidatedDraft) -> Result<Output> {
+    let (id, generation) = connections::register(directory, draft)?;
+    Ok(Output::Registered(Registration { id, generation }))
+}
+
 #[doc(hidden)]
 pub fn run() -> std::process::ExitCode {
     let mut args = std::env::args_os().skip(1);
@@ -312,15 +320,22 @@ pub fn run() -> std::process::ExitCode {
         if args.next().is_some() {
             return Err(Error::Usage);
         }
-        let request = parse(command.to_str().ok_or(Error::Usage)?, io::stdin().lock())?;
-        let endpoint = Endpoint::for_service(SERVICE).map_err(|_| Error::Unavailable)?;
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|_| Error::Unavailable)?;
-        let receipt = runtime.block_on(exchange(&endpoint, &request))?;
+        let output = match parse(command.to_str().ok_or(Error::Usage)?, io::stdin().lock())? {
+            Command::Register(draft) => {
+                let directory = dirs::config_dir().ok_or(Error::StoreUnavailable)?.join(env!("ZZABBA_APP_IDENTIFIER"));
+                register(&directory, draft)?
+            }
+            Command::Request(request) => {
+                let endpoint = Endpoint::for_service(SERVICE).map_err(|_| Error::Unavailable)?;
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|_| Error::Unavailable)?;
+                Output::Reply(runtime.block_on(exchange(&endpoint, &request))?)
+            }
+        };
         let mut stdout = io::stdout().lock();
-        serde_json::to_writer(&mut stdout, &receipt).map_err(|_| Error::InvalidResponse)?;
+        serde_json::to_writer(&mut stdout, &output).map_err(|_| Error::InvalidResponse)?;
         writeln!(stdout).map_err(|_| Error::InvalidResponse)
     })();
     match result {

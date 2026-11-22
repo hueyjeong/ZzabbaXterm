@@ -1,4 +1,4 @@
-use std::fs;
+use std::{fs, time::Duration};
 
 use super::*;
 use crate::{ai::review_proposal, connections::tests::{TestDir, draft}};
@@ -220,25 +220,4 @@ fn policy_change_frees_all_slots_and_retains_only_local_read_only_history() {
     assert_eq!(state.history(&other).unwrap(), json!([]));
     state.select(2, Some(target)).unwrap();
     assert!(state.decide(2, &local, &targets, decision()).is_err());
-}
-
-#[test]
-fn draft_retransmissions_do_not_extend_expiry_or_open_twice() {
-    let dir = TestDir::new();
-    let make = || serde_json::from_value::<connections::profile::Draft>(draft(dir.path(), "work", "a")).unwrap().validate().unwrap();
-    let host = State::default();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    assert!(host.receive_draft(make(), Instant::now()).is_err());
-    let id = host.receive_draft(make(), deadline).unwrap();
-    let expiry = host.0.lock().unwrap().draft.as_ref().unwrap().expires_at;
-    assert_eq!(host.receive_draft(make(), deadline).unwrap(), id);
-    {
-        let mut state = host.0.lock().unwrap();
-        assert_eq!(state.draft.as_ref().unwrap().expires_at, expiry);
-        assert_eq!(state.open_draft().unwrap()["draftId"], id);
-        assert!(state.open_draft().unwrap().is_null());
-    }
-    assert_eq!(host.receive_draft(make(), deadline).unwrap(), id);
-    host.0.lock().unwrap().draft.as_mut().unwrap().expires_at = Instant::now();
-    assert_ne!(host.receive_draft(make(), deadline).unwrap(), id);
 }

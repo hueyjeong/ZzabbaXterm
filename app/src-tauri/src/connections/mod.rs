@@ -8,6 +8,17 @@ mod store;
 #[cfg(test)]
 pub(crate) mod tests;
 
+pub(crate) fn register(directory: &Path, draft: profile::ValidatedDraft) -> Result<(String, String), crate::ai::cli::Error> {
+    use crate::ai::cli::Error;
+
+    ipc::prepare_config_parent(directory).map_err(|_| Error::StoreUnavailable)?;
+    let id = draft.target_id().to_owned();
+    match store::Store::new(directory).register(draft).map_err(|_| Error::StoreUnavailable)? {
+        store::SaveStatus::Saved => Ok((id, profile::Revision::MIN.to_string())),
+        store::SaveStatus::GroupConflict => Err(Error::GroupConflict),
+        store::SaveStatus::TargetConflict => Err(Error::TargetConflict),
+    }
+}
 pub(crate) fn with_saved_method<T>(directory: &Path, id: &str, use_method: impl FnOnce(profile::MethodRef<'_>) -> Result<T, String>) -> Result<T, String> {
     let file = store::Store::new(directory).load().map_err(|error| format!("프로필 읽기: {error:?}"))?;
     let target = file.targets.into_iter().map(|entry| entry.profile)

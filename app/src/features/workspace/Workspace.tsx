@@ -1,9 +1,8 @@
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { LocalAiPanel } from "../ai/LocalAiPanel";
 import { createLocalConnectionIpc, type SavedConnections } from "../connections/connectionIpc";
 import { LocalConnectionWizard } from "../connections/LocalConnectionWizard";
-import type { ConnectionClose, ReceivedConnectionDraft } from "../connections/profiles";
+import type { ConnectionClose, LocalProfileDraft } from "../connections/profiles";
 import { EditorTab, type EditorTabActions } from "../editor/EditorTab";
 import type { ApprovedEditorFile, ConfirmEditorDiscard } from "../editor/contract";
 import { closeLocalFile, localEditorError, localEditorTransport, openLocalFile } from "../editor/localEditorIpc";
@@ -25,7 +24,7 @@ const connections = createLocalConnectionIpc();
 const confirmEditorDiscard: ConfirmEditorDiscard = async ({ label, reason }) => window.confirm(
   reason === "reload" ? `${label}: 디스크에서 다시 읽을까요? 현재 편집 내용은 사라집니다.` : `${label}: 미저장 편집 내용을 버리고 닫을까요?`,
 );
-type WizardRequest = { draftId: string; initialDraft: ReceivedConnectionDraft; received?: boolean };
+type WizardRequest = { draftId: string; initialDraft: LocalProfileDraft };
 
 function terminalStatus(status: TerminalStatus) {
   switch (status.kind) {
@@ -57,13 +56,11 @@ export function Workspace() {
   const [loadVersion, setLoadVersion] = useState(0);
   const [profileLoad, setProfileLoad] = useState<ProfileLoad>({ kind: "loading" });
   const [wizard, setWizard] = useState<WizardRequest>();
-  const [receivingDraft, setReceivingDraft] = useState(false);
   const [treeWidth, setTreeWidth] = useState(280);
   const [aiWidth, setAiWidth] = useState(360);
   const [chatHeight, setChatHeight] = useState(50);
   const [area, setArea] = useState({ width: 1200, height: 600 });
   const body = useRef<HTMLDivElement>(null);
-  const draftPending = useRef(false);
   const activeButton = useRef<HTMLButtonElement>(null);
   const sideLimit = Math.min(640, Math.floor(area.width * 0.32));
   const left = Math.min(treeWidth, sideLimit);
@@ -84,8 +81,13 @@ export function Workspace() {
     setLoadVersion((version) => version + 1);
   }
 
+  useEffect(() => {
+    window.addEventListener("focus", reloadProfiles);
+    return () => window.removeEventListener("focus", reloadProfiles);
+  }, []);
+
   function openWizard() {
-    if (draftPending.current || wizard) return;
+    if (wizard) return;
     const groupId = crypto.randomUUID();
     setWizard({
       draftId: crypto.randomUUID(), initialDraft: {
@@ -229,22 +231,6 @@ export function Workspace() {
         <aside className="workspace-tree" hidden={focused}>
           <button className="connection-add" type="button" aria-label="연결 추가" onClick={openWizard}>+</button>
           <button className="local-file-open" type="button" disabled={filePickerBusy} onClick={() => void openEditor()}>파일 열기</button>
-          <button type="button" disabled={!!wizard || receivingDraft} onClick={async () => {
-            if (draftPending.current || wizard) return;
-            draftPending.current = true;
-            setReceivingDraft(true);
-            setWindowError("");
-            try {
-              const draft = await invoke<WizardRequest | null>("ai_cli_draft", {});
-              if (draft) setWizard({ ...draft, received: true });
-              else setWindowError("명령줄에서 보낸 연결 설정이 없습니다");
-            } catch (error) {
-              setWindowError(String(error));
-            } finally {
-              draftPending.current = false;
-              setReceivingDraft(false);
-            }
-          }}>명령줄에서 보낸 연결 설정 열기</button>
           {profileLoad.kind === "loading" && <div className="connection-status" role="status">저장된 연결 불러오는 중</div>}
           {profileLoad.kind === "ready" && profileLoad.profiles?.targets.length === 0 &&
             <div className="connection-status" role="status">저장된 연결 없음</div>}
