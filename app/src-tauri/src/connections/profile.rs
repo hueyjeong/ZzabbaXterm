@@ -193,8 +193,6 @@ pub(crate) enum ValidationError {
 }
 
 // 구조 검증과 실제 연결 시험은 별개다.
-#[derive(Serialize)]
-#[serde(transparent)]
 pub(crate) struct ValidatedDraft(Draft);
 
 impl ValidatedDraft {
@@ -230,6 +228,9 @@ impl Draft {
 }
 
 impl ValidatedDraft {
+    pub(super) fn target_id(&self) -> &str {
+        self.0.target.id.as_str()
+    }
     pub(crate) fn ssh_pin_endpoint(&self, target_id: &str, fingerprint: &str) -> Option<crate::ssh::Endpoint> {
         let MethodRef::Ssh { ssh } = self.method() else { return None; };
         if self.0.target.id.as_str() != target_id || ssh.host_key_fingerprint != fingerprint {

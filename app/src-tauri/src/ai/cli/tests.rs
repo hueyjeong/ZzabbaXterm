@@ -8,7 +8,6 @@ use super::*;
 
 #[derive(Default)]
 struct State {
-    drafts: AtomicU64,
     reviews: AtomicU64,
 }
 
@@ -20,12 +19,6 @@ impl Requests for State {
             method: "local".into(),
             generation: "4".into(),
         }])
-    }
-
-    fn open_draft(&self, draft: ValidatedDraft, _: Instant) -> Result<String, Rejected> {
-        assert!(matches!(draft.method(), crate::connections::profile::MethodRef::Local { start_directory, .. } if start_directory.is_absolute()));
-        self.drafts.fetch_add(1, Ordering::Relaxed);
-        Ok("draft-1".into())
     }
 
     fn request_review(&self, proposal: Proposal, _: Instant) -> Result<String, Rejected> {
@@ -44,6 +37,8 @@ async fn restricted_methods_and_exact_fields() {
     for bytes in [
         br#"{"method":"approve","proposalId":"review-1"}"#.as_slice(),
         br#"{"method":"save"}"#,
+        br#"{"method":"register"}"#,
+        br#"{"method":"draft"}"#,
         br#"{"method":"session"}"#,
         br#"{"method":"execute"}"#,
         br#"{"method":"shell"}"#,
@@ -64,19 +59,82 @@ async fn restricted_methods_and_exact_fields() {
         let reply = read_frame(&mut client, MAX_FRAME).await.unwrap();
         assert_eq!(decode::<Receipt>(&reply).unwrap(), Receipt::Failed { error: Error::InvalidRequest }, "{bytes:?}");
     }
-    assert_eq!(requests.drafts.load(Ordering::Relaxed), 0);
     assert_eq!(requests.reviews.load(Ordering::Relaxed), 0);
 }
 
 #[test]
-fn ssh_drafts_do_not_reach_the_local_review() {
+fn register_adds_to_the_app_store_without_overwriting_existing_profiles() {
     let root = connections::tests::TestDir::new();
-    let draft = connections::tests::ssh_draft(root.path());
-    assert!(matches!(parse("draft", draft.to_string().as_bytes()), Err(Error::InvalidRequest)));
-    let requests = State::default();
-    let request = Request::Draft { draft: serde_json::from_value(draft).unwrap() };
-    assert!(matches!(dispatch(request, &requests, Instant::now() + DEADLINE), Err(Error::InvalidRequest)));
-    assert_eq!(requests.drafts.load(Ordering::Relaxed), 0);
+    let directory = root.path().join("config");
+    let mut input = connections::tests::draft(&root.path().join("missing"), "work", "dev-a");
+    let parse_registration = |value: &serde_json::Value| {
+        let Command::Register(draft) = parse("register", value.to_string().as_bytes()).unwrap() else {
+            panic!("등록 명령이 필요합니다");
+        };
+        draft
+    };
+    let output = register(&directory, parse_registration(&input)).unwrap();
+    assert_eq!(serde_json::to_value(output).unwrap(), serde_json::json!({"id": "dev-a", "generation": "1"}));
+    input["targetRevision"] = serde_json::json!(1);
+    input["target"]["displayName"] = serde_json::json!("바뀐 이름");
+    assert!(matches!(register(&directory, parse_registration(&input)), Err(Error::TargetConflict)));
+    let saved = connections::ai_aliases(&directory).unwrap();
+    assert_eq!(saved, [Alias {
+        id: "dev-a".into(), display_name: "작업 셸".into(), method: "local".into(), generation: "1".into(),
+    }]);
+}
+
+#[test]
+fn register_saves_supported_remote_settings_without_keys_or_host_trust() {
+    use serde_json::json;
+
+    let root = connections::tests::TestDir::new();
+    let missing_key = root.path().join("missing-key");
+    let ssh = connections::tests::ssh_draft(root.path());
+    let mut ssm = ssh.clone();
+    ssm["target"] = json!({
+        "id": "ssm-node", "groupId": "work", "displayName": "개발 노드", "defaultMethod": "ssm",
+        "ssm": {"profile": "missing-profile", "region": "ap-northeast-2", "instanceId": "i-0123456789abcdef0"}
+    });
+    for (index, input) in [
+        json!({"kind": "manualPassword"}),
+        json!({"kind": "keyFile", "privateKeyPath": missing_key}),
+        json!({"kind": "agent", "publicKeyPath": missing_key}),
+    ].into_iter().map(|auth| {
+        let mut input = ssh.clone();
+        input["target"]["ssh"]["auth"] = auth;
+        input
+    }).chain([ssm]).enumerate() {
+        let Command::Register(draft) = parse("register", input.to_string().as_bytes()).unwrap() else {
+            panic!("등록 명령이 필요합니다");
+        };
+        let output = register(&root.path().join(index.to_string()), draft).unwrap();
+        assert_eq!(serde_json::to_value(output).unwrap(), json!({"id": input["target"]["id"], "generation": "1"}));
+    }
+}
+
+#[test]
+fn register_rejects_unsupported_ssh_settings_before_save() {
+    use serde_json::json;
+
+    let root = connections::tests::TestDir::new();
+    for (field, value, error) in [
+        ("transport", json!({"kind": "ssm", "profile": "dev", "region": "ap-northeast-2", "instanceId": "i-0123456789abcdef0"}), Error::SshOverSsmUnavailable),
+        ("auth", json!({"kind": "storedPassword", "itemId": "vault-item"}), Error::StoredSshPasswordUnavailable),
+    ] {
+        let mut input = connections::tests::ssh_draft(root.path());
+        input["target"]["ssh"][field] = value;
+        assert_eq!(parse("register", input.to_string().as_bytes()).err(), Some(error));
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn register_rejects_nonstandard_windows_start_directories() {
+    for path in [r"\\server\share\folder", r"\\?\C:\folder", r"\\.\C:\folder"] {
+        let input = connections::tests::draft(Path::new(path), "work", "dev-a");
+        assert_eq!(parse("register", input.to_string().as_bytes()).err(), Some(Error::UnsupportedWindowsStartDirectory), "{path}");
+    }
 }
 
 #[tokio::test]
@@ -123,28 +181,12 @@ async fn verified_local_transport_dispatches_only_requests() {
             operation: Query::Uptime,
         },
     };
-    let draft = serde_json::json!({
-        "version": 1,
-        "group": {"id": "dev", "displayName": "개발"},
-        "target": {"id": "dev-a", "groupId": "dev", "displayName": "노드", "defaultMethod": "local",
-            "local": {"shell": if cfg!(windows) { "powerShell" } else { "bash" },
-                      "startDirectory": std::env::temp_dir()}}
-    });
-    let draft = parse("draft", serde_json::to_vec(&draft).unwrap().as_slice())
-        .ok()
-        .unwrap();
     let requests = Arc::new(State::default());
     for (call, expected) in [
         (
             Outbound::List,
             Ok(Receipt::Listed {
                 connections: requests.list().unwrap(),
-            }),
-        ),
-        (
-            draft,
-            Ok(Receipt::Drafted {
-                draft_id: "draft-1".into(),
             }),
         ),
         (request("missing".into()), Err(Error::Rejected)),
@@ -162,7 +204,6 @@ async fn verified_local_transport_dispatches_only_requests() {
         server.unwrap();
         assert_eq!(result, expected);
     }
-    assert_eq!(requests.drafts.load(Ordering::Relaxed), 1);
     assert_eq!(requests.reviews.load(Ordering::Relaxed), 1);
 }
 
@@ -197,7 +238,6 @@ async fn actual_json_overflow_rejects_before_connect_and_returns_a_wire_error() 
         fn list(&self) -> Result<Vec<Alias>, Rejected> {
             Ok(vec![Alias { id: "a".into(), display_name: "한".repeat(MAX_FRAME / 2), method: "local".into(), generation: "1".into() }])
         }
-        fn open_draft(&self, _: ValidatedDraft, _: Instant) -> Result<String, Rejected> { Err(Rejected) }
         fn request_review(&self, _: Proposal, _: Instant) -> Result<String, Rejected> { Err(Rejected) }
     }
     let listener = Listener::bind(&endpoint).unwrap();

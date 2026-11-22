@@ -137,6 +137,7 @@ fn reply(content: &str) -> Value {
 fn target(id: &str) -> SelectedTarget {
     SelectedTarget {
         profile_id: "dev-a".into(),
+        ssm_profile: Some("fixture".into()),
         region: "ap-northeast-2".into(),
         node_id: id.to_owned(),
         display_name: "개발 노드".into(),
@@ -426,5 +427,37 @@ fn a_partial_or_malformed_chat_reply_is_invalid() {
             Err(OllamaError::InvalidResponse)
         ));
         server.join().unwrap();
+    }
+}
+
+#[test]
+fn proposal_cancellation_drops_the_wait_for_headers_or_body_without_cancelling_chat() {
+    use crate::ai::ipc::model_proposal;
+    use tokio_util::sync::CancellationToken;
+
+    for partial_body in [false, true] {
+        let (started, wait) = tokio::sync::oneshot::channel();
+        let (ollama, proposal_server) = server(Duration::from_secs(5), move |mut socket| {
+            if partial_body {
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\n{").unwrap();
+            }
+            started.send(()).unwrap();
+            assert_eq!(socket.read(&mut [0]).unwrap(), 0);
+        });
+        let (chat, chat_server) = response(reply("응답"));
+        run(async {
+            let token = CancellationToken::new();
+            let (result, (), chat_result) = tokio::time::timeout(Duration::from_secs(3), async {
+                tokio::join!(model_proposal(&ollama, &token, "gemma4", target("node-a")), async {
+                    wait.await.unwrap();
+                    token.cancel();
+                }, chat.chat("gemma4", &[]))
+            }).await.unwrap();
+            assert_eq!(result.unwrap_err(), "제안 요청이 취소되었습니다");
+            assert_eq!(chat_result.unwrap(), "응답");
+            // 런타임 종료가 아니라 요청 취소로 연결이 닫혀야 한다.
+            tokio::task::spawn_blocking(move || proposal_server.join().unwrap()).await.unwrap();
+        });
+        chat_server.join().unwrap();
     }
 }

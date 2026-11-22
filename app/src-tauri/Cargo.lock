@@ -4874,8 +4874,10 @@ name = "zzabbaxterm"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "dirs",
  "getrandom 0.4.3",
  "gtk",
+ "json-patch",
  "libc",
  "portable-pty",
  "reqwest",
@@ -4888,6 +4890,7 @@ dependencies = [
  "ssh-key",
  "tauri",
  "tauri-build",
+ "tauri-utils",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

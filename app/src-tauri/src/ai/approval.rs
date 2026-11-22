@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    collections::{HashMap, VecDeque, hash_map::Entry},
     num::NonZeroU64,
     time::{Duration, Instant},
 };
@@ -10,6 +10,8 @@ use tauri::ipc::Invoke;
 use super::{Operation, ReviewCandidate, SelectedTarget, UPTIME};
 
 const REVIEW_TIMEOUT: Duration = Duration::from_secs(300);
+const REVIEW_LIMIT: usize = 32;
+const DECISION_LIMIT: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -48,7 +50,7 @@ enum Mode {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Card {
-    proposal_id: u32,
+    pub(super) proposal_id: u32,
     source: Source,
     pub(super) target: SelectedTarget,
     pub(super) operation: Operation,
@@ -72,19 +74,12 @@ pub(super) enum Choice {
     Cancel,
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Decision {
     Approved,
     Rejected,
     Cancelled,
-}
-
-#[derive(Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReviewRecord {
-    card: Card,
-    decision: Decision,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -135,6 +130,7 @@ struct Pending {
     policy: Policy,
     expires_at: Instant,
     opened_in: Option<u64>,
+    chat_request: Option<u32>,
 }
 
 impl Pending {
@@ -161,11 +157,34 @@ impl Pending {
 pub struct Reviews {
     next_id: u32,
     pending: HashMap<u32, Pending>,
+    decisions: VecDeque<(Pending, Decision, bool)>,
 }
 
 impl Reviews {
-    pub(super) fn clear(&mut self) {
+    pub(super) fn clear_open(&mut self) {
         self.pending.retain(|_, pending| pending.opened_in.is_none());
+        for (_, _, replayable) in &mut self.decisions {
+            *replayable = false;
+        }
+    }
+
+    pub(super) fn clear_pending(&mut self) {
+        self.pending.clear();
+    }
+
+    pub(super) fn history(&self, local: &LocalReview) -> impl Iterator<Item = (&Card, Decision)> {
+        let now = Instant::now();
+        let document = local.0;
+        self.decisions.iter().rev().filter_map(move |(record, decision, _)| {
+            (record.opened_in == Some(document) && record.expires_at > now)
+                .then_some((&record.card, *decision))
+        })
+    }
+
+    pub(super) fn cancel_chat(&mut self, local: &LocalReview, request_id: u32) {
+        self.pending.retain(|_, pending| {
+            pending.opened_in != Some(local.0) || pending.chat_request != Some(request_id)
+        });
     }
 
     pub(super) fn cli_id(&mut self, target: &SelectedTarget, policy: Policy) -> Option<u32> {
@@ -227,7 +246,7 @@ impl Reviews {
         };
         let now = Instant::now();
         self.pending.retain(|_, proposal| proposal.expires_at > now);
-        if self.pending.len() >= 32 {
+        if self.pending.len() >= REVIEW_LIMIT {
             return Err(ReviewError::Capacity);
         }
         self.next_id = self
@@ -251,17 +270,19 @@ impl Reviews {
                 policy,
                 expires_at: now + REVIEW_TIMEOUT,
                 opened_in: None,
+                chat_request: None,
             },
         );
         Ok(proposal_id)
     }
 
-    pub fn open(
+    pub(super) fn open(
         &mut self,
         local: &LocalReview,
         proposal_id: u32,
         selected: Option<&SelectedTarget>,
         policy: Policy,
+        chat_request: Option<u32>,
     ) -> Result<&Card, ReviewError> {
         let Entry::Occupied(entry) = self.pending.entry(proposal_id) else {
             return Err(ReviewError::Missing);
@@ -272,6 +293,7 @@ impl Reviews {
         }
         let pending = entry.into_mut();
         pending.opened_in = Some(local.0);
+        pending.chat_request = chat_request;
         Ok(&pending.card)
     }
 
@@ -281,7 +303,13 @@ impl Reviews {
         request: DecisionRequest,
         selected: Option<&SelectedTarget>,
         policy: Policy,
-    ) -> Result<ReviewRecord, ReviewError> {
+    ) -> Result<Decision, ReviewError> {
+        if let Some((record, decision, replayable)) = self.decisions.iter().find(|(record, _, _)| {
+            record.card.proposal_id == request.proposal_id
+        }) {
+            record.check(local, selected, policy)?;
+            return if *replayable { Ok(*decision) } else { Err(ReviewError::Stale) };
+        }
         let pending = self
             .pending
             .remove(&request.proposal_id)
@@ -296,10 +324,11 @@ impl Reviews {
             Choice::Reject => Decision::Rejected,
             Choice::Cancel => Decision::Cancelled,
         };
-        Ok(ReviewRecord {
-            card: pending.card,
-            decision,
-        })
+        if self.decisions.len() == DECISION_LIMIT {
+            self.decisions.pop_front();
+        }
+        self.decisions.push_back((pending, decision, true));
+        Ok(decision)
     }
 }
 

@@ -10,9 +10,10 @@
     "allow-ai-select",
     "allow-ai-chat",
     "allow-ai-propose",
+    "allow-ai-cancel-proposal",
     "allow-ai-decide",
+    "allow-ai-decisions",
     "allow-ai-cli-review",
-    "allow-ai-cli-draft",
     "allow-ai-policy",
     "allow-ai-set-policy"
   ]

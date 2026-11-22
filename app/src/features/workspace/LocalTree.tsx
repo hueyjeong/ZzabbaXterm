@@ -2,12 +2,15 @@ import { useLayoutEffect, useRef, useState, type KeyboardEvent } from "react";
 import type { SavedConnections } from "../connections/connectionIpc";
 
 type OpenTarget = (target?: SavedConnections["targets"][number]["profile"]) => void;
+type MenuTarget = { method: string; open: () => void; sshTargetId?: string };
 
-export function LocalTree({ profiles, onOpen }: { profiles?: SavedConnections; onOpen: OpenTarget }) {
+export function LocalTree({ profiles, onOpen, onRegisterSshHost }: {
+  profiles?: SavedConnections; onOpen: OpenTarget; onRegisterSshHost: (targetId: string) => void;
+}) {
   const [query, setQuery] = useState("");
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set());
   const [selected, setSelected] = useState("local");
-  const [menu, setMenu] = useState<{ x: number; y: number; row: HTMLLIElement; open: () => void; method: string }>();
+  const [menu, setMenu] = useState<{ x: number; y: number; row: HTMLLIElement; target: MenuTarget }>();
   const tree = useRef<HTMLUListElement>(null);
   const menuButton = useRef<HTMLButtonElement>(null);
   useLayoutEffect(() => { if (menu) menuButton.current?.focus(); }, [menu]);
@@ -21,6 +24,7 @@ export function LocalTree({ profiles, onOpen }: { profiles?: SavedConnections; o
       targets: profiles.targets.filter(({ profile: target }) => target.groupId === profile.id).map(({ profile: target }) => ({
         key: `target:${target.id}`, name: target.displayName, id: target.id, open: () => onOpen(target),
         method: target.defaultMethod === "ssm" ? "AWS Systems Manager" : target.defaultMethod === "ssh" ? "SSH" : "로컬",
+        sshTargetId: target.defaultMethod === "ssh" ? target.id : undefined,
       })),
     })) ?? []),
   ].flatMap((group) => {
@@ -41,12 +45,12 @@ export function LocalTree({ profiles, onOpen }: { profiles?: SavedConnections; o
     });
   }
 
-  function showMenu(row: HTMLLIElement, open: () => void, x: number, y: number, method: string) {
+  function showMenu(row: HTMLLIElement, target: MenuTarget, x: number, y: number) {
     row.focus();
-    setMenu({ row, open, x: Math.min(x, window.innerWidth - 170), y: Math.min(y, window.innerHeight - 44), method });
+    setMenu({ row, target, x: Math.min(x, window.innerWidth - 170), y: Math.min(y, window.innerHeight - (target.sshTargetId === undefined ? 44 : 80)) });
   }
 
-  function navigate(event: KeyboardEvent<HTMLLIElement>, groupKey?: string, target?: { method: string; open: () => void }) {
+  function navigate(event: KeyboardEvent<HTMLLIElement>, groupKey?: string, target?: MenuTarget) {
     event.stopPropagation();
     const row = event.currentTarget;
     switch (event.key) {
@@ -77,13 +81,15 @@ export function LocalTree({ profiles, onOpen }: { profiles?: SavedConnections; o
       case "ContextMenu": case "F10": {
         if (!target || (event.key === "F10" && !event.shiftKey)) return;
         const rect = row.getBoundingClientRect();
-        showMenu(row, target.open, rect.left, rect.bottom, target.method);
+        showMenu(row, target, rect.left, rect.bottom);
         break;
       }
       default: return;
     }
     event.preventDefault();
   }
+
+  const sshTargetId = menu?.target.sshTargetId;
 
   return <>
     <input className="connection-search" type="search" aria-label="연결 검색" value={query} onChange={(event) => setQuery(event.target.value)} />
@@ -108,7 +114,7 @@ export function LocalTree({ profiles, onOpen }: { profiles?: SavedConnections; o
                 onDoubleClick={target.open} onKeyDown={(event) => navigate(event, undefined, target)}
                 onContextMenu={(event) => {
                   event.preventDefault();
-                  showMenu(event.currentTarget, target.open, event.clientX, event.clientY, target.method);
+                  showMenu(event.currentTarget, target, event.clientX, event.clientY);
                 }}>
                 <div className="tree-row"><span>{target.name}</span>
                   {group.targets.some((other) => other.key !== target.key && other.name === target.name) && <small>{target.id}</small>}
@@ -119,8 +125,8 @@ export function LocalTree({ profiles, onOpen }: { profiles?: SavedConnections; o
         </li>
       ))}
     </ul>
-    {menu && <div className="connection-menu" role="menu" style={{ left: menu.x, top: menu.y }}
-      onBlur={() => setMenu(undefined)} onKeyDown={(event) => {
+    {menu && <div className="connection-menu" role="menu" style={{ left: menu.x, top: menu.y, display: "grid" }}
+      onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setMenu(undefined); }} onKeyDown={(event) => {
         if (event.key === "Escape") {
           event.preventDefault();
           menu.row.focus();
@@ -128,8 +134,13 @@ export function LocalTree({ profiles, onOpen }: { profiles?: SavedConnections; o
       }}>
       <button ref={menuButton} type="button" role="menuitem" onClick={() => {
         setMenu(undefined);
-        menu.open();
-      }}>{menu.method}</button>
+        menu.target.open();
+      }}>{menu.target.method}</button>
+      {sshTargetId !== undefined && <button type="button" role="menuitem" onClick={() => {
+        menu.row.focus();
+        setMenu(undefined);
+        onRegisterSshHost(sshTargetId);
+      }}>호스트 키 등록</button>}
     </div>}
   </>;
 }

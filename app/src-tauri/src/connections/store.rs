@@ -127,12 +127,17 @@ impl Store {
         authorize: impl FnMut() -> Result<(), String>,
         committed: impl FnOnce(),
     ) -> Result<SaveStatus, StoreError> {
-        self.save_with_rename(draft, authorize, committed, |from, to| fs::rename(from, to))
+        self.save_with_rename(draft, false, authorize, committed, |from, to| fs::rename(from, to))
+    }
+
+    pub(super) fn register(&self, draft: ValidatedDraft) -> Result<SaveStatus, StoreError> {
+        self.save_with_rename(draft, true, || Ok(()), || {}, |from, to| fs::rename(from, to))
     }
 
     fn save_with_rename(
         &self,
         draft: ValidatedDraft,
+        insert_only: bool,
         mut authorize: impl FnMut() -> Result<(), String>,
         committed: impl FnOnce(),
         rename: impl FnOnce(&Path, &Path) -> io::Result<()>,
@@ -152,6 +157,9 @@ impl Store {
         let old_group = file.groups.iter_mut().find(|entry| entry.profile.id == group.id);
         let old_target = file.targets.iter_mut().find(|entry| entry.profile.id == target.id);
 
+        if insert_only && old_target.is_some() {
+            return Ok(SaveStatus::TargetConflict);
+        }
         if old_target.as_ref().map(|entry| entry.revision) != target_revision {
             return Ok(SaveStatus::TargetConflict);
         }
@@ -161,7 +169,10 @@ impl Store {
             entry if entry.as_ref().map(|entry| entry.revision) != group_revision => {
                 return Ok(SaveStatus::GroupConflict);
             }
-            Some(entry) if entry.profile != group => entry.update(group)?,
+            Some(entry) if entry.profile != group => {
+                if insert_only { return Ok(SaveStatus::GroupConflict); }
+                entry.update(group)?;
+            }
             Some(_) => {}
             None => file.groups.push(Entry::new(group)),
         }
@@ -184,7 +195,7 @@ impl Store {
         &self,
         draft: ValidatedDraft,
     ) -> Result<SaveStatus, StoreError> {
-        self.save_with_rename(draft, || Ok(()), || {}, |from, to| {
+        self.save_with_rename(draft, false, || Ok(()), || {}, |from, to| {
             // 일반 파일 아래의 경로에서는 권한과 관계없이 실제 rename이 ENOTDIR로 실패한다.
             fs::rename(from.join("not-a-directory"), to)
         })
