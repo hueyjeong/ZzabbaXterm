@@ -1,4 +1,4 @@
-use std::{num::NonZeroU64, path::{Path, PathBuf}};
+use std::{net::IpAddr, num::NonZeroU64, path::{Component, Path, PathBuf}};
 
 use serde::{Deserialize, Serialize};
 
@@ -47,11 +47,13 @@ pub(super) struct Target {
 pub(super) enum Method {
     Local { local: Local },
     Ssm { ssm: Ssm },
+    Ssh { ssh: Ssh },
 }
 
 pub(crate) enum MethodRef<'a> {
     Local { shell: Shell, start_directory: &'a Path },
     Ssm { profile: &'a str, region: &'a str, instance_id: &'a str },
+    Ssh { ssh: &'a Ssh },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -70,10 +72,10 @@ pub(super) struct Local {
 
 #[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(super) struct Ssm {
-    profile: String,
-    region: String,
-    instance_id: String,
+pub(crate) struct Ssm {
+    pub(crate) profile: String,
+    pub(crate) region: String,
+    pub(crate) instance_id: String,
 }
 
 impl Ssm {
@@ -88,6 +90,77 @@ impl Ssm {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct Ssh {
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) account: String,
+    pub(crate) host_key_fingerprint: String,
+    pub(crate) transport: SshTransport,
+    pub(crate) auth: SshAuth,
+}
+
+#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) enum SshTransport {
+    Direct {},
+    Ssm(Ssm),
+}
+
+#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase", deny_unknown_fields)]
+pub(crate) enum SshAuth {
+    Agent { public_key_path: PathBuf },
+    KeyFile { private_key_path: PathBuf },
+    ManualPassword {},
+    StoredPassword { item_id: String },
+}
+
+impl Ssh {
+    fn validate(&self) -> Result<(), ValidationError> {
+        let dns = self.host.strip_suffix('.').unwrap_or(&self.host);
+        if self.port == 0 || (self.host.parse::<IpAddr>().is_err() &&
+            (dns.len() > 253 || !dns.split('.').all(|label| {
+                !label.is_empty() && label.len() <= 63 && !label.starts_with('-') && !label.ends_with('-')
+                    && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            }))) {
+            return Err(ValidationError::SshEndpoint);
+        }
+        if self.account.len() > 64
+            || !self.account.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
+            || !self.account.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+        {
+            return Err(ValidationError::SshAccount);
+        }
+        // 앱의 신뢰 저장소가 실제 서버와 지문을 확인한다. 이곳에서는 참조 형식만 검사한다.
+        let Some(digest) = self.host_key_fingerprint.strip_prefix("SHA256:") else {
+            return Err(ValidationError::SshHostKeyFingerprint);
+        };
+        if digest.len() != 43 || !digest.bytes().all(|b| b.is_ascii_alphanumeric() || b"+/".contains(&b))
+            || !b"AEIMQUYcgkosw048".contains(&digest.as_bytes()[42])
+        {
+            return Err(ValidationError::SshHostKeyFingerprint);
+        }
+        if let SshTransport::Ssm(target) = &self.transport {
+            target.validate()?;
+        }
+        match &self.auth {
+            SshAuth::Agent { public_key_path } | SshAuth::KeyFile { private_key_path: public_key_path }
+                if !valid_ssh_path(public_key_path) => Err(ValidationError::SshKeyPath),
+            SshAuth::StoredPassword { item_id } if !valid_id(item_id) || item_id.starts_with('-') => {
+                Err(ValidationError::SshItemId)
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+fn valid_ssh_path(path: &Path) -> bool {
+    path.is_absolute() && !path.components().any(|part| matches!(part, Component::ParentDir))
+        && path.to_str().is_some_and(|value| !value.chars().any(|c| c.is_control() || "\"%$`*?[{".contains(c)))
 }
 
 #[derive(Debug, PartialEq, Eq, Deserialize)]
@@ -112,6 +185,11 @@ pub(crate) enum ValidationError {
     SsmProfile,
     SsmRegion,
     SsmInstanceId,
+    SshEndpoint,
+    SshAccount,
+    SshHostKeyFingerprint,
+    SshKeyPath,
+    SshItemId,
 }
 
 // 구조 검증과 실제 연결 시험은 별개다.
@@ -123,6 +201,13 @@ impl ValidatedDraft {
             (MethodRef::Local { start_directory: left, .. }, MethodRef::Local { start_directory: right, .. }) => {
                 left.as_os_str() == right.as_os_str()
             }
+            (MethodRef::Ssh { ssh: left }, MethodRef::Ssh { ssh: right }) => match (&left.auth, &right.auth) {
+                (SshAuth::Agent { public_key_path: left }, SshAuth::Agent { public_key_path: right })
+                | (SshAuth::KeyFile { private_key_path: left }, SshAuth::KeyFile { private_key_path: right }) => {
+                    left.as_os_str() == right.as_os_str()
+                }
+                _ => true,
+            },
             _ => true,
         }
     }
@@ -143,6 +228,14 @@ impl Draft {
 }
 
 impl ValidatedDraft {
+    pub(crate) fn ssh_pin_endpoint(&self, target_id: &str, fingerprint: &str) -> Option<crate::ssh::Endpoint> {
+        let MethodRef::Ssh { ssh } = self.method() else { return None; };
+        if self.0.target.id.as_str() != target_id || ssh.host_key_fingerprint != fingerprint {
+            return None;
+        }
+        crate::ssh::Endpoint::new(&ssh.host, ssh.port).ok()
+    }
+
     pub(crate) fn method(&self) -> MethodRef<'_> {
         self.0.target.method()
     }
@@ -167,6 +260,7 @@ impl Target {
         match &self.method {
             Method::Local { local } => MethodRef::Local { shell: local.shell, start_directory: &local.start_directory },
             Method::Ssm { ssm } => MethodRef::Ssm { profile: &ssm.profile, region: &ssm.region, instance_id: &ssm.instance_id },
+            Method::Ssh { ssh } => MethodRef::Ssh { ssh },
         }
     }
 
@@ -190,6 +284,7 @@ impl Target {
                 Ok(())
             }
             Method::Ssm { ssm } => ssm.validate(),
+            Method::Ssh { ssh } => ssh.validate(),
         }
     }
 }

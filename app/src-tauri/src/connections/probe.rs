@@ -88,7 +88,7 @@ impl Runs {
     }
 }
 
-pub(super) fn start(sessions: &Sessions, owner: &str, document: u64, draft_id: String, draft_version: u64, draft: Draft) -> Result<RunKey, String> {
+pub(super) fn start(sessions: &Sessions, owner: &str, document: u64, draft_id: String, draft_version: u64, draft: Draft, config: std::path::PathBuf) -> Result<RunKey, String> {
     if draft_id.is_empty() || draft_version > (1 << 53) - 1 {
         return Err("초안 ID 또는 버전이 올바르지 않습니다".into());
     }
@@ -109,7 +109,7 @@ pub(super) fn start(sessions: &Sessions, owner: &str, document: u64, draft_id: S
         let tested = Arc::clone(&draft);
         let completed = sessions.probe_completion(owner.into(), document, key.run_id.clone());
         thread::Builder::new().name("connection-probe".into()).spawn(move || {
-            worker.run(&tested);
+            worker.run(&tested, &config);
             completed();
         })
             .map_err(|error| format!("연결 시험: {error}"))?;
@@ -243,7 +243,7 @@ mod tests {
             if retired {
                 crate::terminal::tests::assert_live_shell_progress(&sessions);
             }
-            probe.run(&draft);
+            probe.run(&draft, std::path::Path::new(""));
             completed();
             response.unwrap().unwrap();
             assert!(retired);

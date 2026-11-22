@@ -118,6 +118,85 @@ fn c02_rejects_mixed_methods_forbidden_fields_and_invalid_references() {
     }
 }
 
+fn ssh_draft(dir: &Path) -> Value {
+    let mut value = draft(dir, "work", "ssh-server");
+    value["target"] = json!({
+        "id": "ssh-server", "groupId": "work", "displayName": "개발 서버", "defaultMethod": "ssh",
+        "ssh": {
+            "host": "dev.example.test", "port": 2222, "account": "deploy",
+            "hostKeyFingerprint": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "transport": {"kind": "direct"}, "auth": {"kind": "manualPassword"}
+        }
+    });
+    value
+}
+
+#[test]
+fn f01_pin_registration_resolves_only_the_validated_draft_target() {
+    let dir = TestDir::new();
+    let input = ssh_draft(dir.path());
+    let fingerprint = input["target"]["ssh"]["hostKeyFingerprint"].as_str().unwrap();
+    let draft = serde_json::from_value::<Draft>(input.clone()).unwrap().validate().unwrap();
+    assert_eq!(draft.ssh_pin_endpoint("ssh-server", fingerprint), Some(crate::ssh::Endpoint::new("dev.example.test", 2222).unwrap()));
+    assert_eq!(draft.ssh_pin_endpoint("other-server", fingerprint), None);
+    assert_eq!(draft.ssh_pin_endpoint("ssh-server", "SHA256:other"), None);
+}
+
+#[test]
+fn f01_loads_existing_local_and_ssm_v1_with_ssh_reference() {
+    let dir = TestDir::new();
+    let local = draft(dir.path(), "work", "local-shell");
+    let ssm = ssm_draft(dir.path());
+    let mut file = json!({
+        "version": 1,
+        "groups": [{"revision": 7, "profile": local["group"]}],
+        "targets": [{"revision": 8, "profile": local["target"]}, {"revision": 9, "profile": ssm["target"]}],
+    });
+    fs::write(dir.file(), serde_json::to_vec(&file).unwrap()).unwrap();
+    let store = Store::new(dir.path());
+    let mut ssh = ssh_draft(dir.path());
+    ssh["groupRevision"] = json!(7);
+    ssh["target"]["ssh"]["transport"] = ssm["target"]["ssm"].clone();
+    ssh["target"]["ssh"]["transport"]["kind"] = json!("ssm");
+    ssh["target"]["ssh"]["auth"] = json!({"kind": "agent", "publicKeyPath": dir.path().join("test.pub")});
+    assert_eq!(save(&store, ssh.clone()).unwrap(), SaveStatus::Saved);
+    file["targets"].as_array_mut().unwrap().push(json!({"revision": 1, "profile": ssh["target"]}));
+    assert_eq!(serde_json::to_value(store.load().unwrap()).unwrap(), file);
+}
+
+#[test]
+fn f01_rejects_ambiguous_ssh_methods_and_non_reference_values() {
+    let dir = TestDir::new();
+    let valid = ssh_draft(dir.path());
+    let checked = |value| serde_json::from_value::<Draft>(value).unwrap().validate().is_ok();
+    assert!(checked(valid.clone()));
+    for (pointer, key) in [
+        ("/target", "local"), ("/target", "ssm"), ("/target/ssh", "command"), ("/target/ssh", "args"),
+        ("/target/ssh/transport", "profile"), ("/target/ssh/auth", "password"), ("/target/ssh/auth", "itemId"),
+    ] {
+        let mut input = valid.clone();
+        input.pointer_mut(pointer).unwrap()[key] = json!("forbidden");
+        assert!(serde_json::from_value::<Draft>(input).is_err(), "{pointer}/{key}");
+    }
+    for (key, value) in [
+        ("host", json!("-oProxyCommand")), ("host", json!("dev.example.test\nProxyCommand bad")),
+        ("account", json!("user@other")), ("port", json!(0)), ("hostKeyFingerprint", json!("SHA256:not-a-pin")),
+        ("transport", json!({"kind": "ssm", "profile": "--profile", "region": "ap-northeast-2", "instanceId": "i-0123456789abcdef0"})),
+        ("auth", json!({"kind": "storedPassword", "itemId": "--raw"})),
+        ("auth", json!({"kind": "keyFile", "privateKeyPath": "relative"})),
+    ] {
+        let mut input = valid.clone();
+        input["target"]["ssh"][key] = value;
+        assert!(!checked(input), "{key}");
+    }
+    for auth in [json!({"kind": "storedPassword", "itemId": "vault-item"}),
+        json!({"kind": "keyFile", "privateKeyPath": dir.path().join("private-key")})] {
+        let mut input = valid.clone();
+        input["target"]["ssh"]["auth"] = auth;
+        assert!(checked(input));
+    }
+}
+
 #[cfg(any(windows, unix))]
 pub(crate) fn with_saved_pty_targets(run: impl FnOnce(&Path, &Path)) {
     let root = TestDir::new();
@@ -146,7 +225,7 @@ mod local_probe {
 
     fn start_at(sessions: &Sessions, dir: &Path, version: u64) -> RunKey {
         start(sessions, "main", sessions.document("main"), "draft".into(), version,
-            serde_json::from_value(draft(dir, "work", "first")).unwrap()).unwrap()
+            serde_json::from_value(draft(dir, "work", "first")).unwrap(), dir.to_owned()).unwrap()
     }
 
     fn save_at(sessions: &Sessions, owner: &str, run: &RunKey, input: Value, store: &Store) -> Result<(), String> {
@@ -220,7 +299,7 @@ mod local_probe {
         let input = draft(&dir.0, "work", "first");
         let run = start_at(&sessions, &dir.0, 1);
         let other = start(&sessions, "other", 0, "draft".into(), 1,
-            serde_json::from_value(input.clone()).unwrap()).unwrap();
+            serde_json::from_value(input.clone()).unwrap(), dir.0.clone()).unwrap();
         assert!(cancel(&sessions, "other", 0, &run).is_err());
         cancel(&sessions, "main", 0, &run).unwrap();
         assert!(wait(&sessions, "main", 0, &run).is_err());
@@ -229,11 +308,11 @@ mod local_probe {
         sessions.navigate("main");
         assert!(wait(&sessions, "main", 0, &run).is_err());
         assert!(start(&sessions, "main", 0, "draft".into(), 3,
-            serde_json::from_value(input.clone()).unwrap()).is_err());
+            serde_json::from_value(input.clone()).unwrap(), dir.0.clone()).is_err());
         assert!(save_at(&sessions, "main", &run, input.clone(), &store).is_err());
         sessions.destroy("main");
         assert!(start(&sessions, "main", sessions.document("main"), "draft".into(), 3,
-            serde_json::from_value(input.clone()).unwrap()).is_err());
+            serde_json::from_value(input.clone()).unwrap(), dir.0.clone()).is_err());
         wait(&sessions, "other", 0, &other).unwrap();
         save_at(&sessions, "other", &other, input, &store).unwrap();
     }
@@ -279,7 +358,7 @@ mod local_probe {
         let store = Store::new(&settings).observe_lock_wait(move || blocked_tx.send(()).unwrap());
         let input = draft(&dir.0, "work", "first");
         let run = start(&sessions, "profile", 0, "draft".into(), 1,
-            serde_json::from_value(input.clone()).unwrap()).unwrap();
+            serde_json::from_value(input.clone()).unwrap(), dir.0.clone()).unwrap();
         wait(&sessions, "profile", 0, &run).unwrap();
         let unrelated = start_at(&sessions, &dir.0, 1);
         thread::scope(|scope| {

@@ -9,6 +9,7 @@ use super::{Event, process::{Launch, Session, Stop}, remote, size};
 
 const MARKER: &[u8] = b"ZZABBA-C01:314159";
 const SSM_MARKER: &[u8] = b"ZZABBA-C02:314159";
+const SSH_MARKER: &[u8] = b"ZZABBA-F01:314159";
 // 표식의 완성 문자열은 PTY가 되비추는 입력에 없다.
 const SSM_CHECK: &[u8] = b"[ \"$(uname -s)\" = Linux ] || exit 19; printf 'ZZABBA-C02:%d\\n' \"$((314000+159))\" && exit 0; exit 19\r";
 const TIMEOUT: Duration = Duration::from_secs(8);
@@ -55,10 +56,11 @@ impl Probe {
         Self { session: Arc::new(Session::new(owner, ssm)), deadline: Instant::now() + timeout, state: Mutex::default(), ready: Condvar::new() }
     }
 
-    pub(crate) fn run(&self, draft: &ValidatedDraft) {
+    pub(crate) fn run(&self, draft: &ValidatedDraft, config: &std::path::Path) {
         let launch = match draft.method() {
             MethodRef::Local { shell, start_directory } => command(shell, start_directory).map(Launch::Local),
             MethodRef::Ssm { profile, region, instance_id } => remote::Target::new(profile, region, instance_id).map(Launch::Ssm),
+            MethodRef::Ssh { ssh } => crate::ssh::terminal::saved(config, ssh).map(|launch| Launch::Ssh(launch.for_probe())),
         };
         self.finish(launch.and_then(|launch| self.measure(launch)));
     }
@@ -125,7 +127,8 @@ impl Probe {
             return Err(TIMED_OUT.into());
         }
         let ssm = command.is_ssm();
-        let marker = if ssm { SSM_MARKER } else { MARKER };
+        let ssh = matches!(command, Launch::Ssh(_));
+        let marker = if ssh { SSH_MARKER } else if ssm { SSM_MARKER } else { MARKER };
         let (sender, receiver) = mpsc::sync_channel(1);
         let session = Arc::downgrade(&self.session);
         let output = std::cell::Cell::new((0u64, 0usize));
@@ -155,7 +158,9 @@ impl Probe {
                 Event::Connecting => Ok(()),
                 Event::Ready => session.upgrade().ok_or(super::CLOSED.to_owned())?.input(SSM_CHECK),
                 Event::Exited(0) if matched == marker.len() => sender.send(Ok(())).map_err(|err| err.to_string()),
-                Event::Exited(23) if !ssm => sender.send(Err("셸이 요청한 작업 디렉터리에서 시작하지 못했습니다".into()))
+                Event::Exited(23) if !ssm && !ssh => sender.send(Err("셸이 요청한 작업 디렉터리에서 시작하지 못했습니다".into()))
+                    .map_err(|err| err.to_string()),
+                Event::Exited(code) if ssh => sender.send(Err(format!("SSH 연결 시험 실패 (종료 코드 {code})")))
                     .map_err(|err| err.to_string()),
                 Event::Exited(code) => sender.send(Err(format!("셸 시험 출력 또는 종료 상태가 올바르지 않습니다 (종료 코드 {code})")))
                     .map_err(|err| err.to_string()),

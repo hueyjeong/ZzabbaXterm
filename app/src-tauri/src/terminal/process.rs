@@ -1,5 +1,6 @@
 use super::remote;
 use crate::ssm::CancellationToken;
+use crate::ssh::terminal::DirectLaunch;
 use super::{CHUNK, CLOSED, CloseResult, Event, LocalClose, WINDOW, stage};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::{
@@ -57,6 +58,7 @@ impl Flow {
 pub(super) enum Launch {
     Local(CommandBuilder),
     Ssm(remote::Target),
+    Ssh(DirectLaunch),
 }
 
 impl Launch {
@@ -154,12 +156,13 @@ impl Session {
         }
         let mut remote = match &command {
             Launch::Ssm(target) => Some(tauri::async_runtime::block_on(target.prepare(self.cancel.as_ref().unwrap()))?),
-            Launch::Local(_) => None,
+            Launch::Local(_) | Launch::Ssh(_) => None,
         };
         if self.flow.lock().unwrap().stop.is_some() {
             return Err(stage("open", CLOSED));
         }
         if ssm { send(Event::Connecting)?; }
+        let mut ssh_plan = None;
         #[cfg(windows)]
         let job = remote.as_ref().map(|_| process_job::Job::new()).transpose()
             .map_err(|error| stage("SSM Job", error))?;
@@ -236,9 +239,18 @@ impl Session {
                     return Err(self.after_failed_spawn(stage("reader worker", error), remote.take()));
                 }
             };
+            let command = match command {
+                Launch::Ssm(_) => None,
+                Launch::Local(command) => Some(command),
+                Launch::Ssh(launch) => {
+                    let (command, plan) = launch.into_parts();
+                    ssh_plan = Some(plan);
+                    Some(command)
+                }
+            };
             let mut child = match command {
-                Launch::Ssm(_) => remote_child.take().unwrap(),
-                Launch::Local(command) => {
+                None => remote_child.take().unwrap(),
+                Some(command) => {
                     if self.flow.lock().unwrap().stop.is_some() {
                         self.teardown(pair, writer, event_tx, drain);
                         return Err(stage("open", CLOSED));

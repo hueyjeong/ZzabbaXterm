@@ -7,6 +7,7 @@
   "permissions": [
     "allow-connection-test-start",
     "allow-connection-test-wait",
+    "allow-verify-ssh-host",
     "allow-connection-test-cancel",
     "allow-connection-save",
     "allow-connections-load",
