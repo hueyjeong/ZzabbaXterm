@@ -56,7 +56,7 @@ impl Target {
         #[cfg(test)]
         if let Some(program) = &self.fixture {
             let (cli, scope, request, permit) = crate::ssm::fixture_start(program);
-            return Ok(Remote { cli, scope, request, spawned: false, fixture: Some(permit) });
+            return Ok(Remote { cli, scope, request, spawned: false, fixture: Some(permit), is_fixture: true });
         }
         let cli = AwsCli::probe(cancel).await.map_err(start_error)?;
         let node = cli.online_nodes(&self.scope, cancel).await.map_err(start_error)?
@@ -68,6 +68,8 @@ impl Target {
             cli, scope: self.scope.clone(), request, spawned: false,
             #[cfg(test)]
             fixture: None,
+            #[cfg(test)]
+            is_fixture: false,
         })
     }
 }
@@ -79,6 +81,14 @@ pub(super) struct Remote {
     spawned: bool,
     #[cfg(test)]
     fixture: Option<crate::ssm::StartPermit>,
+    #[cfg(test)]
+    is_fixture: bool,
+}
+
+pub(super) struct SsmIdentity {
+    pub(super) account_id: String,
+    pub(super) region: String,
+    pub(super) instance_id: String,
 }
 
 impl Remote {
@@ -103,9 +113,17 @@ impl Remote {
         Ok(child)
     }
 
-    pub(super) fn wait_connected(&self, cancel: &CancellationToken) -> Result<(), String> {
+    pub(super) fn wait_connected(&self, cancel: &CancellationToken, work_tab: bool) -> Result<Option<SsmIdentity>, String> {
         tauri::async_runtime::block_on(self.cli.wait_connected(&self.request, &self.scope, cancel))
-            .map_err(|_| format!("연결 확인 불가: {}", self.request.target()))
+            .map_err(|_| format!("연결 확인 불가: {}", self.request.target()))?;
+        if !work_tab { return Ok(None); }
+        #[cfg(test)]
+        if self.is_fixture { return Ok(None); }
+        Ok(Some(SsmIdentity {
+            account_id: self.account_id().into(),
+            region: self.scope.region().into(),
+            instance_id: self.request.target().into(),
+        }))
     }
 
     pub(super) fn close(&mut self) -> (RemoteClose, Option<String>) {

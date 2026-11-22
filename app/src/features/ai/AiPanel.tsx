@@ -1,5 +1,6 @@
 import { useId, useLayoutEffect, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
 import type { AiPanelProps, ChatMessage, Proposal, ProposalTarget, RecordedDecision } from "./contracts";
+import { SessionSelection, type SessionSelectionProps } from "./SessionSelection";
 import "./ai.css";
 
 type ChatState = { kind: "idle" } | { kind: "sending" } | { kind: "failed"; message: string };
@@ -37,7 +38,7 @@ function navigateTopTabs(event: KeyboardEvent<HTMLDivElement>) {
   next.click();
 }
 
-export function AiPanel(props: AiPanelProps & { topTabs?: AiTopTabs }) {
+export function AiPanel(props: AiPanelProps & { topTabs?: AiTopTabs; sessionSelection?: SessionSelectionProps }) {
   const [modelName, setModelName] = useState("");
   const [selected, setSelected] = useState("");
   const model = props.models.includes(modelName) ? modelName : "";
@@ -68,6 +69,8 @@ export function AiPanel(props: AiPanelProps & { topTabs?: AiTopTabs }) {
         role={visibleTabs ? "tabpanel" : undefined} aria-labelledby={visibleTabs ? `${chatPanel}-tab` : chatTitle}
         hidden={itemSelected} inert={itemSelected} tabIndex={visibleTabs && !itemSelected ? 0 : undefined}>
         {!visibleTabs && <h2 id={chatTitle}>AI 채팅</h2>}
+        {props.sessionSelection && <SessionSelection {...props.sessionSelection}
+          visible={props.sessionSelection.visible !== false && !itemSelected} />}
         {props.modelError && <p role="alert">{props.modelError}</p>}
         {props.onRefresh && <button type="button" onClick={props.onRefresh}>모델 및 대상 새로고침</button>}
         <Chat models={props.models} model={model} onModelChange={setModelName} onSendChat={props.onSendChat} />

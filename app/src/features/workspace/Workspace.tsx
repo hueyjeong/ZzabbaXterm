@@ -300,6 +300,10 @@ export function Workspace() {
   }
 
   const current = tabs.find((tab) => tab.id === active);
+  const aiSessions = tabs.flatMap(tab => tab.kind === "terminal" && tab.ssm && tab.sessionId &&
+    tab.status.kind === "running" && !tab.closeStatus
+    ? [{ id: tab.sessionId, label: tab.label, region: tab.ssm.region, node: tab.ssm.instanceId }]
+    : []);
   const visibleSplit = split && (active === split.left || active === split.right) ? split : null;
   const splitCandidates = !visibleSplit && current?.kind === "terminal" && !current.closeStatus &&
     (current.status.kind === "running" || current.status.kind === "opening" || current.status.kind === "connecting")
@@ -417,7 +421,7 @@ export function Workspace() {
             value={splitPosition} min={20} max={80} onChange={setSplitPosition} />}
         </div>
         <aside className="workspace-ai" hidden={focused} aria-label="오른쪽 도구">
-          <LocalAiPanel profilesVersion={loadVersion} topTabs={{
+          <LocalAiPanel profilesVersion={loadVersion} sessionCandidates={aiSessions} focused={focused} topTabs={{
             item: {
               id: "files", label: "파일",
               content: <>

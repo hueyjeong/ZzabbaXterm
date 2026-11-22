@@ -32,6 +32,7 @@ fn main() {
         "storage_edit_close",
         "ai_cli_review",
         "ai_policy", "ai_set_policy",
+        "ai_session_selection", "ai_session_select", "ai_session_confirm", "ai_session_clear",
     ]);
     let mut attributes = tauri_build::Attributes::new().app_manifest(app);
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")

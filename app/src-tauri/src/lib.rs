@@ -27,6 +27,7 @@ pub fn run() {
         .manage(SftpIpc::default())
         .manage(StorageIpc::default())
         .manage(ai::ipc::State::default())
+        .manage(ai::session_selection::State::default())
         .plugin(ssm::ipc::lifecycle())
         .setup(|app| {
             if let Ok(registration) = connections::ipc::initialize_ssh_registration(app) {
@@ -42,6 +43,8 @@ pub fn run() {
                 }
                 let sessions = webview.state::<Sessions>();
                 sessions.navigate(webview.label());
+                webview.state::<ai::session_selection::State>()
+                    .document_changed(webview.label(), sessions.document(webview.label()));
                 webview.state::<SftpIpc>().navigate(webview.label(), sessions.document(webview.label()));
                 webview.state::<LocalEditors>().navigate(webview.label());
                 webview.state::<StorageIpc>().navigate(webview.label());
@@ -50,6 +53,9 @@ pub fn run() {
         .invoke_handler(move |invoke| {
             if invoke.message.command() == "terminal_open" {
                 terminal_open(invoke);
+                true
+            } else if ai::session_selection::handles(invoke.message.command()) {
+                ai::session_selection::dispatch(invoke);
                 true
             } else if ai::ipc::handles(invoke.message.command()) {
                 ai::ipc::dispatch(invoke);
@@ -85,7 +91,10 @@ pub fn run() {
                 if let Some(registration) = app.try_state::<ssh::registration::Registration>() {
                     registration.document_changed(&label);
                 }
-                app.state::<Sessions>().destroy(&label);
+                let sessions = app.state::<Sessions>();
+                sessions.destroy(&label);
+                app.state::<ai::session_selection::State>()
+                    .document_changed(&label, sessions.document(&label));
                 app.state::<SftpIpc>().destroy(&label);
                 app.state::<LocalEditors>().destroy(&label);
                 app.state::<StorageIpc>().navigate(&label);

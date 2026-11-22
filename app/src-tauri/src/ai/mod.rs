@@ -3,6 +3,7 @@ pub mod approval;
 pub mod cli;
 pub(crate) mod ipc;
 mod ollama;
+pub(crate) mod session_selection;
 
 pub use ollama::{ChatMessage, ChatRole, Ollama, OllamaError};
 

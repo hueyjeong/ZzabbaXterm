@@ -30,6 +30,7 @@ struct Flow {
     child_exited: bool,
     finished: bool,
     stop: Option<Stop>,
+    ssm_identity: Option<remote::SsmIdentity>,
     sftp: Option<SftpOwner>,
     sent: u64,
     acked: u64,
@@ -77,6 +78,7 @@ impl Launch {
 
 pub(super) struct Session {
     pub(super) owner: String,
+    pub(super) document: Option<u64>,
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     cancel: Option<CancellationToken>,
     close_result: Mutex<CloseResult>,
@@ -96,6 +98,7 @@ impl Session {
     pub(super) fn new(owner: &str, ssm: bool) -> Self {
         Self {
             owner: owner.into(),
+            document: None,
             cancel: ssm.then(CancellationToken::new),
             close_result: Mutex::new(CloseResult::default()),
             unconfirmed: Mutex::new(None),
@@ -109,6 +112,13 @@ impl Session {
 
     pub(super) fn is_ssm(&self) -> bool {
         self.cancel.is_some()
+    }
+
+    pub(super) fn with_ssm_identity<T>(&self, check: impl FnOnce(&remote::SsmIdentity) -> T) -> Option<T> {
+        let flow = self.flow.lock().unwrap();
+        flow.live().ok()?;
+        if flow.finished || self.cancel.as_ref()?.is_cancelled() { return None; }
+        Some(check(flow.ssm_identity.as_ref()?))
     }
 
     pub(super) fn sftp_context(&self) -> Option<(Arc<ConnectionPlan>, CancellationToken, TaskTrackerToken)> {
@@ -326,9 +336,13 @@ impl Session {
                     let connected = &mut connected;
                     scope.spawn(move || {
                         let cancel = self.cancel.as_ref().unwrap();
-                        let result = remote.wait_connected(cancel).and_then(|()| {
+                        let result = remote.wait_connected(cancel, self.document.is_some()).and_then(|identity| {
                             *connected = true;
                             if !cancel.is_cancelled() {
+                                if let Some(identity) = identity {
+                                    let mut flow = self.flow.lock().unwrap();
+                                    if flow.live().is_ok() { flow.ssm_identity = Some(identity); }
+                                }
                                 send_event(Event::Ready { account_id: remote.account_id().into() })?;
                             }
                             Ok(())
@@ -771,3 +785,91 @@ mod ssh_child;
 #[cfg(test)]
 mod probe_cleanup_tests;
 use ssh_child::{poll as poll_ssh, terminate as terminate_ssh};
+
+#[cfg(test)]
+pub(crate) struct LiveSsmFixture<'a> {
+    sessions: &'a super::Sessions,
+    id: String,
+    pub(crate) identity: super::LiveSsmIdentity,
+}
+
+#[cfg(test)]
+impl Drop for LiveSsmFixture<'_> {
+    fn drop(&mut self) {
+        self.sessions.registry.lock().unwrap().sessions.remove(&self.id);
+    }
+}
+
+#[cfg(test)]
+impl super::Sessions {
+    pub(crate) fn insert_live_ssm_fixture(&self, owner: &str, document: u64, account_id: &str, region: &str, instance_id: &str) -> super::LiveSsmFixture<'_> {
+        let mut session = Session::new(owner, true);
+        session.document = Some(document);
+        *session.flow.get_mut().unwrap() = Flow {
+            started: true,
+            ssm_identity: Some(remote::SsmIdentity {
+                account_id: account_id.into(), region: region.into(), instance_id: instance_id.into(),
+            }),
+            ..Flow::default()
+        };
+        let id = self.next_id();
+        self.registry.lock().unwrap().sessions.insert(id.clone(), Arc::new(session));
+        let identity = super::LiveSsmIdentity {
+            id: id.clone(), document, account_id: account_id.into(), region: region.into(), instance_id: instance_id.into(),
+        };
+        LiveSsmFixture { sessions: self, id, identity }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn live_ssm_identity_is_checked_under_registry_and_flow_locks() {
+    use super::{LiveSsmIdentity, Sessions};
+
+    let sessions = Sessions::default();
+    let document = sessions.document("main");
+    let fixture = sessions.insert_live_ssm_fixture("main", document, "123456789012", "us-west-2", "i-01234567");
+    let expected = fixture.identity.clone();
+    let id = &expected.id;
+    let session = sessions.get("main", id).unwrap();
+    let lookup = |document| sessions.live_ssm_identity("main", document, id);
+    let identity = session.flow.lock().unwrap().ssm_identity.take();
+    let before_ready = lookup(document);
+    session.flow.lock().unwrap().ssm_identity = identity;
+    let live = lookup(document);
+    let other_owner = sessions.live_ssm_identity("other", document, id);
+    let other_document = sessions.live_ssm_identity("main", document + 1, id);
+    let check = || sessions.with_live_ssm_session("main", &expected, || 7);
+    let locked = sessions.with_live_ssm_session("main", &expected, || {
+        (sessions.registry.try_lock().is_err(), session.flow.try_lock().is_err())
+    });
+    let wrong_node = sessions.with_live_ssm_session("main", &LiveSsmIdentity {
+        instance_id: "i-76543210".into(), ..expected.clone()
+    }, || 7);
+    session.flow.lock().unwrap().child_exited = true;
+    let exited = check();
+    session.flow.lock().unwrap().child_exited = false;
+    sessions.registry.lock().unwrap().documents.insert("main".into(), document + 1);
+    let old_document = lookup(document);
+    let current_document = lookup(document + 1);
+    sessions.registry.lock().unwrap().documents.remove("main");
+    session.cancel.as_ref().unwrap().cancel();
+    let cancelled = check();
+    session.stop(Stop::Closed);
+    let stopped = check();
+    drop(fixture);
+    let removed = lookup(document);
+
+    assert_eq!(before_ready, None);
+    assert_eq!(live, Some(expected));
+    assert_eq!(other_owner, None);
+    assert_eq!(other_document, None);
+    assert_eq!(locked, Some((true, true)));
+    assert_eq!(wrong_node, None);
+    assert_eq!(exited, None);
+    assert_eq!(cancelled, None);
+    assert_eq!(stopped, None);
+    assert_eq!(old_document, None);
+    assert_eq!(current_document, None);
+    assert_eq!(removed, None);
+}

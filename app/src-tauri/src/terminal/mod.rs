@@ -16,6 +16,8 @@ mod pty_flow_tests;
 pub(crate) mod tests;
 
 use process::{Launch, Session};
+#[cfg(test)]
+pub(crate) use process::LiveSsmFixture;
 use remote::RemoteClose;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
@@ -66,6 +68,15 @@ pub(crate) struct Sessions {
     registry: Arc<Mutex<Registry>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LiveSsmIdentity {
+    pub(crate) id: String,
+    pub(crate) document: u64,
+    pub(crate) account_id: String,
+    pub(crate) region: String,
+    pub(crate) instance_id: String,
+}
+
 #[derive(Default)]
 struct Registry {
     sessions: HashMap<String, Arc<Session>>,
@@ -78,6 +89,18 @@ struct Registry {
     shutdown: bool,
 }
 
+impl Registry {
+    fn main_session(&self, owner: &str, document: u64, id: &str) -> Option<&Session> {
+        if self.shutdown || self.exiting || self.closing.contains(owner) || self.destroyed.contains(owner)
+            || self.documents.get(owner).copied().unwrap_or(0) != document
+        {
+            return None;
+        }
+        let session = self.sessions.get(id)?;
+        (session.owner == owner && session.document == Some(document)).then(|| session.as_ref())
+    }
+}
+
 impl Sessions {
     #[cfg(test)]
     fn open(&self, owner: &str, size: PtySize, command: CommandBuilder, send: impl Fn(Event) -> Result<(), String> + Send + 'static) -> Result<String, String> {
@@ -86,6 +109,26 @@ impl Sessions {
 
     pub(crate) fn document(&self, owner: &str) -> u64 {
         self.registry.lock().unwrap().documents.get(owner).copied().unwrap_or(0)
+    }
+
+    pub(crate) fn live_ssm_identity(&self, owner: &str, document: u64, id: &str) -> Option<LiveSsmIdentity> {
+        let registry = self.registry.lock().unwrap();
+        registry.main_session(owner, document, id)?.with_ssm_identity(|identity| LiveSsmIdentity {
+            id: id.into(),
+            document,
+            account_id: identity.account_id.clone(),
+            region: identity.region.clone(),
+            instance_id: identity.instance_id.clone(),
+        })
+    }
+
+    // 콜백은 두 잠금 아래에서 실행되므로 터미널에 다시 접근하거나 대기하면 안 된다.
+    pub(crate) fn with_live_ssm_session<T>(&self, owner: &str, identity: &LiveSsmIdentity, check: impl FnOnce() -> T) -> Option<T> {
+        let registry = self.registry.lock().unwrap();
+        registry.main_session(owner, identity.document, &identity.id)?.with_ssm_identity(|live| {
+            (live.account_id == identity.account_id && live.region == identity.region && live.instance_id == identity.instance_id)
+                .then(check)
+        }).flatten()
     }
 
     pub(crate) fn with_probes<T>(&self, owner: &str, document: u64, use_probes: impl FnOnce(&mut Runs) -> Result<T, String>) -> Result<T, String> {
@@ -132,7 +175,9 @@ impl Sessions {
     fn open_document(&self, owner: &str, document: u64, size: PtySize, command: Launch, send: impl Fn(Event) -> Result<(), String> + Send + 'static) -> Result<String, String> {
         validate_size(size)?;
         let id = self.next_id();
-        let session = Arc::new(Session::new(owner, command.is_ssm()));
+        let mut session = Session::new(owner, command.is_ssm());
+        session.document = Some(document);
+        let session = Arc::new(session);
         let ssh = matches!(command, Launch::Ssh(_));
         {
             let mut registry = self.registry.lock().unwrap();

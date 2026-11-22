@@ -15,6 +15,10 @@
     "allow-ai-decisions",
     "allow-ai-cli-review",
     "allow-ai-policy",
-    "allow-ai-set-policy"
+    "allow-ai-set-policy",
+    "allow-ai-session-selection",
+    "allow-ai-session-select",
+    "allow-ai-session-confirm",
+    "allow-ai-session-clear"
   ]
 }
