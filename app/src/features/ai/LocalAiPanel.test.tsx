@@ -4,6 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { AiTopTabs } from "./AiPanel";
 import { LocalAiPanel } from "./LocalAiPanel";
+import type { SessionSelectionCandidate, SessionSelectionSnapshot } from "./SessionSelection";
 
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
@@ -25,8 +26,9 @@ afterEach(async () => {
   vi.unstubAllGlobals();
 });
 
-const render = (profilesVersion = 0, topTabs?: AiTopTabs) =>
-  act(async () => root.render(<LocalAiPanel profilesVersion={profilesVersion} topTabs={topTabs} />));
+const render = (profilesVersion = 0, topTabs?: AiTopTabs, sessionCandidates?: readonly SessionSelectionCandidate[], focused = false) =>
+  act(async () => root.render(<LocalAiPanel profilesVersion={profilesVersion} topTabs={topTabs}
+    sessionCandidates={sessionCandidates} focused={focused} />));
 const selects = () => [...host.querySelectorAll("select")];
 const button = (name: string) => [...host.querySelectorAll("button")].find((item) => item.textContent === name);
 async function select(index: number, option: number) {
@@ -110,6 +112,75 @@ it("SFTP 탭 버튼이 없는 동안에도 Workspace가 주입한 패널을 유�
   expect(panel.hidden || panel.hasAttribute("inert")).toBe(false);
   expect(input.value).toBe("/srv");
   expect(onSelect).not.toHaveBeenCalled();
+});
+
+const session = { id: "41", label: "개발 서버", region: "ap-northeast-2", node: "i-0123456789abcdef0" } satisfies SessionSelectionCandidate;
+const sessionSelection = { id: session.id, region: session.region, node: session.node, selectionId: "9007199254740993", confirmed: false } satisfies SessionSelectionSnapshot;
+const filesTab = { item: { id: "files", label: "파일", content: <input aria-label="SFTP 경로" /> },
+  selectedId: null, onSelect: vi.fn() } satisfies AiTopTabs;
+
+it("열린 SSM 세션의 선택·확정·해제만 호출하고 파일과 집중 보기 전환 후에도 확정을 유지한다", async () => {
+  invoke.mockImplementation(async (command) => {
+    if (command === "ai_session_select") return sessionSelection;
+    if (command === "ai_session_confirm") return { ...sessionSelection, confirmed: true };
+    if (command === "ai_session_clear") return null;
+    return command === "ai_policy" ? false : [];
+  });
+  await render(0, filesTab);
+  expect(selects().flatMap((field) => [...field.options]).some((option) => option.value === session.id)).toBe(false);
+  await render(0, filesTab, [session]);
+  expect(host.querySelector(".workspace-chat select option[value='41']")?.textContent).toBe("개발 서버 (세션 41)");
+  invoke.mockClear();
+
+  await select(0, 1);
+  await act(async () => button("연결 확인")?.click());
+  expect(host.querySelector(".workspace-chat [role=status]")?.textContent).toBe("연결 확인됨");
+
+  const field = selects()[0];
+  await render(0, { ...filesTab, selectedId: filesTab.item.id }, [session]);
+  expect(field.closest<HTMLElement>(".workspace-chat")?.hidden).toBe(true);
+  await render(0, filesTab, [session], true);
+  expect(field.closest("[hidden]")).not.toBeNull();
+  await render(0, filesTab, [session]);
+  expect(selects()[0]).toBe(field);
+  expect(field.value).toBe(session.id);
+  expect(host.querySelector(".workspace-chat [role=status]")?.textContent).toBe("연결 확인됨");
+
+  await act(async () => button("선택 해제")?.click());
+  expect(field.value).toBe("");
+  expect(invoke.mock.calls).toEqual([
+    ["ai_session_select", { id: session.id }],
+    ["ai_session_confirm", { id: session.id, selectionId: sessionSelection.selectionId }],
+    ["ai_session_clear", { selectionId: sessionSelection.selectionId }],
+  ]);
+});
+
+it.each(["파일", "집중 보기"])("%s로 전환하면 진행 중인 연결 확인을 해제한다", async (view) => {
+  const confirmation = Promise.withResolvers<SessionSelectionSnapshot>();
+  invoke.mockImplementation(async (command) => {
+    if (command === "ai_session_select") return sessionSelection;
+    if (command === "ai_session_confirm") return confirmation.promise;
+    if (command === "ai_session_clear") return null;
+    return command === "ai_policy" ? false : [];
+  });
+  await render(0, filesTab, [session]);
+  invoke.mockClear();
+  await select(0, 1);
+  await act(async () => button("연결 확인")?.click());
+
+  const tabs = view === "파일" ? { ...filesTab, selectedId: filesTab.item.id } : filesTab;
+  await render(0, tabs, [session], view === "집중 보기");
+  await act(async () => confirmation.resolve({ ...sessionSelection, confirmed: true }));
+  await render(0, filesTab, [session]);
+
+  expect(selects()[0].value).toBe("");
+  expect(host.textContent).not.toContain("연결 확인됨");
+  expect(button("연결 확인")).toBeUndefined();
+  expect(invoke.mock.calls).toEqual([
+    ["ai_session_select", { id: session.id }],
+    ["ai_session_confirm", { id: session.id, selectionId: sessionSelection.selectionId }],
+    ["ai_session_clear", { selectionId: sessionSelection.selectionId }],
+  ]);
 });
 
 it.each([["승인", "approve", "승인 기록됨"], ["거절", "reject", "거절 기록됨"]])(

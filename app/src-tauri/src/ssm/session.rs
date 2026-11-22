@@ -14,10 +14,17 @@ use portable_pty::{
 use serde::Deserialize;
 use std::{ffi::OsStr, io, path::Path, sync::Arc};
 
+#[derive(Clone, Copy)]
+pub(crate) enum SessionDocument<'a> {
+    DefaultShell,
+    AiSharedControl { account_id: &'a str, target: &'a str },
+}
+
 // 각 요청을 앱 세션에 보관하고 start-session은 요청당 한 번만 호출한다.
 pub struct StartRequest {
     scope: Scope,
     target: String,
+    document_name: Option<&'static str>,
     reason: String,
     owner: Arc<str>,
     credentials: Arc<Credentials>,
@@ -82,6 +89,7 @@ pub(crate) fn fixture_start(program: &Path) -> (AwsCli, Scope, StartRequest, Sta
     let request = StartRequest {
         scope: scope.clone(),
         target: "i-01234567".into(),
+        document_name: None,
         reason: "zzabbaxterm-0123456789abcdef0123456789abcdef".into(),
         owner: "arn:aws:sts::123456789012:assumed-role/Sample/Sample".into(),
         credentials: credentials.clone(),
@@ -176,12 +184,22 @@ impl AwsCli {
         node: &OnlineNode,
         cancel: &CancellationToken,
     ) -> Result<StartRequest, CliError> {
+        self.prepare_document_start(scope, node, SessionDocument::DefaultShell, cancel)
+    }
+
+    pub(crate) fn prepare_document_start(
+        &self,
+        scope: &Scope,
+        node: &OnlineNode,
+        document: SessionDocument<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<StartRequest, CliError> {
         require_node_scope(&self.0, scope, node)?;
         if cancel.is_cancelled() {
             return Err(CliError::Cancelled);
         }
         node.credentials.require_current()?;
-        prepare_start(scope, node)
+        prepare_start(scope, node, document)
     }
 
     pub async fn authorize_start(
@@ -263,7 +281,7 @@ impl AwsCli {
 
 impl StartRequest {
     pub(crate) fn account_id(&self) -> &str {
-        self.owner.splitn(6, ':').nth(4).expect("validated STS caller ARN")
+        caller_account_id(&self.owner)
     }
 
     async fn wait_connected_with(
@@ -317,13 +335,16 @@ impl StartRequest {
     }
 
     fn start_command(&self, cwd: &Path, plugin_path: &OsStr) -> CommandBuilder {
+        let args = ["--target", self.target.as_str(), "--reason", self.reason.as_str(),
+            "--document-name", self.document_name.unwrap_or_default()];
+        let args = if self.document_name.is_some() { &args[..] } else { &args[..4] };
         let spec = self
             .scope
             .command(
                 &self.program,
                 "ssm",
                 "start-session",
-                &["--target", &self.target, "--reason", &self.reason],
+                args,
             )
             .with_credentials(&self.scope, &self.credentials);
         let mut command = CommandBuilder::new(spec.program());
@@ -600,12 +621,29 @@ fn require_node_scope(program: &Path, scope: &Scope, node: &OnlineNode) -> Resul
     Ok(())
 }
 
-fn prepare_start(scope: &Scope, node: &OnlineNode) -> Result<StartRequest, CliError> {
+fn caller_account_id(owner: &str) -> &str {
+    owner.splitn(6, ':').nth(4).expect("validated STS caller ARN")
+}
+
+fn prepare_start(scope: &Scope, node: &OnlineNode, document: SessionDocument<'_>) -> Result<StartRequest, CliError> {
+    let document_name = match document {
+        SessionDocument::DefaultShell => None,
+        SessionDocument::AiSharedControl { account_id, target } => {
+            if target != node.instance_id() {
+                return Err(CliError::InvalidTarget);
+            }
+            if account_id != caller_account_id(&node.owner) {
+                return Err(CliError::CallerChanged);
+            }
+            Some("ZzabbaAiSharedControl")
+        }
+    };
     let mut nonce = [0; 16];
     getrandom::fill(&mut nonce).map_err(|_| CliError::RandomUnavailable)?;
     Ok(StartRequest {
         scope: scope.clone(),
         target: node.instance_id.clone(),
+        document_name,
         reason: format!("zzabbaxterm-{:032x}", u128::from_be_bytes(nonce)),
         owner: node.owner.clone(),
         credentials: node.credentials.clone(),

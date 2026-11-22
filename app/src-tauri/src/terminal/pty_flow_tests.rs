@@ -194,6 +194,7 @@ fn f01_two_saved_ssh_launches_reap_only_the_owned_plan_and_child() {
         let (mut second, second_plan) = open();
         assert_ne!(first.id, second.id);
         assert_ne!(first_plan, second_plan);
+        assert!(sessions.live_ssm_identity("main", sessions.document("main"), &first.id).is_none());
         assert!(matches!(tauri::async_runtime::block_on(sessions.connect_sftp("other", &first.id)),
             Err(crate::editor::sftp::Error::Terminal(error)) if error == "다른 창의 세션입니다"));
         let (first_context, first_cancel, first_worker) = sessions.get("main", &first.id).unwrap().sftp_context().unwrap();
@@ -426,6 +427,7 @@ fn c02_close_before_start_retires_only_the_unstarted_pty() {
         };
         let (first, first_events) = open();
         let (peer, peer_events) = open();
+        assert!(sessions.live_ssm_identity("main", document, &first).is_none());
         // 마법사나 탭이 닫기를 누르기 전에 네이티브 작업자가 먼저 끝날 수 있다.
         let retired = sessions.get("main", &first).unwrap();
         retired.stop(super::process::Stop::Closed);
@@ -485,6 +487,7 @@ fn c02_native_start_outcomes() {
                         }
                         Event::Connecting => {}
                         Event::Ready { .. } if mode == "connected" => {
+                            assert!(sessions.live_ssm_identity("main", sessions.document("main"), &id).is_none());
                             ready = true;
                             pty.input(b"fixture-input\r");
                         }
@@ -507,6 +510,7 @@ fn c02_native_start_outcomes() {
                 }
             }
             let closed = sessions.close("main", &id).unwrap();
+            assert!(sessions.live_ssm_identity("main", sessions.document("main"), &id).is_none());
             use super::remote::RemoteClose;
             assert_eq!(closed.remote, match mode {
                 "unknown" => RemoteClose::Unconfirmed,
@@ -537,7 +541,7 @@ fn c02_native_pty_creation_failure_stays_local() {
     let mut target = super::remote::Target::new("fixture", "us-west-2", "i-01234567").unwrap();
     target.fixture = Some(program);
     let cancel = crate::ssm::CancellationToken::new();
-    let mut remote = tauri::async_runtime::block_on(target.prepare(&cancel)).unwrap();
+    let mut remote = tauri::async_runtime::block_on(target.prepare(None, &cancel)).unwrap();
     #[cfg(windows)]
     let size = size(0, 0);
     #[cfg(unix)]

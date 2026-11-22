@@ -1,6 +1,7 @@
 use portable_pty::{Child, PtyPair, PtySize};
 
-use crate::ssm::{AwsCli, CancellationToken, CliError, Scope, StartRequest};
+use crate::ssm::{AwsCli, CancellationToken, CliError, Scope, SessionDocument, StartRequest};
+use super::LiveSsmIdentity;
 
 const START_DIAGNOSTIC_LIMIT: usize = 8 * 1024;
 
@@ -34,7 +35,7 @@ pub(crate) enum RemoteClose {
     Unconfirmed,
 }
 
-pub(super) struct Target {
+pub(crate) struct Target {
     scope: Scope,
     instance_id: String,
     #[cfg(test)]
@@ -42,7 +43,7 @@ pub(super) struct Target {
 }
 
 impl Target {
-    pub(super) fn new(profile: &str, region: &str, instance_id: &str) -> Result<Self, String> {
+    pub(crate) fn new(profile: &str, region: &str, instance_id: &str) -> Result<Self, String> {
         let scope = Scope::new(profile.into(), region.into()).map_err(start_error)?;
         Ok(Self {
             scope,
@@ -52,24 +53,60 @@ impl Target {
         })
     }
 
-    pub(super) async fn prepare(&self, cancel: &CancellationToken) -> Result<Remote, String> {
+    pub(super) async fn prepare(&self, central: Option<&LiveSsmIdentity>, cancel: &CancellationToken) -> Result<Remote, String> {
+        let document = match central {
+            Some(identity) if self.scope.profile() == identity.profile && self.scope.region() == identity.region
+                && self.instance_id == identity.instance_id => SessionDocument::AiSharedControl {
+                    account_id: &identity.account_id, target: &identity.instance_id,
+                },
+            Some(_) => return Err(start_error(CliError::InvalidTarget)),
+            None => SessionDocument::DefaultShell,
+        };
         #[cfg(test)]
         if let Some(program) = &self.fixture {
+            if central.is_some() { return Err(start_error(CliError::InvalidTarget)); }
             let (cli, scope, request, permit) = crate::ssm::fixture_start(program);
-            return Ok(Remote { cli, scope, request, spawned: false, fixture: Some(permit) });
+            return Ok(Remote { cli, scope, request, spawned: false, fixture: Some(permit), is_fixture: true });
         }
         let cli = AwsCli::probe(cancel).await.map_err(start_error)?;
         let node = cli.online_nodes(&self.scope, cancel).await.map_err(start_error)?
             .into_iter().find(|node| node.instance_id() == self.instance_id)
             .ok_or_else(|| start_error(CliError::TargetNotConnected))?;
         cli.check_plugin(cancel).await.map_err(start_error)?;
-        let request = cli.prepare_start(&self.scope, &node, cancel).await.map_err(start_error)?;
+        let request = cli.prepare_document_start(&self.scope, &node, document, cancel).map_err(start_error)?;
         Ok(Remote {
             cli, scope: self.scope.clone(), request, spawned: false,
             #[cfg(test)]
             fixture: None,
+            #[cfg(test)]
+            is_fixture: false,
         })
     }
+}
+
+#[cfg(test)]
+#[test]
+fn shared_control_rejects_mismatched_target_and_default_shell_fixture() {
+    let mut target = Target::new("fixture", "us-west-2", "i-01234567").unwrap();
+    let identity = LiveSsmIdentity {
+        id: "0".into(), document: 0, account_id: "123456789012".into(),
+        profile: "fixture".into(), region: "us-west-2".into(), instance_id: "i-01234567".into(),
+    };
+    let invalid = start_error(CliError::InvalidTarget);
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let check = |target: &Target, identity: &LiveSsmIdentity| {
+        assert_eq!(tauri::async_runtime::block_on(target.prepare(Some(identity), &cancel)).err().as_deref(), Some(invalid.as_str()));
+    };
+    for change in [
+        LiveSsmIdentity { profile: "other".into(), ..identity.clone() },
+        LiveSsmIdentity { region: "us-east-1".into(), ..identity.clone() },
+        LiveSsmIdentity { instance_id: "i-76543210".into(), ..identity.clone() },
+    ] {
+        check(&target, &change);
+    }
+    target.fixture = Some(std::path::PathBuf::new());
+    check(&target, &identity);
 }
 
 pub(super) struct Remote {
@@ -79,6 +116,15 @@ pub(super) struct Remote {
     spawned: bool,
     #[cfg(test)]
     fixture: Option<crate::ssm::StartPermit>,
+    #[cfg(test)]
+    is_fixture: bool,
+}
+
+pub(super) struct SsmIdentity {
+    pub(super) account_id: String,
+    pub(super) profile: String,
+    pub(super) region: String,
+    pub(super) instance_id: String,
 }
 
 impl Remote {
@@ -103,9 +149,18 @@ impl Remote {
         Ok(child)
     }
 
-    pub(super) fn wait_connected(&self, cancel: &CancellationToken) -> Result<(), String> {
+    pub(super) fn wait_connected(&self, cancel: &CancellationToken, work_tab: bool) -> Result<Option<SsmIdentity>, String> {
         tauri::async_runtime::block_on(self.cli.wait_connected(&self.request, &self.scope, cancel))
-            .map_err(|_| format!("연결 확인 불가: {}", self.request.target()))
+            .map_err(|_| format!("연결 확인 불가: {}", self.request.target()))?;
+        if !work_tab { return Ok(None); }
+        #[cfg(test)]
+        if self.is_fixture { return Ok(None); }
+        Ok(Some(SsmIdentity {
+            account_id: self.account_id().into(),
+            profile: self.scope.profile().into(),
+            region: self.scope.region().into(),
+            instance_id: self.request.target().into(),
+        }))
     }
 
     pub(super) fn close(&mut self) -> (RemoteClose, Option<String>) {

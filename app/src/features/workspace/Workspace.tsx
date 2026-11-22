@@ -12,6 +12,8 @@ import type { SsmTarget } from "../ssm/ssm";
 import { StorageTab } from "../storage/StorageTab";
 import { TerminalView } from "../terminal/TerminalView";
 import type { TerminalStatus } from "../terminal/session";
+import { TunnelTab } from "../tunnels/TunnelTab";
+import { tunnelIpc } from "../tunnels/tunnelIpc";
 import { LocalTree } from "./LocalTree";
 import { Splitter } from "./Splitter";
 import { macTitleBar, TitleBar } from "./TitleBar";
@@ -22,6 +24,7 @@ type Split = { left: number; right: number };
 type Tab = { id: number; label: string } & (
   | { kind: "terminal"; targetId?: string; ssm?: SsmTarget; ssh?: SshTransport["kind"]; status: TerminalStatus; sessionId?: string; sftpSessionId?: string; closeStatus?: CloseStatus }
   | { kind: "editor"; file: ApprovedEditorFile; transport: EditorTransport; close: () => Promise<void>; source: EditorSource }
+  | { kind: "tunnel"; handle: string; targetId: string; name: string; method: "ssh" | "ssm"; closeStatus?: CloseStatus; closeError?: string }
 );
 type StorageTarget = { targetId: string; label: string; closeStatus?: CloseStatus };
 type ProfileLoad = { kind: "loading" | "ready"; profiles?: SavedConnections }
@@ -189,6 +192,27 @@ export function Workspace() {
     selectTab(id);
   }
 
+  async function openTunnel(targetId: string, name: string, method: "ssh" | "ssm", share?: { tab: string; id: string }) {
+    const id = nextTab.current++;
+    const label = `${name} · 터널 ${id}`;
+    const handle = await tunnelIpc.open(targetId, label);
+    const tab = { kind: "tunnel", id, label, handle, targetId, name, method } as const;
+    if (share) {
+      try {
+        await tunnelIpc.share(share.tab, handle, share.id);
+      } catch (error) {
+        try {
+          await tunnelIpc.close(handle);
+        } catch (closeError) {
+          setTabs(current => [...current, { ...tab, closeStatus: "unconfirmed", closeError: String(closeError) }]);
+        }
+        throw error;
+      }
+    }
+    setTabs(current => [...current, tab]);
+    selectTab(id);
+  }
+
   function openStorageTarget(targetId: string, label: string) {
     setStorageTargets((current) => current.some((target) => target.targetId === targetId)
       ? current : [...current, { targetId, label }]);
@@ -256,25 +280,33 @@ export function Workspace() {
   async function closeTab(id: number) {
     const tab = liveTabs.current.find(item => item.id === id);
     if (!tab || closingTabs.current.has(id)) return;
-    if (tab.kind === "terminal" && (tab.ssm || tab.ssh)) {
+    if (tab.kind === "tunnel" || (tab.kind === "terminal" && (tab.ssm || tab.ssh))) {
       closingTabs.current.add(id);
-      setTabs(current => current.map(item => item.id === id && item.kind === "terminal" ? { ...item, closeStatus: "closing" } : item));
+      setTabs(current => current.map(item => item.id === id && item.kind !== "editor" ? { ...item, closeStatus: "closing" } : item));
       try {
-        if (tab.sftpSessionId) {
-          const sftp = sftpPanels.current.get(tab.sftpSessionId);
-          try {
-            await sftp?.confirmClose();
-            if (sftp) setTabs(current => current.map(item => item.id === id && item.kind === "terminal"
-              ? { ...item, sftpSessionId: undefined } : item));
-          } catch {
-            // SFTP 분리가 실패해도 부모 SSH의 종료로 해당 세션을 정리한다.
+        if (tab.kind === "tunnel") {
+          await tunnelIpc.close(tab.handle);
+        } else {
+          if (tab.sftpSessionId) {
+            const sftp = sftpPanels.current.get(tab.sftpSessionId);
+            try {
+              await sftp?.confirmClose();
+              if (sftp) setTabs(current => current.map(item => item.id === id && item.kind === "terminal"
+                ? { ...item, sftpSessionId: undefined } : item));
+            } catch {
+              // SFTP 분리가 실패해도 부모 SSH의 종료로 해당 세션을 정리한다.
+            }
           }
+          const session = sessionClosers.current.get(id);
+          if (!session) throw new Error("세션 종료 상태를 확인할 수 없습니다");
+          await session.confirmClose();
         }
-        const session = sessionClosers.current.get(id);
-        if (!session) throw new Error("세션 종료 상태를 확인할 수 없습니다");
-        await session.confirmClose();
-      } catch {
-        setTabs(current => current.map(item => item.id === id && item.kind === "terminal" ? { ...item, closeStatus: "unconfirmed" } : item));
+      } catch (error) {
+        setTabs(current => current.map(item => {
+          if (item.id !== id || item.kind === "editor") return item;
+          return item.kind === "tunnel" ? { ...item, closeStatus: "unconfirmed", closeError: String(error) }
+            : { ...item, closeStatus: "unconfirmed" };
+        }));
         return;
       } finally {
         closingTabs.current.delete(id);
@@ -294,12 +326,18 @@ export function Workspace() {
 
   function updateStatus(id: number, status: TerminalStatus, sessionId?: string) {
     setTabs((current) => current.map((tab) => tab.id === id && tab.kind === "terminal"
-      ? { ...tab, status, sessionId: sessionId ?? tab.sessionId,
-        sftpSessionId: status.kind === "running" && (sessionId ?? tab.sessionId) === tab.sftpSessionId ? tab.sftpSessionId : undefined }
+      ? {
+        ...tab, status, sessionId: sessionId ?? tab.sessionId,
+        sftpSessionId: status.kind === "running" && (sessionId ?? tab.sessionId) === tab.sftpSessionId ? tab.sftpSessionId : undefined
+      }
       : tab));
   }
 
   const current = tabs.find((tab) => tab.id === active);
+  const aiSessions = tabs.flatMap(tab => tab.kind === "terminal" && tab.ssm && tab.sessionId &&
+    tab.status.kind === "running" && !tab.closeStatus
+    ? [{ id: tab.sessionId, label: tab.label, region: tab.ssm.region, node: tab.ssm.instanceId }]
+    : []);
   const visibleSplit = split && (active === split.left || active === split.right) ? split : null;
   const splitCandidates = !visibleSplit && current?.kind === "terminal" && !current.closeStatus &&
     (current.status.kind === "running" || current.status.kind === "opening" || current.status.kind === "connecting")
@@ -357,7 +395,10 @@ export function Workspace() {
             <button onClick={reloadProfiles}>다시 불러오기</button>
           </div>}
           <LocalTree profiles={profileLoad.profiles} onOpen={openTab} onRegisterSshHost={(targetId) => void registerSavedSshHost(targetId)}
-            onRetestS3={retestStorageTarget} />
+            onRetestS3={retestStorageTarget} onOpenTunnel={(targetId, name, method) => {
+              setWindowError("");
+              void openTunnel(targetId, name, method).catch(error => setWindowError(String(error)));
+            }} />
         </aside>
         <div className={`workspace-center${visibleSplit ? " workspace-center-split" : ""}`}>
           <div className="workspace-center-actions" hidden={!visibleSplit && !splitCandidates.length}>
@@ -393,6 +434,11 @@ export function Workspace() {
                 <TerminalView active={visible} focusRequested={id === focusTab} label={label} targetId={tab.targetId}
                   remote={!!tab.ssm} ssh={!!tab.ssh} closing={!!tab.closeStatus} closeRef={tab.ssm || tab.ssh ? bindClose : undefined}
                   onStatus={(status, sessionId) => updateStatus(id, status, sessionId)} />
+              ) : tab.kind === "tunnel" ? (
+                <TunnelTab tab={tab.handle} targetId={tab.targetId} method={tab.method}
+                  closeState={tab.closeStatus === "closing" ? { kind: "closing" } : tab.closeStatus === "unconfirmed"
+                    ? { kind: "unconfirmed", error: tab.closeError ?? "종료 확인 불가" } : undefined}
+                  onShare={(targetId, tabHandle, tunnelId) => openTunnel(targetId, tab.name, tab.method, { tab: tabHandle, id: tunnelId })} />
               ) : (
                 <EditorTab file={tab.file} active={id === active} transport={tab.transport}
                   confirmDiscard={(request) => confirmEditorDiscard(tab.source, request)}
@@ -417,7 +463,7 @@ export function Workspace() {
             value={splitPosition} min={20} max={80} onChange={setSplitPosition} />}
         </div>
         <aside className="workspace-ai" hidden={focused} aria-label="오른쪽 도구">
-          <LocalAiPanel profilesVersion={loadVersion} topTabs={{
+          <LocalAiPanel profilesVersion={loadVersion} sessionCandidates={aiSessions} focused={focused} topTabs={{
             item: {
               id: "files", label: "파일",
               content: <>
@@ -487,7 +533,8 @@ export function Workspace() {
           ? [current.targetId ? current.label : "내 PC", current.ssm ?
             `SSM · ${current.ssm.profile} / ${current.ssm.region} / ${current.ssm.instanceId}` : current.ssh ? "SSH" : "로컬", current.sessionId,
           !current.closeStatus && terminalStatus(current.status)].filter(Boolean).join(" · ")
-          : current ? `${current.source === "local" ? "내 PC · 로컬 파일" : current.source === "sftp" ? "SFTP" : "S3"} · ${current.label}` : "연결 없음"}</span>
+          : current?.kind === "tunnel" ? current.label
+            : current ? `${current.source === "local" ? "내 PC · 로컬 파일" : current.source === "sftp" ? "SFTP" : "S3"} · ${current.label}` : "연결 없음"}</span>
         {windowError && <span role="alert">{windowError}</span>}
         {fileError && <span role="alert">{fileError}</span>}
         {hostRegistration && <span role={hostRegistration.kind}>{hostRegistration.message}</span>}

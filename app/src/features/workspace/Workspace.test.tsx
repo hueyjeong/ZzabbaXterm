@@ -62,6 +62,7 @@ let closeTerminal: (id: string) => Promise<unknown>;
 let runDiscovery: (args: unknown) => Promise<unknown>;
 let runStorage: (command: string, args: unknown) => Promise<unknown>;
 let runSftp: (command: string, args: unknown) => Promise<unknown>;
+let runTunnel: (command: string, args: unknown) => Promise<unknown>;
 let openFile: () => Promise<unknown>;
 let saveFile: () => Promise<unknown>;
 
@@ -104,6 +105,7 @@ beforeEach(async () => {
   runDiscovery = async () => { throw new Error("예상하지 않은 SSM 검색"); };
   runStorage = async command => { throw new Error(`예상하지 않은 스토리지 명령: ${command}`); };
   runSftp = async command => { throw new Error(`예상하지 않은 SFTP 명령: ${command}`); };
+  runTunnel = async command => { throw new Error(`예상하지 않은 터널 명령: ${command}`); };
   openFile = async () => ({ status: "cancelled" });
   saveFile = async () => null;
   native.invoke.mockImplementation(async (command, args) => {
@@ -113,6 +115,7 @@ beforeEach(async () => {
     if (command === "ssm_discovery") return runDiscovery(args);
     if (command.startsWith("storage_")) return runStorage(command, args);
     if (command.startsWith("editor_sftp_")) return runSftp(command, args);
+    if (command.startsWith("tunnel_")) return runTunnel(command, args);
     if (command === "editor_local_open") return openFile();
     if (command === "editor_local_save") return saveFile();
     if (command === "terminal_start") return starts.get(args.id);
@@ -650,6 +653,30 @@ describe("C02 SSM 연결", () => {
 
   const node = { profile: "company", region: "ap-northeast-2", instanceId: "i-00000001" };
 
+  it("저장된 SSM 터널 탭에는 공식 포트 전달 차단 상태만 표시한다", async () => {
+    loadProfiles = async () => ({
+      ...emptyStore,
+      groups: [{ revision: 1, profile: { id: "work", displayName: "작업" } }],
+      targets: [{ revision: 1, profile: { id: "node", groupId: "work", displayName: "관리 노드", defaultMethod: "ssm", ssm: node } }],
+    });
+    runTunnel = async command => {
+      if (command === "tunnel_tab_open") return "ssm-tunnel";
+      if (command === "tunnel_status") return [];
+      throw new Error(command);
+    };
+    await restartWorkspace();
+    const row = [...tree().querySelectorAll<HTMLElement>('[role="treeitem"]')]
+      .find(item => item.querySelector(":scope > .tree-row > span")?.textContent === "관리 노드");
+    expect(row).toBeDefined();
+    await act(async () => { row?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true })); });
+    await press("터널 열기");
+    expect(connectionCalls("tunnel_tab_open")).toEqual([["tunnel_tab_open", { target: "node", label: "관리 노드 · 터널 2" }]]);
+    const panel = find('.workspace-center section[aria-label="터널"]');
+    expect(panel.textContent).toContain("공식 SSM 포트 전달의 바이너리 보존을 확인할 수 없습니다");
+    expect(panel.querySelector("form")).toBeNull();
+    expect(connectionCalls("tunnel_start")).toEqual([]);
+  });
+
   it("선택한 노드 참조만 시험하고 실패 후에도 선택을 보존하며 저장은 비활성화한다", async () => {
     vi.stubGlobal("__ZZABBA_SSM_DOCUMENT__", "test-document");
     let requestId = 0;
@@ -943,7 +970,8 @@ describe("C02 SSM 연결", () => {
       .find((item) => item.textContent === "관리 노드");
     expect(row).toBeDefined();
     await key(row!, "ContextMenu");
-    expect(find('[role="menu"]').textContent).toBe("AWS Systems Manager");
+    expect([...find('[role="menu"]').querySelectorAll('[role="menuitem"]')].map(item => item.textContent))
+      .toEqual(["AWS Systems Manager", "터널 열기"]);
     await press("AWS Systems Manager");
     const [{ output, ...args }] = calls("open").slice(-1);
     expect(output).toBeDefined();
@@ -1191,7 +1219,8 @@ describe("F01 직접 SSH", () => {
     expect(connectionCalls("register_saved_ssh_host")).toEqual([]);
 
     await key(target, "ContextMenu");
-    expect([...find('[role="menu"]').querySelectorAll('[role="menuitem"]')].map(item => item.textContent)).toEqual(["SSH", "호스트 키 등록"]);
+    expect([...find('[role="menu"]').querySelectorAll('[role="menuitem"]')].map(item => item.textContent))
+      .toEqual(["SSH", "호스트 키 등록", "터널 열기"]);
     await press("호스트 키 등록");
     expect(host.querySelector('[role="menu"]')).toBeNull();
     expect(find('footer [role="alert"]').textContent).toContain("SSH 호스트 키 등록이 취소되었습니다");
@@ -1284,6 +1313,62 @@ describe("현재 SSH 세션의 SFTP", () => {
     const { id } = started[started.length - 1];
     return { id, receive: channels.get(id)! };
   }
+
+  it("저장된 SSH 터널을 중앙에 열고 공유 실패와 종료 미확인에 각 네이티브 핸들을 사용한다", async () => {
+    const close = vi.fn().mockResolvedValueOnce(null).mockRejectedValueOnce("터널 자식 종료 확인 불가").mockResolvedValue(null);
+    const pendingShare = vi.fn().mockRejectedValueOnce("공유 실패").mockResolvedValue(null);
+    let opens = 0;
+    runTunnel = async (command, args) => {
+      if (command === "tunnel_tab_open") return `tunnel-${++opens}`;
+      if (command === "tunnel_tab_close") return close(args);
+      if (command === "tunnel_share") return pendingShare(args);
+      if (command === "tunnel_status") return [{
+        id: "forward", endpoint: "127.0.0.1:8090", route: "-L", owners: ["서버 A"], state: "ready", error: null,
+      }];
+      throw new Error(command);
+    };
+    await openSecond();
+    await press("파일");
+    const fileConnection = find('select[aria-label="파일 연결"]');
+    const row = [...tree().querySelectorAll<HTMLElement>('[role="treeitem"]')]
+      .find(item => item.querySelector(":scope > .tree-row > span")?.textContent === "서버 A");
+    expect(row).toBeDefined();
+    await act(async () => { row?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true })); });
+    expect(button("호스트 키 등록")).toBeDefined();
+    const openedTerminals = calls("open").length;
+    await press("터널 열기");
+    const title = "서버 A · 터널 3";
+    expect(connectionCalls("tunnel_tab_open")).toEqual([["tunnel_tab_open", { target: "ssh-0", label: title }]]);
+    expect(calls("open")).toHaveLength(openedTerminals);
+    const panel = find('.workspace-center section[aria-label="터널"]');
+    expect(panel.closest("[hidden]")).toBeNull();
+    expect(status()).toContain(title);
+    expect(find('select[aria-label="파일 연결"]')).toBe(fileConnection);
+    expect(fileConnection.closest("[hidden], [inert]")).toBeNull();
+    await press("로컬 2");
+    expect([...find<HTMLSelectElement>(".workspace-center-actions select").options].map(option => option.text))
+      .toEqual(["선택", "로컬 1"]);
+    await press(title);
+
+    await press("새 탭에 공유");
+    expect(pendingShare).toHaveBeenCalledWith({ tab: "tunnel-1", to: "tunnel-2", id: "forward" });
+    expect(close).toHaveBeenNthCalledWith(1, { tab: "tunnel-2" });
+    expect(panel.querySelector('[role="alert"]')?.textContent).toBe("공유 실패");
+    expect(button("서버 A · 터널 4")).toBeUndefined();
+
+    await press("새 탭에 공유");
+    expect(pendingShare).toHaveBeenLastCalledWith({ tab: "tunnel-1", to: "tunnel-3", id: "forward" });
+    expect(button("서버 A · 터널 5")?.getAttribute("aria-pressed")).toBe("true");
+    await press(title);
+    await press(`${title} 닫기`);
+    expect(close).toHaveBeenNthCalledWith(2, { tab: "tunnel-1" });
+    expect(panel.querySelector('[role="alert"]')?.textContent).toBe("터널 자식 종료 확인 불가");
+    await press(`${title} 종료 다시 확인`);
+    expect(close).toHaveBeenNthCalledWith(3, { tab: "tunnel-1" });
+    expect(button(title)).toBeUndefined();
+    expect(button("서버 A · 터널 5")?.getAttribute("aria-pressed")).toBe("true");
+    expect(find('select[aria-label="파일 연결"]')).toBe(fileConnection);
+  });
 
   it("채팅과 중앙 탭을 전환해도 SSH별 목록과 초안을 유지하고 종료된 세션만 분리한다", async () => {
     runSftp = async (command, args) => {

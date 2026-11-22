@@ -2,11 +2,12 @@ import { useLayoutEffect, useRef, useState, type KeyboardEvent } from "react";
 import type { SavedConnections } from "../connections/connectionIpc";
 
 type OpenTarget = (target?: SavedConnections["targets"][number]["profile"]) => void;
-type MenuTarget = { method: string; open: () => void; sshTargetId?: string; s3TargetId?: string };
+type MenuTarget = { method: string; open: () => void; sshTargetId?: string; s3TargetId?: string; openTunnel?: () => void };
 
-export function LocalTree({ profiles, onOpen, onRegisterSshHost, onRetestS3 }: {
+export function LocalTree({ profiles, onOpen, onRegisterSshHost, onRetestS3, onOpenTunnel }: {
   profiles?: SavedConnections; onOpen: OpenTarget; onRegisterSshHost: (targetId: string) => void;
   onRetestS3?: (targetId: string) => void;
+  onOpenTunnel: (targetId: string, name: string, method: "ssh" | "ssm") => void;
 }) {
   const [query, setQuery] = useState("");
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set());
@@ -28,6 +29,8 @@ export function LocalTree({ profiles, onOpen, onRegisterSshHost, onRetestS3 }: {
           : target.defaultMethod === "s3" ? "S3" : "로컬",
         sshTargetId: target.defaultMethod === "ssh" ? target.id : undefined,
         s3TargetId: target.defaultMethod === "s3" && onRetestS3 ? target.id : undefined,
+        openTunnel: target.defaultMethod === "ssm" || (target.defaultMethod === "ssh" && target.ssh.transport.kind === "direct")
+          ? () => onOpenTunnel(target.id, target.displayName, target.defaultMethod) : undefined,
       })),
     })) ?? []),
   ].flatMap((group) => {
@@ -50,7 +53,8 @@ export function LocalTree({ profiles, onOpen, onRegisterSshHost, onRetestS3 }: {
 
   function showMenu(row: HTMLLIElement, target: MenuTarget, x: number, y: number) {
     row.focus();
-    const menuHeight = target.sshTargetId !== undefined || target.s3TargetId !== undefined ? 80 : 44;
+    const extraActions = Number(target.sshTargetId !== undefined) + Number(target.s3TargetId !== undefined) + Number(!!target.openTunnel);
+    const menuHeight = 44 + 36 * extraActions;
     setMenu({ row, target, x: Math.min(x, window.innerWidth - 170), y: Math.min(y, window.innerHeight - menuHeight) });
   }
 
@@ -147,6 +151,11 @@ export function LocalTree({ profiles, onOpen, onRegisterSshHost, onRetestS3 }: {
         setMenu(undefined);
         onRegisterSshHost(sshTargetId);
       }}>호스트 키 등록</button>}
+      {menu.target.openTunnel && <button type="button" role="menuitem" onClick={() => {
+        menu.row.focus();
+        setMenu(undefined);
+        menu.target.openTunnel?.();
+      }}>터널 열기</button>}
       {s3TargetId !== undefined && <button type="button" role="menuitem" onClick={() => {
         menu.row.focus();
         setMenu(undefined);

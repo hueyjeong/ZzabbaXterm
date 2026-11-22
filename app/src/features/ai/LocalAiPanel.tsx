@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState } from "react";
 import { AiPanel, type AiTopTabs } from "./AiPanel";
 import type { AiPanelProps, ChatReply, DecisionRecord, Proposal, ProposalTarget, RecordedDecision, TargetRef } from "./contracts";
+import type { SessionSelectionProps } from "./SessionSelection";
 
 const sendChat: AiPanelProps["onSendChat"] = async (request) => {
   try {
@@ -13,7 +14,18 @@ const sendChat: AiPanelProps["onSendChat"] = async (request) => {
 
 let nextRequestId = 0;
 
-export function LocalAiPanel({ profilesVersion, topTabs }: { profilesVersion: number; topTabs?: AiTopTabs }) {
+const sessionActions: SessionSelectionProps["actions"] = {
+  select: (id) => invoke("ai_session_select", { id }),
+  confirm: (id, selectionId) => invoke("ai_session_confirm", { id, selectionId }),
+  clear: (selectionId) => invoke("ai_session_clear", { selectionId }),
+};
+
+export function LocalAiPanel({ profilesVersion, topTabs, sessionCandidates, focused = false }: {
+  profilesVersion: number;
+  topTabs?: AiTopTabs;
+  sessionCandidates?: SessionSelectionProps["candidates"];
+  focused?: boolean;
+}) {
   const [models, setModels] = useState<readonly string[]>([]);
   const [history, setHistory] = useState<readonly DecisionRecord[]>([]);
   const [policyVersion, setPolicyVersion] = useState(0);
@@ -167,6 +179,7 @@ export function LocalAiPanel({ profilesVersion, topTabs }: { profilesVersion: nu
   return <AiPanel models={models} targets={targets} proposals={cliCard ? [cliCard] : []} onSelectTarget={select}
     history={history} policyVersion={policyVersion} onReadDecision={readDecision}
     onOpenCliReview={openCliReview} topTabs={topTabs}
+    sessionSelection={sessionCandidates && { candidates: sessionCandidates, visible: !focused, actions: sessionActions }}
     policyControl={<>
       {blocked !== undefined && <label><input type="checkbox" checked={blocked} disabled={savingPolicy}
         onChange={(event) => void updatePolicy(event.currentTarget.checked)} /> 조회 승인 차단</label>}

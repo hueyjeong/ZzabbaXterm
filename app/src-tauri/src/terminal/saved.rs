@@ -30,7 +30,7 @@ fn rejects_saved_s3_without_launching_a_pty() {
 pub(super) fn command(config: &Path, id: &str) -> Result<CommandBuilder, String> {
     match launch(config, id)? {
         Launch::Local(command) => Ok(command),
-        Launch::Ssm(_) | Launch::Ssh(_) => Err("로컬 연결이 아닙니다".into()),
+        Launch::Ssm(_) | Launch::Ssh(_) | Launch::AiControl(..) => Err("로컬 연결이 아닙니다".into()),
     }
 }
 

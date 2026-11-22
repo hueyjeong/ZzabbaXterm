@@ -1,0 +1,11 @@
+.tunnel-panel { flex: 1; min-height: 0; padding: 16px; overflow: auto; }
+.tunnel-panel h2 { margin-top: 0; font-size: 15px; }
+.tunnel-panel fieldset { display: flex; align-items: end; flex-wrap: wrap; gap: 8px; border: 0; margin: 0; padding: 0; min-width: 0; }
+.tunnel-panel label { display: grid; gap: 4px; }
+.tunnel-panel input[type="number"] { width: 9ch; }
+.tunnel-panel button { min-height: 32px; padding-inline: 10px; border: 1px solid var(--border); }
+.tunnel-panel button:disabled { opacity: .5; cursor: default; }
+.tunnel-panel ul { display: grid; gap: 8px; padding: 0; list-style: none; }
+.tunnel-panel li { display: grid; gap: 4px; justify-items: start; border-top: 1px solid var(--border); padding-block: 8px; }
+.tunnel-panel [role="alert"] { color: #ffb7ad; }
+.tunnel-panel [role="status"] { color: var(--accent); }
