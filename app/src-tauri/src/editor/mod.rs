@@ -23,6 +23,7 @@ use std::{
 };
 
 use sha2::{Digest, Sha256};
+use storage_files::DownloadPublicationError;
 
 static COMMIT: Mutex<()> = Mutex::new(());
 const CLI_READ_LIMIT: usize = 8 * 1024 * 1024;
@@ -78,6 +79,8 @@ pub(crate) enum SaveStage {
 pub(crate) enum SaveError {
     Conflict(LocalConflict),
     Io { stage: SaveStage, source: io::Error },
+    Revoked,
+    PublicationUnconfirmed { recovery_path: PathBuf },
 }
 
 #[derive(PartialEq, Eq)]
@@ -154,20 +157,34 @@ impl LocalFile {
     }
 
     /// 호출자가 버퍼를 소유한다. 충돌과 오류에서 버퍼와 저장 기준은 그대로 남는다.
-    /// 해시 검사와 OS 교체는 별도 작업이다. 마지막 검사 직후의 외부 쓰기는 경합할 수 있다.
-    pub(crate) fn save(&mut self, buffer: &str) -> Result<(), SaveError> {
+    #[cfg(test)]
+    fn save(&mut self, buffer: &str) -> Result<(), SaveError> {
         self.save_with_sync(buffer, File::sync_all)
     }
 
+    #[cfg(test)]
     fn save_with_sync(
         &mut self,
         buffer: &str,
         sync: impl FnOnce(&File) -> io::Result<()>,
     ) -> Result<(), SaveError> {
+        self.save_checked(buffer, sync, || Ok(()))
+    }
+
+    fn save_checked<G>(
+        &mut self,
+        buffer: &str,
+        sync: impl FnOnce(&File) -> io::Result<()>,
+        authorize: impl FnOnce() -> Result<G, SaveError>,
+    ) -> Result<(), SaveError> {
         use SaveStage::*;
 
         check_open_parent(&self.selected_parent, &self.parent, self.cli_path).map_err(save_read_error)?;
-        let access = os::Access::read(&self.original).map_err(at(PreservePermissions))?;
+        let initial = self.parent.open_file(&self.name)
+            .map_err(lookup_error).map_err(save_read_error)?
+            .ok_or(SaveError::Conflict(LocalConflict::NotRegular))?;
+        let access = os::Access::read_editor(&initial).map_err(at(PreservePermissions))?;
+        drop(initial);
         let mut temp = self.parent.stage(Some(&access)).map_err(at(CreateTemporary))?;
         let bytes = buffer.as_bytes();
         temp.file().write_all(bytes).map_err(at(WriteTemporary))?;
@@ -196,14 +213,14 @@ impl LocalFile {
             };
             return Err(SaveError::Conflict(reason));
         }
-        if !access.matches(&current).map_err(at(PreservePermissions))? {
+        if !access.matches_editor(&current).map_err(at(PreservePermissions))? {
             return Err(SaveError::Conflict(LocalConflict::PermissionsChanged));
         }
         self.parent
             .check_replace_access(&self.name, &current)
             .map_err(at(Replace))?;
         if !access
-            .matches(temp.file())
+            .matches_editor(temp.file())
             .map_err(at(PreservePermissions))?
         {
             return Err(at(PreservePermissions)(io::Error::new(
@@ -211,7 +228,30 @@ impl LocalFile {
                 "temporary file access differs before replacement",
             )));
         }
-        let file = temp.replace(&self.name).map_err(at(Replace))?;
+        let _authorized = authorize()?;
+        let file = temp.publish_editor(&self.name, &current, |mut original| {
+            let before = original.metadata()?;
+            let mut hash = Sha256::new();
+            original.rewind()?;
+            let len = io::copy(&mut original, &mut hash)?;
+            let after = original.metadata()?;
+            if before.len() != len || after.len() != len
+                || before.modified()? != after.modified()?
+                || os::file_id(original)? != version.id
+                || <[u8; 32]>::from(hash.finalize()) != version.digest
+                || !access.matches_editor(original)?
+            {
+                return Err(io::Error::other("original changed at publication"));
+            }
+            check_open_parent(&self.selected_parent, &self.parent, self.cli_path)
+                .map_err(|error| match error {
+                    OpenError::Io(source) => source,
+                    _ => io::Error::other("parent changed at publication"),
+                })
+        }).map_err(|error| match error {
+            DownloadPublicationError::Io(source) => at(Replace)(source),
+            DownloadPublicationError::Unconfirmed(recovery_path) => SaveError::PublicationUnconfirmed { recovery_path },
+        })?;
         self.original = file;
         self.version = Version { id, digest };
         Ok(())
