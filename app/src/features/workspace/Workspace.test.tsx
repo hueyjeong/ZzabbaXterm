@@ -1578,8 +1578,8 @@ describe("F01 직접 SSH", () => {
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
     await key(row, "ContextMenu");
     await press("nano 연동으로 열기");
-    expect(calls("open").at(-1)).toMatchObject({ targetId: "nano", remoteEditor: true });
-    const { id: sessionId } = calls("start").at(-1);
+    expect(calls("open").slice(-1)[0]).toMatchObject({ targetId: "nano", remoteEditor: true });
+    const { id: sessionId } = calls("start").slice(-1)[0];
     expect(receiveNanoOpen).toBeDefined();
     const event = "editor-remote-nano-open";
     await act(async () => { void receiveNanoOpen?.({ event, id: 1, payload: { offerId: "2".repeat(32), sessionId: "999" } }); });
