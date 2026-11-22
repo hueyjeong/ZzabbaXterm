@@ -20,6 +20,7 @@ class Fixture(ServerInterface):
     def __init__(self):
         self.ready = threading.Event()
         self.result = None
+        self.shell = False
 
     def get_allowed_auths(self, username):
         return "password,publickey"
@@ -37,6 +38,7 @@ class Fixture(ServerInterface):
         return True
 
     def check_channel_shell_request(self, channel):
+        self.shell = True
         self.result = b"FIXTURE-REOPENED\n"
         self.ready.set()
         return True
@@ -59,6 +61,11 @@ def serve(client):
             channel = transport.accept(20)
             if channel and server.ready.wait(10):
                 channel.sendall(server.result)
+                if server.shell:
+                    channel.settimeout(20)
+                    while channel.recv(1024):
+                        pass
+                    return
                 channel.send_exit_status(0)
                 channel.close()
         except (OSError, EOFError):

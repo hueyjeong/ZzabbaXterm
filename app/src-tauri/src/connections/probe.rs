@@ -287,7 +287,7 @@ mod tests {
         input["target"]["ssh"]["port"] = json!(port);
         input["target"]["ssh"]["account"] = json!("fixture-user");
         input["target"]["ssh"]["hostKeyFingerprint"] = json!(fingerprint);
-        let terminal = |secret: Option<&[u8]>, id: &str, rx: mpsc::Receiver<InvokeResponseBody>| {
+        let terminal = |secret: &[u8], id: &str, rx: mpsc::Receiver<InvokeResponseBody>, close_after: Option<&str>| {
             let mut output = Vec::new();
             let mut cursor_sent = false;
             let mut sent = false;
@@ -302,20 +302,24 @@ mod tests {
                             sessions.input("main", id, b"\x1b[1;1R").unwrap();
                             cursor_sent = true;
                         }
-                        if let Some(secret) = secret && !sent && (text.contains("password:") || text.contains("passphrase for key")) {
+                        if !sent && (text.contains("password:") || text.contains("passphrase for key")) {
                             sessions.input("main", id, secret).unwrap();
                             sent = true;
                         }
+                        if close_after.is_some_and(|marker| text.contains(marker)) {
+                            sessions.close_ssh_fixture(id);
+                            break;
+                        }
                     }
                     Ok(InvokeResponseBody::Json(event)) => {
+                        assert!(close_after.is_none(), "저장된 셸이 닫기 요청 전에 종료됐습니다: {event}");
                         assert!(event.contains("exited") && event.contains("\"value\":0"), "{event}: {}", String::from_utf8_lossy(&output));
                         break;
                     }
                     Err(error) => panic!("{error}: {}", String::from_utf8_lossy(&output)),
                 }
             }
-            assert_eq!(sent, secret.is_some());
-            output
+            assert!(sent);
         };
         let cancelled = start(&sessions, "main", 0, "draft".into(), 0,
             serde_json::from_value(input.clone()).unwrap(), dir.path().into()).unwrap();
@@ -343,7 +347,7 @@ mod tests {
             let request = || serde_json::from_value(json!({"run":run,"draft":input})).unwrap();
             assert!(save_confirmed(&sessions, "main", 0, request(), &store).is_err());
             sessions.start("main", &id).unwrap();
-            terminal(Some(b"fixture-password\r"), &id, rx);
+            terminal(b"fixture-password\r", &id, rx, None);
             assert_eq!(wait(&sessions, "main", 0, &run).unwrap().session_id, id);
             save_confirmed(&sessions, "main", 0, request(), &store).unwrap();
             assert_eq!(serde_json::to_value(store.load().unwrap()).unwrap()["targets"][0]["profile"], input["target"]);
@@ -354,8 +358,7 @@ mod tests {
                 })).unwrap();
                 assert_ne!(reopened, id);
                 sessions.start("main", &reopened).unwrap();
-                let output = terminal(Some(b"fixture-password\r"), &reopened, rx);
-                assert!(String::from_utf8_lossy(&output).contains("FIXTURE-REOPENED"));
+                terminal(b"fixture-password\r", &reopened, rx, Some("FIXTURE-REOPENED"));
             }
         }
     }

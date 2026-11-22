@@ -157,6 +157,15 @@ impl Sessions {
             move |event| event.send(&output).map_err(|error| error.to_string()))
     }
 
+    #[cfg(test)]
+    pub(crate) fn close_ssh_fixture(&self, id: &str) {
+        assert!(self.close("other", id).is_err());
+        let result = self.close("main", id).unwrap();
+        assert_eq!(result.local, LocalClose::CliReaped);
+        assert_eq!(result.warning(), None);
+        assert!(self.input("main", id, b"closed").is_err());
+    }
+
 
     fn get(&self, owner: &str, id: &str) -> Result<Arc<Session>, String> {
         let registry = self.registry.lock().unwrap();
