@@ -40,7 +40,7 @@ impl Drop for TestDir {
     }
 }
 
-fn draft(dir: &Path, group: &str, target: &str) -> Value {
+pub(super) fn draft(dir: &Path, group: &str, target: &str) -> Value {
     json!({
         "version": 1,
         "groupRevision": null,
@@ -75,6 +75,13 @@ pub(crate) fn with_saved_pty_targets(run: impl FnOnce(&Path, &Path)) {
         assert_eq!(save(&store, draft(&directory, id, id)).unwrap(), SaveStatus::Saved);
         directory
     });
+    #[cfg(windows)]
+    {
+        let mut verbatim = std::ffi::OsString::from(r"\\?\");
+        verbatim.push(dirs[0].as_os_str());
+        verbatim.push(r"\.");
+        assert_eq!(save(&store, draft(Path::new(&verbatim), "first", "verbatim")).unwrap(), SaveStatus::Saved);
+    }
     run(&root.0, &dirs[1]);
 }
 
@@ -173,6 +180,21 @@ mod local_probe {
         let sessions = Sessions::default();
         let run = start_at(&sessions, Path::new(&path), 1);
         wait(&sessions, "main", 0, &run).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn c01_probe_rejects_nonstandard_windows_paths() {
+        let dir = TestDir::new();
+        let sessions = Sessions::default();
+        let mut verbatim = std::ffi::OsString::from(r"\\?\");
+        verbatim.push(dir.0.as_os_str());
+        verbatim.push(r"\.");
+        let expected = "작업 디렉터리: Windows 드라이브의 일반 절대 경로만 지원합니다";
+        for path in [Path::new(&verbatim), Path::new(r"\\server\share\dir"), Path::new(r"\\.\C:\dir")] {
+            let run = start_at(&sessions, path, 1);
+            assert_eq!(wait(&sessions, "main", 0, &run).err().as_deref(), Some(expected));
+        }
     }
 
     #[test]

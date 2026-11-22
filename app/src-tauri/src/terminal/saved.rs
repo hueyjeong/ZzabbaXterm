@@ -1,16 +1,12 @@
-use std::{fs, path::Path};
+use std::path::Path;
 
 use portable_pty::CommandBuilder;
 
 use crate::connections::{profile::Shell, saved_local};
 
-use super::stage;
-
 pub(super) fn command(config: &Path, id: &str) -> Result<CommandBuilder, String> {
     let (shell, directory) = saved_local(config, id)?;
-    if !fs::metadata(&directory).map_err(|error| stage("작업 디렉터리", error))?.is_dir() {
-        return Err("작업 디렉터리: 디렉터리가 아닙니다".into());
-    }
+    super::validate_working_directory(&directory)?;
 
     // portable-pty는 시작 직전에 경로가 사라지면 홈을 선택할 수 있다. 프롬프트 전에 실제 위치를 확인한다.
     let mut command = match shell {
