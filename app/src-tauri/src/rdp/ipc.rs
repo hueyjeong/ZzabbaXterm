@@ -9,7 +9,8 @@ use tauri::{Manager, UriSchemeContext, UriSchemeResponder, Webview, WebviewWindo
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use super::{Error, Event, Session, native, route::{self, Route}};
+use crate::{connections::profile::valid_id, tunnels::{Destination, ipc::{Protocol, TunnelTabs}}};
+use super::{Error, Event, Session, native, route};
 use input::{Command, Controls};
 
 const COMMANDS: [&str; 5] = ["rdp_prepare", "rdp_connect", "rdp_input", "rdp_ack", "rdp_close"];
@@ -26,10 +27,16 @@ pub(crate) struct Sessions(Mutex<Registry>);
 #[derive(Default)]
 struct Registry {
     document: u64,
-    proof: Option<(String, String)>,
+    proof: Option<DocumentProof>,
     generation: u64,
     tabs: HashMap<String, Arc<Slot>>,
     approving: Option<Arc<()>>,
+}
+
+struct DocumentProof {
+    key: String,
+    origin: String,
+    tunnel_epoch: u64,
 }
 
 struct Slot {
@@ -53,7 +60,39 @@ struct Identity { session_id: String, generation: u64 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Draft { host: String, port: u16 }
+struct Draft {
+    host: String,
+    port: u16,
+    #[serde(default, deserialize_with = "read_source")]
+    source: Option<Source>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Source { tab_handle: String, tunnel_id: String, target_id: String, destination: ForwardDestination }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ForwardDestination { host: String, port: u16 }
+
+fn read_source<'de, D: serde::Deserializer<'de>>(value: D) -> Result<Option<Source>, D::Error> {
+    Source::deserialize(value).map(Some)
+}
+
+impl Draft {
+    fn approval_text(&self, dns: &str) -> Result<String, Error> {
+        if !route::dns_name(dns) || self.port == 0 { return Err(Error::InvalidServerName); }
+        let Some(source) = &self.source else {
+            return Ok(format!("서버: {dns}:{}\n경로: 직접\n로그인: NLA", self.port));
+        };
+        let ForwardDestination { host, port } = &source.destination;
+        if !matches!(host.as_str(), "127.0.0.1" | "::1") || *port != self.port || !valid_id(&source.target_id) {
+            return Err(Error::InvalidForwardDestination);
+        }
+        let destination = std::net::SocketAddr::new(host.parse().map_err(|_| Error::InvalidForwardDestination)?, *port);
+        Ok(format!("경로: R01 SSH 전달\nSSH 대상 ID: {}\n포워드 목적지: {destination}\nTLS 인증 DNS: {dns}\n로그인: NLA", source.target_id))
+    }
+}
 
 impl Registry {
     fn get(&self, id: &Identity, document: u64) -> Option<&Arc<Slot>> {
@@ -113,6 +152,7 @@ pub(super) fn opaque() -> Option<String> {
 }
 
 pub(crate) fn issue_document(webview: &Webview, url: &tauri::Url) {
+    if webview.label() != "main" || webview.window_ref().label() != "main" { return; }
     let bundled = if cfg!(windows) {
         url.host_str() == Some("tauri.localhost") && matches!(url.scheme(), "http" | "https") && url.port().is_none()
     } else { url.host_str() == Some("localhost") && url.scheme() == "tauri" && url.port().is_none() };
@@ -123,10 +163,12 @@ pub(crate) fn issue_document(webview: &Webview, url: &tauri::Url) {
     if state.document > MAX_SAFE || state.proof.is_some() { return; }
     let Some(proof) = opaque() else { return; };
     let epoch = state.document;
+    // 연결 요청 시점의 새 R01 문서가 아니라 증표를 발급한 문서에 연결을 묶는다.
+    let tunnel_epoch = webview.state::<TunnelTabs>().epoch();
     let origin = if bundled && !cfg!(windows) { "tauri://localhost".into() } else { url.origin().ascii_serialization() };
     let href = serde_json::to_string(url.as_str()).unwrap();
     let script = format!("if (window === top && location.href === {href} && (window.__ZZABBA_RDP_DOCUMENT__?.epoch ?? -1) < {epoch}) {{ window.__ZZABBA_RDP_DOCUMENT__ = Object.freeze({{epoch: {epoch}, proof: '{proof}'}}); }}");
-    if webview.eval(script).is_ok() { state.proof = Some((proof, origin)); }
+    if webview.eval(script).is_ok() { state.proof = Some(DocumentProof { key: proof, origin, tunnel_epoch }); }
 }
 
 pub(crate) fn protocol(ctx: UriSchemeContext<'_, tauri::Wry>, request: Request<Vec<u8>>, responder: UriSchemeResponder) {
@@ -138,7 +180,7 @@ pub(crate) fn protocol(ctx: UriSchemeContext<'_, tauri::Wry>, request: Request<V
         let origin = request.headers().get("origin")?.to_str().ok()?;
         let sessions = ctx.app_handle().state::<Sessions>();
         let state = sessions.0.lock().unwrap();
-        if !state.proof.as_ref().is_some_and(|(key, expected)| key == proof && expected == origin) { return None; }
+        if !state.proof.as_ref().is_some_and(|expected| expected.key == proof && expected.origin == origin) { return None; }
         let (kind, body) = state.tabs.values().find_map(|slot| {
             let mut pending = slot.mailbox.lock().unwrap();
             pending.as_mut().filter(|p| p.ticket == ticket)?.body.take()
@@ -153,11 +195,6 @@ pub(crate) fn protocol(ctx: UriSchemeContext<'_, tauri::Wry>, request: Request<V
 }
 
 pub(crate) fn dispatch(invoke: Invoke) {
-    dispatch_with_route(invoke, Route::Direct);
-}
-
-/// R01 may supply a live approved lease for rdp_connect; the WebView cannot choose a route.
-pub(crate) fn dispatch_with_route(invoke: Invoke, route: Route) {
     let caller = invoke.message.webview_ref();
     if caller.label() != "main" || caller.window_ref().label() != "main" || invoke.acl.is_none() {
         invoke.resolver.reject(CLOSED); return;
@@ -166,7 +203,10 @@ pub(crate) fn dispatch_with_route(invoke: Invoke, route: Route) {
     let sessions = caller.state::<Sessions>();
     let mut state = sessions.0.lock().unwrap();
     let proof = invoke.message.headers().get("x-zzabba-rdp-document").and_then(|v| v.to_str().ok());
-    if !state.proof.as_ref().is_some_and(|(key, _)| Some(key.as_str()) == proof) { invoke.resolver.reject(CLOSED); return; }
+    let Some(proof) = state.proof.as_ref().filter(|expected| Some(expected.key.as_str()) == proof) else {
+        invoke.resolver.reject(CLOSED); return;
+    };
+    let tunnel_epoch = proof.tunnel_epoch;
     let document = state.document;
     let arg = |key| CommandItem { name, key, plugin: None, message: &invoke.message, acl: &invoke.acl };
     macro_rules! read {
@@ -223,23 +263,49 @@ pub(crate) fn dispatch_with_route(invoke: Invoke, route: Route) {
             state.approving = Some(approval.clone());
             drop(state);
             invoke.resolver.respond_async(async move {
-                let result = run(&window, &slot, &channel, draft, route, approval).await;
+                let result = run(&window, &slot, &channel, draft, tunnel_epoch, approval).await;
                 let sessions = window.state::<Sessions>();
                 let mut state = sessions.0.lock().unwrap();
                 if state.get(&id, document).is_some() { state.tabs.remove(&id.session_id); }
                 slot.close();
-                result.map_err(|e| InvokeError::from(message(e)))
+                result.map_err(InvokeError::from)
             });
         }
         _ => invoke.resolver.reject(CLOSED),
     }
 }
 
-async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draft: Draft, mut route: Route, approval: Arc<()>) -> Result<(), Error> {
+async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draft: Draft, tunnel_epoch: u64, approval: Arc<()>) -> Result<(), String> {
     let life = &slot.life;
     let prompt = life.child_token();
     let _prompt_lifetime = prompt.clone().drop_guard();
-    let loss = route.loss();
+    let dns = draft.host.to_ascii_lowercase();
+    let description = draft.approval_text(&dns).map_err(message)?;
+    native::confirm(window.clone(), description, prompt.clone(), approval.clone()).await.map_err(message)?;
+    let size = DesktopSize { width: 1024, height: 768 };
+    let mut lease;
+    let (target, loss, target_name) = if let Some(source) = draft.source {
+        let destination = Destination { host: source.destination.host, port: source.destination.port };
+        let target_name = format!("{dns} (TLS DNS)");
+        let caller = window.clone();
+        let live = prompt.clone();
+        // 발급 중 취소되어도 작업을 기다려 인계 소켓과 임대를 이 경로에서 정리한다.
+        let (issued, approved_destination) = tauri::async_runtime::spawn_blocking(move || {
+            if live.is_cancelled() { return Err(CLOSED.into()); }
+            let directory = caller.path().app_config_dir().map_err(|error| error.to_string())?;
+            let lease = caller.state::<TunnelTabs>().open_desktop(tunnel_epoch, &directory,
+                (&source.tab_handle, &source.tunnel_id), &source.target_id, &destination, Protocol::Rdp)?;
+            Ok::<_, String>((lease, destination))
+        }).await.map_err(|_| message(Error::Transport))??;
+        lease = issued;
+        if life.is_cancelled() { return Err(CLOSED.into()); }
+        let loss = lease.loss();
+        let target = route::forwarded(dns, &approved_destination, size, &mut lease).map_err(message)?;
+        (target, Some(loss), target_name)
+    } else {
+        let target_name = format!("{dns}:{}", draft.port);
+        (route::direct(dns, draft.port, size), None, target_name)
+    };
     let stopped = async {
         tokio::select! { biased;
             () = life.cancelled() => Error::Closed,
@@ -247,18 +313,13 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
         }
     };
     tokio::pin!(stopped);
-    let open = async {
-        let dns = draft.host.to_ascii_lowercase();
-        let target_name = format!("{dns}:{}", draft.port);
-        let path = match &route { Route::Direct => "직접", Route::Forwarded(_) => "R01 전달" };
-        let target = route.target(dns, draft.port, DesktopSize { width: 1024, height: 768 })?;
-        native::confirm(window.clone(), format!("서버: {target_name}\n경로: {path}\n로그인: NLA"), prompt.clone(), approval.clone()).await?;
-        Session::open(target, tokio_rustls::rustls::RootCertStore::empty(),
-            || native::account(window.clone(), target_name, prompt.clone(), approval.clone())).await
-    };
     let mut session = tokio::select! { biased;
-        error = &mut stopped => return Err(error),
-        session = open => session?,
+        error = &mut stopped => {
+            prompt.cancel();
+            return Err(message(error).into());
+        },
+        session = Session::open(target, tokio_rustls::rustls::RootCertStore::empty(),
+            || native::account(window.clone(), target_name, prompt.clone(), approval.clone())) => session.map_err(message)?,
     };
     drop(approval);
     let operation = async {
@@ -325,11 +386,12 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
         error = &mut stopped => Err(error),
         outcome = operation => outcome,
     };
+    prompt.cancel();
     if result.is_ok() {
-        session.finish().await
+        session.finish().await.map_err(|error| message(error).into())
     } else {
         session.close().await;
-        result
+        result.map_err(|error| message(error).into())
     }
 }
 
@@ -342,6 +404,7 @@ pub(super) fn message(error: Error) -> &'static str {
         Error::Closed => CLOSED,
         Error::Credentials => "RDP 계정 입력이 취소되었거나 올바르지 않습니다",
         Error::InvalidServerName => "RDP 서버 DNS 이름 또는 포트가 올바르지 않습니다",
+        Error::InvalidForwardDestination => "RDP 터널 목적지가 올바르지 않습니다",
         Error::Tcp => "RDP TCP 연결 실패",
         Error::Negotiation => "RDP 서버와 NLA를 협상할 수 없습니다",
         Error::TrustStore => "RDP 신뢰 저장소를 읽을 수 없습니다",
@@ -359,6 +422,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rdp_approval_separates_forward_destination_from_tls_dns() {
+        let mut draft: Draft = serde_json::from_value(serde_json::json!({
+            "host": "rdp.example.invalid", "port": 3390,
+            "source": { "tabHandle": "owned-tab", "tunnelId": "7", "targetId": "ssh-server",
+                "destination": { "host": "::1", "port": 3390 } }
+        })).unwrap();
+        assert_eq!(draft.approval_text(&draft.host).unwrap(),
+            "경로: R01 SSH 전달\nSSH 대상 ID: ssh-server\n포워드 목적지: [::1]:3390\nTLS 인증 DNS: rdp.example.invalid\n로그인: NLA");
+        draft.port = 3389;
+        assert_eq!(draft.approval_text(&draft.host), Err(Error::InvalidForwardDestination));
+        assert!(serde_json::from_value::<Draft>(serde_json::json!({
+            "host": "rdp.example.invalid", "port": 3390, "source": null
+        })).is_err());
+        let direct: Draft = serde_json::from_value(serde_json::json!({
+            "host": "rdp.example.invalid", "port": 3389
+        })).unwrap();
+        assert_eq!(direct.approval_text(&direct.host).unwrap(),
+            "서버: rdp.example.invalid:3389\n경로: 직접\n로그인: NLA");
+    }
+
+    #[test]
     fn rdp_document_retirement_discards_unclaimed_output_and_rejects_old_generations() {
         let sessions = Sessions::default();
         let slot = Arc::new(Slot::new(1));
@@ -366,7 +450,7 @@ mod tests {
         let (done, mut acknowledged) = oneshot::channel();
         {
             let mut state = sessions.0.lock().unwrap();
-            state.proof = Some(("old".into(), "app".into()));
+            state.proof = Some(DocumentProof { key: "old".into(), origin: "app".into(), tunnel_epoch: 2 });
             state.tabs.insert(id.session_id.clone(), slot.clone());
             assert!(state.get(&id, 0).is_some());
             assert!(state.get(&Identity { session_id: id.session_id.clone(), generation: 2 }, 0).is_none());

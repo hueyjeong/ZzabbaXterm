@@ -123,3 +123,20 @@ it("폐기한 탭의 픽셀은 Canvas에 그리거나 ACK하지 않는다", asyn
   expect(f.draw).not.toHaveBeenCalled();
   expect(f.calls("rdp_ack")).toEqual([{ id, sequence: 1, offset: 0 }]);
 });
+
+it("터널 연결 거부 시 목적지와 TLS DNS를 구분해 전달하고 직접 연결로 재시도하지 않는다", async () => {
+  vi.stubGlobal("__ZZABBA_RDP_DOCUMENT__", { proof });
+  const ended = vi.fn();
+  const source = { tabHandle: "owned-tab", tunnelId: "7", targetId: "ssh-server", destination: { host: "::1", port: 3390 } };
+  const draft = { host: "rdp.example.invalid", port: 3390, source };
+  invoke.mockImplementation((name) => {
+    if (name === "rdp_prepare") return Promise.resolve(id);
+    if (name === "rdp_connect") return Promise.reject("승인된 터널 목적지가 일치하지 않습니다");
+    return Promise.resolve();
+  });
+  connect(draft, vi.fn(), vi.fn(), vi.fn(), vi.fn(), ended);
+  await vi.waitFor(() => expect(ended).toHaveBeenCalledWith("승인된 터널 목적지가 일치하지 않습니다"));
+  expect(invoke.mock.calls.map(([name]) => name)).toEqual(["rdp_prepare", "rdp_connect", "rdp_close"]);
+  expect(invoke.mock.calls[1]?.[1]).toMatchObject({ id, draft });
+  expect(invoke.mock.calls[1]?.[2]).toEqual({ headers: { "x-zzabba-rdp-document": proof } });
+});

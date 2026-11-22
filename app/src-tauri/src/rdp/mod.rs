@@ -74,6 +74,7 @@ pub enum Error {
     Closed,
     Credentials,
     InvalidServerName,
+    InvalidForwardDestination,
     Tcp,
     Negotiation,
     TrustStore,

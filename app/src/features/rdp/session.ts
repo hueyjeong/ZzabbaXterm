@@ -1,8 +1,9 @@
 import { Channel, convertFileSrc, invoke, type InvokeArgs } from "@tauri-apps/api/core";
 import type { RemoteDesktopEvent, RemoteDesktopIdentity, RemoteDesktopSession } from "../remoteDesktop/session";
+import type { DesktopTunnelSource } from "../tunnels/tunnelIpc";
 import { scanCode } from "./keys";
 
-interface Draft { readonly host: string; readonly port: number }
+interface Draft { readonly host: string; readonly port: number; readonly source?: DesktopTunnelSource }
 export interface Capabilities { readonly copy: boolean; readonly paste: boolean; readonly resize: boolean }
 export interface Connection extends RemoteDesktopSession {
   clipboard(action: "copy" | "paste"): void;

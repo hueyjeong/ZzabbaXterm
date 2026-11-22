@@ -1,26 +1,29 @@
 import { useLayoutEffect, useRef, useState, type SubmitEvent } from "react";
 import { RemoteDesktopView } from "../remoteDesktop/RemoteDesktopView";
+import type { DesktopTunnelSource } from "../tunnels/tunnelIpc";
 import { connect, type Capabilities, type Connection } from "./session";
 
 const noChannels: Capabilities = { copy: false, paste: false, resize: false };
 
-export function RdpTab({ active, label }: { readonly active: boolean; readonly label: string }) {
+export function RdpTab({ active, label, source }: { readonly active: boolean; readonly label: string; readonly source?: DesktopTunnelSource }) {
   const cancel = useRef<(() => void) | undefined>(undefined);
   const [host, setHost] = useState("");
   const [port, setPort] = useState("3389");
-  const [opening, setOpening] = useState(false);
+  const [opening, setOpening] = useState<{ host: string; port: number; forwardedAddress: string | undefined }>();
   const [connection, setConnection] = useState<Connection>();
   const [channels, setChannels] = useState(noChannels);
   const [ready, setReady] = useState(false);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
+  const destination = source?.destination;
+  const forwardedAddress = destination && `${destination.host.includes(":") ? `[${destination.host}]` : destination.host}:${destination.port}`;
 
   useLayoutEffect(() => () => cancel.current?.(), []);
 
   function reset() {
     cancel.current?.();
     cancel.current = undefined;
-    setOpening(false);
+    setOpening(undefined);
     setConnection(undefined);
     setChannels(noChannels);
     setReady(false);
@@ -31,8 +34,10 @@ export function RdpTab({ active, label }: { readonly active: boolean; readonly l
     event.preventDefault();
     if (!event.nativeEvent.isTrusted || !active || cancel.current) return;
     setError("");
-    setOpening(true);
-    cancel.current = connect({ host: host.trim(), port: Number(port) }, setConnection,
+    const hostName = host.trim();
+    const draft = source ? { host: hostName, port: source.destination.port, source } : { host: hostName, port: Number(port) };
+    setOpening({ host: source ? hostName.toLowerCase() : hostName, port: draft.port, forwardedAddress });
+    cancel.current = connect(draft, setConnection,
       setChannels, setReady, setNotice, (message) => {
         reset();
         setError(message);
@@ -41,13 +46,14 @@ export function RdpTab({ active, label }: { readonly active: boolean; readonly l
 
   return <section aria-label={label}>
     {!(opening || connection) && <form className="remote-desktop-toolbar" onSubmit={submit}>
-      <label>서버 DNS <input value={host} onChange={(event) => setHost(event.target.value)} required maxLength={253} /></label>
-      <label>포트 <input type="number" value={port} min={1} max={65535} onChange={(event) => setPort(event.target.value)} required /></label>
-      <button type="submit" disabled={!active}>직접 연결</button>
+      {forwardedAddress && <span>포워드 목적지: {forwardedAddress}</span>}
+      <label>{source ? "TLS 인증 DNS" : "서버 DNS"} <input value={host} onChange={(event) => setHost(event.target.value)} required maxLength={253} /></label>
+      {!source && <label>포트 <input type="number" value={port} min={1} max={65535} onChange={(event) => setPort(event.target.value)} required /></label>}
+      <button type="submit" disabled={!active}>{source ? "터널 연결" : "직접 연결"}</button>
     </form>}
-    {(opening || connection) && <div className="remote-desktop-toolbar">
-      <span>{host.trim()}:{port} · NLA</span>
-      {!connection && <span role="status">승인 대기 중</span>}
+    {opening && <div className="remote-desktop-toolbar">
+      <span>{opening.forwardedAddress ? <>포워드 목적지: {opening.forwardedAddress} · TLS 인증 DNS: {opening.host} · NLA</> : `${opening.host}:${opening.port} · NLA`}</span>
+      {!ready && <span role="status">연결 중</span>}
       <button type="button" onClick={reset}>연결 종료</button>
       {connection && <>
         <button type="button" disabled={!active || !ready || !channels.copy} onClick={(event) => {
