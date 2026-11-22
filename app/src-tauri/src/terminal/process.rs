@@ -8,6 +8,9 @@ use std::{
 };
 
 const POLL: Duration = Duration::from_millis(10);
+const START_TIMEOUT: Duration = Duration::from_secs(5);
+const ACK_TIMEOUT: Duration = Duration::from_secs(15);
+const ACK_STALLED: &str = "ack: 출력 처리 확인 시간이 초과되었습니다";
 
 pub(super) enum Stop {
     Closed,
@@ -17,14 +20,28 @@ pub(super) enum Stop {
 #[derive(Default)]
 struct Flow {
     started: bool,
+    start_deadline: Option<std::time::Instant>,
     child_exited: bool,
     finished: bool,
     stop: Option<Stop>,
     sent: u64,
     acked: u64,
+    ack_deadline: Option<std::time::Instant>,
 }
 
 impl Flow {
+    fn expire_start(&mut self) {
+        if self.stop.is_none() && self.start_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            self.stop = Some(Stop::Disconnected("start: 시작 요청 시간이 초과되었습니다".into()));
+        }
+    }
+
+    fn expire_ack(&mut self) {
+        if self.stop.is_none() && self.ack_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            self.stop = Some(Stop::Disconnected(ACK_STALLED.into()));
+        }
+    }
+
     fn live(&self) -> Result<(), String> {
         if !self.started || self.child_exited || self.stop.is_some() {
             return Err(CLOSED.into());
@@ -121,6 +138,7 @@ impl Session {
             drop(pair.slave);
             *self.writer.lock().unwrap() = Some(writer);
             *self.master.lock().unwrap() = Some(pair.master);
+            self.flow.lock().unwrap().start_deadline = Some(std::time::Instant::now() + START_TIMEOUT);
             let _ = ready.send(Ok(()));
 
             let event = self.reap(child.as_mut());
@@ -156,13 +174,22 @@ impl Session {
     fn reap(&self, child: &mut dyn Child) -> Option<Event> {
         loop {
             let mut flow = self.flow.lock().unwrap();
+            flow.expire_start();
+            flow.expire_ack();
             if flow.stop.is_some() {
+                self.wake.notify_all();
                 drop(flow);
                 self.terminate(child);
                 return None;
             }
-            match child.try_wait() {
-                Ok(Some(_)) => {
+            if let Some(deadline) = flow.start_deadline {
+                // Keep the ConPTY reader ready to drain on start or timeout.
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                drop(self.wake.wait_timeout(flow, remaining).unwrap());
+                continue;
+            }
+            match child_ready(child) {
+                Ok(true) => {
                     flow.child_exited = true;
                     self.wake.notify_all();
                     drop(flow);
@@ -171,7 +198,7 @@ impl Session {
                         Err(error) => Event::Disconnected(stage("wait", error)),
                     });
                 }
-                Ok(None) => drop(self.wake.wait_timeout(flow, POLL).unwrap()),
+                Ok(false) => drop(self.wake.wait_timeout(flow, POLL).unwrap()),
                 Err(error) => {
                     flow.child_exited = true;
                     drop(flow);
@@ -205,7 +232,7 @@ impl Session {
         loop {
             let mut flow = self.flow.lock().unwrap();
             while flow.stop.is_none() && (!flow.started || flow.sent - flow.acked == WINDOW as u64) {
-                flow = self.wake.wait(flow).unwrap();
+                flow = self.wait_for_ack(flow);
             }
             let limit = if flow.stop.is_some() {
                 #[cfg(unix)]
@@ -249,6 +276,9 @@ impl Session {
             };
             let mut flow = self.flow.lock().unwrap();
             if flow.stop.is_some() { continue; }
+            if flow.sent == flow.acked {
+                flow.ack_deadline = Some(std::time::Instant::now() + ACK_TIMEOUT);
+            }
             flow.sent += count as u64;
             drop(flow);
             if let Err(error) = send(Event::Bytes(buffer[..count].to_vec())) {
@@ -258,15 +288,28 @@ impl Session {
         drop(reader);
         let mut flow = self.flow.lock().unwrap();
         while flow.stop.is_none() && flow.sent != flow.acked {
-            flow = self.wake.wait(flow).unwrap();
+            flow = self.wait_for_ack(flow);
         }
         Ok(())
     }
 
+    fn wait_for_ack<'a>(&'a self, flow: std::sync::MutexGuard<'a, Flow>) -> std::sync::MutexGuard<'a, Flow> {
+        let Some(deadline) = flow.ack_deadline else { return self.wake.wait(flow).unwrap(); };
+        let (mut flow, _) = self.wake.wait_timeout(flow, deadline.saturating_duration_since(std::time::Instant::now())).unwrap();
+        flow.expire_ack();
+        if flow.stop.is_some() { self.wake.notify_all(); }
+        flow
+    }
+
     pub(super) fn start(&self) -> Result<(), String> {
         let mut flow = self.flow.lock().unwrap();
-        if flow.stop.is_some() || flow.finished { return Err(CLOSED.into()); }
+        flow.expire_start();
+        if flow.stop.is_some() || flow.finished || (!flow.started && flow.start_deadline.is_none()) {
+            self.wake.notify_all();
+            return Err(CLOSED.into());
+        }
         flow.started = true;
+        flow.start_deadline = None;
         self.wake.notify_all();
         Ok(())
     }
@@ -277,6 +320,7 @@ impl Session {
         if position > flow.sent { return Err("ack: 전송 범위를 넘었습니다".into()); }
         if position > flow.acked {
             flow.acked = position;
+            flow.ack_deadline = (flow.acked < flow.sent).then(|| std::time::Instant::now() + ACK_TIMEOUT);
             self.wake.notify_all();
         }
         Ok(())
@@ -329,6 +373,24 @@ impl Session {
 
     pub(super) fn wait_finished(&self) {
         drop(self.wake.wait_while(self.flow.lock().unwrap(), |flow| !flow.finished).unwrap());
+    }
+}
+
+#[cfg(unix)]
+fn child_ready(child: &mut dyn Child) -> io::Result<bool> {
+    child.try_wait().map(|status| status.is_some())
+}
+
+#[cfg(windows)]
+fn child_ready(child: &mut dyn Child) -> io::Result<bool> {
+    use windows_sys::Win32::{Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT}, System::Threading::WaitForSingleObject};
+    let handle = child.as_raw_handle().ok_or(io::ErrorKind::InvalidInput)?;
+    // portable-pty 0.9 treats the valid exit code 259 as STILL_ACTIVE in try_wait.
+    // A signaled process handle distinguishes it from a running process.
+    match unsafe { WaitForSingleObject(handle, 0) } {
+        WAIT_OBJECT_0 => Ok(true),
+        WAIT_TIMEOUT => Ok(false),
+        _ => Err(io::Error::last_os_error()),
     }
 }
 

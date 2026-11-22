@@ -21,7 +21,7 @@ function nativePeer() {
     await vi.waitFor(() => expect(open).toHaveBeenCalledTimes(1));
     opening.resolve(id);
   }
-  function send(bytes: ArrayBuffer | { kind: "exited"; value: number }) {
+  function send(bytes: ArrayBuffer | { kind: "exited"; value: number } | { kind: "disconnected"; value: string }) {
     const receiver = open.mock.calls[0]?.[1];
     if (!receiver) throw new Error("세션 수신기가 없습니다");
     receiver(bytes);
@@ -50,6 +50,32 @@ describe("L01 터미널 세션", () => {
     a.session.input("ignored");
     expect(a.input).not.toHaveBeenCalled();
     b.session.close();
+  });
+
+  it("시작 응답 전의 입력은 보내지 않고 초기 VT 질의는 시작 뒤에 처리한다", async () => {
+    const starting = Promise.withResolvers<void>();
+    const peer = nativePeer();
+    peer.start.mockReturnValueOnce(starting.promise);
+    peer.write.mockImplementation(() => {
+      peer.session.input("\x1b[1;1R");
+      return 0;
+    });
+    peer.session.input("ID 발급 전");
+    await peer.openAs("a");
+    await vi.waitFor(() => expect(peer.start).toHaveBeenCalledWith("a"));
+    peer.session.input("시작 응답 전");
+    peer.send(new Uint8Array([0x1b, 0x5b, 0x36, 0x6e]).buffer);
+    await Promise.resolve();
+    expect(peer.status).toHaveBeenLastCalledWith({ kind: "opening" }, "a");
+    expect(peer.input).not.toHaveBeenCalled();
+    starting.resolve();
+    await vi.waitFor(() => expect(peer.status).toHaveBeenLastCalledWith({ kind: "running" }, "a"));
+    peer.session.input("준비된 입력");
+    await vi.waitFor(() => expect(peer.input).toHaveBeenCalledTimes(2));
+    expect(peer.input.mock.calls.map(([id, bytes]) => [id, new TextDecoder().decode(bytes)])).toEqual([
+      ["a", "\x1b[1;1R"], ["a", "준비된 입력"],
+    ]);
+    peer.session.close();
   });
 
   it("키와 붙여넣기를 한 번씩 순서대로 보내고 닫힌 탭의 대기 키는 버린다", async () => {
@@ -91,5 +117,18 @@ describe("L01 터미널 세션", () => {
     stale.reject("resize: 오래된 요청");
     await vi.waitFor(() => expect(peer.status).toHaveBeenLastCalledWith({ kind: "disconnected", value: "resize: OS 오류" }, "a"));
     expect(peer.close).toHaveBeenCalledExactlyOnceWith("a");
+  });
+
+  it("닫힌 ID의 늦은 ACK가 실제 단절 이유를 가리지 않는다", async () => {
+    const peer = nativePeer();
+    peer.ack.mockRejectedValueOnce("세션이 닫혔습니다");
+    await peer.openAs("a");
+    await vi.waitFor(() => expect(peer.status).toHaveBeenLastCalledWith({ kind: "running" }, "a"));
+    peer.send(new Uint8Array([65]).buffer);
+    peer.callbacks[0]?.();
+    await vi.waitFor(() => expect(peer.ack).toHaveBeenCalledWith("a", 1));
+    await Promise.resolve();
+    peer.send({ kind: "disconnected", value: "read: OS 오류" });
+    expect(peer.status).toHaveBeenLastCalledWith({ kind: "disconnected", value: "read: OS 오류" }, "a");
   });
 });

@@ -42,6 +42,8 @@ export function connectLocalTerminal(
   let id: string | undefined;
   let stopped = false;
   let started = false;
+  // Rust limits unacknowledged output, including bytes received before the start reply.
+  const earlyOutput: Message[] = [];
   let latestSize = initialSize;
   let position = 0;
   let inputs = Promise.resolve();
@@ -63,18 +65,23 @@ export function connectLocalTerminal(
     if (stopped) return;
     const sessionId = id;
     stopped = true;
+    earlyOutput.length = 0;
     release();
     status({ kind: started ? "disconnected" : "failed", value: String(error) }, sessionId);
   };
   const receive = (message: Message) => {
     if (stopped || id === undefined) return;
+    if (!started) {
+      earlyOutput.push(message);
+      return;
+    }
     if (message instanceof ArrayBuffer) {
       const handle = id;
       try {
         write(new Uint8Array(message), () => {
           if (stopped) return;
           position += message.byteLength;
-          void ipc.ack(handle, position).catch(fail);
+          void ipc.ack(handle, position).catch(failOperation);
         });
       } catch (error) {
         fail(error);
@@ -110,13 +117,16 @@ export function connectLocalTerminal(
     await ipc.start(opened);
     if (stopped) return;
     started = true;
+    for (const message of earlyOutput) receive(message);
+    earlyOutput.length = 0;
+    if (stopped) return;
     status({ kind: "running" }, opened);
     if (latestSize !== initialSize) flushSize(latestSize);
   })().catch(fail);
 
   return {
     input(data: string) {
-      if (stopped || id === undefined) return;
+      if (!started || stopped || id === undefined) return;
       inputs = inputs.then(async () => {
         if (!stopped && id !== undefined) await ipc.input(id, encoder.encode(data));
       }).catch(failOperation);
@@ -128,6 +138,7 @@ export function connectLocalTerminal(
     },
     close() {
       stopped = true;
+      earlyOutput.length = 0;
       release();
     },
   };

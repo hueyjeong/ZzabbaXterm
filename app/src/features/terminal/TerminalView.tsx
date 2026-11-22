@@ -24,7 +24,7 @@ function text(status: TerminalStatus) {
 // Keep the component mounted with a stable tab key; only unmount closes the session.
 export function TerminalView({ active, label, onStatus }: TerminalViewProps) {
   const host = useRef<HTMLDivElement>(null);
-  const refresh = useRef<(() => void) | null>(null);
+  const refresh = useRef<((focus: boolean) => void) | null>(null);
   const [status, setStatus] = useState<TerminalStatus>({ kind: "opening" });
   const statusListener = useRef(onStatus);
   useLayoutEffect(() => { statusListener.current = onStatus; }, [onStatus]);
@@ -58,9 +58,10 @@ export function TerminalView({ active, label, onStatus }: TerminalViewProps) {
     };
     const observer = new ResizeObserver(layout);
     observer.observe(element);
-    refresh.current = () => {
+    refresh.current = (focus) => {
       layout();
-      term.focus();
+      if (focus) term.focus();
+      else term.blur();
     };
     return () => {
       refresh.current = null;
@@ -72,13 +73,13 @@ export function TerminalView({ active, label, onStatus }: TerminalViewProps) {
   }, []);
 
   useLayoutEffect(() => {
-    if (active) refresh.current?.();
-  }, [active]);
+    refresh.current?.(active && status.kind === "running");
+  }, [active, status.kind]);
 
   const message = text(status);
   return (
     <section className="terminal-view" aria-label={label} hidden={!active}>
-      <div className="terminal-screen" ref={host} />
+      <div className="terminal-screen" ref={host} inert={status.kind !== "running"} />
       {message && <div className="terminal-status" role="status">{message}</div>}
     </section>
   );

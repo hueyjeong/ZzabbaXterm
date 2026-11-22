@@ -5,12 +5,24 @@ use terminal::{Sessions, ipc::*};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let other_commands: fn(tauri::ipc::Invoke) -> bool = tauri::generate_handler![
+        terminal_start, terminal_input, terminal_resize, terminal_ack, terminal_close,
+    ];
     tauri::Builder::default()
         .manage(Sessions::default())
-        .invoke_handler(tauri::generate_handler![
-            terminal_open, terminal_start, terminal_input, terminal_resize, terminal_ack,
-            terminal_close,
-        ])
+        .on_page_load(|webview, payload| {
+            if payload.event() == tauri::webview::PageLoadEvent::Started {
+                webview.state::<Sessions>().navigate(webview.label());
+            }
+        })
+        .invoke_handler(move |invoke| {
+            if invoke.message.command() == "terminal_open" {
+                terminal_open(invoke);
+                true
+            } else {
+                other_commands(invoke)
+            }
+        })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| match event {
