@@ -5,6 +5,23 @@ description = "ZzabbaXterm"
 edition = "2024"
 default-run = "zzabbaxterm"
 
+[features]
+default = ["local-cli"]
+local-cli = []
+ai-control = []
+
+# 배포 빌드에서는 Cargo 타깃 대신 준비된 sidecar를 넣는다.
+[[bin]]
+name = "zzabba"
+path = "src/bin/zzabba.rs"
+required-features = ["local-cli"]
+
+# Linux 노드에 별도로 배포한다.
+[[bin]]
+name = "zzabba-ai-control"
+path = "src/bin/zzabba-ai-control.rs"
+required-features = ["ai-control"]
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]

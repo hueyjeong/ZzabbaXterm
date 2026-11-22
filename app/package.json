@@ -8,6 +8,7 @@
     "build": "tsc && vite build",
     "test": "vitest run",
     "preview": "vite preview",
+    "bundle": "node scripts/bundle.mjs",
     "tauri": "tauri"
   },
   "dependencies": {
