@@ -118,12 +118,12 @@ impl DownloadStage<'_> {
         let replacement = if let Some((original, selected)) = &self.target.original {
             let mut current = target.open_file()?.ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
             let access = os::Access::read(original)?;
+            if !access.matches(self.temp.file())? { return Err(changed().into()); }
             let verify = move |file: &mut File| {
                 if version(file)? != *selected || !access.matches(file)? { return Err(changed()); }
                 target.check_parent()
             };
             verify(&mut current)?;
-            if !access.matches(self.temp.file())? { return Err(changed().into()); }
             target.parent.check_replace_access(&target.name, &current)?;
             target.check_file(&selected.id)?;
             Some((current, verify))

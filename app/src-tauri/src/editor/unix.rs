@@ -345,12 +345,12 @@ impl Temporary<'_> {
             }
             let before = moved.metadata()?;
             verify(&mut moved)?;
-            let check_original = || -> io::Result<()> {
+            let check_original = |directory: &File| -> io::Result<()> {
                 let after = moved.metadata()?;
                 if (after.ctime(), after.ctime_nsec()) != (before.ctime(), before.ctime_nsec())
                     || (after.uid(), after.gid(), after.mode())
                         != (before.uid(), before.gid(), before.mode())
-                    || stat_id(&self.directory, recovery)? != Some(expected)
+                    || stat_id(directory, recovery)? != Some(expected)
                     // SAFETY: F_GETLEASE takes no third argument; moved still holds the descriptor.
                     || unsafe { libc::fcntl(moved_fd, libc::F_GETLEASE) } != libc::F_RDLCK
                 {
@@ -358,7 +358,7 @@ impl Temporary<'_> {
                 }
                 Ok(())
             };
-            check_original()?;
+            check_original(&self.directory)?;
             self.install_inner(name, false)?;
             let staged = self.file.as_ref().expect("temporary file is open");
             if self.parent.stat_id(&target)? != Some(file_id(staged)?)
@@ -366,7 +366,7 @@ impl Temporary<'_> {
             {
                 return Err(changed());
             }
-            check_original()?;
+            check_original(&self.directory)?;
             // SAFETY: the held staging directory contains the verified recovery entry.
             if unsafe { libc::unlinkat(staging_fd, recovery.as_ptr(), 0) } == -1 {
                 return Err(io::Error::last_os_error());
