@@ -186,6 +186,26 @@ fn open_at(directory: &File, name: &CStr, flags: libc::c_int) -> io::Result<File
 }
 
 #[cfg(target_os = "linux")]
+fn set_read_lease(file: &File) -> io::Result<()> {
+    // Linux UAPI F_SETSIG. Use a nonfatal notification instead of SIGIO.
+    const F_SETSIG: libc::c_int = 10;
+    let fd = file.as_raw_fd();
+    // SAFETY: both commands take an integer argument on this owned descriptor.
+    if unsafe { libc::fcntl(fd, F_SETSIG, libc::SIGURG) } == -1
+        || unsafe { libc::fcntl(fd, libc::F_SETLEASE, libc::F_RDLCK) } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn read_lease_held(file: &File) -> bool {
+    // SAFETY: F_GETLEASE takes no third argument and the descriptor is live.
+    (unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLEASE) }) == libc::F_RDLCK
+}
+
+#[cfg(target_os = "linux")]
 fn check_acl(file: &File, remove_inherited: bool) -> io::Result<()> {
     for name in [c"system.posix_acl_access", c"system.nfs4_acl"] {
         // SAFETY: a null buffer with size zero queries only the attribute length.
@@ -230,8 +250,36 @@ pub(super) struct Access {
 
 impl Access {
     pub(super) fn read(file: &File) -> io::Result<Self> {
+        Self::read_inner(file, false)
+    }
+
+    pub(super) fn read_editor(file: &File) -> io::Result<Self> {
+        Self::read_inner(file, true)
+    }
+
+    fn read_inner(file: &File, editor: bool) -> io::Result<Self> {
         check_acl(file, false)?;
         let metadata = file.metadata()?;
+        if editor {
+            if metadata.nlink() != 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "hard links cannot be preserved",
+                ));
+            }
+            #[cfg(target_os = "linux")]
+            // SAFETY: a null buffer with size zero queries the length of visible attribute names.
+            match unsafe { libc::flistxattr(file.as_raw_fd(), std::ptr::null_mut(), 0) } {
+                -1 => return Err(io::Error::last_os_error()),
+                0 => (),
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "extended attributes cannot be preserved",
+                    ));
+                }
+            }
+        }
         Ok(Self {
             uid: metadata.uid(),
             gid: metadata.gid(),
@@ -241,6 +289,10 @@ impl Access {
 
     pub(super) fn matches(&self, file: &File) -> io::Result<bool> {
         Ok(*self == Self::read(file)?)
+    }
+
+    pub(super) fn matches_editor(&self, file: &File) -> io::Result<bool> {
+        Ok(*self == Self::read_editor(file)?)
     }
 
     pub(super) fn finish_staging(&self, file: &File) -> io::Result<()> {
@@ -287,27 +339,116 @@ impl Temporary<'_> {
         Ok(())
     }
 
-    pub(super) fn install(mut self, name: &OsStr, replace: bool) -> io::Result<()> {
-        self.install_inner(name, replace)
+    pub(super) fn install(self, name: &OsStr, replace: bool) -> io::Result<()> {
+        if replace {
+            return Err(io::ErrorKind::Unsupported.into());
+        }
+        self.install_inner(&c_name(name))
     }
 
-    pub(super) fn replace(mut self, name: &OsStr) -> io::Result<File> {
-        self.install_inner(name, true)?;
-        Ok(self.file.take().expect("temporary file is open"))
+    #[cfg(target_os = "linux")]
+    pub(super) fn publish_editor(
+        self,
+        name: &OsStr,
+        expected: &File,
+        verify: impl FnOnce(&File) -> io::Result<()>,
+    ) -> Result<File, DownloadPublicationError> {
+        self.publish_editor_inner(name, expected, verify, || Ok(()))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn publish_editor_inner(
+        self,
+        name: &OsStr,
+        expected: &File,
+        verify: impl FnOnce(&File) -> io::Result<()>,
+        after_move: impl FnOnce() -> io::Result<()>,
+    ) -> Result<File, DownloadPublicationError> {
+        let expected = file_id(expected)?;
+        let original = self
+            .parent
+            .open_file(name)?
+            .ok_or_else(|| io::Error::from(io::ErrorKind::AlreadyExists))?;
+        if file_id(&original)? != expected {
+            return Err(io::Error::from(io::ErrorKind::AlreadyExists).into());
+        }
+        // Closing this independent read descriptor releases the lease on every exit.
+        set_read_lease(&original)?;
+        let access = Access::read_editor(&original)?;
+        let staged = self.file.as_ref().expect("temporary file is open");
+        if !access.matches_editor(staged)? {
+            return Err(io::Error::from(io::ErrorKind::AlreadyExists).into());
+        }
+
+        verify(&original)?;
+
+        let parent = self.parent;
+        self.publish_existing(
+            name,
+            expected,
+            Some(original),
+            |original| {
+                after_move()?;
+                if !access.matches_editor(original)? {
+                    return Err(io::ErrorKind::AlreadyExists.into());
+                }
+                Ok(())
+            },
+            |original, staged| {
+                let published = parent.open_file(name)?.ok_or(io::ErrorKind::NotFound)?;
+                if file_id(&published)? != staged || !access.matches_editor(original)? {
+                    return Err(io::ErrorKind::AlreadyExists.into());
+                }
+                Ok(published)
+            },
+        )
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn publish_editor(
+        self,
+        _: &OsStr,
+        _: &File,
+        _: impl FnOnce(&File) -> io::Result<()>,
+    ) -> Result<File, DownloadPublicationError> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "safe editor replacement is unavailable on this platform",
+        )
+        .into())
     }
 
     #[cfg(target_os = "linux")]
     pub(super) fn publish_download(
-        mut self,
+        self,
         name: &OsStr,
         current: &File,
         verify: impl FnOnce(&mut File) -> io::Result<()>,
     ) -> Result<(), DownloadPublicationError> {
+        self.publish_existing(name, file_id(current)?, None, verify, |_, _| Ok(()))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn publish_existing<T>(
+        self,
+        name: &OsStr,
+        expected: FileId,
+        leased: Option<File>,
+        verify: impl FnOnce(&mut File) -> io::Result<()>,
+        retain: impl FnOnce(&File, FileId) -> io::Result<T>,
+    ) -> Result<T, DownloadPublicationError> {
         self.check_private()?;
-        let expected = file_id(current)?;
         let target = c_name(name);
         let recovery = c"original";
         let staging_fd = self.directory.as_raw_fd();
+        if let Some(original) = leased.as_ref() {
+            if self.parent.stat_id(&target)? != Some(expected)
+                || !read_lease_held(original)
+                || !self.parent.still_at_path()?
+            {
+                return Err(io::Error::from(io::ErrorKind::AlreadyExists).into());
+            }
+        }
         // SAFETY: the held directory descriptors and single-component names are valid.
         if unsafe {
             libc::syscall(
@@ -329,28 +470,25 @@ impl Temporary<'_> {
             });
         }
 
-        let result = (|| -> io::Result<()> {
+        let result = (|| -> io::Result<T> {
             let changed = || io::Error::from(io::ErrorKind::AlreadyExists);
             if stat_id(&self.directory, recovery)? != Some(expected) {
                 return Err(changed());
             }
-            let mut moved = open_at(
-                &self.directory,
-                recovery,
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-            )?;
-            if file_id(&moved)? != expected {
-                return Err(changed());
-            }
-            let moved_fd = moved.as_raw_fd();
-            // Linux UAPI F_SETSIG. Use a nonfatal notification instead of SIGIO.
-            const F_SETSIG: libc::c_int = 10;
-            // SAFETY: both commands take an integer argument on this owned descriptor.
-            if unsafe { libc::fcntl(moved_fd, F_SETSIG, libc::SIGURG) } == -1
-                || unsafe { libc::fcntl(moved_fd, libc::F_SETLEASE, libc::F_RDLCK) } == -1
-            {
-                return Err(io::Error::last_os_error());
-            }
+            let mut moved = if let Some(original) = leased {
+                original
+            } else {
+                let moved = open_at(
+                    &self.directory,
+                    recovery,
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+                )?;
+                if file_id(&moved)? != expected {
+                    return Err(changed());
+                }
+                set_read_lease(&moved)?;
+                moved
+            };
             let before = moved.metadata()?;
             verify(&mut moved)?;
             let check_original = |directory: &File| -> io::Result<()> {
@@ -359,19 +497,17 @@ impl Temporary<'_> {
                     || (after.uid(), after.gid(), after.mode())
                         != (before.uid(), before.gid(), before.mode())
                     || stat_id(directory, recovery)? != Some(expected)
-                    // SAFETY: F_GETLEASE takes no third argument; moved still holds the descriptor.
-                    || unsafe { libc::fcntl(moved_fd, libc::F_GETLEASE) } != libc::F_RDLCK
+                    || !read_lease_held(&moved)
                 {
                     return Err(changed());
                 }
                 Ok(())
             };
             check_original(&self.directory)?;
-            self.install_inner(name, false)?;
-            let staged = self.file.as_ref().expect("temporary file is open");
-            if self.parent.stat_id(&target)? != Some(file_id(staged)?)
-                || !self.parent.still_at_path()?
-            {
+            self.install_inner(&target)?;
+            let staged = file_id(self.file.as_ref().expect("temporary file is open"))?;
+            let published = retain(&moved, staged)?;
+            if self.parent.stat_id(&target)? != Some(staged) || !self.parent.still_at_path()? {
                 return Err(changed());
             }
             check_original(&self.directory)?;
@@ -379,7 +515,7 @@ impl Temporary<'_> {
             if unsafe { libc::unlinkat(staging_fd, recovery.as_ptr(), 0) } == -1 {
                 return Err(io::Error::last_os_error());
             }
-            Ok(())
+            Ok(published)
         })();
         result.map_err(|_| {
             // The parent may have moved since selection; prefer the held directory's current name.
@@ -405,7 +541,7 @@ impl Temporary<'_> {
         .into())
     }
 
-    fn install_inner(&mut self, name: &OsStr, replace: bool) -> io::Result<()> {
+    fn install_inner(&self, target: &CStr) -> io::Result<()> {
         self.check_private()?;
         let held = self.file.as_ref().expect("temporary file is open");
         let named = open_at(
@@ -416,20 +552,14 @@ impl Temporary<'_> {
         if file_id(held)? != file_id(&named)? {
             return Err(io::Error::other("temporary file was replaced"));
         }
-        let target = c_name(name);
         // SAFETY: both names are single components relative to the held directories.
-        if !replace {
-            if unsafe { libc::linkat(self.directory.as_raw_fd(), c"body".as_ptr(), self.parent.file.as_raw_fd(), target.as_ptr(), 0) } == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            return Ok(());
-        }
         if unsafe {
-            libc::renameat(
+            libc::linkat(
                 self.directory.as_raw_fd(),
                 c"body".as_ptr(),
                 self.parent.file.as_raw_fd(),
                 target.as_ptr(),
+                0,
             )
         } == -1
         {
@@ -467,6 +597,108 @@ impl Drop for Temporary<'_> {
 mod tests {
     use super::*;
     use std::{fs, io::Write};
+
+    #[test]
+    fn editor_returns_a_read_only_handle_to_the_new_named_file() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = Directory::open(root.path().to_owned()).unwrap();
+        let name = OsStr::new("chosen");
+        let path = root.path().join(name);
+        fs::write(&path, b"original").unwrap();
+        let original = File::open(&path).unwrap();
+        let access = Access::read_editor(&original).unwrap();
+        let mut temp = parent.stage(None).unwrap();
+        temp.file().write_all(b"edited").unwrap();
+        access.finish_staging(temp.file()).unwrap();
+
+        let mut published = temp.publish_editor(name, &original, |_| Ok(())).unwrap();
+        assert_eq!(
+            file_id(&published).unwrap(),
+            file_id(&File::open(&path).unwrap()).unwrap()
+        );
+        assert_eq!(
+            published.write_all(b"outside").unwrap_err().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"edited");
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn editor_leaves_original_named_when_a_writer_is_open() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = Directory::open(root.path().to_owned()).unwrap();
+        let name = OsStr::new("chosen");
+        let path = root.path().join(name);
+        fs::write(&path, b"original").unwrap();
+        let original = File::open(&path).unwrap();
+        let mut writer = File::options().write(true).open(&path).unwrap();
+        let mut temp = parent.stage(None).unwrap();
+        temp.file().write_all(b"edited").unwrap();
+
+        let result = temp.publish_editor(name, &original, |_| panic!("lease admitted a writer"));
+        assert!(matches!(result, Err(DownloadPublicationError::Io(error))
+            if error.kind() == io::ErrorKind::WouldBlock));
+        writer.write_all(b"external").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"external");
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn editor_rejects_a_hard_link_without_changing_download_access() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("chosen");
+        let alias = root.path().join("alias");
+        fs::write(&path, b"original").unwrap();
+        let original = File::open(&path).unwrap();
+        let access = Access::read_editor(&original).unwrap();
+        fs::hard_link(&path, &alias).unwrap();
+
+        assert!(matches!(access.matches_editor(&original), Err(error)
+            if error.kind() == io::ErrorKind::Unsupported));
+        assert!(access.matches(&original).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), b"original");
+        assert_eq!(fs::read(&alias).unwrap(), b"original");
+    }
+
+    #[test]
+    fn editor_preserves_a_name_claim_and_reports_recovery_in_the_moved_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let selected = root.path().join("selected");
+        let moved = root.path().join("moved");
+        fs::create_dir(&selected).unwrap();
+        let parent = Directory::open(selected.clone()).unwrap();
+        let name = OsStr::new("chosen");
+        let path = selected.join(name);
+        fs::write(&path, b"original").unwrap();
+        let original = File::open(&path).unwrap();
+        let access = Access::read_editor(&original).unwrap();
+        let mut temp = parent.stage(None).unwrap();
+        temp.file().write_all(b"edited").unwrap();
+        access.finish_staging(temp.file()).unwrap();
+
+        let result = temp.publish_editor_inner(name, &original, |_| Ok(()), || {
+            fs::rename(&selected, &moved)?;
+            File::options()
+                .write(true)
+                .create_new(true)
+                .open(moved.join(name))?
+                .write_all(b"external")
+        });
+        let Err(DownloadPublicationError::Unconfirmed(recovery)) = result else {
+            panic!("editor publication did not return a recovery path: {result:?}");
+        };
+        assert!(recovery.starts_with(&moved), "{recovery:?}");
+        assert_eq!(fs::read(&recovery).unwrap(), b"original");
+        // A contender can reopen the recovered original once publication returns.
+        File::options()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&recovery)
+            .unwrap();
+        assert_eq!(fs::read(moved.join(name)).unwrap(), b"external");
+        assert_eq!(fs::read_dir(recovery.parent().unwrap()).unwrap().count(), 1);
+    }
 
     #[test]
     fn download_keeps_both_files_when_the_destination_is_claimed_after_the_move() {
