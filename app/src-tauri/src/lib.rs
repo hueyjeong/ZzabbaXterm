@@ -1,4 +1,6 @@
 mod connections;
+#[allow(dead_code, reason = "PIN 등록 및 SFTP는 별도 통합 경계")]
+mod ssh;
 pub mod ssm;
 mod terminal;
 mod workspace_window;

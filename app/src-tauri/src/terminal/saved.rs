@@ -10,6 +10,7 @@ pub(super) fn launch(config: &Path, id: &str) -> Result<Launch, String> {
     with_saved_method(config, id, |method| match method {
         MethodRef::Local { shell, start_directory } => local(shell, start_directory).map(Launch::Local),
         MethodRef::Ssm { profile, region, instance_id } => remote::Target::new(profile, region, instance_id).map(Launch::Ssm),
+        MethodRef::Ssh { ssh } => crate::ssh::terminal::saved(config, ssh).map(Launch::Ssh),
     })
 }
 
@@ -17,7 +18,7 @@ pub(super) fn launch(config: &Path, id: &str) -> Result<Launch, String> {
 pub(super) fn command(config: &Path, id: &str) -> Result<CommandBuilder, String> {
     match launch(config, id)? {
         Launch::Local(command) => Ok(command),
-        Launch::Ssm(_) => Err("로컬 연결이 아닙니다".into()),
+        Launch::Ssm(_) | Launch::Ssh(_) => Err("로컬 연결이 아닙니다".into()),
     }
 }
 

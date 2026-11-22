@@ -3,6 +3,7 @@ import type { SavedConnections } from "./connectionIpc";
 import { SsmSelectionView } from "../ssm/SsmSelectionView";
 import { useSsmSelection } from "../ssm/ssm";
 import { createSsmDiscovery } from "../ssm/ssmDiscovery";
+import { SshMethodFields, SshAuthFields, SshReview } from "./SshFields";
 import {
   createLocalConnectionWizard,
   type LocalConnectionActions,
@@ -31,9 +32,10 @@ const discovery = createSsmDiscovery();
 
 function Wizard(props: LocalConnectionWizardProps) {
   const [wizard] = useState(() => createLocalConnectionWizard(props.draftId, props.initialDraft));
-  const { step, draft, status, remoteCleanup } = useSyncExternalStore(wizard.subscribe, wizard.getSnapshot);
+  const { step, draft, status, sshPin, remoteCleanup } = useSyncExternalStore(wizard.subscribe, wizard.getSnapshot);
   const { target } = draft;
-  const ssm = useSsmSelection(discovery, target.defaultMethod === "ssm" &&
+  const useSsm = target.defaultMethod === "ssm" || (target.defaultMethod === "ssh" && target.ssh.transport.kind === "ssm" && (step === "auth" || step === "verify"));
+  const ssm = useSsmSelection(discovery, useSsm &&
     status.kind !== "closing" && status.kind !== "closed" && status.kind !== "closeFailed", wizard.invalidateSsmSelection);
   const dialog = useRef<HTMLDialogElement>(null);
   useLayoutEffect(() => {
@@ -46,6 +48,7 @@ function Wizard(props: LocalConnectionWizardProps) {
   if (status.kind === "closed") return null;
   const locked = status.kind === "saving" || status.kind === "closing" || status.kind === "closeFailed";
   const canSave = status.kind === "passed" || status.kind === "saveFailed";
+  const ssh = target.defaultMethod === "ssh" ? target.ssh : null;
 
   return (
     <dialog ref={dialog} className="connection-wizard" aria-label="연결 추가" onCancel={(event) => {
@@ -73,33 +76,51 @@ function Wizard(props: LocalConnectionWizardProps) {
         {step === "method" && (
           <>
             <div><label>접속 방식 <select value={target.defaultMethod} onChange={(event) => {
-              wizard.selectMethod(event.currentTarget.value === "ssm" ? "ssm" : "local");
+              const method = event.currentTarget.value;
+              if (method === "local" || method === "ssm" || method === "ssh") wizard.selectMethod(method);
             }}>
               <option value="local">로컬</option>
               <option value="ssm">AWS Systems Manager</option>
+              <option value="ssh">SSH</option>
             </select></label></div>
             {target.defaultMethod === "local" && <>
               <div>셸: {target.local.shell === "powerShell" ? "PowerShell" : "Bash"}</div>
               <div><label>시작 디렉터리 <input value={target.local.startDirectory} onChange={event => wizard.edit("startDirectory", event.target.value)} /></label></div>
             </>}
+            {ssh && <SshMethodFields ssh={ssh} edit={wizard.editSsh} />}
           </>
         )}
-        {step === "auth" && (target.defaultMethod === "local" ? <div>현재 사용자</div> : <SsmSelectionView state={ssm} />)}
+        {step === "auth" && <>
+          {target.defaultMethod === "local" && <div>현재 사용자</div>}
+          {useSsm && <SsmSelectionView state={ssm} />}
+          {ssh && <SshAuthFields ssh={ssh} edit={wizard.editSsh} />}
+        </>}
         {step === "verify" && (
           <>
             <div>{draft.group.displayName} / {target.displayName}</div>
-            {target.defaultMethod === "local" ? <div>{target.local.startDirectory}</div> : target.ssm && <dl aria-label="SSM 연결 대상">
+            {target.defaultMethod === "local" && <div>{target.local.startDirectory}</div>}
+            {target.defaultMethod === "ssm" && target.ssm && <dl aria-label="SSM 연결 대상">
               <div><dt>SSO 프로필</dt><dd>{target.ssm.profile}</dd></div>
               <div><dt>리전</dt><dd>{target.ssm.region}</dd></div>
               <div><dt>인스턴스 ID</dt><dd>{target.ssm.instanceId}</dd></div>
             </dl>}
-            <button type="button" disabled={status.kind === "testing" || !!remoteCleanup} onClick={() => void wizard.test(props)}>연결 테스트</button>
+            {ssh && <>
+              <SshReview ssh={ssh} />
+              <button type="button" disabled={!props.verifySshHost || sshPin.kind === "checking" || sshPin.kind === "verified"}
+                onClick={() => void wizard.verifySshHost(props)}>등록된 호스트 키 확인</button>
+              {!props.verifySshHost && <div role="status">호스트 키 확인 사용 불가</div>}
+              {sshPin.kind === "checking" && <div role="status">호스트 키 확인 중</div>}
+              {sshPin.kind === "verified" && <div role="status">호스트 키 확인 완료</div>}
+              {sshPin.kind === "failed" && <div role="alert">{sshPin.error}</div>}
+            </>}
+            <button type="button" disabled={status.kind === "testing" || !!remoteCleanup || (!!ssh && sshPin.kind !== "verified")}
+              onClick={() => void wizard.test(props)}>연결 테스트</button>
             <button type="button" disabled={!canSave} onClick={() => void wizard.save(props)}>저장</button>
           </>
         )}
         {step !== "target" && <button type="button" onClick={() => wizard.go(-1)}>이전</button>}
         {step !== "verify" && <button type="button"
-          disabled={step === "auth" && target.defaultMethod === "ssm" && !ssm.selection}
+          disabled={step === "auth" && ((useSsm && !ssm.selection) || (!!ssh && !wizard.canReviewSsh(ssm.selection)))}
           onClick={() => wizard.go(1, ssm.selection)}>다음</button>}
       </fieldset>
       <button type="button" disabled={locked && status.kind !== "closeFailed"} onClick={() => void wizard.close(props)}>

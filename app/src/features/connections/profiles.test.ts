@@ -196,3 +196,59 @@ describe("C01 로컬 연결 IPC", () => {
     expect(ipc).toHaveBeenCalledExactlyOnceWith("connections_load", {});
   });
 });
+
+describe("F01 SSH 마법사", () => {
+  it("이전 호스트 키 확인과 늦은 SSM 선택으로 직접 SSH 시험을 승인할 수 없다", async () => {
+    const first = Promise.withResolvers<void>();
+    const verifySshHost = vi.fn().mockReturnValueOnce(first.promise).mockResolvedValueOnce(undefined);
+    const peer = { ...nativePeer(), verifySshHost };
+    const wizard = createLocalConnectionWizard("work-draft", draft);
+    const ssm = { profile: "company", region: "ap-northeast-2", instanceId: "i-0123456789abcdef0" };
+    const host = {
+      host: "ssh.actual.test", port: "2222", account: "deploy",
+      hostKeyFingerprint: `SHA256:${"A".repeat(43)}`,
+    };
+    wizard.go(1);
+    wizard.selectMethod("ssh");
+    wizard.editSsh({ ...host, transport: { kind: "ssm" } });
+    wizard.go(1);
+    wizard.editSsh({ auth: { kind: "storedPassword", itemId: "vault-item" } });
+    wizard.go(1, null);
+    expect(wizard.getSnapshot().step).toBe("auth");
+    wizard.go(1, ssm);
+    await wizard.test(peer);
+    expect(ipc).not.toHaveBeenCalled();
+    const oldApproval = wizard.verifySshHost(peer);
+    wizard.go(-1);
+    wizard.go(-1);
+    wizard.editSsh({ host: "second.actual.test", transport: { kind: "direct" } });
+    wizard.go(1);
+    wizard.editSsh({ auth: { kind: "manualPassword" } });
+    wizard.go(1, ssm);
+    first.resolve();
+    await oldApproval;
+    await wizard.test(peer);
+    await wizard.save(peer);
+    expect(ipc).not.toHaveBeenCalled();
+    await wizard.verifySshHost(peer);
+    expect(verifySshHost.mock.calls).toEqual([
+      [{ targetId: draft.target.id, host: host.host, port: 2222, hostKeyFingerprint: host.hostKeyFingerprint }],
+      [{ targetId: draft.target.id, host: "second.actual.test", port: 2222, hostKeyFingerprint: host.hostKeyFingerprint }],
+    ]);
+    ipc.mockRejectedValueOnce("SSH 연결 시험을 실행할 수 없습니다");
+    await wizard.test(peer);
+    await wizard.save(peer);
+    expect(ipc.mock.calls).toEqual([["connection_test_start", {
+      draftId: "work-draft", draftVersion: expect.any(Number), draft: {
+        ...draft, target: {
+          id: draft.target.id, groupId: draft.target.groupId, displayName: draft.target.displayName,
+          defaultMethod: "ssh", ssh: {
+            host: "second.actual.test", port: 2222, account: "deploy", hostKeyFingerprint: host.hostKeyFingerprint,
+            transport: { kind: "direct" }, auth: { kind: "manualPassword" },
+          },
+        },
+      },
+    }]]);
+    expect(wizard.getSnapshot().status).toEqual({ kind: "testFailed", error: "SSH 연결 시험을 실행할 수 없습니다" });
+  });
+});

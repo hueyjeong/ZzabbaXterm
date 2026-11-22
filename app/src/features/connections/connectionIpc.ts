@@ -23,6 +23,10 @@ export function createLocalConnectionIpc(): Omit<LocalConnectionActions, "onClos
 
   return {
     load: () => invoke<SavedConnections>("connections_load", {}),
+    async verifySshHost({ host, port, hostKeyFingerprint }) {
+      const result = await invoke<unknown>("connection_ssh_verify_pin", { pin: { host, port, hostKeyFingerprint } });
+      if (result !== null) throw new Error("등록된 SSH 호스트 키 확인 응답이 올바르지 않습니다");
+    },
     async test(attempt) {
       const started = invoke<ConnectionTestRun>("connection_test_start", attempt);
       const execution: Execution = { started, cancelled: false };

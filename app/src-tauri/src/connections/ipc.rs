@@ -12,7 +12,19 @@ pub(crate) fn handle(invoke: Invoke, other: fn(Invoke) -> bool) -> bool {
             let draft_version = args.get("draftVersion")?;
             let draft = args.get("draft")?;
             Ok(move |caller: Webview, document| {
-                probe::start(&caller.state::<Sessions>(), caller.label(), document, draft_id, draft_version, draft)
+                let config = caller.path().app_config_dir().map_err(|error| format!("앱 설정 디렉터리: {error}"))?;
+                probe::start(&caller.state::<Sessions>(), caller.label(), document, draft_id, draft_version, draft, config)
+            })
+        }),
+        "connection_ssh_verify_pin" => dispatch(invoke, "connection_ssh_verify_pin", |args| {
+            let pin = args.get("pin")?;
+            Ok(move |caller: Webview, document| {
+                let sessions = caller.state::<Sessions>();
+                let check = || sessions.with_probes(caller.label(), document, |_| Ok(()));
+                check()?;
+                let config = caller.path().app_config_dir().map_err(|error| format!("앱 설정 디렉터리: {error}"))?;
+                crate::ssh::terminal::verify_pin(&config, &pin)?;
+                check()
             })
         }),
         "connection_test_wait" => dispatch(invoke, "connection_test_wait", |args| {

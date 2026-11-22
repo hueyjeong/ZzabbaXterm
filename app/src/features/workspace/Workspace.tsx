@@ -11,7 +11,7 @@ import { macTitleBar, TitleBar } from "./TitleBar";
 import "./workspace.css";
 
 type Tab = {
-  id: number; label: string; targetId?: string; ssm?: SsmTarget; status: TerminalStatus; sessionId?: string;
+  id: number; label: string; targetId?: string; ssm?: SsmTarget; ssh?: true; status: TerminalStatus; sessionId?: string;
   closeStatus?: "closing" | "unconfirmed"
 };
 type ProfileLoad = { kind: "loading" | "ready"; profiles?: SavedConnections }
@@ -122,7 +122,8 @@ export function Workspace() {
     const id = nextTab.current++;
     setTabs((current) => [...current, {
       id, label: target?.displayName ?? `로컬 ${id}`, targetId: target?.id,
-      ssm: target?.defaultMethod === "ssm" ? target.ssm : undefined, status: { kind: "opening" },
+      ssm: target?.defaultMethod === "ssm" ? target.ssm : undefined,
+      ssh: target?.defaultMethod === "ssh" ? true : undefined, status: { kind: "opening" },
     }]);
     selectTab(id);
   }
@@ -223,12 +224,13 @@ export function Workspace() {
       </div>
       <footer className="workspace-status">
         <span role="status">{current ? [current.targetId ? current.label : "내 PC", current.ssm ?
-          `SSM · ${current.ssm.profile} / ${current.ssm.region} / ${current.ssm.instanceId}` : "로컬", current.sessionId,
+          `SSM · ${current.ssm.profile} / ${current.ssm.region} / ${current.ssm.instanceId}` : current.ssh ? "SSH" : "로컬", current.sessionId,
         !current.closeStatus && terminalStatus(current.status)].filter(Boolean).join(" · ") : "연결 없음"}</span>
         {windowError && <span role="alert">{windowError}</span>}
         <span>AI 전용 셸 · 대기</span>
       </footer>
       {wizard && <LocalConnectionWizard {...wizard} groups={profileLoad.profiles?.groups ?? []}
+        verifySshHost={connections.verifySshHost}
         test={connections.test} cancelTest={connections.cancelTest} save={connections.save} onClose={closeWizard} />}
     </main>
   );

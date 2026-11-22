@@ -763,3 +763,70 @@ describe("C02 SSM 연결", () => {
     expect(button("로컬 1")?.getAttribute("aria-pressed")).toBe("true");
   });
 });
+
+describe("F01 직접 SSH", () => {
+  const fingerprint = `SHA256:${"A".repeat(43)}`;
+
+  it("등록된 핀이 없으면 연결 시험과 저장을 차단한다", async () => {
+    runConnectionCommand = async () => { throw "등록된 SSH 호스트 키가 없습니다"; };
+    const select = async (label: string, value: string) => {
+      const control = [...find("dialog").querySelectorAll("label")]
+        .find(item => item.firstChild?.textContent?.trim() === label)?.querySelector("select");
+      if (!control) throw new Error(label);
+      await act(async () => {
+        control.value = value;
+        control.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      return control;
+    };
+    await press("연결 추가");
+    await press("다음");
+    await select("접속 방식", "ssh");
+    expect(find<HTMLOptionElement>('option[value="ssm"][disabled]').textContent).toContain("SSH-over-SSM");
+    await changeInput("서버 호스트", "dev.example.invalid");
+    await changeInput("SSH 포트", "2222");
+    await changeInput("SSH 계정", "deploy");
+    await changeInput("호스트 키 SHA256 지문", fingerprint);
+    await press("다음");
+    const auth = await select("SSH 인증 방식", "manualPassword");
+    expect(auth.querySelector<HTMLOptionElement>('option[value="storedPassword"]')?.disabled).toBe(true);
+    await press("다음");
+    expect(find('[aria-label="SSH 연결 대상"]').textContent).toContain("deploy");
+    await press("등록된 호스트 키 확인");
+    expect(connectionCalls("connection_ssh_verify_pin")).toEqual([["connection_ssh_verify_pin", {
+      pin: { host: "dev.example.invalid", port: 2222, hostKeyFingerprint: fingerprint },
+    }]]);
+    expect(find("dialog [role=alert]").textContent).toBe("등록된 SSH 호스트 키가 없습니다");
+    expect(button("연결 테스트")?.disabled).toBe(true);
+    expect(button("저장")?.disabled).toBe(true);
+    expect(connectionCalls("connection_test_start")).toEqual([]);
+    expect(connectionCalls("ssm_discovery")).toEqual([]);
+  });
+
+  it("같은 저장 대상을 두 번 열고 닫은 탭의 PTY ID만 회수한다", async () => {
+    loadProfiles = async () => ({
+      version: 1,
+      groups: [{ revision: 1, profile: { id: "work", displayName: "작업" } }],
+      targets: [{
+        revision: 1, profile: {
+          id: "server", groupId: "work", displayName: "개발 서버", defaultMethod: "ssh",
+          ssh: {
+            host: "dev.example.invalid", port: 2222, account: "deploy", hostKeyFingerprint: fingerprint,
+            transport: { kind: "direct" }, auth: { kind: "manualPassword" }
+          }
+        }
+      }],
+    });
+    await restartWorkspace();
+    const target = [...tree().querySelectorAll<HTMLElement>('[role="treeitem"]')].find(item => item.textContent === "개발 서버")!;
+    await key(target, "Enter");
+    await key(target, "Enter");
+    expect(calls("open").slice(-2).map(args => args.targetId)).toEqual(["server", "server"]);
+    const [first, second] = calls("start").slice(-2).map(args => args.id);
+    expect(first).not.toBe(second);
+    native.invoke.mockClear();
+    await press("개발 서버 닫기");
+    expect(calls("close")).toEqual([{ id: first }]);
+    expect(status()).toContain(`SSH · ${second}`);
+  });
+});
