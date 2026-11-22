@@ -1,6 +1,6 @@
 use super::remote;
 use crate::ssm::CancellationToken;
-use crate::ssh::{ConnectionPlan, terminal::DirectLaunch};
+use crate::ssh::{ConnectionPlan, nano::Startup, terminal::DirectLaunch};
 use super::{CHUNK, CLOSED, CloseResult, Event, LiveSsmIdentity, LocalClose, WINDOW, stage};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::{
@@ -36,6 +36,7 @@ struct Flow {
     sftp: Option<SftpOwner>,
     editor_cancel: Option<CancellationToken>,
     editor_start: Option<tokio::sync::oneshot::Sender<()>>,
+    editor_startup: Option<Startup>,
     sent: u64,
     acked: u64,
     ack_deadline: Option<std::time::Instant>,
@@ -325,9 +326,12 @@ impl Session {
                             if flow.stop.is_some() { cancel.cancel(); }
                             flow.editor_cancel = Some(cancel.clone());
                         }
-                        if let Some((running, started)) = launch.prepare_editor(cancel) {
+                        if let Some((mut running, started)) = launch.prepare_editor(cancel) {
+                            let startup = running.take_startup();
+                            let mut flow = self.flow.lock().unwrap();
+                            flow.editor_start = Some(started);
+                            flow.editor_startup = startup;
                             editor = Some(running);
-                            self.flow.lock().unwrap().editor_start = Some(started);
                         }
                     }
                     let (command, plan) = launch.into_parts();
@@ -630,11 +634,13 @@ impl Session {
 
     fn drain(&self, mut reader: Box<dyn Read + Send>, send: &impl Fn(Event) -> Result<(), String>, mut diagnostic: Option<&mut remote::StartDiagnostic>) -> Result<(), String> {
         let mut buffer = [0; CHUNK];
+        let mut startup: Option<Startup> = None;
         loop {
             let mut flow = self.flow.lock().unwrap();
             while flow.stop.is_none() && (!flow.started || flow.sent - flow.acked == WINDOW as u64) {
                 flow = self.wait_for_ack(flow);
             }
+            if let Some(editor) = flow.editor_startup.take() { startup = Some(editor); }
             let limit = if flow.stop.is_some() {
                 #[cfg(unix)]
                 return Ok(());
@@ -675,24 +681,45 @@ impl Session {
                     return Err(stage("read", error));
                 }
             };
-            if let Some(output) = &mut diagnostic { output.record(&buffer[..count]); }
-            let mut flow = self.flow.lock().unwrap();
-            if flow.stop.is_some() { continue; }
-            if flow.sent == flow.acked {
-                flow.ack_deadline = Some(std::time::Instant::now() + ACK_TIMEOUT);
-            }
-            flow.sent += count as u64;
-            drop(flow);
-            if let Err(error) = send(Event::Bytes(buffer[..count].to_vec())) {
-                self.stop(Stop::Disconnected(stage("channel", error)));
+            let bytes = &buffer[..count];
+            if let Some(filter) = &mut startup {
+                filter.filter(bytes, |part| self.send_output(part, send));
+                if !filter.pending() { startup = None; }
+            } else {
+                if let Some(output) = &mut diagnostic { output.record(bytes); }
+                self.send_output(bytes, send);
             }
         }
         drop(reader);
+        if let Some(mut filter) = startup {
+            filter.finish(|bytes| self.send_output(bytes, send));
+        }
         let mut flow = self.flow.lock().unwrap();
         while flow.stop.is_none() && flow.sent != flow.acked {
             flow = self.wait_for_ack(flow);
         }
         Ok(())
+    }
+
+    fn send_output(&self, mut bytes: &[u8], send: &impl Fn(Event) -> Result<(), String>) {
+        while !bytes.is_empty() {
+            let mut flow = self.flow.lock().unwrap();
+            while flow.stop.is_none() && flow.sent - flow.acked == WINDOW as u64 {
+                flow = self.wait_for_ack(flow);
+            }
+            if flow.stop.is_some() { return; }
+            if flow.sent == flow.acked {
+                flow.ack_deadline = Some(Instant::now() + ACK_TIMEOUT);
+            }
+            let count = bytes.len().min(WINDOW - (flow.sent - flow.acked) as usize);
+            flow.sent += count as u64;
+            drop(flow);
+            if let Err(error) = send(Event::Bytes(bytes[..count].to_vec())) {
+                self.stop(Stop::Disconnected(stage("channel", error)));
+                return;
+            }
+            bytes = &bytes[count..];
+        }
     }
 
     fn wait_for_ack<'a>(&'a self, flow: std::sync::MutexGuard<'a, Flow>) -> std::sync::MutexGuard<'a, Flow> {
