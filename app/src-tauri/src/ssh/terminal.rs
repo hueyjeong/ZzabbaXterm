@@ -8,6 +8,7 @@ use super::{ApprovedHost, Authentication, Client, ConnectionPlan, Error, Invocat
 pub(crate) struct DirectLaunch {
     command: CommandBuilder,
     plan: Arc<ConnectionPlan>,
+    editor: Option<(super::nano::Binding, tokio::sync::oneshot::Sender<()>)>,
 }
 
 impl DirectLaunch {
@@ -23,7 +24,26 @@ impl DirectLaunch {
         }
         let plan = Arc::new(ConnectionPlan::prepare(store, approved_host, account, Transport::Direct, auth)?);
         let command = command(plan.invocation(Client::Ssh));
-        Ok(Self { command, plan })
+        Ok(Self { command, plan, editor: None })
+    }
+
+    pub(crate) fn enable_editor(&mut self, app: tauri::AppHandle, owner: String, document: u64) -> tokio::sync::oneshot::Sender<String> {
+        let (id, parent) = tokio::sync::oneshot::channel();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        self.editor = Some((super::nano::Binding { app, owner, document, parent, started: ready }, started));
+        id
+    }
+
+    pub(crate) fn editor_requested(&self) -> bool { self.editor.is_some() }
+
+    pub(crate) fn prepare_editor(&mut self, cancel: tokio_util::sync::CancellationToken) -> Option<(super::nano::Running, tokio::sync::oneshot::Sender<()>)> {
+        let (binding, started) = self.editor.take()?;
+        let invocation = self.plan.editor_invocation(true)?;
+        let (ready, running) = super::nano::Running::prepare(Arc::clone(&self.plan), binding, cancel)?;
+        let mut shell = command(invocation);
+        shell.args([super::nano::HELPER, "shell", &ready.session_id]);
+        self.command = shell;
+        Some((running, started))
     }
 
     /// 터미널 감독자와 SFTP 작업자가 같은 계획을 공유한다.

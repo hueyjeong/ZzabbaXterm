@@ -34,6 +34,8 @@ struct Flow {
     stop: Option<Stop>,
     ssm_identity: Option<remote::SsmIdentity>,
     sftp: Option<SftpOwner>,
+    editor_cancel: Option<CancellationToken>,
+    editor_start: Option<tokio::sync::oneshot::Sender<()>>,
     sent: u64,
     acked: u64,
     ack_deadline: Option<std::time::Instant>,
@@ -311,10 +313,23 @@ impl Session {
                     return Err(self.after_failed_spawn(stage("reader worker", error), remote.take()));
                 }
             };
+            let mut editor = None;
             let command = match command {
                 Launch::Ssm(_) | Launch::AiControl(..) => None,
                 Launch::Local(command) => Some(command),
-                Launch::Ssh(launch) => {
+                Launch::Ssh(mut launch) => {
+                    if launch.editor_requested() {
+                        let cancel = CancellationToken::new();
+                        {
+                            let mut flow = self.flow.lock().unwrap();
+                            if flow.stop.is_some() { cancel.cancel(); }
+                            flow.editor_cancel = Some(cancel.clone());
+                        }
+                        if let Some((running, started)) = launch.prepare_editor(cancel) {
+                            editor = Some(running);
+                            self.flow.lock().unwrap().editor_start = Some(started);
+                        }
+                    }
                     let (command, plan) = launch.into_parts();
                     ssh_plan = Some(plan);
                     Some(command)
@@ -385,8 +400,9 @@ impl Session {
                 event
             });
             let sftp = self.flow.lock().unwrap().sftp.take();
-            if let Some(SftpOwner { cancel, workers, .. }) = sftp {
-                cancel.cancel();
+            if let Some(owner) = &sftp { owner.cancel.cancel(); }
+            drop(editor);
+            if let Some(SftpOwner { workers, .. }) = sftp {
                 if let Some(workers) = workers {
                     workers.close();
                     if !workers.is_empty() {
@@ -700,6 +716,7 @@ impl Session {
         }
         flow.started = true;
         flow.start_deadline = None;
+        if let Some(editor) = flow.editor_start.take() { let _ = editor.send(()); }
         self.wake.notify_all();
         if self.cancel.is_some() {
             let pending = |flow: &mut Flow| !flow.attached && !flow.finished && flow.stop.is_none();
@@ -800,6 +817,7 @@ impl Session {
         if let Some(cancel) = &self.cancel { cancel.cancel(); }
         let mut flow = self.flow.lock().unwrap();
         if let Some(sftp) = &flow.sftp { sftp.cancel.cancel(); }
+        if let Some(cancel) = &flow.editor_cancel { cancel.cancel(); }
         if flow.stop.is_none() || matches!(reason, Stop::Closed) {
             flow.stop = Some(reason);
         }

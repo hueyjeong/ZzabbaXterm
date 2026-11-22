@@ -31,6 +31,8 @@ enum Scenario {
     ExternalDelete,
     ChangedHandleMetadata,
     ChangedTargetDuringRead,
+    WriteAccessDenied,
+    NonRegular,
     NoExtension,
     OtherExtensionVersion,
     CreateRefused,
@@ -208,9 +210,13 @@ impl Fixture {
                 if !self.root.join(name).exists() {
                     Packet::error(id, StatusCode::NoSuchFile)
                 } else {
+                    let mut attrs = self.attrs(name, self.mode);
+                    if self.scenario == Scenario::NonRegular {
+                        attrs.permissions = Some(0o120777);
+                    }
                     Attrs {
                         id,
-                        attrs: self.attrs(name, self.mode),
+                        attrs,
                     }
                     .into()
                 }
@@ -222,6 +228,20 @@ impl Fixture {
                     FILE => handle(b"original\0"),
                     DECOY_FILE => handle(b"decoy"),
                     path => panic!("예상하지 않은 파일: {path}"),
+                }
+            }
+            Packet::Open(request) if request.pflags.bits() == (OpenFlags::READ | OpenFlags::WRITE).bits() => {
+                self.read_opens += 1;
+                self.reached_eof = false;
+                assert!(request.attrs.permissions.is_none());
+                if self.scenario == Scenario::WriteAccessDenied {
+                    Packet::error(id, StatusCode::PermissionDenied)
+                } else {
+                    match request.filename.to_str().unwrap() {
+                        FILE => handle(b"original\0"),
+                        DECOY_FILE => handle(b"decoy"),
+                        path => panic!("예상하지 않은 파일: {path}"),
+                    }
                 }
             }
             Packet::Open(request) => {
@@ -442,6 +462,43 @@ async fn connect(
             .unwrap(),
         server,
     )
+}
+
+pub(in crate::editor) async fn in_memory_session(root: &std::path::Path, text: &str) -> Session {
+    let fixture = Fixture::new(root.to_owned(), Scenario::Normal);
+    fs::write(root.join("original"), text).unwrap();
+    let plan = plan(&root.join("trust"), "editor");
+    let (connection, _) = connect(plan, fixture).await;
+    Session::in_memory(connection)
+}
+
+#[tokio::test]
+async fn absolute_open_uses_existing_write_access_without_changing_the_original() {
+    for scenario in [Scenario::Normal, Scenario::WriteAccessDenied, Scenario::NonRegular, Scenario::NoExtension] {
+        let root = tempfile::tempdir().unwrap();
+        let plan = plan(&root.path().join("trust"), "editor");
+        let (mut connection, server) = connect(plan, Fixture::new(root.path().into(), scenario)).await;
+        for path in ["/", "한글.txt", "C:/workspace/한글.txt", "/workspace/../한글.txt", "/workspace/.zzabba-edit-other"] {
+            assert!(matches!(connection.open_absolute(path).await, Err(Error::InvalidPath)), "{path}");
+        }
+        match (scenario, connection.open_absolute(FILE).await) {
+            (Scenario::Normal, Ok((mut file, text))) => {
+                assert_eq!(text, ORIGINAL);
+                assert_eq!(connection.reopen(&file).await.unwrap().1, ORIGINAL);
+                fs::write(root.path().join("original"), EXTERNAL).unwrap();
+                assert!(matches!(connection.save(&mut file, EDITED).await,
+                    SaveOutcome::Conflict { remote: RemoteVersion::Text(text), .. } if text == EXTERNAL));
+                fs::write(root.path().join("original"), ORIGINAL).unwrap();
+            }
+            (Scenario::WriteAccessDenied, Err(Error::Protocol(error))) => assert!(status(&error, StatusCode::PermissionDenied)),
+            (Scenario::NonRegular, Err(Error::NotRegular)) |
+            (Scenario::NoExtension, Err(Error::AtomicReplaceUnavailable)) => (),
+            (_, result) => panic!("예상하지 않은 원격 열기 결과: {:?}", result.err()),
+        }
+        drop(connection);
+        assert!(!server.await.unwrap().renamed);
+        assert_eq!(fs::read_to_string(root.path().join("original")).unwrap(), ORIGINAL);
+    }
 }
 
 async fn listed_file(connection: &mut Connection) -> Entry {

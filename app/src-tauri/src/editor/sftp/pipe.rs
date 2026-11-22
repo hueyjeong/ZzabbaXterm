@@ -108,6 +108,23 @@ impl Session {
         self.process.run(self.deadline, self.connection.open(entry)).await
     }
 
+    pub(in crate::editor) async fn open_absolute(&mut self, path: &str) -> Result<(File, String)> {
+        self.process.run(self.deadline, self.connection.open_absolute(path)).await
+    }
+
+    #[cfg(test)]
+    pub(super) fn in_memory(connection: Connection) -> Self {
+        Self {
+            connection,
+            process: Process {
+                stop: CancellationToken::new().drop_guard(),
+                ended: CancellationToken::new(),
+                worker: None,
+            },
+            deadline: DEADLINE,
+        }
+    }
+
     pub(crate) async fn reopen(&mut self, file: &File) -> Result<(File, String)> {
         self.process.run(self.deadline, self.connection.reopen(file)).await
     }

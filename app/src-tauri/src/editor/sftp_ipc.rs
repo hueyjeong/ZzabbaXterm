@@ -1,11 +1,12 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}},
+    sync::{Arc, Mutex},
 };
 
 use serde::Serialize;
 use tauri::{Manager, ipc::{CommandArg, CommandItem, Invoke}};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio_util::sync::CancellationToken;
 
 use crate::terminal::Sessions;
 
@@ -19,9 +20,66 @@ type Slot = Arc<AttachmentSlot>;
 
 #[derive(Default)]
 struct AttachmentSlot {
-    closing: AtomicBool,
+    lifetime: CancellationToken,
+    owners: Mutex<Owners>,
     state: AsyncMutex<Attachment>,
 }
+
+#[derive(Default)]
+struct Owners {
+    panel: Option<Arc<CancellationToken>>,
+    bridge: Option<CancellationToken>,
+    closing: bool,
+}
+
+pub(crate) enum SharedSftpNamespace {
+    AdministratorConfirmed,
+}
+
+pub(crate) struct BridgeSlot {
+    label: String,
+    generation: u64,
+    id: String,
+    slot: Slot,
+    cancel: CancellationToken,
+}
+
+impl BridgeSlot {
+    pub(crate) fn cancellation(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+
+    fn check(&self, state: &SftpIpc) -> Result<()> {
+        state.current(&self.label, self.generation, &self.id, &self.slot)?;
+        if self.cancel.is_cancelled() {
+            return Err(Error::Disconnected);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for BridgeSlot {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct BridgeError(Error);
+
+impl From<Error> for BridgeError {
+    fn from(error: Error) -> Self {
+        Self(error)
+    }
+}
+
+impl std::fmt::Display for BridgeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.0)
+    }
+}
+
+impl std::error::Error for BridgeError {}
 
 #[derive(Default)]
 enum Attachment {
@@ -33,6 +91,26 @@ enum Attachment {
 }
 
 impl Attachment {
+    async fn connect(&mut self, connect: impl Future<Output = Result<Session, sftp::Error>>) -> Result<&mut Attached> {
+        if matches!(self, Self::Opening) {
+            match connect.await {
+                Ok(session) => *self = Self::Active(Attached::new(session)),
+                Err(sftp::Error::Reap(_)) => {
+                    *self = Self::CloseFailed(Error::RemoteFailure);
+                    return Err(Error::RemoteFailure);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        } else if let Self::Active(attached) = self {
+            attached.refresh_transport(connect).await?;
+        }
+        match self {
+            Self::Active(attached) => Ok(attached),
+            Self::CloseFailed(error) => Err(*error),
+            Self::Opening | Self::Closing => Err(Error::Disconnected),
+        }
+    }
+
     async fn close(&mut self) -> Result<()> {
         let session = match std::mem::replace(self, Self::Closing) {
             Self::Active(attached) => attached.transport.into_session(),
@@ -63,6 +141,14 @@ pub(crate) struct SftpIpc(Mutex<HashMap<String, Document>>);
 struct Document {
     generation: u64,
     parents: HashMap<String, Slot>,
+}
+
+impl Drop for Document {
+    fn drop(&mut self) {
+        for slot in self.parents.values() {
+            slot.lifetime.cancel();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -127,6 +213,8 @@ impl Transport {
 struct OpenFile {
     file: File,
     unknown: bool,
+    bridge: bool,
+    on_close: Option<Box<dyn FnOnce() + Send>>,
 }
 
 #[derive(Serialize)]
@@ -145,10 +233,10 @@ struct Listing {
 }
 
 #[derive(Serialize)]
-struct Opened {
-    handle: String,
-    name: String,
-    text: String,
+pub(crate) struct Opened {
+    pub(crate) handle: String,
+    pub(crate) name: String,
+    pub(crate) text: String,
 }
 
 impl SftpIpc {
@@ -168,13 +256,156 @@ impl SftpIpc {
         let _ = self.remove(label, generation, id, None);
     }
 
-    fn reserve(&self, label: &str, generation: u64, id: &str) -> Result<Slot> {
+    fn admit<T>(
+        &self, label: &str, generation: u64, id: &str,
+        claim: impl FnOnce(&mut Owners, &CancellationToken) -> Result<T>,
+    ) -> Result<(Slot, T)> {
         let mut documents = self.0.lock().unwrap();
         let document = documents.get_mut(label).filter(|doc| doc.generation == generation).ok_or(Error::DocumentClosed)?;
-        let std::collections::hash_map::Entry::Vacant(entry) = document.parents.entry(id.into()) else {
+        let slot = document.parents.entry(id.into()).or_default();
+        let mut owners = slot.owners.lock().unwrap();
+        if owners.closing {
             return Err(Error::Unavailable);
+        }
+        Ok((slot.clone(), claim(&mut owners, &slot.lifetime)?))
+    }
+
+    fn reserve(&self, label: &str, generation: u64, id: &str) -> Result<(Slot, Arc<CancellationToken>)> {
+        self.admit(label, generation, id, |owners, lifetime| {
+            if owners.panel.is_some() {
+                return Err(Error::Unavailable);
+            }
+            let cancel = Arc::new(lifetime.child_token());
+            owners.panel = Some(cancel.clone());
+            Ok(cancel)
+        })
+    }
+
+    pub(crate) fn bind_bridge(
+        &self, label: &str, generation: u64, id: &str, _: SharedSftpNamespace,
+    ) -> Result<BridgeSlot, BridgeError> {
+        if label != "main" {
+            return Err(Error::Unavailable.into());
+        }
+        let (slot, cancel) = self.admit(label, generation, id, |owners, lifetime| {
+            if owners.bridge.is_some() {
+                return Err(Error::Unavailable);
+            }
+            let cancel = lifetime.child_token();
+            owners.bridge = Some(cancel.clone());
+            Ok(cancel)
+        })?;
+        Ok(BridgeSlot { label: label.into(), generation, id: id.into(), slot, cancel })
+    }
+
+    pub(crate) async fn open_bridge(
+        &self, bridge: &BridgeSlot, sessions: &Sessions, path: &str,
+    ) -> Result<Opened, BridgeError> {
+        self.open_bridge_with(bridge, path, sessions.connect_sftp(&bridge.label, &bridge.id)).await
+    }
+
+    async fn open_bridge_with(
+        &self, bridge: &BridgeSlot, path: &str, connect: impl Future<Output = Result<Session, sftp::Error>>,
+    ) -> Result<Opened, BridgeError> {
+        bridge.check(self)?;
+        let mut guard = bridge.slot.state.lock().await;
+        bridge.check(self)?;
+        let attached = guard.connect(connect).await?;
+        bridge.check(self)?;
+        // 패널과 채널을 공유하므로 시작한 SFTP 읽기는 기존 제한 시간 안에 회수한다.
+        let result = attached.transport.connected()?.open_absolute(path).await;
+        let (file, text) = attached.transport.finish(result)?;
+        bridge.check(self)?;
+        let name = path.rsplit('/').next().expect("absolute file path").into();
+        attached.insert_file(file, name, text, true).map_err(Into::into)
+    }
+
+    pub(crate) async fn watch_bridge_close(
+        &self, bridge: &BridgeSlot, handle: &str, callback: impl FnOnce() + Send + 'static,
+    ) -> Result<(), BridgeError> {
+        let mut guard = bridge.slot.state.lock().await;
+        bridge.check(self)?;
+        let Attachment::Active(attached) = &mut *guard else {
+            return Err(Error::InvalidHandle.into());
         };
-        Ok(entry.insert(Arc::default()).clone())
+        let file = attached.files.get_mut(handle).filter(|file| file.bridge && file.on_close.is_none())
+            .ok_or(Error::InvalidHandle)?;
+        file.on_close = Some(Box::new(callback));
+        Ok(())
+    }
+
+    pub(crate) async fn discard_bridge_file(&self, bridge: &BridgeSlot, handle: &str) {
+        let mut guard = bridge.slot.state.lock().await;
+        if self.current(&bridge.label, bridge.generation, &bridge.id, &bridge.slot).is_ok() {
+            if let Attachment::Active(attached) = &mut *guard {
+                if attached.files.get(handle).is_some_and(|file| file.bridge) {
+                    attached.files.remove(handle);
+                }
+            }
+        }
+    }
+
+    async fn attach_panel(
+        &self, label: &str, generation: u64, id: &str, slot: &Slot, panel: &Arc<CancellationToken>,
+        connect: impl Future<Output = Result<Session, sftp::Error>>,
+    ) -> Result<Listing> {
+        let mut guard = slot.state.lock().await;
+        self.current(label, generation, id, slot)?;
+        check_panel(panel)?;
+        let result = match guard.connect(connect).await {
+            Ok(attached) if !panel.is_cancelled() => attached.list(None).await,
+            Ok(_) => Err(Error::Disconnected),
+            Err(error) => Err(error),
+        };
+        self.current(label, generation, id, slot)?;
+        check_panel(panel)?;
+        if result.is_err() {
+            panel.cancel();
+            self.release_panel(label, generation, id, slot, panel, &mut guard).await?;
+        }
+        result
+    }
+
+    async fn release_panel(
+        &self, label: &str, generation: u64, id: &str, slot: &Slot, panel: &Arc<CancellationToken>,
+        guard: &mut Attachment,
+    ) -> Result<()> {
+        let preserve_bridge = {
+            let mut owners = slot.owners.lock().unwrap();
+            if !owners.panel.as_ref().is_some_and(|active| Arc::ptr_eq(active, panel)) {
+                return Ok(());
+            }
+            let preserve = owners.bridge.as_ref().is_some_and(|token| !token.is_cancelled())
+                || matches!(guard, Attachment::Active(attached) if attached.files.values().any(|file| file.bridge));
+            if preserve {
+                owners.panel = None;
+            } else {
+                owners.closing = true;
+            }
+            preserve
+        };
+        if preserve_bridge {
+            if let Attachment::Active(attached) = guard {
+                attached.browser = Browser::default();
+                attached.files.retain(|_, file| file.bridge);
+            }
+        } else {
+            guard.close().await?;
+            let _ = self.remove(label, generation, id, Some(slot));
+        }
+        Ok(())
+    }
+
+    async fn close_file(&self, label: &str, generation: u64, id: &str, slot: &Slot, handle: &str) {
+        let mut guard = slot.state.lock().await;
+        if self.current(label, generation, id, slot).is_ok() {
+            if let Attachment::Active(attached) = &mut *guard {
+                if let Some(callback) = attached.files.remove(handle).and_then(|file| file.on_close) {
+                    drop(guard);
+                    callback();
+                }
+            }
+        }
     }
 
     fn slot(&self, label: &str, generation: u64, id: &str) -> Result<Option<Slot>> {
@@ -185,7 +416,7 @@ impl SftpIpc {
 
     fn current(&self, label: &str, generation: u64, id: &str, slot: &Slot) -> Result<()> {
         if self.slot(label, generation, id)?.is_some_and(|active| Arc::ptr_eq(&active, slot))
-            && !slot.closing.load(Ordering::Acquire)
+            && !slot.lifetime.is_cancelled() && !slot.owners.lock().unwrap().closing
         {
             Ok(())
         } else {
@@ -201,8 +432,16 @@ impl SftpIpc {
                 return Ok(None);
             }
         }
-        Ok(document.parents.remove(id))
+        let removed = document.parents.remove(id);
+        if let Some(slot) = &removed {
+            slot.lifetime.cancel();
+        }
+        Ok(removed)
     }
+}
+
+fn check_panel(panel: &CancellationToken) -> Result<()> {
+    if panel.is_cancelled() { Err(Error::Disconnected) } else { Ok(()) }
 }
 
 fn opaque_id() -> Result<String> {
@@ -258,7 +497,7 @@ impl Attached {
         self.browser.list(&mut self.transport, entry).await
     }
 
-    async fn refresh_transport(&mut self, sessions: &Sessions, owner: &str, id: &str) -> Result<()> {
+    async fn refresh_transport(&mut self, connect: impl Future<Output = Result<Session, sftp::Error>>) -> Result<()> {
         match &mut self.transport {
             Transport::Connected(_) => return Ok(()),
             Transport::CloseFailed(error) => return Err(*error),
@@ -272,8 +511,7 @@ impl Attached {
                 }
             }
         }
-        let result = sessions.connect_sftp(owner, id).await;
-        let session = self.transport.finish(result)?;
+        let session = self.transport.finish(connect.await)?;
         self.transport = Transport::Connected(session);
         Ok(())
     }
@@ -282,14 +520,28 @@ impl Attached {
         let entry = self.browser.entries.get(entry_id).filter(|entry| !entry.is_directory()).ok_or(Error::InvalidEntry)?;
         let result = self.transport.connected()?.open(entry).await;
         let (file, text) = self.transport.finish(result)?;
+        let name = entry.name().into();
+        self.insert_file(file, name, text, false)
+    }
+
+    fn insert_file(&mut self, file: File, name: String, text: String, bridge: bool) -> Result<Opened> {
         let handle = loop {
             let handle = opaque_id()?;
             if let std::collections::hash_map::Entry::Vacant(entry) = self.files.entry(handle.clone()) {
-                entry.insert(OpenFile { file, unknown: false });
+                entry.insert(OpenFile { file, unknown: false, bridge, on_close: None });
                 break handle;
             }
         };
-        Ok(Opened { handle, name: entry.name().into(), text })
+        Ok(Opened { handle, name, text })
+    }
+
+    fn check_file(&self, slot: &Slot, handle: &str) -> Result<()> {
+        let file = self.files.get(handle).ok_or(Error::InvalidHandle)?;
+        if file.bridge || slot.owners.lock().unwrap().panel.as_ref().is_some_and(|panel| !panel.is_cancelled()) {
+            Ok(())
+        } else {
+            Err(Error::Disconnected)
+        }
     }
 
     async fn read(&mut self, handle: &str, reload: bool) -> Result<String> {
@@ -297,7 +549,8 @@ impl Attached {
         let result = self.transport.connected()?.reopen(&opened.file).await;
         let (file, text) = self.transport.finish(result)?;
         if reload {
-            *opened = OpenFile { file, unknown: false };
+            opened.file = file;
+            opened.unknown = false;
         }
         Ok(text)
     }
@@ -368,56 +621,27 @@ pub(crate) fn dispatch(invoke: Invoke) -> bool {
     }
     let id = arg!(String, "sessionId");
     if command == "editor_sftp_attach" {
-        let slot = get!(state.reserve(label, generation, &id), reject);
+        let (slot, panel) = get!(state.reserve(label, generation, &id), reject);
         resolver.respond_async(async move {
             let state = webview.state::<SftpIpc>();
             let label = webview.label();
-            let mut guard = slot.state.lock().await;
-            state.current(label, generation, &id, &slot)?;
             let sessions = webview.state::<Sessions>();
-            let result = match sessions.connect_sftp(label, &id).await {
-                Ok(session) => {
-                    let mut attached = Attached::new(session);
-                    let result = if slot.closing.load(Ordering::Acquire) {
-                        Err(Error::Disconnected)
-                    } else {
-                        attached.list(None).await
-                    };
-                    *guard = Attachment::Active(attached);
-                    result
-                }
-                Err(sftp::Error::Reap(_)) => {
-                    *guard = Attachment::CloseFailed(Error::RemoteFailure);
-                    Err(Error::RemoteFailure)
-                }
-                Err(error) => Err(error.into()),
-            };
-            state.current(label, generation, &id, &slot)?;
-            match result {
-                Ok(listing) => Ok(listing),
-                Err(error) => {
-                    if let Err(cleanup) = guard.close().await {
-                        return Err(cleanup.into());
-                    }
-                    let _ = state.remove(label, generation, &id, Some(&slot));
-                    Err(error.into())
-                }
-            }
+            state.attach_panel(label, generation, &id, &slot, &panel, sessions.connect_sftp(label, &id))
+                .await.map_err(Into::into)
         });
         return true;
     }
     if command == "editor_sftp_detach" {
-        let slot = get!(state.slot(label, generation, &id), reject);
-        if let Some(slot) = &slot {
-            slot.closing.store(true, Ordering::Release);
-        }
+        let panel = get!(state.slot(label, generation, &id), reject).and_then(|slot| {
+            let panel = slot.owners.lock().unwrap().panel.clone()?;
+            panel.cancel();
+            Some((slot, panel))
+        });
         resolver.respond_async(async move {
-            let Some(slot) = slot else { return Ok(()) };
+            let Some((slot, panel)) = panel else { return Ok(()) };
             let state = webview.state::<SftpIpc>();
             let mut guard = slot.state.lock().await;
-            guard.close().await?;
-            let _ = state.remove(webview.label(), generation, &id, Some(&slot));
-            Ok(())
+            state.release_panel(webview.label(), generation, &id, &slot, &panel, &mut guard).await.map_err(Into::into)
         });
         return true;
     }
@@ -429,20 +653,24 @@ pub(crate) fn dispatch(invoke: Invoke) -> bool {
     }
     let slot = get!(slot.ok_or(Error::Unavailable), reject);
     macro_rules! run {
-        ($attached:ident, $body:expr) => {
+        ($attached:ident, $slot:ident, $access:expr, $body:expr) => {
             resolver.respond_async(async move {
                 let state = webview.state::<SftpIpc>();
                 let sessions = webview.state::<Sessions>();
                 let label = webview.label();
                 let mut guard = slot.state.lock().await;
+                let $slot = &slot;
                 state.current(label, generation, &id, &slot)?;
                 let Attachment::Active($attached) = &mut *guard else {
                     return Err(Error::Unavailable.into());
                 };
-                $attached.refresh_transport(&sessions, label, &id).await?;
+                $access?;
+                $attached.refresh_transport(sessions.connect_sftp(label, &id)).await?;
                 state.current(label, generation, &id, &slot)?;
+                $access?;
                 let result = $body;
                 state.current(label, generation, &id, &slot)?;
+                $access?;
                 result.map_err(Into::into)
             })
         };
@@ -450,16 +678,18 @@ pub(crate) fn dispatch(invoke: Invoke) -> bool {
     match command {
         "editor_sftp_list" => {
             let entry = arg!(Option<String>, "entryId");
-            run!(attached, attached.list(entry.as_deref()).await);
+            let panel = get!(slot.owners.lock().unwrap().panel.clone().ok_or(Error::Unavailable), reject);
+            run!(attached, _slot, check_panel(&panel), attached.list(entry.as_deref()).await);
         }
         "editor_sftp_open" => {
             let entry = arg!(String, "entryId");
-            run!(attached, attached.open(&entry).await);
+            let panel = get!(slot.owners.lock().unwrap().panel.clone().ok_or(Error::Unavailable), reject);
+            run!(attached, _slot, check_panel(&panel), attached.open(&entry).await);
         }
         "editor_sftp_compare" | "editor_sftp_reload" => {
             let handle = arg!(String, "handle");
             let reload = command == "editor_sftp_reload";
-            run!(attached, attached.read(&handle, reload).await);
+            run!(attached, file_slot, attached.check_file(file_slot, &handle), attached.read(&handle, reload).await);
         }
         "editor_sftp_save" => {
             let handle = arg!(String, "handle");
@@ -470,6 +700,7 @@ pub(crate) fn dispatch(invoke: Invoke) -> bool {
                 let Attachment::Active(attached) = &mut *guard else {
                     return Err(Error::Unavailable.into());
                 };
+                attached.check_file(&slot, &handle)?;
                 // 교체를 시도한 뒤에는 세션이 닫혀도 코어가 확인한 저장 결과를 돌려준다.
                 attached.save(&handle, &text).await.map_err(Into::into)
             });
@@ -477,13 +708,7 @@ pub(crate) fn dispatch(invoke: Invoke) -> bool {
         "editor_sftp_close" => {
             let handle = arg!(String, "handle");
             resolver.respond_async(async move {
-                let state = webview.state::<SftpIpc>();
-                let mut guard = slot.state.lock().await;
-                if state.current(webview.label(), generation, &id, &slot).is_ok() {
-                    if let Attachment::Active(attached) = &mut *guard {
-                        attached.files.remove(&handle);
-                    }
-                }
+                webview.state::<SftpIpc>().close_file(webview.label(), generation, &id, &slot, &handle).await;
                 Ok(())
             });
         }

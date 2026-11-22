@@ -295,20 +295,39 @@ impl Connection {
         if entry.is_directory {
             return Err(Error::NotRegular);
         }
-        self.open_bound(&entry.directory, &entry.path).await
+        self.open_bound(&entry.directory, &entry.path, OpenFlags::READ).await
+    }
+
+    pub(super) async fn open_absolute(&mut self, path: &str) -> Result<(File, String)> {
+        validate_absolute(path)?;
+        let (parent, name) = path.rsplit_once('/').ok_or(Error::InvalidPath)?;
+        if name.is_empty() || name.starts_with(".zzabba-edit-") {
+            return Err(Error::InvalidPath);
+        }
+        if !self.atomic_replace {
+            return Err(Error::AtomicReplaceUnavailable);
+        }
+        let parent = if parent.is_empty() { "/" } else { parent };
+        let directory = Arc::new(ListedDirectory {
+            plan: Arc::clone(&self.plan),
+            access_path: parent.to_owned(),
+            canonical_path: parent.to_owned(),
+        });
+        self.open_bound(&directory, path, OpenFlags::READ | OpenFlags::WRITE).await
     }
 
     /// 결과 미확인이나 충돌 이후 같은 연결 계획과 경로에서 새 기준본을 읽는다.
     pub(crate) async fn reopen(&mut self, file: &File) -> Result<(File, String)> {
-        self.open_bound(&file.directory, &file.path).await
+        self.open_bound(&file.directory, &file.path, OpenFlags::READ).await
     }
 
     async fn open_bound(
         &self,
         directory: &Arc<ListedDirectory>,
         path: &str,
+        flags: OpenFlags,
     ) -> Result<(File, String)> {
-        let (bytes, access) = self.read_path(directory, path).await?;
+        let (bytes, access) = self.read_path(directory, path, flags).await?;
         let baseline = Revision::new(&bytes, access);
         let text = String::from_utf8(bytes).map_err(|_| Error::InvalidUtf8)?;
         Ok((
@@ -442,14 +461,18 @@ impl Connection {
         &self,
         directory: &ListedDirectory,
         path: &str,
+        flags: OpenFlags,
     ) -> Result<(Vec<u8>, Access)> {
         directory.check(self).await?;
         let before = self.channel.lstat(path).await?.attrs;
         let access = Access::regular(&before)?;
+        if flags.contains(OpenFlags::WRITE) && access.mode & 0o7000 != 0 {
+            return Err(Error::UnsafePermissions);
+        }
         self.check_target_path(path).await?;
         let handle = self
             .channel
-            .open(path, OpenFlags::READ, FileAttributes::empty())
+            .open(path, flags, FileAttributes::empty())
             .await?
             .handle;
         let result = async {
@@ -560,7 +583,7 @@ impl Connection {
     }
 
     async fn recheck(&self, file: &File) -> Result<Option<RemoteVersion>> {
-        match self.read_path(&file.directory, &file.path).await {
+        match self.read_path(&file.directory, &file.path, OpenFlags::READ).await {
             Ok((bytes, access)) if Revision::new(&bytes, access) == file.baseline => Ok(None),
             Ok((bytes, _)) => Ok(Some(match String::from_utf8(bytes) {
                 Ok(text) => RemoteVersion::Text(text),
@@ -659,4 +682,4 @@ fn failed(stage: SaveStage, error: Error, cleanup: Option<Cleanup>) -> SaveOutco
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

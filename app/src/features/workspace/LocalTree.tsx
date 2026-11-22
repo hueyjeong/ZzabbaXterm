@@ -1,8 +1,8 @@
 import { useLayoutEffect, useRef, useState, type KeyboardEvent } from "react";
 import type { SavedConnections } from "../connections/connectionIpc";
 
-type OpenTarget = (target?: SavedConnections["targets"][number]["profile"]) => void;
-type MenuTarget = { method: string; open: () => void; sshTargetId?: string; s3TargetId?: string; openTunnel?: () => void };
+type OpenTarget = (target?: SavedConnections["targets"][number]["profile"], options?: { readonly remoteEditor?: true }) => void;
+type MenuTarget = { method: string; open: () => void; sshTargetId?: string; s3TargetId?: string; openTunnel?: () => void; openRemoteEditor?: () => void };
 
 export function LocalTree({ profiles, onOpen, onRegisterSshHost, onRetestS3, onOpenTunnel }: {
   profiles?: SavedConnections; onOpen: OpenTarget; onRegisterSshHost: (targetId: string) => void;
@@ -28,6 +28,12 @@ export function LocalTree({ profiles, onOpen, onRegisterSshHost, onRetestS3, onO
         method: target.defaultMethod === "ssm" ? "AWS Systems Manager" : target.defaultMethod === "ssh" ? "SSH"
           : target.defaultMethod === "s3" ? "S3" : "로컬",
         sshTargetId: target.defaultMethod === "ssh" ? target.id : undefined,
+        openRemoteEditor: target.defaultMethod === "ssh" && target.ssh.transport.kind === "direct" &&
+          (target.ssh.auth.kind === "agent" || target.ssh.auth.kind === "keyFile") ? () => {
+            if (window.confirm(`${target.displayName} (${target.ssh.account}@${target.ssh.host}:${target.ssh.port}): 관리자가 SSH 셸과 SFTP에서 같은 경로가 같은 파일을 가리킨다고 확인했습니까?`)) {
+              onOpen(target, { remoteEditor: true });
+            }
+          } : undefined,
         s3TargetId: target.defaultMethod === "s3" && onRetestS3 ? target.id : undefined,
         openTunnel: target.defaultMethod === "ssm" || (target.defaultMethod === "ssh" && target.ssh.transport.kind === "direct")
           ? () => onOpenTunnel(target.id, target.displayName, target.defaultMethod) : undefined,
@@ -53,7 +59,8 @@ export function LocalTree({ profiles, onOpen, onRegisterSshHost, onRetestS3, onO
 
   function showMenu(row: HTMLLIElement, target: MenuTarget, x: number, y: number) {
     row.focus();
-    const extraActions = Number(target.sshTargetId !== undefined) + Number(target.s3TargetId !== undefined) + Number(!!target.openTunnel);
+    const extraActions = Number(target.sshTargetId !== undefined) + Number(target.s3TargetId !== undefined) +
+      Number(!!target.openTunnel) + Number(!!target.openRemoteEditor);
     const menuHeight = 44 + 36 * extraActions;
     setMenu({ row, target, x: Math.min(x, window.innerWidth - 170), y: Math.min(y, window.innerHeight - menuHeight) });
   }
@@ -146,6 +153,11 @@ export function LocalTree({ profiles, onOpen, onRegisterSshHost, onRetestS3, onO
         setMenu(undefined);
         menu.target.open();
       }}>{menu.target.method}</button>
+      {menu.target.openRemoteEditor && <button type="button" role="menuitem" onClick={() => {
+        menu.row.focus();
+        setMenu(undefined);
+        menu.target.openRemoteEditor?.();
+      }}>nano 연동으로 열기</button>}
       {sshTargetId !== undefined && <button type="button" role="menuitem" onClick={() => {
         menu.row.focus();
         setMenu(undefined);

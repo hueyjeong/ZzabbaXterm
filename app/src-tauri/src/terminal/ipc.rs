@@ -20,9 +20,10 @@ pub(crate) fn terminal_open(invoke: Invoke) {
             u16::from_command(argument("cols"))?,
             Channel::<InvokeResponseBody>::from_command(argument("output"))?,
             Option::<String>::from_command(argument("targetId"))?,
+            Option::<bool>::from_command(argument("remoteEditor"))?,
         ))
     };
-    let (webview, rows, cols, output, target_id) = match parse() {
+    let (webview, rows, cols, output, target_id, remote_editor) = match parse() {
         Ok(args) => args,
         Err(error) => { resolver.invoke_error(error); return; }
     };
@@ -30,18 +31,27 @@ pub(crate) fn terminal_open(invoke: Invoke) {
         resolver.reject("앱의 로컬 기본 창에서만 저장된 연결을 열 수 있습니다");
         return;
     }
+    let remote_editor = remote_editor == Some(true) && target_id.is_some();
     resolver.respond_async(async move {
         blocking(move || {
-            let command = match target_id {
+            let mut command = match target_id {
                 Some(id) => {
                     let directory = webview.path().app_config_dir().map_err(|error| stage("앱 설정 디렉터리", error))?;
                     saved::launch(&directory, &id)?
                 }
                 None => Launch::Local(shell()),
             };
-            webview.state::<Sessions>().open_document(webview.label(), document, size(rows, cols), command, move |event| {
+            let parent = match &mut command {
+                Launch::Ssh(launch) if remote_editor => Some(launch.enable_editor(
+                    webview.app_handle().clone(), webview.label().into(), document,
+                )),
+                _ => None,
+            };
+            let id = webview.state::<Sessions>().open_document(webview.label(), document, size(rows, cols), command, move |event| {
                 event.send(&output).map_err(|error| error.to_string())
-            })
+            })?;
+            if let Some(parent) = parent { let _ = parent.send(id.clone()); }
+            Ok(id)
         }).await.map_err(Into::into)
     });
 }
