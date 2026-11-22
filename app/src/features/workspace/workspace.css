@@ -62,6 +62,7 @@
 }
 .workspace-tab button { padding-inline: 12px; }
 .workspace-tab button:last-child { width: 28px; padding: 0; }
+.workspace-tabs .storage-add { flex: none; padding-inline: 12px; }
 .workspace-drag-gap { flex: 1 0 48px; }
 .workspace-mode { flex: none; width: 86px; border-inline-start: 1px solid var(--border) !important; }
 .window-control { flex: none; width: 44px; font-size: 17px !important; }

@@ -9,14 +9,39 @@ use std::{
 
 const CONFIG_LIMIT: u64 = 1024 * 1024;
 
-pub(super) struct ExportConfig {
-    pub(super) ini: String,
-    pub(super) cache_key: String,
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct DirectSsoConfig {
+    pub(crate) account: String,
+    pub(crate) role: String,
+    pub(crate) region: String,
+    pub(crate) start_url: String,
+    pub(crate) session: Option<String>,
+}
+
+impl DirectSsoConfig {
+    pub(super) fn cli_ini(&self) -> String {
+        self.cli_ini_for("default")
+    }
+
+    pub(super) fn cli_ini_for(&self, profile: &str) -> String {
+        let Self { account, role, region, start_url, session } = self;
+        let section = if profile == "default" { "default".to_owned() } else { format!("profile \"{}\"", profile.replace('"', "\\\"")) };
+        let mut config = format!("[{section}]\nsso_account_id = {account}\nsso_role_name = {role}\n");
+        if let Some(name) = session {
+            config.push_str(&format!("sso_session = {name}\n[sso-session \"{name}\"]\n"));
+        }
+        config.push_str(&format!("sso_region = {region}\nsso_start_url = {start_url}\n"));
+        config
+    }
+
+    pub(crate) fn cache_key(&self) -> &str {
+        self.session.as_deref().unwrap_or(&self.start_url)
+    }
 }
 
 pub(super) struct Profiles {
     known: HashSet<String>,
-    direct: HashMap<String, ExportConfig>,
+    direct: HashMap<String, DirectSsoConfig>,
 }
 
 impl Profiles {
@@ -36,9 +61,14 @@ impl Profiles {
         }
     }
 
-    pub(super) fn export_config(&self, name: &str) -> Result<&ExportConfig, CliError> {
+    pub(super) fn export_config(&self, name: &str) -> Result<&DirectSsoConfig, CliError> {
         self.require(name)?;
         Ok(&self.direct[name])
+    }
+
+    pub(super) fn take_export_config(&mut self, name: &str) -> Result<DirectSsoConfig, CliError> {
+        self.require(name)?;
+        Ok(self.direct.remove(name).expect("required direct profile"))
     }
 
     fn parse(config: &str, credentials: &str) -> Result<Self, CliError> {
@@ -103,7 +133,7 @@ impl Profiles {
 fn direct_config(
     options: &Options<'_>,
     sessions: &HashMap<String, Section<'_>>,
-) -> Option<ExportConfig> {
+) -> Option<DirectSsoConfig> {
     if options.keys().any(|key| {
         key.starts_with("aws_")
             || matches!(
@@ -154,15 +184,12 @@ fn direct_config(
     {
         return None;
     }
-    // 이름은 앱의 Scope에 남기고 CLI에는 검증한 공급자 설정만 전달한다.
-    let mut config = format!("[default]\nsso_account_id = {account}\nsso_role_name = {role}\n");
-    if let Some(name) = name {
-        config.push_str(&format!("sso_session = {name}\n[sso-session \"{name}\"]\n"));
-    }
-    config.push_str(&format!("sso_region = {region}\nsso_start_url = {url}\n"));
-    Some(ExportConfig {
-        ini: config,
-        cache_key: name.unwrap_or(url).to_owned(),
+    Some(DirectSsoConfig {
+        account: (*account).to_owned(),
+        role: (*role).to_owned(),
+        region: (*region).to_owned(),
+        start_url: (*url).to_owned(),
+        session: name.map(str::to_owned),
     })
 }
 

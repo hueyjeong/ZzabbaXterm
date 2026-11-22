@@ -65,6 +65,22 @@ impl Directory {
         Ok(file.metadata()?.is_file().then_some(file))
     }
 
+    pub(super) fn open_storage_file(&self, name: &OsStr) -> io::Result<Option<File>> {
+        let name = c_name(name);
+        // Only ENOENT from the no-follow lookup on the held parent means a new destination.
+        let selected = match self.stat_id(&name) {
+            Ok(Some(id)) => id,
+            Ok(None) => return Err(io::ErrorKind::InvalidInput.into()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let file = self.open_at(&name, libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK)?;
+        if !file.metadata()?.is_file() || file_id(&file)? != selected {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        Ok(Some(file))
+    }
+
     pub(super) fn check_replace_access(&self, name: &OsStr, file: &File) -> io::Result<()> {
         if file.metadata()?.permissions().readonly() {
             return Err(io::Error::new(
@@ -86,7 +102,7 @@ impl Directory {
         self.stat_id(&c_name(name))
     }
 
-    pub(super) fn stage(&self, _: &Access) -> io::Result<Temporary<'_>> {
+    pub(super) fn stage(&self, _: Option<&Access>) -> io::Result<Temporary<'_>> {
         let name = c_name(&temporary_name()?);
         // SAFETY: the held parent and single component remain live through mkdirat.
         if unsafe { libc::mkdirat(self.file.as_raw_fd(), name.as_ptr(), 0o700) } == -1 {
@@ -259,7 +275,16 @@ impl Temporary<'_> {
         Ok(())
     }
 
+    pub(super) fn install(mut self, name: &OsStr, replace: bool) -> io::Result<()> {
+        self.install_inner(name, replace)
+    }
+
     pub(super) fn replace(mut self, name: &OsStr) -> io::Result<File> {
+        self.install_inner(name, true)?;
+        Ok(self.file.take().expect("temporary file is open"))
+    }
+
+    fn install_inner(&mut self, name: &OsStr, replace: bool) -> io::Result<()> {
         self.check_private()?;
         let held = self.file.as_ref().expect("temporary file is open");
         let named = open_at(
@@ -272,6 +297,12 @@ impl Temporary<'_> {
         }
         let target = c_name(name);
         // SAFETY: both names are single components relative to the held directories.
+        if !replace {
+            if unsafe { libc::linkat(self.directory.as_raw_fd(), c"body".as_ptr(), self.parent.file.as_raw_fd(), target.as_ptr(), 0) } == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            return Ok(());
+        }
         if unsafe {
             libc::renameat(
                 self.directory.as_raw_fd(),
@@ -283,7 +314,7 @@ impl Temporary<'_> {
         {
             return Err(io::Error::last_os_error());
         }
-        Ok(self.file.take().expect("temporary file is open"))
+        Ok(())
     }
 }
 

@@ -22,9 +22,20 @@ fn main() {
         "ai_cancel_proposal",
         "ai_decisions",
         "ssm_discovery",
+        "storage_open", "storage_list_buckets", "storage_list_objects", "storage_select_local_file",
+        "storage_upload", "storage_download", "storage_cancel_approval", "storage_close",
+        "storage_relogin",
         "ai_cli_review",
         "ai_policy", "ai_set_policy",
     ]);
-    tauri_build::try_build(tauri_build::Attributes::new().app_manifest(app))
-        .expect("failed to build app permissions");
+    let mut attributes = tauri_build::Attributes::new().app_manifest(app);
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+    {
+        attributes = attributes.windows_attributes(tauri_build::WindowsAttributes::new_without_app_manifest());
+        // Common Controls v6는 Tauri 실행 파일과 라이브러리 테스트에 필요하다.
+        println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
+        println!("cargo:rustc-link-arg=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'");
+    }
+    tauri_build::try_build(attributes).expect("failed to build app permissions");
 }
