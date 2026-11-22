@@ -44,18 +44,21 @@ fn closing_a_slot_revokes_requests_and_cannot_remove_its_replacement() {
 
 #[tokio::test]
 async fn bridge_and_panel_share_the_parent_transport_but_not_handles_across_parents() {
+    use crate::editor::nano_bridge::Outcome;
     use sftp::tests::in_memory_session;
 
     const PATH: &str = "/workspace/한글.txt";
+    const OFFER: &str = "first-offer";
     let first_root = tempfile::tempdir().unwrap();
     let second_root = tempfile::tempdir().unwrap();
     let ipc = SftpIpc::default();
+    let nano = NanoBridge::default();
     ipc.navigate("main", 1);
     ipc.navigate("other", 1);
     assert!(matches!(ipc.bind_bridge("other", 1, "first", SharedSftpNamespace::AdministratorConfirmed),
         Err(BridgeError(Error::Unavailable))));
     let bridge = ipc.bind_bridge("main", 1, "first", SharedSftpNamespace::AdministratorConfirmed).unwrap();
-    let remote = ipc.open_bridge_with(&bridge, PATH, async { Ok(in_memory_session(first_root.path(), "첫 파일").await) }).await.unwrap();
+    let remote = ipc.open_bridge_with(&bridge, PATH, OFFER, async { Ok(in_memory_session(first_root.path(), "첫 파일").await) }).await.unwrap();
 
     let (slot, panel) = ipc.reserve("main", 1, "first").unwrap();
     assert!(Arc::ptr_eq(&slot, &bridge.slot));
@@ -70,28 +73,32 @@ async fn bridge_and_panel_share_the_parent_transport_but_not_handles_across_pare
     assert_ne!(remote.handle, listed.handle);
 
     let other = ipc.bind_bridge("main", 1, "second", SharedSftpNamespace::AdministratorConfirmed).unwrap();
-    let same_name = ipc.open_bridge_with(&other, PATH, async { Ok(in_memory_session(second_root.path(), "둘째 파일").await) }).await.unwrap();
+    let same_name = ipc.open_bridge_with(&other, PATH, "second-offer", async { Ok(in_memory_session(second_root.path(), "둘째 파일").await) }).await.unwrap();
     assert_eq!(same_name.name, remote.name);
     assert_ne!(same_name.text, remote.text);
-    assert!(matches!(ipc.watch_bridge_close(&other, &remote.handle, || panic!()).await, Err(BridgeError(Error::InvalidHandle))));
-    assert!(matches!(ipc.watch_bridge_close(&bridge, &listed.handle, || panic!()).await, Err(BridgeError(Error::InvalidHandle))));
-
-    let (closed, mut observed) = tokio::sync::oneshot::channel();
-    ipc.watch_bridge_close(&bridge, &remote.handle, || { let _ = closed.send(()); }).await.unwrap();
+    let handle = remote.handle.clone();
+    let request = CancellationToken::new();
+    let (_, mut observed) = nano.offer(OFFER.into(), 1, "first", remote, request, bridge.cancellation());
+    nano.claim("main", 1, OFFER).unwrap();
+    assert!(nano.mounted("main", 1, OFFER, &handle));
+    ipc.discard_bridge_file(&other, OFFER, &handle).await;
+    ipc.discard_bridge_file(&bridge, OFFER, &listed.handle).await;
+    ipc.discard_bridge_file(&bridge, "wrong-offer", &handle).await;
     panel.cancel();
     {
         let mut guard = slot.state.lock().await;
         ipc.release_panel("main", 1, "first", &slot, &panel, &mut guard).await.unwrap();
         let Attachment::Active(attached) = &mut *guard else { panic!("패널 분리로 브리지 전송이 종료됨") };
         assert!(matches!(attached.read(&listed.handle, false).await, Err(Error::InvalidHandle)));
-        assert_eq!(attached.read(&remote.handle, true).await.unwrap(), "첫 파일");
-        assert!(matches!(attached.save(&remote.handle, "새 내용").await.unwrap(), SaveResult::Saved));
+        assert_eq!(attached.check_file(&slot, &handle, &nano, "main", 1, "first"), Ok(()));
+        assert_eq!(attached.read(&handle, true).await.unwrap(), "첫 파일");
+        assert!(matches!(attached.save(&handle, "새 내용").await.unwrap(), SaveResult::Saved));
         assert!(matches!(attached.open(&listing.entries[0].entry_id).await, Err(Error::InvalidEntry)));
     }
-    ipc.close_file("main", 1, "second", &other.slot, &remote.handle).await;
+    ipc.close_file(&nano, "main", 1, "second", &other.slot, &handle).await;
     assert!(matches!(observed.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
-    ipc.close_file("main", 1, "first", &slot, &remote.handle).await;
-    assert_eq!(observed.try_recv(), Ok(()));
+    ipc.close_file(&nano, "main", 1, "first", &slot, &handle).await;
+    assert_eq!(observed.try_recv().unwrap(), Outcome::Closed);
 
     let (reattached, new_panel) = ipc.reserve("main", 1, "first").unwrap();
     assert!(Arc::ptr_eq(&reattached, &slot));
@@ -101,15 +108,19 @@ async fn bridge_and_panel_share_the_parent_transport_but_not_handles_across_pare
         let owners = slot.owners.lock().unwrap();
         assert!(Arc::ptr_eq(owners.panel.as_ref().unwrap(), &new_panel));
     }
-    let discarded = ipc.open_bridge_with(&bridge, PATH, async { panic!("다시 열기도 같은 전송을 사용해야 함") }).await.unwrap();
-    ipc.watch_bridge_close(&bridge, &discarded.handle, || panic!("오퍼 폐기는 탭 닫기가 아님")).await.unwrap();
-    ipc.discard_bridge_file(&bridge, &discarded.handle).await;
-    ipc.close_file("main", 1, "first", &slot, &discarded.handle).await;
+    let discarded = ipc.open_bridge_with(&bridge, PATH, "discarded", async { panic!("다시 열기도 같은 전송을 사용해야 함") }).await.unwrap();
+    let discarded_handle = discarded.handle.clone();
+    let (_, mut unnotified) = nano.offer("discarded".into(), 1, "first", discarded,
+        CancellationToken::new(), bridge.cancellation());
+    nano.claim("main", 1, "discarded").unwrap();
+    ipc.discard_bridge_file(&bridge, "discarded", &discarded_handle).await;
+    ipc.close_file(&nano, "main", 1, "first", &slot, &discarded_handle).await;
+    assert!(matches!(unnotified.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
 
     let cancelled = bridge.cancellation();
     ipc.navigate("main", 2);
     assert!(cancelled.is_cancelled() && other.cancellation().is_cancelled());
-    assert!(matches!(ipc.open_bridge_with(&bridge, PATH, async { panic!("이전 세대의 요청") }).await,
+    assert!(matches!(ipc.open_bridge_with(&bridge, PATH, OFFER, async { panic!("이전 세대의 요청") }).await,
         Err(BridgeError(Error::DocumentClosed))));
 }
 
@@ -124,7 +135,7 @@ async fn bridge_cancellation_during_attach_rejects_the_open_without_revoking_the
         cancel.cancel();
         Ok(sftp::tests::in_memory_session(root.path(), "내용").await)
     };
-    assert!(matches!(ipc.open_bridge_with(&bridge, "/workspace/한글.txt", start).await,
+    assert!(matches!(ipc.open_bridge_with(&bridge, "/workspace/한글.txt", "offer", start).await,
         Err(BridgeError(Error::Disconnected))));
 
     let (slot, panel) = ipc.reserve("main", 1, "ssh").unwrap();
@@ -133,6 +144,58 @@ async fn bridge_cancellation_during_attach_rejects_the_open_without_revoking_the
     let Attachment::Active(attached) = &mut *guard else { panic!("SFTP 전송 없음") };
     assert!(attached.files.is_empty());
     assert_eq!(attached.open(&listing.entries[0].entry_id).await.unwrap().text, "내용");
+}
+
+#[tokio::test]
+async fn bridge_file_authority_requires_the_exact_live_mount() {
+    use crate::editor::nano_bridge::{MountStatus, Outcome};
+
+    const PATH: &str = "/workspace/한글.txt";
+    const OFFER: &str = "offer";
+    let root = tempfile::tempdir().unwrap();
+    let ipc = SftpIpc::default();
+    let nano = NanoBridge::default();
+    ipc.navigate("main", 1);
+    let bridge = ipc.bind_bridge("main", 1, "ssh", SharedSftpNamespace::AdministratorConfirmed).unwrap();
+    let opened = ipc.open_bridge_with(&bridge, PATH, OFFER, async {
+        Ok(sftp::tests::in_memory_session(root.path(), "내용").await)
+    }).await.unwrap();
+    let handle = opened.handle.clone();
+    let request = CancellationToken::new();
+    let (_, mut done) = nano.offer(OFFER.into(), 1, "ssh", opened, request.clone(), bridge.cancellation());
+    let (slot, panel) = ipc.reserve("main", 1, "ssh").unwrap();
+    let listing = ipc.attach_panel("main", 1, "ssh", &slot, &panel, async { panic!("공유 전송 재사용") }).await.unwrap();
+    {
+        let mut guard = slot.state.lock().await;
+        let Attachment::Active(attached) = &mut *guard else { panic!("SFTP 전송 없음") };
+        let listed = attached.open(&listing.entries[0].entry_id).await.unwrap();
+        assert_eq!(attached.check_file(&slot, &listed.handle, &nano, "main", 1, "ssh"), Ok(()));
+        let check = |label: &str, generation, parent: &str, handle: &str| {
+            attached.check_file(&slot, handle, &nano, label, generation, parent)
+        };
+        assert_eq!(check("main", 1, "ssh", &handle), Err(Error::InvalidHandle));
+        nano.claim("main", 1, OFFER).unwrap();
+        assert_eq!(check("main", 1, "ssh", &handle), Err(Error::InvalidHandle));
+        assert!(nano.mounted("main", 1, OFFER, &handle));
+        assert_eq!(check("main", 1, "ssh", &handle), Ok(()));
+        assert_eq!(check("other", 1, "ssh", &handle), Err(Error::InvalidHandle));
+        assert_eq!(check("main", 2, "ssh", &handle), Err(Error::InvalidHandle));
+        assert_eq!(check("main", 1, "other", &handle), Err(Error::InvalidHandle));
+        assert_eq!(check("main", 1, "ssh", "other-handle"), Err(Error::InvalidHandle));
+        assert!(!nano.is_mounted("main", 1, "ssh", "wrong-offer", &handle));
+        request.cancel();
+        assert_eq!(check("main", 1, "ssh", &handle), Err(Error::InvalidHandle));
+        assert_eq!(check("main", 1, "ssh", &listed.handle), Ok(()));
+    }
+    assert_eq!(nano.mount_failed("main", 1, OFFER, Some(&handle)), MountStatus::Unavailable);
+    ipc.discard_bridge_file(&bridge, OFFER, &handle).await;
+    {
+        let guard = slot.state.lock().await;
+        let Attachment::Active(attached) = &*guard else { panic!("실패 폐기는 공유 전송을 유지해야 함") };
+        assert!(!attached.files.contains_key(&handle));
+    }
+    ipc.close_file(&nano, "main", 1, "ssh", &slot, &handle).await;
+    assert_eq!(done.try_recv().unwrap(), Outcome::Failed);
 }
 
 #[tokio::test]

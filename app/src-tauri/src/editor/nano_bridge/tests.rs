@@ -32,11 +32,14 @@ fn recovery_claim_and_mount_stay_in_the_exact_document() {
     assert!(!state.mounted(MAIN, 5, id, "wrong-handle"));
     assert!(!state.mounted(MAIN, 6, id, &claim.handle));
     assert!(state.mounted(MAIN, 5, id, &claim.handle));
-    assert!(!state.claim_delivery_failed(MAIN, 5, id));
+    assert_eq!(state.mount_failed(MAIN, 5, id, None), MountStatus::Unavailable);
     state.interrupted(id, true);
-    NanoBridge::file_closed(&state.0, &other.offer_id);
+    state.file_closed(MAIN, 5, "12", &other.offer_id, &claim.handle);
+    state.file_closed(MAIN, 5, "13", id, &claim.handle);
+    state.file_closed(MAIN, 4, "12", id, &claim.handle);
+    state.file_closed(MAIN, 5, "12", id, "wrong-handle");
     assert!(matches!(done.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
-    NanoBridge::file_closed(&state.0, id);
+    state.file_closed(MAIN, 5, "12", id, &claim.handle);
     assert_eq!(done.try_recv().unwrap(), Outcome::Closed);
 }
 
@@ -65,17 +68,68 @@ fn failed_claim_delivery_and_disconnected_mount_fail_the_remote_wait() {
     let state = NanoBridge::default();
     let (offer, mut done, _, _) = fixture(&state);
     state.claim(MAIN, 5, &offer.offer_id).unwrap();
-    assert!(!state.claim_delivery_failed(MAIN, 4, &offer.offer_id));
-    assert!(state.claim_delivery_failed(MAIN, 5, &offer.offer_id));
+    assert_eq!(state.mount_failed(MAIN, 4, &offer.offer_id, None), MountStatus::Unavailable);
+    assert!(matches!(done.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+    assert_eq!(state.mount_failed(MAIN, 5, &offer.offer_id, None), MountStatus::Unavailable);
     assert_eq!(done.try_recv().unwrap(), Outcome::Failed);
-    assert!(!state.claim_delivery_failed(MAIN, 5, &offer.offer_id));
+    assert_eq!(state.mount_failed(MAIN, 5, &offer.offer_id, None), MountStatus::Unavailable);
 
     let (offer, mut done, _, slot) = fixture(&state);
     state.claim(MAIN, 5, &offer.offer_id).unwrap();
     assert!(state.mounted(MAIN, 5, &offer.offer_id, "exact-handle"));
     slot.cancel();
-    NanoBridge::file_closed(&state.0, &offer.offer_id);
+    assert!(!state.is_mounted(MAIN, 5, "12", &offer.offer_id, "exact-handle"));
+    state.file_closed(MAIN, 5, "12", &offer.offer_id, "exact-handle");
     assert_eq!(done.try_recv().unwrap(), Outcome::Failed);
+}
+
+#[test]
+fn recovery_retains_a_live_exact_mount_or_revokes_the_exact_claim() {
+    let state = NanoBridge::default();
+    let (offer, mut done, _, _) = fixture(&state);
+    let id = &offer.offer_id;
+    let claim = state.claim(MAIN, 5, id).unwrap();
+    let handle = claim.handle.as_str();
+    assert_eq!(state.mount_failed(MAIN, 5, id, Some("wrong-handle")), MountStatus::Unavailable);
+    assert!(state.mounted(MAIN, 5, id, handle));
+    assert_eq!(state.mount_failed("other", 5, id, Some(handle)), MountStatus::Unavailable);
+    assert_eq!(state.mount_failed(MAIN, 4, id, Some(handle)), MountStatus::Unavailable);
+    assert_eq!(state.mount_failed(MAIN, 5, id, Some(handle)), MountStatus::Mounted);
+    assert!(state.is_mounted(MAIN, 5, "12", id, handle));
+    assert!(!state.is_mounted(MAIN, 5, "12", id, "wrong-handle"));
+    assert_eq!(state.mount_failed(MAIN, 5, id, Some("wrong-handle")), MountStatus::Unavailable);
+    assert!(matches!(done.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+
+    let (offer, mut done, _, _) = fixture(&state);
+    let revoked_id = &offer.offer_id;
+    state.claim(MAIN, 5, revoked_id).unwrap();
+    assert_eq!(state.mount_failed(MAIN, 5, revoked_id, Some(handle)), MountStatus::Unavailable);
+    assert_eq!(done.try_recv().unwrap(), Outcome::Failed);
+    assert!(!state.mounted(MAIN, 5, revoked_id, handle));
+    assert!(state.is_mounted(MAIN, 5, "12", id, handle));
+}
+
+#[test]
+fn cancelling_a_pending_offer_preserves_fallback_and_cancelled_mounts_are_unavailable() {
+    let state = NanoBridge::default();
+    let (offer, mut done, _, _) = fixture(&state);
+    assert_eq!(state.mount_failed(MAIN, 5, &offer.offer_id, None), MountStatus::Unavailable);
+    assert_eq!(done.try_recv().unwrap(), Outcome::Unattached);
+    assert!(state.claim(MAIN, 5, &offer.offer_id).is_none());
+
+    let (offer, mut done, cancel, _) = fixture(&state);
+    let claim = state.claim(MAIN, 5, &offer.offer_id).unwrap();
+    assert!(state.mounted(MAIN, 5, &offer.offer_id, &claim.handle));
+    cancel.cancel();
+    assert_eq!(state.mount_failed(MAIN, 5, &offer.offer_id, Some(&claim.handle)), MountStatus::Unavailable);
+    assert_eq!(done.try_recv().unwrap(), Outcome::Failed);
+}
+
+#[test]
+fn mount_recovery_result_is_a_lowercase_wire_string() {
+    let wire = |status| serde_json::to_value(status).unwrap();
+    assert_eq!(wire(MountStatus::Mounted), serde_json::json!("mounted"));
+    assert_eq!(wire(MountStatus::Unavailable), serde_json::json!("unavailable"));
 }
 
 #[tokio::test]

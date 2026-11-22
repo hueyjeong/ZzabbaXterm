@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::{Arc, Mutex}, time::Duration};
+use std::{collections::HashMap, sync::Mutex, time::Duration};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, EventTarget, Manager};
@@ -16,7 +16,7 @@ use super::{
 const OFFER_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
-pub(crate) struct NanoBridge(Arc<Mutex<HashMap<String, Entry>>>);
+pub(crate) struct NanoBridge(Mutex<HashMap<String, Entry>>);
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -48,8 +48,15 @@ enum Phase {
     Mounted,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum MountStatus {
+    Mounted,
+    Unavailable,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Outcome {
+pub(super) enum Outcome {
     Unattached,
     Failed,
     Closed,
@@ -106,21 +113,37 @@ impl NanoBridge {
         true
     }
 
-    pub(crate) fn claim_delivery_failed(&self, label: &str, document: u64, offer_id: &str) -> bool {
+    pub(super) fn mount_failed(
+        &self, label: &str, document: u64, offer_id: &str, handle: Option<&str>,
+    ) -> MountStatus {
         if label != MAIN {
-            return false;
+            return MountStatus::Unavailable;
         }
         let mut entries = self.0.lock().unwrap();
-        if !entries.get(offer_id).is_some_and(|entry| {
-            entry.document == document && matches!(entry.phase, Phase::Claimed)
-        }) {
-            return false;
+        let Some(entry) = entries.get(offer_id) else { return MountStatus::Unavailable; };
+        if entry.document != document || handle.is_some_and(|handle| entry.handle != handle) {
+            return MountStatus::Unavailable;
         }
-        entries.remove(offer_id).unwrap().finish(Outcome::Failed);
-        true
+        let outcome = match entry.phase {
+            Phase::Mounted if handle.is_none() => return MountStatus::Unavailable,
+            Phase::Mounted if entry.accepts(document) => return MountStatus::Mounted,
+            Phase::Pending(_) => Outcome::Unattached,
+            Phase::Claimed | Phase::Mounted => Outcome::Failed,
+        };
+        entries.remove(offer_id).unwrap().finish(outcome);
+        MountStatus::Unavailable
     }
 
-    fn offer(
+    pub(super) fn is_mounted(
+        &self, label: &str, document: u64, parent: &str, offer_id: &str, handle: &str,
+    ) -> bool {
+        label == MAIN && self.0.lock().unwrap().get(offer_id).is_some_and(|entry| {
+            entry.accepts(document) && entry.session_id == parent && entry.handle == handle
+                && matches!(entry.phase, Phase::Mounted)
+        })
+    }
+
+    pub(super) fn offer(
         &self, offer_id: String, document: u64, session_id: &str, opened: Opened,
         request: CancellationToken, slot: CancellationToken,
     ) -> (NanoOffer, oneshot::Receiver<Outcome>) {
@@ -149,15 +172,23 @@ impl NanoBridge {
         entries.remove(offer_id).unwrap().finish(outcome);
     }
 
-    fn file_closed(entries: &Mutex<HashMap<String, Entry>>, offer_id: &str) {
-        if let Some(entry) = entries.lock().unwrap().remove(offer_id) {
-            let outcome = match entry.phase {
-                Phase::Pending(_) => Outcome::Unattached,
-                Phase::Mounted if entry.accepts(entry.document) => Outcome::Closed,
-                Phase::Claimed | Phase::Mounted => Outcome::Failed,
-            };
-            entry.finish(outcome);
+    pub(super) fn file_closed(
+        &self, label: &str, document: u64, parent: &str, offer_id: &str, handle: &str,
+    ) {
+        if label != MAIN {
+            return;
         }
+        let mut entries = self.0.lock().unwrap();
+        let Some(entry) = entries.get(offer_id) else { return; };
+        if entry.document != document || entry.session_id != parent || entry.handle != handle {
+            return;
+        }
+        let outcome = match entry.phase {
+            Phase::Pending(_) => Outcome::Unattached,
+            Phase::Mounted if entry.accepts(document) => Outcome::Closed,
+            Phase::Claimed | Phase::Mounted => Outcome::Failed,
+        };
+        entries.remove(offer_id).unwrap().finish(outcome);
     }
 }
 
@@ -172,19 +203,12 @@ async fn open(
     if request.is_cancelled() || slot_cancel.is_cancelled() || sessions.document(MAIN) != document {
         return Outcome::Unattached;
     }
-    let Ok(opened) = sftp.open_bridge(slot, &sessions, path).await else { return Outcome::Unattached; };
-    let handle = opened.handle.clone();
     let offer_id = uuid::Uuid::new_v4().simple().to_string();
+    let Ok(opened) = sftp.open_bridge(slot, &sessions, path, &offer_id).await else { return Outcome::Unattached; };
+    let handle = opened.handle.clone();
     let state = app.state::<NanoBridge>();
-    let callback_state = Arc::downgrade(&state.0);
-    let callback_id = offer_id.clone();
-    // 감시를 먼저 설치해 마운트 승인 직후의 닫기를 놓치지 않는다.
-    if sftp.watch_bridge_close(slot, &handle, move || {
-        if let Some(entries) = callback_state.upgrade() {
-            NanoBridge::file_closed(&entries, &callback_id);
-        }
-    }).await.is_err() || request.is_cancelled() || slot_cancel.is_cancelled() {
-        sftp.discard_bridge_file(slot, &handle).await;
+    if request.is_cancelled() || slot_cancel.is_cancelled() {
+        sftp.discard_bridge_file(slot, &offer_id, &handle).await;
         return Outcome::Unattached;
     }
     let (offer, mut done) = state.offer(offer_id.clone(), document, parent, opened, request.clone(), slot_cancel.clone());
@@ -212,8 +236,8 @@ async fn open(
             }
         }
     };
-    if outcome == Outcome::Unattached {
-        sftp.discard_bridge_file(slot, &handle).await;
+    if outcome != Outcome::Closed {
+        sftp.discard_bridge_file(slot, &offer_id, &handle).await;
     }
     outcome
 }

@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::terminal::Sessions;
 
-use super::sftp::{self, Entry, File, Session};
+use super::{nano_bridge::NanoBridge, sftp::{self, Entry, File, Session}};
 
 mod response;
 use response::{Error, SaveResult, SaveStage};
@@ -213,8 +213,7 @@ impl Transport {
 struct OpenFile {
     file: File,
     unknown: bool,
-    bridge: bool,
-    on_close: Option<Box<dyn FnOnce() + Send>>,
+    bridge_offer: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -298,14 +297,14 @@ impl SftpIpc {
         Ok(BridgeSlot { label: label.into(), generation, id: id.into(), slot, cancel })
     }
 
-    pub(crate) async fn open_bridge(
-        &self, bridge: &BridgeSlot, sessions: &Sessions, path: &str,
+    pub(super) async fn open_bridge(
+        &self, bridge: &BridgeSlot, sessions: &Sessions, path: &str, offer_id: &str,
     ) -> Result<Opened, BridgeError> {
-        self.open_bridge_with(bridge, path, sessions.connect_sftp(&bridge.label, &bridge.id)).await
+        self.open_bridge_with(bridge, path, offer_id, sessions.connect_sftp(&bridge.label, &bridge.id)).await
     }
 
     async fn open_bridge_with(
-        &self, bridge: &BridgeSlot, path: &str, connect: impl Future<Output = Result<Session, sftp::Error>>,
+        &self, bridge: &BridgeSlot, path: &str, offer_id: &str, connect: impl Future<Output = Result<Session, sftp::Error>>,
     ) -> Result<Opened, BridgeError> {
         bridge.check(self)?;
         let mut guard = bridge.slot.state.lock().await;
@@ -317,28 +316,14 @@ impl SftpIpc {
         let (file, text) = attached.transport.finish(result)?;
         bridge.check(self)?;
         let name = path.rsplit('/').next().expect("absolute file path").into();
-        attached.insert_file(file, name, text, true).map_err(Into::into)
+        attached.insert_file(file, name, text, Some(offer_id.into())).map_err(Into::into)
     }
 
-    pub(crate) async fn watch_bridge_close(
-        &self, bridge: &BridgeSlot, handle: &str, callback: impl FnOnce() + Send + 'static,
-    ) -> Result<(), BridgeError> {
-        let mut guard = bridge.slot.state.lock().await;
-        bridge.check(self)?;
-        let Attachment::Active(attached) = &mut *guard else {
-            return Err(Error::InvalidHandle.into());
-        };
-        let file = attached.files.get_mut(handle).filter(|file| file.bridge && file.on_close.is_none())
-            .ok_or(Error::InvalidHandle)?;
-        file.on_close = Some(Box::new(callback));
-        Ok(())
-    }
-
-    pub(crate) async fn discard_bridge_file(&self, bridge: &BridgeSlot, handle: &str) {
+    pub(super) async fn discard_bridge_file(&self, bridge: &BridgeSlot, offer_id: &str, handle: &str) {
         let mut guard = bridge.slot.state.lock().await;
         if self.current(&bridge.label, bridge.generation, &bridge.id, &bridge.slot).is_ok() {
             if let Attachment::Active(attached) = &mut *guard {
-                if attached.files.get(handle).is_some_and(|file| file.bridge) {
+                if attached.files.get(handle).and_then(|file| file.bridge_offer.as_deref()) == Some(offer_id) {
                     attached.files.remove(handle);
                 }
             }
@@ -376,7 +361,7 @@ impl SftpIpc {
                 return Ok(());
             }
             let preserve = owners.bridge.as_ref().is_some_and(|token| !token.is_cancelled())
-                || matches!(guard, Attachment::Active(attached) if attached.files.values().any(|file| file.bridge));
+                || matches!(guard, Attachment::Active(attached) if attached.files.values().any(|file| file.bridge_offer.is_some()));
             if preserve {
                 owners.panel = None;
             } else {
@@ -387,7 +372,7 @@ impl SftpIpc {
         if preserve_bridge {
             if let Attachment::Active(attached) = guard {
                 attached.browser = Browser::default();
-                attached.files.retain(|_, file| file.bridge);
+                attached.files.retain(|_, file| file.bridge_offer.is_some());
             }
         } else {
             guard.close().await?;
@@ -396,14 +381,17 @@ impl SftpIpc {
         Ok(())
     }
 
-    async fn close_file(&self, label: &str, generation: u64, id: &str, slot: &Slot, handle: &str) {
+    async fn close_file(
+        &self, nano: &NanoBridge, label: &str, generation: u64, id: &str, slot: &Slot, handle: &str,
+    ) {
         let mut guard = slot.state.lock().await;
         if self.current(label, generation, id, slot).is_ok() {
             if let Attachment::Active(attached) = &mut *guard {
-                if let Some(callback) = attached.files.remove(handle).and_then(|file| file.on_close) {
-                    drop(guard);
-                    callback();
+                if let Some(offer_id) = attached.files.get(handle).and_then(|file| file.bridge_offer.as_deref()) {
+                    // 슬롯 잠금 안에서 마운트 상태를 먼저 닫아 복구 응답과 파일 제거가 엇갈리지 않게 한다.
+                    nano.file_closed(label, generation, id, offer_id, handle);
                 }
+                attached.files.remove(handle);
             }
         }
     }
@@ -521,23 +509,31 @@ impl Attached {
         let result = self.transport.connected()?.open(entry).await;
         let (file, text) = self.transport.finish(result)?;
         let name = entry.name().into();
-        self.insert_file(file, name, text, false)
+        self.insert_file(file, name, text, None)
     }
 
-    fn insert_file(&mut self, file: File, name: String, text: String, bridge: bool) -> Result<Opened> {
+    fn insert_file(&mut self, file: File, name: String, text: String, bridge_offer: Option<String>) -> Result<Opened> {
         let handle = loop {
             let handle = opaque_id()?;
             if let std::collections::hash_map::Entry::Vacant(entry) = self.files.entry(handle.clone()) {
-                entry.insert(OpenFile { file, unknown: false, bridge, on_close: None });
+                entry.insert(OpenFile { file, unknown: false, bridge_offer });
                 break handle;
             }
         };
         Ok(Opened { handle, name, text })
     }
 
-    fn check_file(&self, slot: &Slot, handle: &str) -> Result<()> {
+    fn check_file(
+        &self, slot: &Slot, handle: &str, nano: &NanoBridge, label: &str, generation: u64, id: &str,
+    ) -> Result<()> {
         let file = self.files.get(handle).ok_or(Error::InvalidHandle)?;
-        if file.bridge || slot.owners.lock().unwrap().panel.as_ref().is_some_and(|panel| !panel.is_cancelled()) {
+        if let Some(offer_id) = &file.bridge_offer {
+            if nano.is_mounted(label, generation, id, offer_id, handle) {
+                return Ok(());
+            }
+            return Err(Error::InvalidHandle);
+        }
+        if slot.owners.lock().unwrap().panel.as_ref().is_some_and(|panel| !panel.is_cancelled()) {
             Ok(())
         } else {
             Err(Error::Disconnected)
@@ -689,7 +685,9 @@ pub(crate) fn dispatch(invoke: Invoke) -> bool {
         "editor_sftp_compare" | "editor_sftp_reload" => {
             let handle = arg!(String, "handle");
             let reload = command == "editor_sftp_reload";
-            run!(attached, file_slot, attached.check_file(file_slot, &handle), attached.read(&handle, reload).await);
+            run!(attached, file_slot,
+                attached.check_file(file_slot, &handle, &webview.state::<NanoBridge>(), webview.label(), generation, &id),
+                attached.read(&handle, reload).await);
         }
         "editor_sftp_save" => {
             let handle = arg!(String, "handle");
@@ -700,7 +698,7 @@ pub(crate) fn dispatch(invoke: Invoke) -> bool {
                 let Attachment::Active(attached) = &mut *guard else {
                     return Err(Error::Unavailable.into());
                 };
-                attached.check_file(&slot, &handle)?;
+                attached.check_file(&slot, &handle, &webview.state::<NanoBridge>(), webview.label(), generation, &id)?;
                 // 교체를 시도한 뒤에는 세션이 닫혀도 코어가 확인한 저장 결과를 돌려준다.
                 attached.save(&handle, &text).await.map_err(Into::into)
             });
@@ -708,7 +706,7 @@ pub(crate) fn dispatch(invoke: Invoke) -> bool {
         "editor_sftp_close" => {
             let handle = arg!(String, "handle");
             resolver.respond_async(async move {
-                webview.state::<SftpIpc>().close_file(webview.label(), generation, &id, &slot, &handle).await;
+                webview.state::<SftpIpc>().close_file(&webview.state::<NanoBridge>(), webview.label(), generation, &id, &slot, &handle).await;
                 Ok(())
             });
         }

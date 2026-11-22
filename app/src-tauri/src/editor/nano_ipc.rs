@@ -29,6 +29,8 @@ pub(crate) fn dispatch(invoke: Invoke) -> bool {
     }
     // IPC를 받은 문서의 세대를 동기 경계에서 캡처한다.
     let document = webview.state::<Sessions>().document(label);
+    let has_handle = command == FAILED && matches!(message.payload(), InvokeBody::Json(body) if body.get("handle").is_some());
+    let arity = if has_handle { 2 } else { arity };
     if !matches!(message.payload(), InvokeBody::Json(body) if
         (arity == 0 && body.is_null()) || body.as_object().is_some_and(|fields| fields.len() == arity))
     {
@@ -71,11 +73,8 @@ pub(crate) fn dispatch(invoke: Invoke) -> bool {
                 Err(InvokeError::from("원격 nano 편집 탭의 마운트를 승인할 수 없습니다"))
             }
         })),
-        FAILED => {
-            // 마운트 응답만 유실된 경우에는 이미 승인된 탭을 유지한다.
-            bridge.claim_delivery_failed(label, document, offer_id);
-            resolver.resolve(());
-        }
+        FAILED => resolver.respond(has_handle.then(|| id("handle")).transpose()
+            .map(|handle| bridge.mount_failed(label, document, offer_id, handle))),
         _ => unreachable!(),
     }
     true
