@@ -50,7 +50,8 @@ fn only_the_current_reservation_publishes_settings_and_tab() {
         }, || aws_smithy_runtime_api::client::http::SharedHttpClient::new(crate::storage::tests::replay([]))).unwrap();
         PreparedOpen {
             client, target: settings.view(), settings: Some(settings.stage_save(path.clone()).unwrap()),
-            initial_buckets: Page { rows: Vec::new(), next_token: None }, approved_saved: None,
+            initial_buckets: Page { rows: Vec::new(), next_token: None },
+            approved_saved: ApprovedSaved { path: path.clone(), expected: None },
         }
     };
 
@@ -60,7 +61,7 @@ fn only_the_current_reservation_publishes_settings_and_tab() {
     assert!(matches!(state.finish_compatible(document.clone(), id.clone(), &first, Ok(cancelled)), Err(OpenError::Settings(SettingsError::Cancelled))));
     assert_eq!(Settings::load(&path).err(), Some(SettingsError::NotFound));
     assert!(!state.close(&document, &id));
-    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
 
     let stale = state.reserve_compatible(&document, &id).unwrap();
     let before_replacement = prepare("stale-before");
@@ -82,7 +83,42 @@ fn only_the_current_reservation_publishes_settings_and_tab() {
     assert!(matches!(state.finish_compatible(current_doc, id.clone(), &before_navigation, Ok(navigating)), Err(OpenError::Settings(SettingsError::Cancelled))));
     assert_eq!(Settings::load(&path).unwrap().view().alias, "current");
     assert!(!state.close(&state.document("main"), &id));
-    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+
+    for existing in [false, true] {
+        if !existing {
+            std::fs::remove_file(&path).unwrap();
+        }
+        let race = |alias| {
+            let state = StorageIpc::default();
+            let document = state.document("main");
+            let id = Uuid::new_v4().to_string();
+            let closed = state.reserve_compatible(&document, &id).unwrap();
+            let mut prepared = prepare(alias);
+            if existing {
+                let saved = Settings::load(&path).unwrap();
+                prepared.approved_saved.expected = Some((saved.saved_view().unwrap(), saved.item_id().into()));
+            }
+            (state, document, id, closed, prepared)
+        };
+        let first = race("first");
+        let second = race("second");
+        let start = std::sync::Barrier::new(2);
+        let finish = |(state, document, id, closed, prepared): (StorageIpc, _, _, _, _)| {
+            start.wait();
+            state.finish_compatible(document, id, &closed, Ok(prepared))
+        };
+        let (winner, loser) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| finish(first));
+            let second = finish(second);
+            match (first.join().unwrap(), second) {
+                (Ok(winner), Err(loser)) | (Err(loser), Ok(winner)) => (winner, loser),
+                _ => panic!("expected one publish"),
+            }
+        });
+        assert!(matches!(loser, OpenError::Settings(SettingsError::WrongService)));
+        assert_eq!(Settings::load(&path).unwrap().view(), winner.target);
+    }
 }
 
 #[tokio::test]
@@ -126,7 +162,7 @@ async fn validation_reuses_first_page_and_rejects_failed_requests_and_stale_key_
             assert_eq!(Settings::check_saved(&path, &expected, "unapproved"), Err(SettingsError::WrongService));
             let prepared = PreparedOpen {
                 client, target: original.view(), settings: Some(original.stage_save(path.clone()).unwrap()), initial_buckets,
-                approved_saved: Some(ApprovedSaved { path: path.clone(), expected, item_id: "original".into() }),
+                approved_saved: ApprovedSaved { path: path.clone(), expected: Some((expected, "original".into())) },
             };
             settings("replacement").stage_save(path.clone()).unwrap().publish().unwrap();
             assert!(matches!(state.finish_compatible(document.clone(), id.clone(), &closed, Ok(prepared)), Err(OpenError::Settings(SettingsError::WrongService))));
@@ -138,7 +174,12 @@ async fn validation_reuses_first_page_and_rejects_failed_requests_and_stale_key_
                 ServiceKey::new("fixture-access".into(), "fixture-secret".into())
             }, || SharedHttpClient::new(crate::storage::tests::replay([response(status, xml)]))).unwrap();
             let initial_buckets = verify_open(&client, &closed).await.unwrap();
-            let ready = PreparedOpen { client, target: original.view(), settings: None, initial_buckets, approved_saved: None };
+            original.stage_save(path.clone()).unwrap().publish().unwrap();
+            let saved = Settings::load(&path).unwrap();
+            let ready = PreparedOpen {
+                client, target: saved.view(), settings: None, initial_buckets,
+                approved_saved: ApprovedSaved { path: path.clone(), expected: Some((saved.saved_view().unwrap(), saved.item_id().into())) },
+            };
             let session = state.finish_compatible(document.clone(), id.clone(), &closed, Ok(ready)).unwrap();
             assert_eq!(session.initial_buckets.rows[0].name, "fixture-bucket");
             assert_eq!(session.initial_buckets.next_token.as_deref(), Some("next"));

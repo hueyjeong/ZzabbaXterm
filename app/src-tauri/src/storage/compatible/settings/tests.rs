@@ -82,6 +82,21 @@ fn settings_replace_atomically_and_expose_only_the_public_view() {
 }
 
 #[test]
+fn publish_lock_is_exclusive_and_separate_from_the_replaced_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("compatible.json");
+    let lock = Settings::lock_file(&path).unwrap();
+    let contender = OpenOptions::new().read(true).write(true).open(path.with_extension("lock")).unwrap();
+    assert!(matches!(contender.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
+    let settings = Settings::new(input(ENDPOINT, "경쟁"), reference()).unwrap();
+    settings.stage_save(path.clone()).unwrap().publish().unwrap();
+    assert!(matches!(contender.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
+    drop(lock);
+    contender.try_lock().unwrap();
+    assert_eq!(Settings::load(&path).unwrap().item_id(), ITEM);
+}
+
+#[test]
 fn edited_endpoint_and_cancel_stop_before_approval_or_key_read() {
     let other = "https://other.example.test";
     assert_eq!(

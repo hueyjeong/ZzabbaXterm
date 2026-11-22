@@ -1,4 +1,4 @@
-use std::{ptr::null_mut, slice, sync::Mutex};
+use std::{ptr::null_mut, slice};
 
 use windows_sys::Win32::{
     Foundation::{ERROR_CANCELLED, ERROR_NOT_FOUND, GetLastError},
@@ -15,7 +15,6 @@ mod enrollment;
 pub(crate) use enrollment::prompt;
 
 const MAX_FIELD_UNITS: usize = 256;
-static WRITES: Mutex<()> = Mutex::new(());
 
 struct Credential(*mut CREDENTIALW);
 
@@ -62,7 +61,9 @@ pub(super) fn read(target: &str) -> Result<ServiceKey, KeyAccessError> {
     decode(read_raw(&target)?.blob()?)
 }
 
-pub(crate) fn write_new(target: &str, label: &str, payload: &mut [u8]) -> Result<(), KeyAccessError> {
+pub(crate) fn write_new(
+    target: &str, label: &str, payload: &mut [u8], claim: impl FnOnce() -> Result<(), KeyAccessError>,
+) -> Result<(), KeyAccessError> {
     if target.is_empty() || target.len() > 256 || target.chars().any(char::is_control)
         || label.trim().is_empty() || label.len() > 128 || label.chars().any(char::is_control)
         || !valid_payload(payload)
@@ -71,8 +72,7 @@ pub(crate) fn write_new(target: &str, label: &str, payload: &mut [u8]) -> Result
     }
     let mut target: Vec<u16> = target.encode_utf16().chain([0]).collect();
     let mut label: Vec<u16> = label.encode_utf16().chain([0]).collect();
-    // CredWriteW에는 create-only 플래그가 없다. 앱의 쓰기 경쟁은 이 잠금으로 막는다.
-    let _guard = WRITES.lock().map_err(|_| KeyAccessError::Unavailable)?;
+    // shortcut: CredWriteW에는 create-only 플래그가 없어 외부 쓰기와의 경쟁은 막을 수 없다.
     match read_raw(&target) {
         Ok(_) => return Err(KeyAccessError::AlreadyExists),
         Err(KeyAccessError::Missing) => {}
@@ -87,6 +87,7 @@ pub(crate) fn write_new(target: &str, label: &str, payload: &mut [u8]) -> Result
         Persist: CRED_PERSIST_LOCAL_MACHINE,
         ..Default::default()
     };
+    claim()?;
     if unsafe { CredWriteW(&value, 0) } == 0 {
         return Err(KeyAccessError::Unavailable);
     }

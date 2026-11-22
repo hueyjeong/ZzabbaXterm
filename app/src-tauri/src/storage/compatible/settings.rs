@@ -1,8 +1,15 @@
 use std::{
-    fs::File,
+    fs::{File, OpenOptions},
     io::{BufWriter, Read, Write},
     path::{Path, PathBuf},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -147,6 +154,35 @@ impl StagedSettings {
 }
 
 impl Settings {
+    pub(in crate::storage) fn lock_file(path: &Path) -> Result<File, SettingsError> {
+        // 설정은 원자 교체되므로 교체 대상과 별개의 파일을 계속 사용한다.
+        let path = path.with_extension("lock");
+        let regular = |metadata: &std::fs::Metadata| {
+            #[cfg(windows)]
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return false;
+            }
+            metadata.is_file()
+        };
+        match path.symlink_metadata() {
+            Ok(metadata) if !regular(&metadata) => return Err(SettingsError::Io),
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(SettingsError::Io),
+            _ => {}
+        }
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        #[cfg(windows)]
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        let lock = options.open(path).map_err(|_| SettingsError::Io)?;
+        if !regular(&lock.metadata().map_err(|_| SettingsError::Io)?) {
+            return Err(SettingsError::Io);
+        }
+        lock.lock().map_err(|_| SettingsError::Io)?;
+        Ok(lock)
+    }
+
     /// 선택 경계에서 만든 원래 참조를 받는다. 변경된 주소에 기존 항목을 다시 묶을 수 없다.
     #[cfg(test)]
     pub(crate) fn new(input: SettingsInput, key: ServiceKeyRef) -> Result<Self, SettingsError> {

@@ -5,13 +5,17 @@ use zeroize::Zeroize;
 
 use super::{APPLICATION, Attributes, KeyAccessError, LIBSECRET, List, Owned, Ptr, Release, SECRET_SEARCH_ALL, SearchResults};
 
-pub(crate) fn write_new(target: &str, label: &str, payload: &mut [u8]) -> Result<(), KeyAccessError> {
-    let result = create(target, label, payload);
+pub(crate) fn write_new(
+    target: &str, label: &str, payload: &mut [u8], claim: impl FnOnce() -> Result<(), KeyAccessError>,
+) -> Result<(), KeyAccessError> {
+    let result = create(target, label, payload, claim);
     payload.zeroize();
     result
 }
 
-fn create(target: &str, label: &str, payload: &[u8]) -> Result<(), KeyAccessError> {
+fn create(
+    target: &str, label: &str, payload: &[u8], claim: impl FnOnce() -> Result<(), KeyAccessError>,
+) -> Result<(), KeyAccessError> {
     let attributes = Attributes::new(target)?;
     let label = CString::new(label).map_err(|_| KeyAccessError::Invalid)?;
     let len = isize::try_from(payload.len()).map_err(|_| KeyAccessError::Invalid)?;
@@ -89,8 +93,11 @@ fn create(target: &str, label: &str, payload: &[u8]) -> Result<(), KeyAccessErro
         }
         // 프롬프트가 반환돼도 실행하지 않고, 암호화 세션을 맺은 서비스 소유자에게만 전송한다.
         // shortcut: 검색과 생성은 원자적이지 않다. 외부 등록과 경합해도 교체는 금지되며 중복은 읽기에서 거부된다.
-        let reply = service_proxy.connection().call_sync(
-            Some(owner.as_str()), collection_proxy.object_path().as_str(),
+        let connection = service_proxy.connection();
+        let path = collection_proxy.object_path();
+        claim()?;
+        let reply = connection.call_sync(
+            Some(owner.as_str()), path.as_str(),
             "org.freedesktop.Secret.Collection", "CreateItem", Some(&args),
             Some(VariantTy::new("(oo)").expect("정적 D-Bus 응답 타입")), gio::DBusCallFlags::NO_AUTO_START,
             30_000, gio::Cancellable::NONE,

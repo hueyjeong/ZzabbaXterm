@@ -106,18 +106,24 @@ struct PreparedOpen {
     target: SettingsView,
     settings: Option<StagedSettings>,
     initial_buckets: Page<BucketRow>,
-    approved_saved: Option<ApprovedSaved>,
+    approved_saved: ApprovedSaved,
 }
 
 struct ApprovedSaved {
     path: PathBuf,
-    expected: SavedSettingsView,
-    item_id: String,
+    expected: Option<(SavedSettingsView, String)>,
 }
 
 impl ApprovedSaved {
     fn check(&self) -> Result<(), SettingsError> {
-        Settings::check_saved(&self.path, &self.expected, &self.item_id)
+        match &self.expected {
+            Some((expected, item)) => Settings::check_saved(&self.path, expected, item),
+            None => match Settings::load(&self.path) {
+                Err(SettingsError::NotFound) => Ok(()),
+                Err(error) => Err(error),
+                Ok(_) => Err(SettingsError::WrongService),
+            },
+        }
     }
 }
 
@@ -160,16 +166,26 @@ impl StorageIpc {
         &self, document: Document, id: String, closed: &Arc<watch::Sender<bool>>,
         prepared: Result<PreparedOpen, OpenError>,
     ) -> Result<CompatibleSession, OpenError> {
+        // 파일 잠금 대기와 디스크 확인 중에도 탭 종료와 탐색을 처리할 수 있다.
+        let file_lock = prepared.as_ref().ok().map(|open| {
+            let lock = Settings::lock_file(&open.approved_saved.path)?;
+            open.approved_saved.check()?;
+            Ok::<_, SettingsError>(lock)
+        }).transpose();
         let mut registry = self.0.lock().unwrap();
         if !registry.compatible_is_pending(&document, &id, closed) {
             return Err(SettingsError::Cancelled.into());
         }
         registry.pending_compatible.remove(&id);
-        let PreparedOpen { client, target, settings, initial_buckets, approved_saved } = prepared?;
-        if let Err(error) = approved_saved.as_ref().map(ApprovedSaved::check).transpose() {
-            drop(registry);
-            return Err(error.into());
-        }
+        let PreparedOpen { client, target, settings, initial_buckets, .. } = prepared?;
+        let _file_lock = match file_lock {
+            Ok(lock) => lock,
+            Err(error) => {
+                drop(registry);
+                return Err(error.into());
+            }
+        };
+
         // 최종 파일 교체와 탭 게시는 같은 예약에 속한다. 임시 파일 쓰기와 동기화는 락 밖에서 끝낸다.
         let published = match settings.map(StagedSettings::publish).transpose() {
             Ok(file) => file,
@@ -204,18 +220,24 @@ pub(super) async fn open<R: tauri::Runtime>(webview: tauri::Webview<R>, document
                     OpenRequest::Saved { expected } => (expected, None),
                     OpenRequest::Revise { expected, settings } => (expected, Some(settings)),
                     OpenRequest::Select { settings, item_id } => {
-                        return Ok((Settings::select(settings, item_id)?, true, None));
+                        let settings = Settings::select(settings, item_id)?;
+                        let expected = match Settings::load(&path) {
+                            Ok(saved) => Some((saved.saved_view()?, saved.item_id().into())),
+                            Err(SettingsError::NotFound) => None,
+                            Err(error) => return Err(error),
+                        };
+                        return Ok((settings, true, ApprovedSaved { path, expected }));
                     }
                 };
                 let saved = Settings::load(&path)?;
                 if saved.saved_view()? != expected { return Err(SettingsError::WrongService); }
-                let approved = ApprovedSaved { path, expected, item_id: saved.item_id().into() };
+                let approved = ApprovedSaved { path, expected: Some((expected, saved.item_id().into())) };
                 let save = revision.is_some();
                 let settings = match revision {
                     Some(input) => saved.revise(input)?,
                     None => saved,
                 };
-                Ok((settings, save, Some(approved)))
+                Ok((settings, save, approved))
             }
         }).await.map_err(|_| SettingsError::Io)??;
         let view = settings.view();
@@ -245,25 +267,23 @@ pub(super) async fn open<R: tauri::Runtime>(webview: tauri::Webview<R>, document
                     if !registry.compatible_is_pending(&document, &id, &closed) {
                         return false;
                     }
-                    if let Some(approved) = &approved_saved {
-                        if item != approved.item_id {
-                            approval_error = Some(SettingsError::WrongService);
-                        } else {
-                            approval_error = approved.check().err();
-                        }
-                    }
+                    approval_error = if item == settings.item_id() {
+                        approved_saved.check().err()
+                    } else {
+                        Some(SettingsError::WrongService)
+                    };
                     approval_error.is_none()
                 });
                 let client = match approval_error {
                     Some(error) => return Err(error),
                     None => client?,
                 };
-                if let Some(approved) = &approved_saved {
+                {
                     let registry = state.0.lock().unwrap();
                     if !registry.compatible_is_pending(&document, &id, &closed) {
                         return Err(SettingsError::Cancelled);
                     }
-                    approved.check()?;
+                    approved_saved.check()?;
                 }
                 Ok((client, target, settings, path, approved_saved))
             }
