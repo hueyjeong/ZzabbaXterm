@@ -938,7 +938,7 @@ mod tests {
                     let status = unsafe {
                         NtQueryEaFile(file.as_raw_handle(), &mut IO_STATUS_BLOCK::default(),
                             output.as_mut_ptr().cast(), size_of_val(&output) as u32,
-                            1, null(), 0, null(), 1)
+                            true, null(), 0, null(), true)
                     };
                     assert_eq!(status, 0, "{}", nt_error(status));
                     // SAFETY: 데이터 범위가 초기화된 출력 버퍼 안에 있다.
