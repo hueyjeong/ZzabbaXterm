@@ -1,4 +1,4 @@
-use super::{Event, Sessions, shell, size};
+use super::{CLOSED, Event, Sessions, shell, size};
 use std::{
     sync::mpsc::{self, Receiver, RecvTimeoutError},
     thread,
@@ -38,6 +38,22 @@ const PEER: &str = r#"$n = [int][Console]::ReadLine(); [Console]::WriteLine(('L0
 #[cfg(unix)]
 const PEER: &str = r#"IFS= read -r n && printf 'L03-PEER:%d;\n' "$((n * n))""#;
 
+#[cfg(windows)]
+const PROMPT: &[u8] = b"function prompt { 'L03-' + 'READY> ' }\r";
+#[cfg(unix)]
+const PROMPT: &[u8] = b"PS1='L03-''READY> '\r";
+const READY: &[u8] = b"L03-READY>";
+
+#[cfg(windows)]
+const FLOOD: &[u8] = b"while ($true) { [Console]::WriteLine('L03-FLOOD:0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ;') }\r";
+#[cfg(unix)]
+const FLOOD: &[u8] = b"yes 'L03-FLOOD:0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ;'\r";
+
+#[cfg(windows)]
+const AFTER_INTERRUPT: &[u8] = b"Write-Output ('L03-' + 'AFTER:' + (9 * 9) + ';')\r";
+#[cfg(unix)]
+const AFTER_INTERRUPT: &[u8] = b"printf 'L03-AFTER:%d;\\n' \"$((9 * 9))\"\r";
+
 struct Pty<'a> {
     sessions: &'a Sessions,
     id: String,
@@ -46,12 +62,14 @@ struct Pty<'a> {
 }
 
 impl<'a> Pty<'a> {
-    fn open(sessions: &'a Sessions, script: &str) -> Self {
+    fn open(sessions: &'a Sessions, script: Option<&str>) -> Self {
         let mut command = shell();
-        #[cfg(windows)]
-        command.args(["-Command", script]);
-        #[cfg(unix)]
-        command.args(["-c", script]);
+        if let Some(script) = script {
+            #[cfg(windows)]
+            command.args(["-Command", script]);
+            #[cfg(unix)]
+            command.args(["-c", script]);
+        }
         let (tx, events) = mpsc::channel();
         let id = sessions
             .open("main", size(24, 120), command, move |event| {
@@ -59,13 +77,16 @@ impl<'a> Pty<'a> {
             })
             .expect("네이티브 PTY 열기");
         sessions.start("main", &id).unwrap();
-        let mut pty = Self { sessions, id, events, output: Vec::new() };
+        let pty = Self { sessions, id, events, output: Vec::new() };
         #[cfg(windows)]
         {
+            let mut pty = pty;
             // ConPTY의 커서 위치 질의에 xterm과 같은 응답을 보낸다.
-            pty.until_bytes(b"\x1b[6n");
+            pty.until_bytes(b"\x1b[6n", 0, false);
             pty.input(b"\x1b[1;1R");
+            pty
         }
+        #[cfg(unix)]
         pty
     }
 
@@ -79,7 +100,7 @@ impl<'a> Pty<'a> {
 
     fn next(&mut self, deadline: Instant) -> Event {
         let event = self.events.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .unwrap_or_else(|error| panic!("세션 {}: PTY 출력 {}바이트 뒤 이벤트 대기: {error}", self.id, self.output.len()));
+            .unwrap_or_else(|error| panic!("세션 {}: PTY 출력 {}바이트 뒤 이벤트 대기: {error}; 끝부분 {:?}", self.id, self.output.len(), String::from_utf8_lossy(&self.output[self.output.len().saturating_sub(256)..])));
         if let Event::Bytes(bytes) = &event {
             assert!((1..=16 * 1024).contains(&bytes.len()), "출력 조각이 16 KiB 범위를 벗어남: {}", bytes.len());
             self.output.extend_from_slice(bytes);
@@ -87,11 +108,13 @@ impl<'a> Pty<'a> {
         event
     }
 
-    fn until_bytes(&mut self, marker: &[u8]) {
+    fn until_bytes(&mut self, marker: &[u8], mut offset: usize, ack: bool) {
         let deadline = Instant::now() + TIMEOUT;
-        let mut offset = 0;
         while !self.output[offset..].windows(marker.len()).any(|part| part == marker) {
-            offset = self.output.len().saturating_sub(marker.len() - 1);
+            offset = offset.max(self.output.len().saturating_sub(marker.len() - 1));
+            if ack {
+                self.ack(self.output.len());
+            }
             assert!(matches!(self.next(deadline), Event::Bytes(_)), "표식 전에 PTY가 종료됨: {marker:?}");
         }
     }
@@ -105,13 +128,13 @@ impl<'a> Pty<'a> {
     }
 
     fn assert_stalled(&self) {
-        assert!(matches!(self.events.recv_timeout(QUIET), Err(RecvTimeoutError::Timeout)),
-            "크레딧을 모두 사용한 뒤 ACK 없이 PTY 이벤트가 도착함");
+        let event = self.events.recv_timeout(QUIET);
+        assert!(matches!(event, Err(RecvTimeoutError::Timeout)), "ACK를 보류했지만 PTY 이벤트가 도착함: {event:?}");
     }
 }
 
 fn load(sessions: &Sessions) -> Pty<'_> {
-    Pty::open(sessions, &LOAD.replace("@COUNT@", &RECORDS.to_string()).replace("@PAYLOAD@", PAYLOAD))
+    Pty::open(sessions, Some(&LOAD.replace("@COUNT@", &RECORDS.to_string()).replace("@PAYLOAD@", PAYLOAD)))
 }
 
 // 네이티브 open/input/close가 반환하지 않는 회귀도 시험 전체를 멈추지 않게 한다.
@@ -139,9 +162,9 @@ fn l03_pty_credit_resumes_in_order_without_blocking_input_or_peer() {
         a.input(b"11");
         a.input(b"1\r");
         a.input(b"222\r");
-        let mut b = Pty::open(&sessions, PEER);
+        let mut b = Pty::open(&sessions, Some(PEER));
         b.input(b"9\r");
-        b.until_bytes(b"L03-PEER:81;");
+        b.until_bytes(b"L03-PEER:81;", 0, false);
         b.ack(b.output.len());
         assert!(matches!(a.events.try_recv(), Err(mpsc::TryRecvError::Empty)), "B가 응답하는 동안 A의 출력 상한이 풀림");
 
@@ -151,18 +174,32 @@ fn l03_pty_credit_resumes_in_order_without_blocking_input_or_peer() {
         a.ack(PARTIAL - 1);
         a.assert_stalled();
 
-        a.ack(a.output.len());
+        let from = a.output.len();
+        let end = b"L03-END:111:222;";
+        a.until_bytes(end, from, true);
+        // 빈 입력은 PTY에 쓰지 않고 자식 종료 상태만 확인한다.
         let deadline = Instant::now() + TIMEOUT;
         loop {
-            match a.next(deadline) {
-                Event::Bytes(_) => a.ack(a.output.len()),
-                Event::Exited(code) => {
-                    assert_eq!(code, 7);
-                    break;
+            match sessions.input("main", &a.id, b"") {
+                Err(error) => { assert_eq!(error, CLOSED); break; }
+                Ok(()) => {
+                    assert!(Instant::now() < deadline, "마지막 출력 뒤 자식이 종료되지 않음");
+                    thread::sleep(Duration::from_millis(10));
                 }
-                Event::Disconnected(reason) => panic!("자연 종료 대신 PTY 단절: {reason}"),
             }
         }
+        // ConPTY가 마지막 표식 뒤에 보낼 수 있는 VT 바이트까지 받되 ACK는 보류한다.
+        loop {
+            assert!(Instant::now() < deadline, "자식 종료 후 PTY 출력이 끝나지 않음");
+            match a.events.recv_timeout(QUIET) {
+                Ok(Event::Bytes(bytes)) => a.output.extend_from_slice(&bytes),
+                Err(RecvTimeoutError::Timeout) => break,
+                other => panic!("마지막 ACK 전 종료 이벤트 또는 출력 채널 닫힘: {other:?}"),
+            }
+        }
+        a.ack(a.output.len());
+        let event = a.next(Instant::now() + TIMEOUT);
+        assert!(matches!(event, Event::Exited(7)), "마지막 ACK 뒤 종료 이벤트: {event:?}");
 
         // ConPTY가 줄 사이에 생성하는 VT 제어는 허용하되 레코드 안의 원본 바이트를 비교한다.
         let prefix = b"L03-ROW:";
@@ -176,7 +213,6 @@ fn l03_pty_credit_resumes_in_order_without_blocking_input_or_peer() {
             assert_eq!(a.output.get(offset..last_end), Some(row.as_bytes()), "레코드 {i}의 순서 또는 바이트 불일치");
         }
         assert!(rows.next().is_none(), "추가 레코드 수신");
-        let end = b"L03-END:111:222;";
         assert_eq!(a.output.windows(b"L03-END:".len()).filter(|bytes| *bytes == b"L03-END:").count(), 1,
             "종료 표식 누락 또는 중복");
         assert!(a.output[last_end..].windows(end.len()).any(|bytes| bytes == end),
@@ -196,5 +232,31 @@ fn l03_pty_close_reaps_credit_blocked_session_without_ack() {
         assert!(matches!(a.events.try_recv(), Err(mpsc::TryRecvError::Disconnected)),
             "닫기 완료 뒤 출력 송신자가 남았거나 이벤트가 추가됨");
         assert!(sessions.get("main", &a.id).is_err(), "닫기 완료 뒤 세션이 등록부에 남음");
+    });
+}
+
+#[test]
+fn l03_pty_ctrl_c_during_credit_stall_keeps_shell_reusable() {
+    bounded(|| {
+        let sessions = Sessions::default();
+        let mut pty = Pty::open(&sessions, None);
+        pty.input(PROMPT);
+        pty.until_bytes(READY, 0, true);
+        let start = pty.output.len();
+        pty.ack(start);
+
+        pty.input(FLOOD);
+        pty.fill(start + WINDOW);
+        assert!(pty.output[start..].windows(b"L03-FLOOD:".len()).any(|bytes| bytes == b"L03-FLOOD:"));
+        pty.assert_stalled();
+
+        pty.input(b"\x03");
+        let interrupted = pty.output.len();
+        pty.ack(interrupted);
+        pty.until_bytes(READY, interrupted, true);
+        let resumed = pty.output.len();
+        pty.input(AFTER_INTERRUPT);
+        pty.until_bytes(b"L03-AFTER:81;", resumed, true);
+        sessions.close("main", &pty.id).unwrap();
     });
 }
