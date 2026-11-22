@@ -52,6 +52,15 @@ impl Sessions {
         use_probes(&mut registry.probes)
     }
 
+    pub(crate) fn probe_completion(&self, run_id: String) -> impl FnOnce() + Send + use<> {
+        let registry = Arc::downgrade(&self.registry);
+        move || {
+            if let Some(registry) = registry.upgrade() {
+                registry.lock().unwrap().probes.reap(&run_id);
+            }
+        }
+    }
+
     pub(crate) fn next_id(&self) -> String {
         self.next.fetch_add(1, Ordering::Relaxed).to_string()
     }
@@ -206,12 +215,27 @@ enum Event {
     Disconnected(String),
 }
 
+fn validate_working_directory(directory: &std::path::Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        // 확장·장치·UNC 경로에는 일반 Win32 경로 정규화를 적용할 수 없다.
+        if !matches!(directory.components().next(), Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_))) {
+            return Err("작업 디렉터리: Windows 드라이브의 일반 절대 경로만 지원합니다".into());
+        }
+    }
+    if !std::fs::metadata(directory).map_err(|error| stage("작업 디렉터리", error))?.is_dir() {
+        return Err("작업 디렉터리: 디렉터리가 아닙니다".into());
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 const POWERSHELL_CWD_MATCH: &str = concat!(
     "[string]::Equals(",
     "[IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($directory)), ",
     "[IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath([Environment]::CurrentDirectory)), ",
-    "[StringComparison]::OrdinalIgnoreCase)",
+    "[StringComparison]::Ordinal)",
 );
 
 fn shell() -> CommandBuilder {

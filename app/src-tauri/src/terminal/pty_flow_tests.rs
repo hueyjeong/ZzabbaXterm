@@ -293,6 +293,9 @@ fn c01_saved_pty_selects_exact_id_and_keeps_sessions_after_open_errors() {
         };
         read(&mut first, b"C01-CWD:first;");
         read(&mut second, b"C01-CWD:second;");
+        #[cfg(windows)]
+        assert_eq!(super::saved::command(config, "verbatim").err().as_deref(),
+            Some("작업 디렉터리: Windows 드라이브의 일반 절대 경로만 지원합니다"));
         sessions.close("main", &second.id).unwrap();
 
         let delayed = super::saved::command(config, "second").unwrap();

@@ -1,12 +1,11 @@
 use crate::connections::profile::{Shell, ValidatedDraft};
 use portable_pty::CommandBuilder;
 use std::{
-    fs,
     sync::{Arc, Condvar, Mutex, mpsc},
     time::{Duration, Instant},
 };
 
-use super::{Event, process::{Session, Stop}, size, stage};
+use super::{Event, process::{Session, Stop}, size};
 
 const MARKER: &[u8] = b"ZZABBA-C01:314159";
 const TIMEOUT: Duration = Duration::from_secs(8);
@@ -27,8 +26,14 @@ fn scan(needle: &[u8], matched: &mut usize, bytes: &[u8]) -> bool {
 pub(crate) struct Probe {
     session: Arc<Session>,
     deadline: Instant,
-    result: Mutex<Option<Result<(), String>>>,
+    state: Mutex<State>,
     ready: Condvar,
+}
+
+#[derive(Default)]
+struct State {
+    result: Option<Result<(), String>>,
+    stopped: bool,
 }
 
 impl Probe {
@@ -37,7 +42,7 @@ impl Probe {
     }
 
     fn with_timeout(owner: &str, timeout: Duration) -> Self {
-        Self { session: Arc::new(Session::new(owner)), deadline: Instant::now() + timeout, result: Mutex::new(None), ready: Condvar::new() }
+        Self { session: Arc::new(Session::new(owner)), deadline: Instant::now() + timeout, state: Mutex::default(), ready: Condvar::new() }
     }
 
     pub(crate) fn run(&self, draft: &ValidatedDraft) {
@@ -45,31 +50,32 @@ impl Probe {
     }
 
     fn finish(&self, result: Result<(), String>) {
-        let mut completed = self.result.lock().unwrap();
-        *completed = Some(if Instant::now() >= self.deadline { Err(TIMED_OUT.into()) } else { result });
+        self.state.lock().unwrap().result = Some(if Instant::now() >= self.deadline { Err(TIMED_OUT.into()) } else { result });
         self.ready.notify_all();
     }
 
     pub(crate) fn finished(&self) -> bool {
-        self.result.lock().unwrap().is_some()
+        self.state.lock().unwrap().result.is_some()
     }
 
     pub(crate) fn wait(&self) -> Result<(), String> {
-        let (result, _) = self.ready.wait_timeout_while(self.result.lock().unwrap(), self.remaining(), |result| result.is_none()).unwrap();
-        if let Some(result) = result.as_ref() {
-            return result.clone();
+        let (state, _) = self.ready.wait_timeout_while(self.state.lock().unwrap(), self.remaining(), |state| {
+            state.result.is_none() && !state.stopped
+        }).unwrap();
+        if state.stopped {
+            return Err("연결 시험이 취소되었습니다".into());
         }
-        drop(result);
-        self.stop();
-        Err(TIMED_OUT.into())
+        state.result.clone().unwrap_or_else(|| Err(TIMED_OUT.into()))
     }
 
     pub(crate) fn wait_finished(&self) {
-        drop(self.ready.wait_while(self.result.lock().unwrap(), |result| result.is_none()).unwrap());
+        drop(self.ready.wait_while(self.state.lock().unwrap(), |state| state.result.is_none()).unwrap());
     }
 
     pub(crate) fn stop(&self) {
         self.session.stop(Stop::Closed);
+        self.state.lock().unwrap().stopped = true;
+        self.ready.notify_all();
     }
 
     fn remaining(&self) -> Duration {
@@ -120,7 +126,7 @@ impl Probe {
             self.receive(&receiver)?
         });
         if result.is_err() {
-            self.stop();
+            self.session.stop(Stop::Closed);
         }
         self.session.wait_finished();
         result
@@ -140,10 +146,7 @@ impl Probe {
 
 fn command(draft: &ValidatedDraft) -> Result<CommandBuilder, String> {
     let directory = draft.start_directory();
-    // portable-pty는 없는 경로를 홈으로 바꿀 수 있으므로 시작 전에 검사하고 셸에서도 대조한다.
-    if !fs::metadata(directory).map_err(|err| stage("작업 디렉터리", err))?.is_dir() {
-        return Err("작업 디렉터리: 디렉터리가 아닙니다".into());
-    }
+    super::validate_working_directory(directory)?;
     let mut command = match draft.shell() {
         #[cfg(windows)]
         Shell::PowerShell => {

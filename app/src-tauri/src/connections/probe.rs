@@ -51,11 +51,14 @@ impl Runs {
     }
 
     fn retire(&mut self, owner: &str, key: RunKey, probe: Arc<Probe>) {
-        self.retiring.retain(|(_, _, probe)| !probe.finished());
         if !probe.finished() {
             probe.stop();
             self.retiring.push((owner.into(), key, probe));
         }
+    }
+
+    pub(crate) fn reap(&mut self, run_id: &str) {
+        self.retiring.retain(|(_, key, _)| key.run_id != run_id);
     }
 
     pub(crate) fn stop_owner(&mut self, owner: &str) {
@@ -95,7 +98,11 @@ pub(super) fn start(sessions: &Sessions, owner: &str, document: u64, draft_id: S
         let probe = Arc::new(Probe::new(owner));
         let worker = Arc::clone(&probe);
         let tested = Arc::clone(&draft);
-        thread::Builder::new().name("connection-probe".into()).spawn(move || worker.run(&tested))
+        let completed = sessions.probe_completion(key.run_id.clone());
+        thread::Builder::new().name("connection-probe".into()).spawn(move || {
+            worker.run(&tested);
+            completed();
+        })
             .map_err(|error| format!("연결 시험: {error}"))?;
         let run = Run { key: key.clone(), session_id, draft, probe, confirmed: false };
         runs.active.get_mut(owner).unwrap().insert(key.draft_id.clone(), run);
@@ -107,8 +114,11 @@ pub(super) fn wait(sessions: &Sessions, owner: &str, document: u64, key: &RunKey
     let probe = sessions.with_probes(owner, document, |runs| Ok(Arc::clone(&runs.get(owner, key)?.probe)))?;
     let result = probe.wait();
     sessions.with_probes(owner, document, |runs| {
+        if let Err(error) = result {
+            remove_run(runs, owner, key)?;
+            return Err(error);
+        }
         runs.get(owner, key)?;
-        result?;
         let run = runs.active.get_mut(owner).unwrap().get_mut(&key.draft_id).unwrap();
         run.confirmed = true;
         Ok(Passed { run: key.clone(), session_id: run.session_id.clone() })
@@ -116,28 +126,26 @@ pub(super) fn wait(sessions: &Sessions, owner: &str, document: u64, key: &RunKey
 }
 
 pub(super) fn cancel(sessions: &Sessions, owner: &str, document: u64, key: &RunKey) -> Result<(), String> {
-    let probe = sessions.with_probes(owner, document, |runs| {
+    sessions.with_probes(owner, document, |runs| {
         if runs.get(owner, key).is_ok() {
-            let run = runs.active.get_mut(owner).unwrap().remove(&key.draft_id).unwrap();
-            let probe = Arc::clone(&run.probe);
-            runs.retire(owner, run.key, run.probe);
-            return Ok(Some(probe));
+            return remove_run(runs, owner, key);
         }
-        if let Some((previous_owner, _, probe)) = runs.retiring.iter().find(|(_, old, _)| old.run_id == key.run_id) {
-            if previous_owner != owner {
-                return Err(UNTESTED.into());
-            }
-            return Ok(Some(Arc::clone(probe)));
-        }
-        if runs.active.iter().any(|(other, active)| other != owner && active.values().any(|run| run.key.run_id == key.run_id)) {
+        let belongs_to_other = runs.retiring.iter().any(|(previous_owner, old, _)| {
+            previous_owner != owner && old.run_id == key.run_id
+        }) || runs.active.iter().any(|(other, active)| {
+            other != owner && active.values().any(|run| run.key.run_id == key.run_id)
+        });
+        if belongs_to_other {
             return Err(UNTESTED.into());
         }
-        // 교체되거나 이미 회수된 실행의 재취소는 성공으로 끝낸다.
-        Ok(None)
-    })?;
-    if let Some(probe) = probe {
-        probe.wait_finished();
-    }
+        Ok(())
+    })
+}
+
+fn remove_run(runs: &mut Runs, owner: &str, key: &RunKey) -> Result<(), String> {
+    runs.get(owner, key)?;
+    let run = runs.active.get_mut(owner).unwrap().remove(&key.draft_id).unwrap();
+    runs.retire(owner, run.key, run.probe);
     Ok(())
 }
 
@@ -172,5 +180,46 @@ pub(super) fn save_confirmed(sessions: &Sessions, owner: &str, document: u64, re
         SaveStatus::GroupConflict => Err("다른 작업이 그룹을 변경했습니다".into()),
         SaveStatus::TargetConflict => Err("다른 작업이 대상을 변경했습니다".into()),
         SaveStatus::Saved => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connections::tests::{TestDir, draft};
+    use std::{sync::mpsc, time::Duration};
+
+    #[test]
+    fn c01_cancel_retires_a_blocked_probe_until_worker_completion() {
+        let dir = TestDir::new();
+        let sessions = Sessions::default();
+        let key = RunKey { draft_id: "draft".into(), draft_version: 1, run_id: sessions.next_id() };
+        let draft: Draft = serde_json::from_value(draft(dir.path(), "work", "target")).unwrap();
+        let draft = Arc::new(draft.validate().unwrap());
+        let probe = Arc::new(Probe::new("main"));
+        sessions.with_probes("main", 0, |runs| {
+            runs.active.entry("main".into()).or_default().insert(key.draft_id.clone(), Run {
+                key: key.clone(), session_id: sessions.next_id(), draft: Arc::clone(&draft),
+                probe: Arc::clone(&probe), confirmed: false,
+            });
+            Ok(())
+        }).unwrap();
+        let completed = sessions.probe_completion(key.run_id.clone());
+        let (tx, rx) = mpsc::channel();
+        thread::scope(|scope| {
+            let cancellation = || tx.send(cancel(&sessions, "main", 0, &key)).unwrap();
+            scope.spawn(cancellation);
+            let response = rx.recv_timeout(Duration::from_secs(2));
+            let retired = response.is_ok() && !probe.finished() &&
+                cancel(&sessions, "other", 0, &key).is_err() && wait(&sessions, "main", 0, &key).is_err();
+            if retired {
+                crate::terminal::tests::assert_live_shell_progress(&sessions);
+            }
+            probe.run(&draft);
+            completed();
+            response.unwrap().unwrap();
+            assert!(retired);
+            assert!(cancel(&sessions, "other", 0, &key).is_ok());
+        });
     }
 }

@@ -90,6 +90,28 @@ describe("C01 로컬 연결 IPC", () => {
     expect(peer.onClose).toHaveBeenCalledExactlyOnceWith({ kind: "cancelled", draftId: "work-draft" });
   });
 
+  it("시험 시간 초과를 표시하고 취소 응답을 기다리지 않고 닫을 수 있다", async () => {
+    vi.useFakeTimers();
+    try {
+      const peer = nativePeer();
+      const cancel = Promise.withResolvers<null>();
+      const error = "연결 시험 시간이 초과되었습니다";
+      ipc.mockResolvedValueOnce(firstRun).mockRejectedValueOnce(error).mockReturnValueOnce(cancel.promise);
+      const wizard = createLocalConnectionWizard("work-draft", draft);
+      finishSteps(wizard);
+      await wizard.test(peer);
+      expect(wizard.getSnapshot().status).toEqual({ kind: "testFailed", error });
+      const closing = wizard.close(peer);
+      await vi.advanceTimersByTimeAsync(2_000);
+      await closing;
+      cancel.resolve(null);
+      expect(peer.onClose).toHaveBeenCalledExactlyOnceWith({ kind: "cancelled", draftId: "work-draft" });
+      expect(ipc.mock.calls.slice(2)).toEqual([["connection_test_cancel", { run: firstRun }]]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("수정 시 성공 실행을 폐기하고 새 경로의 실제 실패와 입력을 보존한다", async () => {
     const peer = nativePeer();
     ipc.mockResolvedValueOnce(firstRun).mockResolvedValueOnce({ ...firstRun, sessionId: "first-pty" });

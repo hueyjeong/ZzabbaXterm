@@ -51,6 +51,7 @@ type State = Readonly<{ step: Step; draft: LocalProfileDraft; status: Status }>;
 
 const steps = ["target", "method", "auth", "verify"] as const;
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
+const CANCEL_RESPONSE_TIMEOUT = 2_000;
 
 export interface LocalConnectionWizardState {
   getSnapshot(): State;
@@ -133,7 +134,7 @@ export function createLocalConnectionWizard(draftId: string, draft: LocalProfile
       update({ status: { kind: "passed", request: { run, draft: attempt.draft }, attempt } });
     } catch (error) {
       if (isTesting(attempt)) update({ status: { kind: "testFailed", error: errorText(error) } });
-      await cancelPending(attempt);
+      void cancelPending(attempt);
     }
   }
 
@@ -171,9 +172,11 @@ export function createLocalConnectionWizard(draftId: string, draft: LocalProfile
     if (locked() && state.status.kind !== "closeFailed") return;
     const closing = { kind: "closing" } as const;
     update({ status: closing });
-    const results = await cancelPending();
+    const timeout = Promise.withResolvers<null>();
+    const timer = setTimeout(() => timeout.resolve(null), CANCEL_RESPONSE_TIMEOUT);
+    const results = await Promise.race([cancelPending(), timeout.promise]).finally(() => clearTimeout(timer));
     if (state.status !== closing) return;
-    const failures = results.flatMap(result => result.status === "rejected" ? [errorText(result.reason)] : []);
+    const failures = results?.flatMap(result => result.status === "rejected" ? [errorText(result.reason)] : []) ?? [];
     if (failures.length) {
       update({ status: { kind: "closeFailed", error: failures.join("\n") } });
       return;
