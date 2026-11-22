@@ -813,7 +813,7 @@ describe("F01 직접 SSH", () => {
     expect(connectionCalls("ssm_discovery")).toEqual([]);
   });
 
-  it("같은 저장 대상을 두 번 열고 닫은 탭의 PTY ID만 회수한다", async () => {
+  it("SSH 종료가 미확인이면 탭을 남기고 같은 PTY ID로만 다시 확인한다", async () => {
     loadProfiles = async () => ({
       version: 1,
       groups: [{ revision: 1, profile: { id: "work", displayName: "작업" } }],
@@ -834,9 +834,15 @@ describe("F01 직접 SSH", () => {
     expect(calls("open").slice(-2).map(args => args.targetId)).toEqual(["server", "server"]);
     const [first, second] = calls("start").slice(-2).map(args => args.id);
     expect(first).not.toBe(second);
+    closeTerminal = vi.fn().mockRejectedValueOnce("SSH 자식 종료 확인 불가: wait").mockResolvedValue(null);
     native.invoke.mockClear();
     await press("개발 서버 닫기");
     expect(calls("close")).toEqual([{ id: first }]);
+    expect(find(".workspace-tab [role=alert]").textContent?.trim()).toBe("종료 확인 불가");
+    expect(status()).toContain(`SSH · ${second}`);
+    await press("개발 서버 종료 다시 확인");
+    expect(calls("close")).toEqual([{ id: first }, { id: first }]);
+    expect(document.querySelector(".workspace-tab [role=alert]")).toBeNull();
     expect(status()).toContain(`SSH · ${second}`);
   });
 });

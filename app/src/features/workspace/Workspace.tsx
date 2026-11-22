@@ -137,7 +137,7 @@ export function Workspace() {
   async function closeTab(id: number) {
     const tab = liveTabs.current.find(item => item.id === id);
     if (!tab || closingTabs.current.has(id)) return;
-    if (tab.ssm) {
+    if (tab.ssm || tab.ssh) {
       closingTabs.current.add(id);
       setTabs(current => current.map(item => item.id === id ? { ...item, closeStatus: "closing" } : item));
       try {
@@ -194,10 +194,10 @@ export function Workspace() {
           <LocalTree profiles={profileLoad.profiles} onOpen={openTab} />
         </aside>
         <div className="workspace-center">
-          {tabs.map(({ id, label, targetId, ssm, closeStatus }) => (
+          {tabs.map(({ id, label, targetId, ssm, ssh, closeStatus }) => (
             <div className="workspace-session" key={id} hidden={id !== active} inert={id !== active}>
               <TerminalView active={id === active} focusRequested={id === focusTab} label={label} targetId={targetId}
-                remote={!!ssm} closing={!!closeStatus} closeRef={ssm ? (handle) => {
+                remote={!!ssm} ssh={ssh} closing={!!closeStatus} closeRef={ssm || ssh ? (handle) => {
                   if (handle) remoteTerminals.current.set(id, handle);
                   else remoteTerminals.current.delete(id);
                 } : undefined}

@@ -11,6 +11,7 @@ export interface TerminalViewProps {
   readonly label: string;
   readonly targetId?: string;
   readonly remote?: boolean;
+  readonly ssh?: boolean;
   readonly closing?: boolean;
   readonly closeRef?: Ref<{ confirmClose(): Promise<void> }>;
   readonly onStatus?: (status: TerminalStatus, sessionId?: string) => void;
@@ -27,7 +28,7 @@ function text(status: TerminalStatus) {
   }
 }
 
-export function TerminalView({ active, focusRequested, label, targetId, remote, closing, closeRef, onStatus }: TerminalViewProps) {
+export function TerminalView({ active, focusRequested, label, targetId, remote, ssh, closing, closeRef, onStatus }: TerminalViewProps) {
   const host = useRef<HTMLDivElement>(null);
   const session = useRef<LocalTerminal | undefined>(undefined);
   const stopRequested = useRef(false);
@@ -74,7 +75,7 @@ export function TerminalView({ active, focusRequested, label, targetId, remote, 
         session.current = connectLocalTerminal(dimensions, (bytes, parsed) => term.write(bytes, parsed), (next, id) => {
           setStatus(next);
           statusListener.current?.(next, id);
-        }, undefined, targetId, remote);
+        }, undefined, targetId, remote, !!(remote || ssh));
       } else {
         session.current.resize(dimensions);
       }
@@ -96,7 +97,7 @@ export function TerminalView({ active, focusRequested, label, targetId, remote, 
       session.current = undefined;
       term.dispose();
     };
-  }, [targetId, remote]);
+  }, [targetId, remote, ssh]);
 
   useLayoutEffect(() => {
     refresh.current?.(active, !closing && status.kind === "running", focusRequested);
