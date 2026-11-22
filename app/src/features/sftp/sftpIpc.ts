@@ -32,10 +32,12 @@ const unreadable = {
   directoryChanged: errors.pathChanged, readChanged: errors.readChanged,
 } as const;
 type SaveResult = { readonly status: "saved" }
-  | { readonly status: "unknown"; readonly error: SftpError }
+  | { readonly status: "unknown"; readonly error: SftpError; readonly recoveryPath?: string }
   | { readonly status: "failed"; readonly stage: keyof typeof stages; readonly error: SftpError; readonly cleanup?: Cleanup | null }
-  | { readonly status: "conflict"; readonly remote: { readonly kind: "text"; readonly text: string }
-      | { readonly kind: "missing" | keyof typeof unreadable }; readonly cleanup: Cleanup };
+  | {
+    readonly status: "conflict"; readonly remote: { readonly kind: "text"; readonly text: string }
+      | { readonly kind: "missing" | keyof typeof unreadable }; readonly cleanup?: Cleanup
+  };
 
 type Listing = {
   readonly entries: readonly { readonly entryId: string; readonly name: string; readonly isDirectory: boolean }[];
@@ -113,7 +115,11 @@ export function sftpSession(sessionId: string): SftpSession {
       }
       switch (result.status) {
         case "saved": return { kind: "saved" };
-        case "unknown": return { kind: "unknown", message: sftpError(result.error).message };
+        case "unknown": return {
+          kind: "unknown", message: result.recoveryPath
+            ? `${sftpError(result.error).message} · 복구 파일: ${result.recoveryPath}`
+            : sftpError(result.error).message
+        };
         case "failed": {
           const error = sftpError(result.error);
           return { ...error, message: `${stages[result.stage]}: ${error.message}${cleanupMessage(result.cleanup)}` };
