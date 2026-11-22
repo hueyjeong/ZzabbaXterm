@@ -9,9 +9,14 @@ use std::{
 
 const CONFIG_LIMIT: u64 = 1024 * 1024;
 
+pub(super) struct ExportConfig {
+    pub(super) ini: String,
+    pub(super) cache_key: String,
+}
+
 pub(super) struct Profiles {
     known: HashSet<String>,
-    direct: HashMap<String, String>,
+    direct: HashMap<String, ExportConfig>,
 }
 
 impl Profiles {
@@ -31,7 +36,7 @@ impl Profiles {
         }
     }
 
-    pub(super) fn export_config(&self, name: &str) -> Result<&str, CliError> {
+    pub(super) fn export_config(&self, name: &str) -> Result<&ExportConfig, CliError> {
         self.require(name)?;
         Ok(&self.direct[name])
     }
@@ -95,7 +100,10 @@ impl Profiles {
     }
 }
 
-fn direct_config(options: &Options<'_>, sessions: &HashMap<String, Section<'_>>) -> Option<String> {
+fn direct_config(
+    options: &Options<'_>,
+    sessions: &HashMap<String, Section<'_>>,
+) -> Option<ExportConfig> {
     if options.keys().any(|key| {
         key.starts_with("aws_")
             || matches!(
@@ -152,7 +160,10 @@ fn direct_config(options: &Options<'_>, sessions: &HashMap<String, Section<'_>>)
         config.push_str(&format!("sso_session = {name}\n[sso-session \"{name}\"]\n"));
     }
     config.push_str(&format!("sso_region = {region}\nsso_start_url = {url}\n"));
-    Some(config)
+    Some(ExportConfig {
+        ini: config,
+        cache_key: name.unwrap_or(url).to_owned(),
+    })
 }
 
 type Options<'a> = HashMap<String, &'a str>;

@@ -2,7 +2,9 @@ use super::{
     AwsCli, CancellationToken, Captured, CliError, CommandSpec, Credentials, OnlineNode, Scope,
     decode, plugin,
 };
-use portable_pty::{Child, CommandBuilder, PtyPair, PtySize, native_pty_system};
+use portable_pty::{
+    Child, ChildKiller, CommandBuilder, ExitStatus, PtyPair, PtySize, native_pty_system,
+};
 use serde::Deserialize;
 use std::{ffi::OsStr, io, path::Path, sync::Arc};
 
@@ -49,7 +51,51 @@ impl StartPermit {
             )
             .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "SSM plugin search changed"))?;
         let child = pair.slave.spawn_command(self.0).map_err(io::Error::other)?;
-        Ok((pair, child))
+        Ok((
+            pair,
+            Box::new(SessionChild {
+                child,
+                _plugin: self.2,
+                _credentials: self.1,
+            }),
+        ))
+    }
+}
+
+struct SessionChild {
+    child: Box<dyn Child + Send + Sync>,
+    _plugin: plugin::CheckedPlugin,
+    _credentials: Arc<Credentials>,
+}
+
+impl std::fmt::Debug for SessionChild {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionChild").finish_non_exhaustive()
+    }
+}
+
+impl ChildKiller for SessionChild {
+    fn kill(&mut self) -> io::Result<()> {
+        self.child.kill()
+    }
+    fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+        self.child.clone_killer()
+    }
+}
+
+impl Child for SessionChild {
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
+    }
+    fn wait(&mut self) -> io::Result<ExitStatus> {
+        self.child.wait()
+    }
+    fn process_id(&self) -> Option<u32> {
+        self.child.process_id()
+    }
+    #[cfg(windows)]
+    fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+        self.child.as_raw_handle()
     }
 }
 
@@ -157,7 +203,7 @@ impl StartRequest {
             return Ok(None);
         }
         self.credentials.require_current()?;
-        let cwd = std::env::current_dir().map_err(|_| CliError::ProcessIo)?;
+        let cwd = self.credentials.home().path().to_path_buf();
         let path = check_plugin(&cwd).await?;
         self.credentials.require_current()?;
         let command = self.start_command(&cwd, path.path());

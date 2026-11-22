@@ -243,50 +243,67 @@ async fn start_requires_an_online_node_from_the_same_scope() {
     let scope = request().scope;
     let mut captured = Vec::new();
     let nodes = cli
-        .online_nodes_with(&scope, "[default]\n", |spec| {
-            assert_eq!(spec.program(), cli.0.as_ref());
-            let action = spec.args()[1].clone();
-            let mut environment = std::collections::HashMap::new();
-            spec.bound_environment(|key, value| {
-                environment.insert(key.to_owned(), value.to_os_string());
-            });
-            let reply = match action.as_str() {
-                "export-credentials" => {
-                    assert_eq!(
-                        spec.args()[2..6],
-                        ["--profile", "default", "--format", "process"]
-                    );
-                    assert_eq!(
-                        std::fs::read_to_string(&environment["AWS_CONFIG_FILE"]).unwrap(),
-                        "[default]\n"
-                    );
-                    assert!(!environment.contains_key("AWS_SESSION_TOKEN"));
-                    capture(EXPORT.as_bytes().to_vec())
-                }
-                action => {
-                    assert!(
-                        !spec
-                            .args()
-                            .iter()
-                            .any(|arg| arg == "--profile" || arg.contains("fixture-token"))
-                    );
-                    assert_eq!(environment["AWS_SESSION_TOKEN"], "fixture-token");
-                    assert_eq!(environment["AWS_DEFAULT_REGION"], "us-west-2");
-                    match action {
-                        "describe-instance-information" => {
-                            fixture(json!({"InstanceInformationList": [
-                                {"InstanceId": TARGET, "PingStatus": "Online"},
-                                {"InstanceId": "i-11111111", "PingStatus": "ConnectionLost"}
-                            ]}))
-                        }
-                        "get-caller-identity" => identity(),
-                        _ => panic!("unexpected command"),
+        .online_nodes_with(
+            &scope,
+            "[default]\n",
+            Arc::new(super::super::home::CliHome::new().unwrap()),
+            |spec| {
+                assert_eq!(spec.program(), cli.0.as_ref());
+                let action = spec.args()[1].clone();
+                let mut environment = std::collections::HashMap::new();
+                spec.bound_environment(|key, value| {
+                    environment.insert(key.to_owned(), value.to_os_string());
+                });
+                let reply = match action.as_str() {
+                    "export-credentials" => {
+                        assert_eq!(
+                            spec.args()[2..6],
+                            ["--profile", "default", "--format", "process"]
+                        );
+                        assert_eq!(
+                            std::fs::read_to_string(&environment["AWS_CONFIG_FILE"]).unwrap(),
+                            "[default]\n"
+                        );
+                        assert!(!environment.contains_key("AWS_SESSION_TOKEN"));
+                        assert_eq!(environment["HOME"], environment["USERPROFILE"]);
+                        assert!(
+                            !Path::new(&environment["HOME"])
+                                .join(".aws/cli/alias")
+                                .exists()
+                        );
+                        capture(EXPORT.as_bytes().to_vec())
                     }
-                }
-            };
-            captured.push(action);
-            std::future::ready(Ok(reply))
-        })
+                    action => {
+                        assert!(
+                            !spec
+                                .args()
+                                .iter()
+                                .any(|arg| arg == "--profile" || arg.contains("fixture-token"))
+                        );
+                        assert_eq!(environment["AWS_SESSION_TOKEN"], "fixture-token");
+                        assert_eq!(environment["HOME"], environment["USERPROFILE"]);
+                        assert!(
+                            !Path::new(&environment["HOME"])
+                                .join(".aws/sso/cache")
+                                .exists()
+                        );
+                        assert_eq!(environment["AWS_DEFAULT_REGION"], "us-west-2");
+                        match action {
+                            "describe-instance-information" => {
+                                fixture(json!({"InstanceInformationList": [
+                                    {"InstanceId": TARGET, "PingStatus": "Online"},
+                                    {"InstanceId": "i-11111111", "PingStatus": "ConnectionLost"}
+                                ]}))
+                            }
+                            "get-caller-identity" => identity(),
+                            _ => panic!("unexpected command"),
+                        }
+                    }
+                };
+                captured.push(action);
+                std::future::ready(Ok(reply))
+            },
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -361,10 +378,15 @@ async fn start_requires_an_online_node_from_the_same_scope() {
 async fn expired_export_stops_before_sts_or_discovery() {
     let expired = EXPORT.replace("2099-01-01", "2000-01-01");
     let result = fixture_cli()
-        .online_nodes_with(&request().scope, "[default]\n", |spec| {
-            assert_eq!(spec.args()[1], "export-credentials");
-            std::future::ready(Ok(capture(expired.as_bytes().to_vec())))
-        })
+        .online_nodes_with(
+            &request().scope,
+            "[default]\n",
+            Arc::new(super::super::home::CliHome::new().unwrap()),
+            |spec| {
+                assert_eq!(spec.args()[1], "export-credentials");
+                std::future::ready(Ok(capture(expired.as_bytes().to_vec())))
+            },
+        )
         .await;
     assert_eq!(result.err(), Some(CliError::CredentialsExpired));
 }

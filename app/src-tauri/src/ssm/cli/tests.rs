@@ -218,6 +218,12 @@ fn process_fixture() {
             assert!(std::env::var_os("AWS_WEB_IDENTITY_TOKEN_FILE").is_none());
             let config = std::env::var("AWS_CONFIG_FILE").unwrap();
             assert_eq!(config, if cfg!(windows) { "NUL" } else { "/dev/null" });
+            let home = std::env::var_os("HOME").unwrap();
+            assert_eq!(std::env::var_os("USERPROFILE").as_ref(), Some(&home));
+            let home = Path::new(&home);
+            assert!(home.is_dir());
+            assert!(!home.join(".aws/cli/alias").exists());
+            assert!(!home.join(".aws/sso/cache").exists());
         }
         _ => {}
     }

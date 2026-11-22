@@ -1,5 +1,6 @@
 mod cli;
 mod credentials;
+mod home;
 pub mod ipc;
 mod plugin;
 mod profile;
@@ -70,17 +71,25 @@ impl AwsCli {
         let result = CommandSpec::version(Tool::Aws, program.clone())
             .capture(cancel)
             .await?;
-        if !result.stdout.starts_with(b"aws-cli/2.") && !result.stderr.starts_with(b"aws-cli/2.") {
-            result.success()?;
+        let supported = [&result.stdout, &result.stderr].into_iter().any(|output| {
+            std::str::from_utf8(output)
+                .ok()
+                .and_then(|line| line.trim().strip_prefix("aws-cli/"))
+                .and_then(|line| line.split_ascii_whitespace().next())
+                .and_then(plugin::numeric_version)
+                .is_some_and(|version| version[0] == 2 && version >= [2, 31, 0, 0])
+        });
+        result.success()?;
+        if !supported {
             return Err(CliError::AwsCliNotV2);
         }
-        result.success()?;
         Ok(Self(program))
     }
 
     pub async fn check_plugin(&self, cancel: &CancellationToken) -> Result<(), CliError> {
-        let cwd = std::env::current_dir().map_err(|_| CliError::ProcessIo)?;
-        plugin::checked_path(&self.0, &cwd, cancel).await?;
+        let home = home::CliHome::new()?;
+        let cwd = home.path();
+        plugin::checked_path(&self.0, cwd, cancel).await?;
         Ok(())
     }
 
@@ -107,8 +116,12 @@ impl AwsCli {
     ) -> Result<Vec<OnlineNode>, CliError> {
         let profiles = Profiles::load()?;
         let config = profiles.export_config(scope.profile())?;
-        self.online_nodes_with(scope, config, |spec| async move { spec.capture(cancel).await })
-            .await
+        let home = home::CliHome::new()?;
+        home.import_sso_token(&home::user_home()?, &config.cache_key)?;
+        self.online_nodes_with(scope, &config.ini, Arc::new(home), |spec| async move {
+            spec.capture(cancel).await
+        })
+        .await
     }
 
     // Tauri 작업은 캡처 클로저를 빌리지 않는 Send 퓨처를 사용한다.
@@ -116,6 +129,7 @@ impl AwsCli {
         &self,
         scope: &Scope,
         config: &str,
+        home: Arc<home::CliHome>,
         mut capture: impl FnMut(CommandSpec) -> F + Send,
     ) -> Result<Vec<OnlineNode>, CliError>
     where
@@ -138,7 +152,7 @@ impl AwsCli {
                 "process",
             ],
         )
-        .with_config(snapshot.path());
+        .with_config(snapshot.path(), home);
         let credentials = Arc::new(Credentials::parse(capture(export).await?)?);
         drop(snapshot);
         let identity = session::identity_command(&self.0, scope, &credentials);

@@ -28,6 +28,7 @@ impl Drop for Export {
 pub(super) struct Credentials {
     export: Export,
     expires: SystemTime,
+    home: super::home::CliHome,
 }
 
 impl Credentials {
@@ -48,7 +49,11 @@ impl Credentials {
         {
             return Err(CliError::InvalidResponse);
         }
-        let credentials = Self { export, expires };
+        let credentials = Self {
+            export,
+            expires,
+            home: super::home::CliHome::new()?,
+        };
         credentials.require_current()?;
         Ok(credentials)
     }
@@ -65,8 +70,13 @@ impl Credentials {
         Ok(())
     }
 
+    pub(super) fn home(&self) -> &super::home::CliHome {
+        &self.home
+    }
+
     // AWS CLI의 명시적 --profile은 환경 자격 공급자를 끈다. 호출자는 Scope만 유지한다.
     pub(super) fn env(&self, region: &str, mut set: impl FnMut(&str, &OsStr)) {
+        self.home.env(&mut set);
         for (key, value) in [
             ("AWS_ACCESS_KEY_ID", self.export.access_key_id.as_str()),
             ("AWS_SECRET_ACCESS_KEY", &self.export.secret_access_key),

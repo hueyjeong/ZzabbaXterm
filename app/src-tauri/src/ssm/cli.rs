@@ -96,7 +96,7 @@ fn resolve_on_path(file: &str, path: &OsStr) -> Option<PathBuf> {
 pub struct CommandSpec {
     tool: Tool,
     program: Arc<Path>,
-    config: Option<PathBuf>,
+    config: Option<(PathBuf, Arc<super::home::CliHome>)>,
     bound: Option<(super::Scope, Arc<super::Credentials>)>,
     args: Vec<String>,
 }
@@ -196,8 +196,8 @@ impl CommandSpec {
         }
     }
 
-    pub(super) fn with_config(mut self, path: &Path) -> Self {
-        self.config = Some(path.into());
+    pub(super) fn with_config(mut self, path: &Path, home: Arc<super::home::CliHome>) -> Self {
+        self.config = Some((path.into(), home));
         self
     }
 
@@ -211,7 +211,8 @@ impl CommandSpec {
     }
 
     pub(super) fn bound_environment(&self, mut set: impl FnMut(&str, &OsStr)) {
-        if let Some(path) = self.config.as_deref() {
+        if let Some((path, home)) = &self.config {
+            home.env(&mut set);
             super::export_env(path, &mut set);
         }
         if let Some((scope, credentials)) = &self.bound {
@@ -239,6 +240,16 @@ impl CommandSpec {
             credentials.require_current()?;
         }
         capture(self.command(), self.tool, LOOKUP_TIMEOUT, cancel).await
+    }
+
+    pub(super) async fn capture_in(
+        &self,
+        cwd: &Path,
+        cancel: &CancellationToken,
+    ) -> Result<Captured, CliError> {
+        let mut cmd = self.command();
+        cmd.current_dir(cwd);
+        capture(cmd, self.tool, LOOKUP_TIMEOUT, cancel).await
     }
 
     pub(super) async fn login(&self, cancel: &CancellationToken) -> Result<(), CliError> {
