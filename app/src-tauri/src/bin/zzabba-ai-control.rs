@@ -28,8 +28,9 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(target_os = "linux")]
+#[path = "../ai"]
 mod linux {
-    #[path = "shared.rs"]
+    #[path = "control_node_shared.rs"]
     pub(super) mod shared;
 
     use super::control_wire::{self, ClientFrame, NodeFrame, WireOperation, WireStream};
