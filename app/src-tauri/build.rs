@@ -6,9 +6,12 @@ fn main() {
         "connections_load",
         "editor_local_open", "editor_local_save", "editor_local_compare", "editor_local_reload",
         "editor_local_close",
+        "ai_targets", "ai_models", "ai_select", "ai_chat", "ai_propose", "ai_decide",
         "ssm_discovery",
         "storage_open", "storage_list_buckets", "storage_list_objects", "storage_select_local_file",
         "storage_upload", "storage_download", "storage_cancel_approval", "storage_close",
+        "ai_cli_review", "ai_cli_draft",
+        "ai_policy", "ai_set_policy",
     ]);
     let mut attributes = tauri_build::Attributes::new().app_manifest(app);
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")

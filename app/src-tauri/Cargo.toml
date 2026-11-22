@@ -3,6 +3,7 @@ name = "zzabbaxterm"
 version = "0.1.0"
 description = "ZzabbaXterm"
 edition = "2024"
+default-run = "zzabbaxterm"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -36,11 +37,13 @@ aws-smithy-types = "1"
 http = "1"
 percent-encoding = "2"
 sha2 = "0.10"
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+thiserror = "2"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 sha1 = "0.10"
 shlex = "2"
 tempfile = "3"
-tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt", "sync", "time"] }
 tokio-util = "0.7"
 zeroize = "1"
 uuid = { version = "1", features = ["v4"] }
