@@ -1,6 +1,6 @@
 use super::{COMMIT, OpenError, Version, check_parent, os};
 use sha2::{Digest, Sha256};
-use std::{ffi::{OsStr, OsString}, fs::{self, File}, io::{self, Read}, path::{Path, PathBuf}};
+use std::{ffi::OsString, fs::{self, File}, io::{self, Read}, path::{Path, PathBuf}};
 
 struct Location {
     selected_parent: PathBuf,
@@ -30,6 +30,12 @@ impl Location {
         })
     }
 
+    #[cfg(unix)]
+    fn open_file(&self) -> io::Result<Option<File>> {
+        self.parent.open_storage_file(&self.name)
+    }
+
+    #[cfg(windows)]
     fn open_file(&self) -> io::Result<Option<File>> {
         match self.parent.open_file(&self.name) {
             Ok(Some(file)) => Ok(Some(file)),
@@ -144,6 +150,48 @@ mod tests {
         upload.read_to_end(&mut body).unwrap();
         assert_eq!(body, b"original");
         assert_eq!(fs::read(&path).unwrap(), b"replacement");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_download_unix_accepts_absent_only_and_never_clobbers() {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let closed = tokio::sync::watch::Sender::new(false);
+        let path = dir.path().join("new.bin");
+        let approval = DownloadTarget::open(&path).unwrap();
+        assert!(!approval.replaces_existing());
+        let transfer = |approval: &DownloadTarget| {
+            let mut stage = approval.stage().unwrap();
+            stage.writer().unwrap().write_all(b"object").unwrap();
+            stage.commit(&closed, Sha256::digest(b"object").into())
+        };
+        transfer(&approval).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"object");
+        assert!(DownloadTarget::open(&path).unwrap().replaces_existing());
+
+        let late = dir.path().join("late.bin");
+        let approval = DownloadTarget::open(&late).unwrap();
+        fs::write(&late, b"external").unwrap();
+        assert_eq!(transfer(&approval).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&late).unwrap(), b"external");
+
+        let link = dir.path().join("link.bin");
+        let dangling = dir.path().join("dangling.bin");
+        let directory = dir.path().join("directory");
+        let fifo = dir.path().join("fifo");
+        symlink(&path, &link).unwrap();
+        symlink(dir.path().join("absent"), &dangling).unwrap();
+        fs::create_dir(&directory).unwrap();
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the name is NUL-terminated and belongs to the isolated fixture.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        for path in [link, dangling, directory, fifo] {
+            assert_eq!(DownloadTarget::open(&path).err().unwrap().kind(), io::ErrorKind::InvalidInput);
+        }
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 6);
     }
 
     #[test]

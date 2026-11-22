@@ -65,6 +65,22 @@ impl Directory {
         Ok(file.metadata()?.is_file().then_some(file))
     }
 
+    pub(super) fn open_storage_file(&self, name: &OsStr) -> io::Result<Option<File>> {
+        let name = c_name(name);
+        // Only ENOENT from the no-follow lookup on the held parent means a new destination.
+        let selected = match self.stat_id(&name) {
+            Ok(Some(id)) => id,
+            Ok(None) => return Err(io::ErrorKind::InvalidInput.into()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let file = self.open_at(&name, libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK)?;
+        if !file.metadata()?.is_file() || file_id(&file)? != selected {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        Ok(Some(file))
+    }
+
     pub(super) fn check_replace_access(&self, name: &OsStr, file: &File) -> io::Result<()> {
         if file.metadata()?.permissions().readonly() {
             return Err(io::Error::new(
