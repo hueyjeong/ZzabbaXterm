@@ -10,6 +10,7 @@ pub(crate) mod ipc;
 pub(crate) mod nano_bridge;
 pub(crate) mod nano_ipc;
 pub(crate) mod nano_wire;
+pub(crate) mod publication;
 pub(crate) mod registry;
 pub(crate) mod sftp;
 pub(crate) mod sftp_ipc;
@@ -26,7 +27,7 @@ use std::{
 };
 
 use sha2::{Digest, Sha256};
-use storage_files::DownloadPublicationError;
+use publication::{PublicationError, verify_bytes};
 
 static COMMIT: Mutex<()> = Mutex::new(());
 const CLI_READ_LIMIT: usize = 8 * 1024 * 1024;
@@ -252,8 +253,8 @@ impl LocalFile {
                     _ => io::Error::other("parent changed at publication"),
                 })
         }).map_err(|error| match error {
-            DownloadPublicationError::Io(source) => at(Replace)(source),
-            DownloadPublicationError::Unconfirmed(recovery_path) => SaveError::PublicationUnconfirmed { recovery_path },
+            PublicationError::Io(source) => at(Replace)(source),
+            PublicationError::Unconfirmed(recovery_path) => SaveError::PublicationUnconfirmed { recovery_path },
         })?;
         self.original = file;
         self.version = Version { id, digest };
@@ -384,28 +385,6 @@ fn read_cli_bytes(
     }
 }
 
-fn verify_bytes(file: &mut File, expected: &[u8]) -> io::Result<()> {
-    file.rewind()?;
-    let mut actual = [0; 8192];
-    for chunk in expected.chunks(actual.len()) {
-        let read = &mut actual[..chunk.len()];
-        file.read_exact(read)?;
-        if read != chunk {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "temporary file mismatch",
-            ));
-        }
-    }
-    if file.read(&mut actual[..1])? != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "temporary file has trailing bytes",
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod cli_read_tests {
     use super::*;
@@ -473,10 +452,4 @@ mod cli_read_tests {
         assert!(file.save("after").is_err());
         assert_eq!(fs::metadata(&path).unwrap().len(), CLI_READ_LIMIT as u64 + 1);
     }
-}
-
-fn temporary_name() -> io::Result<OsString> {
-    let mut random = [0; 16];
-    getrandom::fill(&mut random).map_err(|error| io::Error::other(error.to_string()))?;
-    Ok(format!(".zzabba-edit-{:032x}.tmp", u128::from_ne_bytes(random)).into())
 }

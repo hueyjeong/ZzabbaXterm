@@ -34,7 +34,7 @@ use windows_sys::{
     },
 };
 
-use super::{storage_files::DownloadPublicationError, temporary_name};
+use super::publication::{PublicationError, temporary_name};
 
 const SHARE: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 
@@ -531,7 +531,7 @@ impl Temporary<'_> {
         name: &OsStr,
         expected: &File,
         verify: impl FnOnce(&File) -> io::Result<()>,
-    ) -> Result<File, DownloadPublicationError> {
+    ) -> Result<File, PublicationError> {
         self.publish_editor_inner(name, expected, verify, || {})
     }
 
@@ -541,7 +541,7 @@ impl Temporary<'_> {
         expected: &File,
         verify: impl FnOnce(&File) -> io::Result<()>,
         after_backup: impl FnOnce(),
-    ) -> Result<File, DownloadPublicationError> {
+    ) -> Result<File, PublicationError> {
         let directory = self.directory;
         self.publish_existing(
             name,
@@ -561,7 +561,7 @@ impl Temporary<'_> {
         name: &OsStr,
         current: &File,
         verify: impl FnOnce(&mut File) -> io::Result<()>,
-    ) -> Result<(), DownloadPublicationError> {
+    ) -> Result<(), PublicationError> {
         self.publish_download_inner(name, current, verify, || {})
     }
 
@@ -571,7 +571,7 @@ impl Temporary<'_> {
         current: &File,
         verify: impl FnOnce(&mut File) -> io::Result<()>,
         after_backup: impl FnOnce(),
-    ) -> Result<(), DownloadPublicationError> {
+    ) -> Result<(), PublicationError> {
         self.publish_existing(name, current, verify, after_backup, Ok).map(drop)
     }
 
@@ -582,7 +582,7 @@ impl Temporary<'_> {
         verify: impl FnOnce(&mut File) -> io::Result<()>,
         after_backup: impl FnOnce(),
         retain: impl FnOnce(File) -> io::Result<File>,
-    ) -> Result<File, DownloadPublicationError> {
+    ) -> Result<File, PublicationError> {
         let directory = self.directory;
         let backup = temporary_name()?;
         let original_id = file_id(current)?;
@@ -612,7 +612,7 @@ impl Temporary<'_> {
                         .unwrap_or(&directory.path)
                         .join(&backup)
                 });
-            DownloadPublicationError::Unconfirmed(path)
+            PublicationError::Unconfirmed(path)
         };
         after_backup();
         if directory.entry_id(&backup).ok() != Some(Some(original_id))
@@ -834,7 +834,7 @@ mod tests {
                 stage.publish_download(name, &current, verify)
             };
             if claimed {
-                let Err(DownloadPublicationError::Unconfirmed(recovery)) = result else {
+                let Err(PublicationError::Unconfirmed(recovery)) = result else {
                     panic!("{result:?}");
                 };
                 assert_eq!(fs::read(recovery).unwrap(), b"original");
@@ -873,7 +873,7 @@ mod tests {
                 }
             });
             if claimed {
-                let Err(DownloadPublicationError::Unconfirmed(recovery)) = result else {
+                let Err(PublicationError::Unconfirmed(recovery)) = result else {
                     panic!("{result:?}");
                 };
                 assert_eq!(fs::read(recovery).unwrap(), b"original");
@@ -927,7 +927,7 @@ mod tests {
 
             assert!(access.matches_editor(&current).is_err(), "{kind}");
             assert!(matches!(stage.publish_editor(name, &current, |_| Ok(())),
-                Err(DownloadPublicationError::Io(_))), "{kind}");
+                Err(PublicationError::Io(_))), "{kind}");
             assert_eq!(fs::read(&path).unwrap(), b"original");
             match kind {
                 "ADS" => assert_eq!(fs::read(&stream).unwrap(), b"outside"),
@@ -978,7 +978,7 @@ mod tests {
                 }
                 Ok(())
             });
-            let Err(DownloadPublicationError::Io(error)) = result else { panic!("{result:?}") };
+            let Err(PublicationError::Io(error)) = result else { panic!("{result:?}") };
             let expected = if replaced { io::ErrorKind::AlreadyExists } else { io::ErrorKind::InvalidData };
             assert_eq!(error.kind(), expected);
             assert_eq!(fs::read(&path).unwrap(), b"external");
@@ -1006,7 +1006,7 @@ mod tests {
         let mut writer = File::options().append(true).share_mode(SHARE).open(&path).unwrap();
         writer.write_all(b" outside").unwrap();
         let result = stage.publish_editor(name, &current, |_| panic!("writer still holds the original"));
-        let Err(DownloadPublicationError::Io(error)) = result else { panic!("{result:?}") };
+        let Err(PublicationError::Io(error)) = result else { panic!("{result:?}") };
         assert_eq!(error.raw_os_error(), Some(ERROR_SHARING_VIOLATION as i32));
         writer.write_all(b" writer").unwrap();
         drop(writer);
