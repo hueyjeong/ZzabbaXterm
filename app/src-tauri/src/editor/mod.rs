@@ -25,6 +25,7 @@ use std::{
 use sha2::{Digest, Sha256};
 
 static COMMIT: Mutex<()> = Mutex::new(());
+const CLI_READ_LIMIT: usize = 8 * 1024 * 1024;
 
 pub(crate) struct LocalFile {
     selected_parent: PathBuf,
@@ -85,20 +86,36 @@ struct Version {
 }
 
 impl LocalFile {
-    /// `path`는 파일 선택기 또는 사용자 전용 CLI가 지정한다. 최종 심볼릭 링크는 거부한다.
+    /// `path`는 파일 선택기가 지정한다. 최종 심볼릭 링크는 거부한다.
     pub(crate) fn open(path: &Path) -> Result<(Self, String), OpenError> {
+        Self::open_with(path, None)
+    }
+
+    fn open_cli(path: &Path, cancelled: &dyn Fn() -> bool) -> Result<(Self, String), OpenError> {
+        if !path.to_str().is_some_and(|text| !text.contains('\0')) {
+            return Err(OpenError::InvalidPath);
+        }
+        Self::open_with(path, Some(cancelled))
+    }
+
+    fn open_with(path: &Path, cancelled: Option<&dyn Fn() -> bool>) -> Result<(Self, String), OpenError> {
         let (Some(selected_parent), Some(name)) = (path.parent(), path.file_name()) else {
             return Err(OpenError::InvalidPath);
         };
         if !path.is_absolute() || !os::valid_path(path) || !os::valid_name(name) {
             return Err(OpenError::InvalidPath);
         }
-        let canonical_parent = fs::canonicalize(selected_parent).map_err(OpenError::Io)?;
-        if !os::valid_path(&canonical_parent) {
-            return Err(OpenError::InvalidPath);
-        }
-        let parent = os::Directory::open(canonical_parent).map_err(OpenError::Io)?;
-        let (original, version, bytes) = snapshot(selected_parent, &parent, name)?;
+        let parent = if let Some(cancelled) = cancelled {
+            check_cancelled(cancelled).map_err(OpenError::Io)?;
+            os::Directory::open_cli(selected_parent).map_err(OpenError::Io)?
+        } else {
+            let canonical_parent = fs::canonicalize(selected_parent).map_err(OpenError::Io)?;
+            if !os::valid_path(&canonical_parent) {
+                return Err(OpenError::InvalidPath);
+            }
+            os::Directory::open(canonical_parent).map_err(OpenError::Io)?
+        };
+        let (original, version, bytes) = snapshot_with(selected_parent, &parent, name, cancelled)?;
         let text = String::from_utf8(bytes).map_err(|_| OpenError::InvalidUtf8)?;
         Ok((
             Self {
@@ -228,15 +245,42 @@ fn snapshot(
     parent: &os::Directory,
     name: &OsStr,
 ) -> Result<(File, Version, Vec<u8>), OpenError> {
-    check_parent(selected_parent, parent)?;
+    snapshot_with(selected_parent, parent, name, None)
+}
+
+fn snapshot_with(
+    selected_parent: &Path,
+    parent: &os::Directory,
+    name: &OsStr,
+    cancelled: Option<&dyn Fn() -> bool>,
+) -> Result<(File, Version, Vec<u8>), OpenError> {
+    let check_parent = || {
+        if let Some(cancelled) = cancelled {
+            check_cancelled(cancelled).map_err(OpenError::Io)?;
+            if !parent.still_at_cli_path(selected_parent).map_err(lookup_error)? {
+                return Err(OpenError::Conflict(LocalConflict::PathChanged));
+            }
+            Ok(())
+        } else {
+            check_parent(selected_parent, parent)
+        }
+    };
+    check_parent()?;
     let mut file = parent
         .open_file(name)
         .map_err(lookup_error)?
         .ok_or(OpenError::Conflict(LocalConflict::NotRegular))?;
     let id = os::file_id(&file).map_err(OpenError::Io)?;
     let before = file.metadata().map_err(OpenError::Io)?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(OpenError::Io)?;
+    let bytes = if let Some(cancelled) = cancelled {
+        let bytes = read_cli_bytes(&mut file, before.len(), cancelled).map_err(OpenError::Io)?;
+        check_cancelled(cancelled).map_err(OpenError::Io)?;
+        bytes
+    } else {
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(OpenError::Io)?;
+        bytes
+    };
     let after = file.metadata().map_err(OpenError::Io)?;
     if before.len() != after.len()
         || after.len() != bytes.len() as u64
@@ -246,11 +290,50 @@ fn snapshot(
     }
     let digest = Sha256::digest(&bytes).into();
     let named_id = parent.entry_id(name).map_err(lookup_error)?;
-    check_parent(selected_parent, parent)?;
+    check_parent()?;
     match named_id {
         Some(named_id) if named_id == id => Ok((file, Version { id, digest }, bytes)),
         Some(_) => Err(OpenError::Conflict(LocalConflict::ChangedDuringRead)),
         None => Err(OpenError::Conflict(LocalConflict::NotRegular)),
+    }
+}
+
+fn check_cancelled(cancelled: &dyn Fn() -> bool) -> io::Result<()> {
+    if cancelled() { Err(io::ErrorKind::Interrupted.into()) } else { Ok(()) }
+}
+
+fn read_cli_bytes(
+    reader: &mut impl Read,
+    len: u64,
+    cancelled: &dyn Fn() -> bool,
+) -> io::Result<Vec<u8>> {
+    if len > CLI_READ_LIMIT as u64 {
+        return Err(io::ErrorKind::FileTooLarge.into());
+    }
+    let mut bytes = Vec::with_capacity(len as usize);
+    let mut chunk = [0; 32 * 1024];
+    loop {
+        check_cancelled(cancelled)?;
+        let remaining = CLI_READ_LIMIT - bytes.len();
+        // 한 바이트로 상한에 도달한 파일의 EOF와 읽는 중 증가를 구별한다.
+        let chunk_len = remaining.max(1).min(chunk.len());
+        let count = match reader.read(&mut chunk[..chunk_len]) {
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if count == 0 {
+            return Ok(bytes);
+        }
+        if count > remaining {
+            return Err(io::ErrorKind::FileTooLarge.into());
+        }
+        if bytes.len() + count > bytes.capacity() {
+            // 파일이 늘어도 버퍼 용량 증가를 CLI 상한 내로 제한한다.
+            let capacity = (bytes.capacity() * 2).max(bytes.len() + count).min(CLI_READ_LIMIT);
+            bytes.reserve_exact(capacity - bytes.len());
+        }
+        bytes.extend_from_slice(&chunk[..count]);
     }
 }
 
@@ -274,6 +357,41 @@ fn verify_bytes(file: &mut File, expected: &[u8]) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_read_tests {
+    use super::*;
+    use std::{cell::Cell, io::repeat};
+
+    #[test]
+    fn cli_reads_at_most_the_limit_and_rejects_larger_metadata_before_reading() {
+        let limit = CLI_READ_LIMIT as u64;
+        let mut oversized = repeat(b'x').take(limit + 2);
+        assert_eq!(
+            read_cli_bytes(&mut oversized, limit + 1, &|| false).unwrap_err().kind(),
+            io::ErrorKind::FileTooLarge,
+        );
+        assert_eq!(oversized.limit(), limit + 2);
+
+        assert_eq!(read_cli_bytes(&mut repeat(b'x').take(limit), limit, &|| false).unwrap().len(), CLI_READ_LIMIT);
+        assert_eq!(
+            read_cli_bytes(&mut oversized, 1, &|| false).unwrap_err().kind(),
+            io::ErrorKind::FileTooLarge,
+        );
+        assert_eq!(oversized.limit(), 1);
+    }
+
+    #[test]
+    fn cli_stops_before_the_next_chunk_when_cancelled() {
+        let calls = Cell::new(0);
+        let mut input = repeat(b'x').take(CLI_READ_LIMIT as u64);
+        let error = read_cli_bytes(&mut input, 0, &|| calls.replace(calls.get() + 1) != 0)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(input.limit(), (CLI_READ_LIMIT - 32 * 1024) as u64);
+        assert_eq!(calls.get(), 2);
+    }
 }
 
 fn temporary_name() -> io::Result<OsString> {

@@ -1,6 +1,6 @@
 use std::{
     ffi::{CStr, CString, OsStr},
-    fs::{File, Permissions},
+    fs::{self, File, Permissions},
     io,
     os::{
         fd::{AsRawFd, FromRawFd},
@@ -47,6 +47,14 @@ impl Directory {
             .open(&path)?;
         let id = file_id(&file)?;
         Ok(Self { path, file, id })
+    }
+
+    pub(super) fn open_cli(path: &Path) -> io::Result<Self> {
+        Self::open(fs::canonicalize(path)?)
+    }
+
+    pub(super) fn still_at_cli_path(&self, path: &Path) -> io::Result<bool> {
+        Ok(fs::canonicalize(path)? == self.path && self.still_at_path()?)
     }
 
     pub(super) fn still_at_path(&self) -> io::Result<bool> {

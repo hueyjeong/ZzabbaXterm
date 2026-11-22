@@ -1,8 +1,11 @@
 use tauri::{AppHandle, Emitter, EventTarget, Manager};
+use tokio::sync::Semaphore;
 
 use super::{LocalFile, cli::Pending, registry::LocalEditors};
 
 pub(super) const MAIN: &str = "main";
+
+static READS: Semaphore = Semaphore::const_new(4);
 
 pub(crate) fn prepare_cli(app: AppHandle, pending: Pending) -> impl Future<Output = ()> + Send + 'static {
     let targeted = (|| {
@@ -15,11 +18,8 @@ pub(crate) fn prepare_cli(app: AppHandle, pending: Pending) -> impl Future<Outpu
         let editors = app.state::<LocalEditors>();
         let opening = pending.opening.clone();
         if lifetime.is_cancelled() || pending.is_inactive() { return; }
-        if !pending.path().is_absolute() || pending.path().to_str().is_none() {
-            pending.open_failed();
-            return;
-        }
 
+        let Ok(permit) = READS.try_acquire() else { pending.open_failed(); return; };
         let path = pending.path().to_owned();
         let read_lifetime = lifetime.clone();
         let read_opening = opening.clone();
@@ -28,12 +28,13 @@ pub(crate) fn prepare_cli(app: AppHandle, pending: Pending) -> impl Future<Outpu
             _ = lifetime.cancelled() => return,
             _ = opening.cancel.cancelled() => return,
             result = tauri::async_runtime::spawn_blocking(move || {
-                if read_lifetime.is_cancelled() || read_opening.is_inactive() { return None; }
-                Some(LocalFile::open(&path))
+                // 연결이 먼저 끝나도 진행 중인 동기 읽기가 슬롯을 보유한다.
+                let _permit = permit;
+                LocalFile::open_cli(&path, &|| read_lifetime.is_cancelled() || read_opening.is_inactive())
             }) => result,
         };
         if lifetime.is_cancelled() || pending.is_inactive() { return; }
-        let Ok(Some(Ok((file, text)))) = opened else { pending.open_failed(); return; };
+        let Ok(Ok((file, text))) = opened else { pending.open_failed(); return; };
         let Ok((request_id, completed)) = editors.offer(MAIN, document, pending, file, text) else { return; };
 
         #[derive(Clone, serde::Serialize)]
