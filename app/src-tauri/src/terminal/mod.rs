@@ -44,6 +44,20 @@ impl CloseResult {
     }
 }
 
+enum Retired {
+    Completed { owner: String, result: CloseResult },
+    Unconfirmed(Arc<Session>),
+}
+
+impl Retired {
+    fn owner(&self) -> &str {
+        match self {
+            Self::Completed { owner, .. } => owner,
+            Self::Unconfirmed(session) => &session.owner,
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Sessions {
     next: AtomicU64,
@@ -53,7 +67,7 @@ pub(crate) struct Sessions {
 #[derive(Default)]
 struct Registry {
     sessions: HashMap<String, Arc<Session>>,
-    close_results: HashMap<String, Arc<Session>>,
+    close_results: HashMap<String, Retired>,
     destroyed: HashSet<String>,
     documents: HashMap<String, u64>,
     probes: Runs,
@@ -114,10 +128,16 @@ impl Sessions {
         let worker_id = id.clone();
         let result = session.launch(size, command, send, move |session| {
             let mut registry = registry.lock().unwrap();
+            let result = session.close_result();
             if session.is_ssm() && !registry.shutdown
                 && registry.documents.get(&session.owner).copied().unwrap_or(0) == document
             {
-                registry.close_results.insert(worker_id.clone(), Arc::clone(session));
+                let retired = if result.warning().is_some() {
+                    Retired::Unconfirmed(Arc::clone(session))
+                } else {
+                    Retired::Completed { owner: session.owner.clone(), result }
+                };
+                registry.close_results.insert(worker_id.clone(), retired);
             }
             registry.sessions.remove(&worker_id);
         });
@@ -157,21 +177,26 @@ impl Sessions {
 
     fn close(&self, owner: &str, id: &str) -> Result<CloseResult, String> {
         let (session, retired) = {
-            let registry = self.registry.lock().unwrap();
-            if let Some(session) = registry.close_results.get(id) {
-                (Arc::clone(session), true)
-            } else {
-                (registry.sessions.get(id).cloned().ok_or(CLOSED)?, false)
+            let mut registry = self.registry.lock().unwrap();
+            match registry.close_results.get(id) {
+                Some(entry) if entry.owner() != owner => return Err("다른 창의 세션입니다".into()),
+                Some(Retired::Completed { .. }) => {
+                    let Some(Retired::Completed { result, .. }) = registry.close_results.remove(id) else { unreachable!() };
+                    return Ok(result);
+                }
+                Some(Retired::Unconfirmed(session)) => (Arc::clone(session), true),
+                None => (registry.sessions.get(id).cloned().ok_or(CLOSED)?, false),
             }
         };
         if session.owner != owner { return Err("다른 창의 세션입니다".into()); }
-        let result = if retired {
-            session.recheck_cleanup()
-        } else {
-            session.stop(process::Stop::Closed);
-            session.wait_finished();
-            session.close_result()
-        };
+        if retired {
+            let result = session.recheck_cleanup();
+            if result.warning().is_none() { self.registry.lock().unwrap().close_results.remove(id); }
+            return Ok(result);
+        }
+        session.stop(process::Stop::Closed);
+        session.wait_finished();
+        let result = session.close_result();
         if result.warning().is_none() { self.registry.lock().unwrap().close_results.remove(id); }
         Ok(result)
     }
@@ -187,7 +212,7 @@ impl Sessions {
     fn stop_owner(&self, owner: &str, destroyed: bool) {
         let mut registry = self.registry.lock().unwrap();
         *registry.documents.entry(owner.into()).or_default() += 1;
-        registry.close_results.retain(|_, session| session.owner != owner);
+        registry.close_results.retain(|_, entry| entry.owner() != owner);
         if destroyed {
             registry.destroyed.insert(owner.into());
         }
@@ -201,6 +226,7 @@ impl Sessions {
         let (sessions, probes) = {
             let mut registry = self.registry.lock().unwrap();
             registry.shutdown = true;
+            registry.close_results.clear();
             (registry.sessions.values().cloned().collect::<Vec<_>>(), registry.probes.stop_all())
         };
         for session in &sessions {
