@@ -188,7 +188,7 @@ impl Sessions {
         {
             let mut registry = self.registry.lock().unwrap();
             if registry.shutdown || registry.destroyed.contains(owner)
-                || remote_editor && (registry.exiting || registry.closing_owner(owner))
+                || remote_editor && (registry.exiting || registry.closing.contains(owner))
             {
                 return Err("open: 창이 닫혔습니다".into());
             }
