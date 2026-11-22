@@ -20,7 +20,7 @@ pub(super) async fn pick<R: tauri::Runtime>(
     selected.await.ok().flatten()
 }
 
-async fn prompt<R: tauri::Runtime>(
+pub(super) async fn prompt<R: tauri::Runtime>(
     window: tauri::Window<R>, title: &'static str, description: String,
     buttons: TASKDIALOG_COMMON_BUTTON_FLAGS, closed: watch::Receiver<bool>,
 ) -> Option<i32> {
