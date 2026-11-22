@@ -64,3 +64,114 @@ fn cancelled_or_stale_native_approval_does_not_start_a_tunnel() {
     assert_eq!(stale.unwrap_err(), STALE);
     assert!(tabs.document(1).unwrap().entries.is_empty());
 }
+
+#[test]
+fn desktop_rejects_protocol_mismatch_and_changed_saved_ssh_before_connecting() {
+    let tabs = TunnelTabs::default();
+    let dir = tempfile::tempdir().unwrap();
+    let target = "ssh-server";
+    let mut profile = crate::connections::tests::ssh_draft(dir.path());
+    let key = |name| json!({"kind":"keyFile", "privateKeyPath": dir.path().join(name)});
+    let save = |profile| {
+        let draft = serde_json::from_value::<crate::connections::profile::Draft>(profile).unwrap().validate().unwrap();
+        crate::connections::save_test_profile(dir.path(), draft);
+    };
+    profile["target"]["ssh"]["auth"] = key("original");
+    save(profile.clone());
+    let epoch = tabs.epoch();
+    let handle = tabs.open(epoch, dir.path(), target.into(), "시험 터널".into()).unwrap();
+    let destination = Destination { host: "127.0.0.1".into(), port: 3389 };
+    let route = Route::SshLocal { server: target.into(), listen: ([127, 0, 0, 1], 3390).into(), destination: destination.clone() };
+    let id = {
+        let mut doc = tabs.document(epoch).unwrap();
+        let owner = doc.tabs[&handle].owner.clone();
+        let id = doc.tunnels.begin(owner, route).unwrap();
+        doc.tabs.get_mut(&handle).unwrap().ids.push(id);
+        doc.entries.insert(id, Entry { endpoint: String::new(), protocol: Some(Protocol::Rdp) });
+        id.0.to_string()
+    };
+    let outsider = tabs.open(epoch, dir.path(), target.into(), "별도 탭".into()).unwrap();
+    assert_eq!(tabs.open_desktop(epoch, dir.path(), (&outsider, &id), target, &destination, Protocol::Rdp)
+        .err().unwrap(), "이 탭이 소유한 터널이 아닙니다");
+    let issue = |protocol| tabs.open_desktop(epoch, dir.path(), (&handle, &id), target, &destination, protocol);
+    assert_eq!(issue(Protocol::Vnc).err().unwrap(), "승인된 터널 서비스가 일치하지 않습니다");
+    assert_eq!(issue(Protocol::Rdp).err().unwrap(), "터널 수신이 준비되지 않았습니다");
+
+    profile["targetRevision"] = json!(1);
+    profile["target"]["ssh"]["auth"] = key("replacement");
+    save(profile.clone());
+    assert_eq!(issue(Protocol::Rdp).err().unwrap(), "승인된 SSH 접속 설정이 변경되었습니다");
+    profile["targetRevision"] = json!(2);
+    profile["target"]["ssh"]["auth"] = key("original");
+    save(profile);
+    assert_eq!(issue(Protocol::Rdp).err().unwrap(), "승인된 SSH 접속 설정이 변경되었습니다");
+
+    tabs.navigate(false);
+    assert_eq!(issue(Protocol::Rdp).err().unwrap(), STALE);
+}
+
+#[test]
+fn desktop_requires_exact_same_host_loopback_destination() {
+    let listen = ([127, 0, 0, 1], 3390).into();
+    for (host, allowed) in [("127.0.0.1", true), ("::1", true), ("127.0.0.2", false), ("localhost", false)] {
+        let destination = Destination { host: host.into(), port: 3389 };
+        let route = Route::SshLocal { server: "ssh-server".into(), listen, destination: destination.clone() };
+        assert_eq!(desktop_listener(&route, "ssh-server", &destination).is_ok(), allowed);
+        assert!(desktop_listener(&route, "other-server", &destination).is_err());
+        assert!(desktop_listener(&route, "ssh-server", &Destination { port: 5900, ..destination }).is_err());
+    }
+}
+
+#[test]
+fn desktop_route_survives_source_close_and_cleans_up_on_last_owner() {
+    use super::super::{Observation, Transport};
+    use std::cell::Cell;
+
+    struct Probe<'a> { signal: Observation, closes: &'a Cell<usize> }
+    impl Transport for Probe<'_> {
+        fn observe(&mut self) -> Observation { std::mem::replace(&mut self.signal, Observation::Pending) }
+        fn close(&mut self) -> std::io::Result<()> {
+            self.closes.set(self.closes.get() + 1);
+            Ok(())
+        }
+    }
+
+    for end in ["release", "child exit", "navigation"] {
+        let closes = Cell::new(0);
+        let mut tunnels = Tunnels::default();
+        let source = tunnels.open_tab("0", "source").unwrap();
+        let id = tunnels.begin(source.clone(), Route::SshLocal {
+            server: "ssh-server".into(), listen: ([127, 0, 0, 1], 3390).into(),
+            destination: Destination { host: "127.0.0.1".into(), port: 3389 },
+        }).unwrap();
+        tunnels.finish_start(id, Ok(Probe { signal: Observation::Listening, closes: &closes })).unwrap();
+        assert!(matches!(tunnels.observe(id, &source).unwrap().state, State::Ready));
+        let owner = tunnels.retain_desktop(id, &source).unwrap();
+        let other_desktop = tunnels.retain_desktop(id, &source).unwrap();
+        let loss = tunnels.entries.get_mut(&id).unwrap().desktop_loss.get_or_insert_with(CancellationToken::new).child_token();
+        assert!(tunnels.close_tab(&source).is_empty());
+        assert_eq!(closes.get(), 0);
+        assert!(tunnels.entries[&id].transport.is_some());
+        assert!(!loss.is_cancelled());
+        assert!(tunnels.release(id, &other_desktop).unwrap());
+        assert_eq!(closes.get(), 0);
+        assert!(!loss.is_cancelled());
+        match end {
+            "navigation" => {
+                tunnels.revoke_desktops();
+                assert!(loss.is_cancelled());
+                assert!(tunnels.close_window("0").is_empty());
+            }
+            "child exit" => {
+                tunnels.entries.get_mut(&id).unwrap().transport.as_mut().unwrap().signal = Observation::Ended("exited".into());
+                assert!(matches!(tunnels.observe_route(id).unwrap().state, State::Disconnected(_)));
+                assert!(loss.is_cancelled());
+                assert!(tunnels.release(id, &owner).unwrap());
+            }
+            _ => assert!(tunnels.release(id, &owner).unwrap()),
+        }
+        assert!(loss.is_cancelled());
+        assert!(!tunnels.entries.contains_key(&id));
+        assert_eq!(closes.get(), 1);
+    }
+}

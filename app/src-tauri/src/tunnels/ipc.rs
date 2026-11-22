@@ -1,7 +1,8 @@
-use std::{collections::HashMap, net::TcpStream, path::Path, sync::{Arc, Mutex}};
+use std::{collections::HashMap, net::TcpStream, num::NonZeroU64, path::Path, sync::{Arc, Mutex, Weak}, thread, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use tauri::{Manager, Webview, ipc::{Invoke, InvokeBody}};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     connections::{profile::{MethodRef, Ssh, SshAuth, SshTransport}, with_saved_method, with_saved_ssh},
@@ -21,7 +22,7 @@ const STALE: &str = "터널 탭이 닫혔습니다";
 const LIMIT: usize = 32;
 
 #[derive(Default)]
-pub(crate) struct TunnelTabs(Mutex<Document>);
+pub(crate) struct TunnelTabs(Arc<Mutex<Document>>);
 
 #[derive(Default)]
 struct Document {
@@ -122,15 +123,83 @@ fn status(view: View<'_>, owners: Vec<String>, entry: &Entry) -> Status {
         }) }
 }
 
+/// 소켓을 넘겨받은 작업도 종료할 때까지 이 임대를 보관한다.
 #[allow(dead_code, reason = "R02·R03의 네이티브 세션에서 사용")]
-pub(crate) struct DesktopRoute<'a> {
-    pub(crate) target: &'a str,
-    pub(crate) ssh: &'a Ssh,
-    pub(crate) destination: &'a Destination,
-    pub(crate) protocol: Protocol,
+pub(crate) struct DesktopLease {
+    document: Weak<Mutex<Document>>,
+    epoch: u64,
+    id: TunnelId,
+    owner: Owner,
+    target: String,
+    ssh: Arc<SavedSsh>,
+    destination: Destination,
+    protocol: Protocol,
+    stream: Option<TcpStream>,
+    loss: CancellationToken,
+}
+
+#[allow(dead_code, reason = "R02·R03의 네이티브 세션에서 사용")]
+impl DesktopLease {
+    pub(crate) fn target(&self) -> &str { &self.target }
+    pub(crate) fn ssh(&self) -> (NonZeroU64, &Ssh) { (self.ssh.0, &self.ssh.1) }
+    pub(crate) fn destination(&self) -> &Destination { &self.destination }
+    pub(crate) fn protocol(&self) -> Protocol { self.protocol }
+    pub(crate) fn loss(&self) -> CancellationToken { self.loss.child_token() }
+
+    pub(crate) fn take_stream(&mut self) -> Result<TcpStream, String> {
+        if self.loss.is_cancelled() { return Err(STALE.into()); }
+        self.stream.take().ok_or_else(|| "터널 소켓을 이미 인계했습니다".into())
+    }
+}
+
+impl Drop for DesktopLease {
+    fn drop(&mut self) {
+        self.loss.cancel();
+        drop(self.stream.take());
+        let Some(document) = self.document.upgrade() else { return; };
+        let mut doc = document.lock().unwrap();
+        if doc.epoch != self.epoch { return; }
+        let _ = doc.tunnels.release(self.id, &self.owner);
+        if !doc.tunnels.entries.contains_key(&self.id) {
+            doc.entries.remove(&self.id);
+            if let Err(error) = doc.tunnels.retry_cleanup(self.id) {
+                eprintln!("SSH 터널 종료 확인 불가: {error}");
+            }
+        }
+    }
+}
+
+// 터널 탭을 닫아도 SSH 자식 종료를 확인한다. 작업은 활성 전달당 하나다.
+fn watch_desktop_route(document: Weak<Mutex<Document>>, epoch: u64, id: TunnelId, loss: CancellationToken) -> std::io::Result<()> {
+    thread::Builder::new().name("desktop-tunnel".into()).spawn(move || loop {
+        thread::sleep(Duration::from_millis(100));
+        let Some(document) = document.upgrade() else { break; };
+        let mut doc = document.lock().unwrap();
+        if loss.is_cancelled() || doc.epoch != epoch
+            || !doc.tunnels.observe_route(id).is_some_and(|route| matches!(route.state, State::Ready))
+        {
+            break;
+        }
+    })?;
+    Ok(())
+}
+
+fn desktop_listener(route: &Route, target: &str, expected: &Destination) -> Result<std::net::SocketAddr, String> {
+    let Route::SshLocal { server, listen, destination } = route else { return Err("로컬 SSH 전달이 필요합니다".into()); };
+    if listen.ip() != std::net::Ipv4Addr::LOCALHOST || listen.port() == 0 {
+        return Err("승인된 로컬 SSH 수신 주소가 일치하지 않습니다".into());
+    }
+    if server != target || destination != expected || destination.port == 0
+        || !matches!(destination.host.as_str(), "127.0.0.1" | "::1")
+    {
+        return Err("승인된 터널 목적지가 일치하지 않습니다".into());
+    }
+    Ok(*listen)
 }
 
 impl TunnelTabs {
+    pub(crate) fn epoch(&self) -> u64 { self.0.lock().unwrap().epoch }
+
     pub(crate) fn navigate(&self, destroyed: bool) {
         let mut doc = self.0.lock().unwrap();
         if doc.destroyed { return; }
@@ -139,6 +208,7 @@ impl TunnelTabs {
         doc.destroyed = destroyed;
         doc.tabs.clear();
         doc.entries.clear();
+        doc.tunnels.revoke_desktops();
         let mut old = std::mem::take(&mut doc.tunnels);
         drop(doc);
         for (id, error) in old.close_window(&window) {
@@ -223,26 +293,40 @@ impl TunnelTabs {
         Ok(Some(id.0.to_string()))
     }
 
-    /// 로컬 리슨 주소가 아니라 승인한 실제 서비스와 프로토콜로 요청한다.
+    /// 네이티브 승인과 문서 검증을 마친 그래픽 작업에만 연결 소켓을 인계한다.
     #[allow(dead_code, reason = "R02·R03의 네이티브 세션에서 사용")]
-    pub(crate) fn open_stream(&self, handle: &str, id: &str, expected: DesktopRoute<'_>) -> Result<TcpStream, String> {
-        let mut doc = self.0.lock().unwrap();
+    pub(crate) fn open_desktop(&self, epoch: u64, directory: &Path, source: (&str, &str),
+                               target: &str, destination: &Destination, protocol: Protocol) -> Result<DesktopLease, String> {
+        let (handle, id) = source;
         let id = TunnelId(id.parse().map_err(|_| "터널 ID가 올바르지 않습니다")?);
+        let mut doc = self.document(epoch)?;
         let Document { tabs, entries, tunnels, .. } = &mut *doc;
-        let tab = tabs.get(handle).ok_or(STALE)?;
-        if tab.target != expected.target || tab.ssh.as_deref().map(|(_, ssh)| ssh) != Some(expected.ssh)
-            || entries.get(&id).and_then(|entry| entry.protocol) != Some(expected.protocol)
-        {
-            return Err("승인된 터널 서비스가 일치하지 않습니다".into());
-        }
-        let view = tunnels.observe(id, &tab.owner).ok_or("이 탭이 소유한 터널이 아닙니다")?;
-        if !matches!(view.state, State::Ready) {
-            return Err("터널 수신이 준비되지 않았습니다".into());
-        }
-        let Route::SshLocal { listen, destination, .. } = view.route else { return Err("로컬 SSH 전달이 필요합니다".into()); };
-        if destination != expected.destination { return Err("승인된 터널 목적지가 일치하지 않습니다".into()); }
-        let address = *listen;
-        tunnels.entries.get_mut(&id).and_then(|entry| entry.transport.as_mut()).ok_or(STALE)?.open_stream(address)
+        let tab = tabs.get(handle).filter(|tab| tunnels.is_open(&tab.owner)).ok_or(STALE)?;
+        let approved = tab.ssh.as_ref().filter(|_| tab.target == target).ok_or("승인된 SSH 대상이 일치하지 않습니다")?;
+        if !tab.ids.contains(&id) { return Err("이 탭이 소유한 터널이 아닙니다".into()); }
+        let service = entries.get(&id).ok_or(STALE)?.protocol;
+        let document = Arc::downgrade(&self.0);
+        // 읽기 잠금을 소켓 검증과 등록까지 유지해 저장 설정 변경과 발급을 직렬화한다.
+        with_saved_ssh(directory, target, |current| {
+            if current.as_ref() != Some(approved.as_ref()) || !matches!(approved.1.transport, SshTransport::Direct {}) {
+                return Err("승인된 SSH 접속 설정이 변경되었습니다".into());
+            }
+            if service != Some(protocol) { return Err("승인된 터널 서비스가 일치하지 않습니다".into()); }
+            let view = tunnels.observe(id, &tab.owner).ok_or("이 탭이 소유한 터널이 아닙니다")?;
+            if !matches!(view.state, State::Ready) { return Err("터널 수신이 준비되지 않았습니다".into()); }
+            let address = desktop_listener(view.route, target, destination)?;
+            let route = tunnels.entries.get_mut(&id).ok_or(STALE)?;
+            let stream = route.transport.as_mut().ok_or(STALE)?.open_stream(address)?;
+            if route.desktop_loss.is_none() {
+                let loss = CancellationToken::new();
+                watch_desktop_route(document.clone(), epoch, id, loss.clone()).map_err(|error| format!("SSH 터널 상태 감시: {error}"))?;
+                route.desktop_loss = Some(loss);
+            }
+            let loss = route.desktop_loss.as_ref().unwrap().child_token();
+            let owner = tunnels.retain_desktop(id, &tab.owner).ok_or(STALE)?;
+            Ok(DesktopLease { document, epoch, id, owner, target: target.into(), ssh: approved.clone(),
+                destination: destination.clone(), protocol, stream: Some(stream), loss })
+        })?
     }
 
     fn snapshot(&self, epoch: u64, handle: &str) -> Result<Vec<Status>, String> {
@@ -316,7 +400,7 @@ struct Share { tab: String, to: String, id: String }
 
 fn job<T: Serialize + Send + 'static>(invoke: Invoke, work: impl FnOnce(Webview, u64) -> Result<T, String> + Send + 'static) {
     let caller = invoke.message.webview_ref().clone();
-    let epoch = caller.state::<TunnelTabs>().0.lock().unwrap().epoch;
+    let epoch = caller.state::<TunnelTabs>().epoch();
     invoke.resolver.respond_async(async move {
         tauri::async_runtime::spawn_blocking(move || work(caller, epoch)).await
             .map_err(|_| tauri::ipc::InvokeError::from("터널 작업을 완료할 수 없습니다"))?
