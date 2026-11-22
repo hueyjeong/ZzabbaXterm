@@ -66,6 +66,7 @@ export interface LocalConnectionWizardState {
   go(delta: -1 | 1, selection?: SsmTarget | null): void;
   edit(field: "groupName" | "targetName" | "startDirectory", value: string): void;
   selectMethod(method: "local" | "ssm"): void;
+  invalidateSsmSelection(): void;
   selectGroup(group: LocalProfileDraft["group"], revision: number | null): void;
   test(actions: LocalConnectionActions): Promise<void>;
   save(actions: LocalConnectionActions): Promise<void>;
@@ -133,6 +134,12 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Local
       ? { defaultMethod, local }
       : { defaultMethod, ssm: null };
     updateDraft({ ...draft, target: { id, groupId, displayName, ...method } });
+  }
+
+  function invalidateSsmSelection() {
+    const { draft } = state;
+    if (locked() || state.step !== "auth" || draft.target.defaultMethod !== "ssm" || !draft.target.ssm) return;
+    updateDraft({ ...draft, target: { ...draft.target, ssm: null } });
   }
 
   function selectGroup(group: LocalProfileDraft["group"], groupRevision: number | null) {
@@ -227,6 +234,7 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Local
     go,
     edit,
     selectMethod,
+    invalidateSsmSelection,
     selectGroup,
     test,
     save,
