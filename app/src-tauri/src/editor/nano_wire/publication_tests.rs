@@ -22,6 +22,21 @@ fn active_open_round_trips_at_path_limit_and_stays_off_local_lane() {
 }
 
 #[test]
+fn peer_frame_lengths_are_checked_before_the_body() {
+    let open = ActiveOpen { id: 9, path: b"/test".to_vec(), snapshot: SNAPSHOT }.encode().unwrap();
+    let header = open[..4].try_into().unwrap();
+    let prefix = open[4..4 + PREFIX].try_into().unwrap();
+    assert!(matches!(decode_peer_prefix(header, prefix), Ok((len, PeerFrame::Open(9))) if len + 4 == open.len()));
+    assert!(decode_peer_prefix((MAX_OPEN_PAYLOAD as u32 + 1).to_be_bytes(), prefix).is_err());
+    let stock = super::super::Request::Open { id: 9, path: b"/test".to_vec() }.encode().unwrap();
+    assert!(decode_peer_prefix(stock[..4].try_into().unwrap(), stock[4..4 + PREFIX].try_into().unwrap()).is_err());
+    let outcome = Outcome::Saved(SNAPSHOT).encode(9, 1).unwrap();
+    let prefix = outcome[4..4 + PREFIX].try_into().unwrap();
+    assert!(matches!(decode_peer_prefix(outcome[..4].try_into().unwrap(), prefix), Ok((_, PeerFrame::Outcome(9)))));
+    assert!(decode_peer_prefix((outcome.len() as u32 - 5).to_be_bytes(), prefix).is_err());
+}
+
+#[test]
 fn operations_round_trip_and_each_truncation_is_rejected() {
     let mut outgoing = OpIds::default();
     let mut incoming = OpIds::default();

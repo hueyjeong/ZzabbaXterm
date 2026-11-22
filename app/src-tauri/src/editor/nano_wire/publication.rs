@@ -9,6 +9,7 @@ const OP_PREFIX: usize = PREFIX + 8;
 const OBS_LEN: usize = 8 + 32;
 const TOKEN_LEN: usize = 16;
 const SNAP_LEN: usize = TOKEN_LEN + OBS_LEN;
+pub(crate) const MAX_OPEN_PAYLOAD: usize = PREFIX + SNAP_LEN + MAX_PATH;
 const OPEN: u8 = 12;
 const COMPARE: u8 = 13;
 const RELOAD: u8 = 14;
@@ -22,6 +23,31 @@ const UNKNOWN: u8 = 21;
 const RECOVERY_PREFIX: &str = ".zzabba-edit-";
 const RECOVERY_SUFFIX: &str = ".tmp/original";
 const RECOVERY_LEN: usize = RECOVERY_PREFIX.len() + 32 + RECOVERY_SUFFIX.len();
+
+pub(crate) enum PeerFrame {
+    Open(u64),
+    Cancel(u64),
+    Outcome(u64),
+}
+
+pub(crate) fn decode_peer_prefix(header: [u8; 4], prefix: &[u8; PREFIX]) -> io::Result<(usize, PeerFrame)> {
+    let len = u32::from_be_bytes(header) as usize;
+    let (kind, id, _) = with_id(prefix)?;
+    let frame_kind = match kind {
+        OPEN => { decode_open_len(header)?; PeerFrame::Open(id) }
+        super::CANCEL if len == PREFIX => PeerFrame::Cancel(id),
+        OBSERVATION if len == OP_PREFIX + OBS_LEN => PeerFrame::Outcome(id),
+        RELOADED | SAVED if len == OP_PREFIX + SNAP_LEN => PeerFrame::Outcome(id),
+        CONFLICT | UNAVAILABLE if len == OP_PREFIX => PeerFrame::Outcome(id),
+        UNKNOWN if len == OP_PREFIX || len == OP_PREFIX + RECOVERY_LEN => PeerFrame::Outcome(id),
+        _ => return Err(invalid()),
+    };
+    Ok((len, frame_kind))
+}
+
+pub(crate) fn is_operation_kind(kind: u8) -> bool {
+    matches!(kind, COMPARE | RELOAD | SAVE)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Observation {
@@ -73,7 +99,7 @@ pub(crate) struct ActiveOpen {
 
 pub(crate) fn decode_open_len(header: [u8; 4]) -> io::Result<usize> {
     let len = u32::from_be_bytes(header) as usize;
-    if !(PREFIX + SNAP_LEN + 1..=PREFIX + SNAP_LEN + MAX_PATH).contains(&len) {
+    if !(PREFIX + SNAP_LEN + 1..=MAX_OPEN_PAYLOAD).contains(&len) {
         return Err(invalid());
     }
     Ok(len)

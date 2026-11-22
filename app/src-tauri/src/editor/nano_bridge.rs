@@ -9,9 +9,12 @@ use crate::terminal::Sessions;
 
 use super::{
     cli_open::MAIN,
-    nano_wire::{Request, Response},
+    nano_wire::{Response, publication::ActiveOpen},
     sftp_ipc::{BridgeSlot, Opened, SftpIpc, SharedSftpNamespace},
 };
+
+mod publication;
+pub(crate) use publication::{PUBLICATION_IO_LIMIT, PublicationOperation, PublicationReply, PublicationWork, PublishError, Publisher};
 
 const OFFER_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -193,10 +196,10 @@ impl NanoBridge {
 }
 
 async fn open(
-    app: &AppHandle, slot: &BridgeSlot, document: u64, parent: &str, path: &[u8],
-    request: &CancellationToken,
+    app: &AppHandle, slot: &BridgeSlot, document: u64, parent: &str, active: ActiveOpen,
+    request: &CancellationToken, work: mpsc::Sender<PublicationWork>,
 ) -> Outcome {
-    let Ok(path) = std::str::from_utf8(path) else { return Outcome::Unattached; };
+    let Ok(path) = std::str::from_utf8(&active.path) else { return Outcome::Unattached; };
     let sftp = app.state::<SftpIpc>();
     let sessions = app.state::<Sessions>();
     let slot_cancel = slot.cancellation();
@@ -204,7 +207,10 @@ async fn open(
         return Outcome::Unattached;
     }
     let offer_id = uuid::Uuid::new_v4().simple().to_string();
-    let Ok(opened) = sftp.open_bridge(slot, &sessions, path, &offer_id).await else { return Outcome::Unattached; };
+    let publisher = Publisher::new(active.id, request.clone(), work);
+    let Ok(opened) = sftp.open_verified_bridge(slot, &sessions, path, &offer_id, active.snapshot, publisher).await else {
+        return Outcome::Unattached;
+    };
     let handle = opened.handle.clone();
     let state = app.state::<NanoBridge>();
     if request.is_cancelled() || slot_cancel.is_cancelled() {
@@ -244,7 +250,7 @@ async fn open(
 
 async fn drive_open(
     id: u64, opened: impl Future<Output = Outcome>, request: &CancellationToken,
-    cancel: &CancellationToken, slot_cancel: &CancellationToken, requests: &mut mpsc::Receiver<Request>,
+    cancel: &CancellationToken, slot_cancel: &CancellationToken, requests: &mut mpsc::Receiver<BridgeRequest>,
 ) -> Option<Outcome> {
     tokio::pin!(opened);
     loop {
@@ -253,9 +259,9 @@ async fn drive_open(
             _ = cancel.cancelled() => break,
             outcome = &mut opened => return Some(outcome),
             message = requests.recv() => match message {
-                Some(Request::Cancel { id: cancelled }) if cancelled == id => request.cancel(),
-                Some(Request::Cancel { .. }) => {},
-                None | Some(Request::Open { .. }) => break,
+                Some(BridgeRequest::Cancel(cancelled)) if cancelled == id => request.cancel(),
+                Some(BridgeRequest::Cancel(_)) => {},
+                None | Some(BridgeRequest::Open(_)) => break,
             },
         }
     }
@@ -265,10 +271,15 @@ async fn drive_open(
     None
 }
 
+pub(crate) enum BridgeRequest {
+    Open(ActiveOpen),
+    Cancel(u64),
+}
+
 // 배치 공개키 인증과 관리자가 확인한 셸·SFTP 공통 경로를 선택한 탭에서만 호출한다.
 pub(crate) async fn run(
     app: AppHandle, owner: String, document: u64, parent: String, cancel: CancellationToken,
-    mut requests: mpsc::Receiver<Request>, responses: mpsc::Sender<Response>,
+    mut requests: mpsc::Receiver<BridgeRequest>, responses: mpsc::Sender<Response>, work: mpsc::Sender<PublicationWork>,
 ) {
     let sftp = app.state::<SftpIpc>();
     let slot = (owner == MAIN && app.get_webview_window(MAIN).is_some_and(|webview| webview.as_ref().window().label() == MAIN))
@@ -280,15 +291,16 @@ pub(crate) async fn run(
             _ = cancel.cancelled() => return,
             message = requests.recv() => message,
         };
-        let (id, path) = match message {
-            Some(Request::Open { id, path }) => (id, path),
-            Some(Request::Cancel { .. }) => continue,
+        let active = match message {
+            Some(BridgeRequest::Open(active)) => active,
+            Some(BridgeRequest::Cancel(_)) => continue,
             None => return,
         };
+        let id = active.id;
         let outcome = if let Some(slot) = &slot {
             let request = cancel.child_token();
             let slot_cancel = slot.cancellation();
-            let opened = open(&app, slot, document, &parent, &path, &request);
+            let opened = open(&app, slot, document, &parent, active, &request, work.clone());
             let Some(outcome) = drive_open(id, opened, &request, &cancel, &slot_cancel, &mut requests).await else {
                 return;
             };

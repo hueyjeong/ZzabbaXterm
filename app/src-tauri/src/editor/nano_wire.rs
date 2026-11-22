@@ -2,8 +2,13 @@ use std::io;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-const VERSION: u8 = 2;
+#[path = "nano_wire/publication.rs"]
+pub(crate) mod publication;
+pub(crate) use publication::{MAX_CONTENT, Observation, Snapshot};
+
+const VERSION: u8 = 3;
 const MAX_PATH: usize = 4096;
+const CANCEL: u8 = 3;
 pub(crate) const MAX_PAYLOAD: usize = 2 + 8 + MAX_PATH;
 pub(crate) const STARTUP_LIMIT: std::time::Duration = std::time::Duration::from_secs(12);
 pub(crate) const REGISTER: [u8; 2] = [VERSION, 8];
@@ -12,7 +17,7 @@ pub(crate) const ADMIT_NANO: [u8; 2] = [VERSION, 12];
 pub(crate) const PROOF_LEN: usize = 16;
 pub(crate) const CHALLENGE_LEN: usize = 2 + 4 + 4 + PROOF_LEN;
 pub(crate) const CONFIRM_LEN: usize = 2 + PROOF_LEN;
-pub(crate) const PTY_PREFIX: &[u8] = b"\x1b]7777;zzabba-nano-2;";
+pub(crate) const PTY_PREFIX: &[u8] = b"\x1b]7777;zzabba-nano-3;";
 pub(crate) const PTY_FRAME_LEN: usize = PTY_PREFIX.len() + PROOF_LEN * 2 + 1;
 pub(crate) const NO_PROOF: [u8; PROOF_LEN] = [0; PROOF_LEN];
 
@@ -27,7 +32,7 @@ impl Lease {
 
     pub(crate) fn proof(&self, pid: i32, sid: i32) -> [u8; PROOF_LEN] {
         let mut digest = Sha256::new();
-        digest.update(b"zzabba-nano-2/startup");
+        digest.update(b"zzabba-nano-3/startup");
         digest.update(&self.0[..]);
         digest.update(pid.to_be_bytes());
         digest.update(sid.to_be_bytes());
@@ -171,7 +176,7 @@ impl Request {
             Self::Open { id, path } if *id != 0 && valid_path(path) => {
                 Ok(frame(2, &[&id.to_be_bytes(), path]))
             }
-            Self::Cancel { id } if *id != 0 => Ok(frame(3, &[&id.to_be_bytes()])),
+            Self::Cancel { id } if *id != 0 => Ok(frame(CANCEL, &[&id.to_be_bytes()])),
             _ => Err(invalid()),
         }
     }
@@ -179,7 +184,7 @@ impl Request {
     pub(crate) fn decode(payload: &[u8]) -> io::Result<Self> {
         match with_id(payload)? {
             (2, id, path) if valid_path(path) => Ok(Self::Open { id, path: path.to_vec() }),
-            (3, id, []) => Ok(Self::Cancel { id }),
+            (CANCEL, id, []) => Ok(Self::Cancel { id }),
             _ => Err(invalid()),
         }
     }
@@ -225,7 +230,7 @@ mod tests {
     fn open_preserves_non_utf8_and_control_bytes() {
         let request = Request::Open { id: 1, path: b"/\xff\n".to_vec() };
         let bytes = request.encode().unwrap();
-        assert_eq!(bytes, b"\0\0\0\r\x02\x02\0\0\0\0\0\0\0\x01/\xff\n");
+        assert_eq!(bytes, b"\0\0\0\r\x03\x02\0\0\0\0\0\0\0\x01/\xff\n");
         assert_eq!(Request::decode(&bytes[4..]).unwrap(), request);
     }
 
@@ -233,7 +238,7 @@ mod tests {
     fn cancel_contains_only_the_exact_request_id() {
         let request = Request::Cancel { id: 0x0102_0304_0506_0708 };
         let mut bytes = request.encode().unwrap();
-        assert_eq!(bytes, b"\0\0\0\n\x02\x03\x01\x02\x03\x04\x05\x06\x07\x08");
+        assert_eq!(bytes, b"\0\0\0\n\x03\x03\x01\x02\x03\x04\x05\x06\x07\x08");
         assert_eq!(Request::decode(&bytes[4..]).unwrap(), request);
         bytes.push(0);
         assert!(Request::decode(&bytes[4..]).is_err());

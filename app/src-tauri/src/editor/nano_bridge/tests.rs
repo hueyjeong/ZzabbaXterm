@@ -138,7 +138,7 @@ async fn only_matching_cancel_interrupts_open_without_revoking_the_slot() {
     let request = cancel.child_token();
     let slot = CancellationToken::new();
     let (send, mut receive) = mpsc::channel(2);
-    send.try_send(Request::Cancel { id: 10 }).unwrap();
+    send.try_send(BridgeRequest::Cancel(10)).unwrap();
     {
         let opened = async {
             request.cancelled().await;
@@ -152,7 +152,7 @@ async fn only_matching_cancel_interrupts_open_without_revoking_the_slot() {
             _ = std::future::ready(()) => {},
         }
         assert!(!request.is_cancelled());
-        send.try_send(Request::Cancel { id: 11 }).unwrap();
+        send.try_send(BridgeRequest::Cancel(11)).unwrap();
         assert_eq!(pending.await, Some(Outcome::Unattached));
     }
     assert!(!slot.is_cancelled());
