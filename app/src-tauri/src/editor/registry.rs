@@ -25,6 +25,14 @@ struct Registry {
     documents: HashMap<String, (Document, CancellationToken)>,
     files: HashMap<String, OpenFile>,
     offers: HashMap<String, Offer>,
+    close_document: Option<(Document, tauri::Url)>,
+    window_close: Option<WindowClose>,
+}
+
+struct WindowClose {
+    document: Document,
+    id: String,
+    approved: bool,
 }
 
 struct OpenFile {
@@ -132,7 +140,54 @@ impl LocalEditors {
     }
 
     pub(crate) fn destroy(&self, label: &str) {
-        self.0.lock().unwrap().revoke(label);
+        let mut registry = self.0.lock().unwrap();
+        registry.revoke(label);
+        if label == "main" { registry.window_close = None; }
+    }
+
+    pub(crate) fn ready_for_window_close(&self, url: &tauri::Url) {
+        let mut registry = self.0.lock().unwrap();
+        if let Some((document, _)) = registry.documents.get("main") {
+            registry.close_document = Some((*document, url.clone()));
+        }
+    }
+
+    pub(crate) fn request_window_close(&self, url: &tauri::Url) -> Result<Option<String>, &'static str> {
+        let mut registry = self.0.lock().unwrap();
+        let Some(document) = registry.window_close_document(url) else { return Ok(None) };
+        if let Some(request) = &registry.window_close {
+            return Ok((!request.approved && request.document == document).then(|| request.id.clone()));
+        }
+        let id = registry.new_handle().map_err(|_| "창 닫기 요청 생성 실패")?;
+        registry.window_close = Some(WindowClose { document, id: id.clone(), approved: false });
+        Ok(Some(id))
+    }
+
+    pub(crate) fn respond_to_window_close(&self, url: &tauri::Url, id: &str, approved: bool) -> Result<(), &'static str> {
+        let mut registry = self.0.lock().unwrap();
+        let document = registry.window_close_document(url);
+        let request = registry.window_close.as_mut().filter(|request| {
+            !request.approved && request.id == id && Some(request.document) == document
+        }).ok_or("창 닫기 요청이 만료되었습니다")?;
+        if approved {
+            request.approved = true;
+        } else {
+            registry.window_close = None;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn with_approved_window_close<T>(&self, url: &tauri::Url, id: &str, close: impl FnOnce() -> T) -> Option<T> {
+        let registry = self.0.lock().unwrap();
+        let request = registry.window_close.as_ref()?;
+        (request.approved && request.id == id && Some(request.document) == registry.window_close_document(url)).then(close)
+    }
+
+    pub(crate) fn clear_window_close(&self, id: &str, approved: bool) {
+        let mut registry = self.0.lock().unwrap();
+        if registry.window_close.as_ref().is_some_and(|request| request.id == id && request.approved == approved) {
+            registry.window_close = None;
+        }
     }
 
     pub(super) fn document(&self, label: &str) -> Result<Document, EditorError> {
@@ -291,6 +346,10 @@ impl Registry {
         }
     }
 
+    fn window_close_document(&self, url: &tauri::Url) -> Option<Document> {
+        self.close_document.as_ref().filter(|(_, ready_url)| ready_url == url).map(|(document, _)| *document)
+    }
+
     fn check_document(&self, label: &str, document: Document) -> Result<(), EditorError> {
         if self.documents.get(label).map(|(owner, _)| *owner) != Some(document) {
             return Err(EditorError::DocumentClosed);
@@ -307,10 +366,55 @@ impl Registry {
     }
 
     fn revoke(&mut self, label: &str) {
+        if label == "main" {
+            self.close_document = None;
+            // 진행 중인 SSH 정리가 닫기 게이트를 풀 때까지 다음 요청을 기다린다.
+            if self.window_close.as_ref().is_some_and(|request| !request.approved) {
+                self.window_close = None;
+            }
+        }
         if let Some((document, lifetime)) = self.documents.remove(label) {
             lifetime.cancel();
             self.offers.retain(|_, offer| offer.document != document);
             self.files.retain(|_, file| file.document != document);
         }
+    }
+}
+
+#[cfg(test)]
+mod window_close_tests {
+    use super::LocalEditors;
+
+    #[test]
+    fn close_requires_the_current_document_and_consumes_each_response() {
+        let editors = LocalEditors::default();
+        let url = "tauri://localhost/".parse().unwrap();
+        let other = "tauri://localhost/other".parse().unwrap();
+        editors.navigate("main");
+        assert!(editors.request_window_close(&url).unwrap().is_none());
+        editors.ready_for_window_close(&url);
+        let id = editors.request_window_close(&url).unwrap().unwrap();
+        assert_eq!(editors.request_window_close(&url).unwrap().as_deref(), Some(id.as_str()));
+        assert!(editors.respond_to_window_close(&other, &id, true).is_err());
+        editors.respond_to_window_close(&url, &id, false).unwrap();
+        assert!(editors.respond_to_window_close(&url, &id, true).is_err());
+
+        let approved = editors.request_window_close(&url).unwrap().unwrap();
+        editors.respond_to_window_close(&url, &approved, true).unwrap();
+        assert!(editors.respond_to_window_close(&url, &approved, true).is_err());
+        assert_eq!(editors.with_approved_window_close(&url, &approved, || ()), Some(()));
+        editors.navigate("main");
+        editors.ready_for_window_close(&url);
+        assert!(editors.with_approved_window_close(&url, &approved, || ()).is_none());
+        assert!(editors.request_window_close(&url).unwrap().is_none());
+        editors.clear_window_close(&approved, true);
+        let pending = editors.request_window_close(&url).unwrap().unwrap();
+        editors.navigate("main");
+        editors.ready_for_window_close(&url);
+        assert!(editors.respond_to_window_close(&url, &pending, true).is_err());
+        let next = editors.request_window_close(&url).unwrap().unwrap();
+        assert_ne!(next, pending);
+        editors.destroy("main");
+        assert!(editors.respond_to_window_close(&url, &next, true).is_err());
     }
 }

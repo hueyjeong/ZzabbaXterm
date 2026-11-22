@@ -71,6 +71,7 @@ pub fn run() {
             } else if payload.event() == tauri::webview::PageLoadEvent::Finished {
                 rdp::ipc::issue_document(&webview, payload.url());
                 vnc::ipc::issue_document(&webview, payload.url());
+                workspace_window::issue_close_document(&webview, payload.url());
             }
         })
         .invoke_handler(move |invoke| {
@@ -110,7 +111,10 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| match event {
             tauri::RunEvent::WindowEvent { label, event: tauri::WindowEvent::CloseRequested { api, .. }, .. } => {
-                if !app.state::<Sessions>().close_ssh_probes(Some(&label)) {
+                if label == workspace_window::MAIN {
+                    api.prevent_close();
+                    workspace_window::request_close(app);
+                } else if !app.state::<Sessions>().close_ssh_probes(Some(&label)) {
                     api.prevent_close();
                 }
             }
