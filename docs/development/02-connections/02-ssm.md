@@ -40,6 +40,17 @@ JS는 문서에서 `window.__ZZABBA_SSM_DOCUMENT__`를 읽는다. 아직 값이 
 
 격리 시험: `cargo test --manifest-path app/src-tauri/Cargo.toml ssm::ipc::tests`.
 
+### 연결 프로필과 시험 자격
+
+마법사의 `AWS Systems Manager` 방식은 SSO 프로필, 리전, 온라인 노드를 선택한다. 기본 리전이 비어 있으면 리전을 직접 입력하고 적용한다. 연결 시험이 실패해도 선택한 값은 남는다.
+
+저장 스키마는 버전 1을 유지한다. 대상은 기존 `id`, `groupId`, `displayName`과 다음 두 방식 중 하나로 구성한다.
+
+- 로컬: `defaultMethod: "local"`, `local: { shell, startDirectory }`.
+- SSM: `defaultMethod: "ssm"`, `ssm: { profile, region, instanceId }`.
+
+Rust는 두 방식이 섞인 레코드와 비밀·실행 파일·임의 인자 등 정의되지 않은 필드를 거부한다. 마법사는 [C01 시험·저장 IPC](01-profiles.md#로컬-마법사-ipc)를 그대로 사용한다. 현재 초안의 실제 연결 시험이 성공한 경우에만 저장할 수 있다. 저장된 SSM 행을 열 때 `terminal_open`의 연결 인자는 `targetId`뿐이며, Rust가 파일에서 대상의 방식을 다시 읽는다.
+
 **완료 증거:** `Windows SSM T1 / Ubuntu SSM T1 / Windows T3 / Ubuntu T3` 네 결과에 OS·WebView·입력기·CLI/플러그인 버전과 실제 관찰을 적는다. T3에는 실패별 화면 상태와 마법사 시험·탭별 세션 정리 근거를 포함한다. 계정·노드·세션 ID는 일관된 별칭으로 가리고 토큰·로그인 URL은 제외한다. 접근할 수 없는 조합은 `미실행(사유)`, macOS는 후속 실기기 검증이다.
 
 참고: [Session Manager 시작](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-sessions-start.html) · [세션 상태 조회](https://docs.aws.amazon.com/cli/latest/reference/ssm/describe-sessions.html)

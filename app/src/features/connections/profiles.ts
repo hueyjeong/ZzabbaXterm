@@ -1,23 +1,30 @@
+import type { SsmTarget } from "../ssm/ssm";
+
 export type LocalShell = "powerShell" | "bash";
 
 // version은 Rust 저장 스키마 버전이고 draftVersion은 이번 편집의 버전이다.
-export type LocalProfileDraft = Readonly<{
+type ProfileDraft<T> = Readonly<{
   version: 1;
   groupRevision: number | null;
   targetRevision: number | null;
   group: Readonly<{ id: string; displayName: string }>;
-  target: Readonly<{
-    id: string;
-    groupId: string;
-    displayName: string;
-    defaultMethod: "local";
-    local: Readonly<{ shell: LocalShell; startDirectory: string }>;
-  }>;
+  target: T;
 }>;
+
+type TargetIdentity = Readonly<{ id: string; groupId: string; displayName: string }>;
+type LocalMethod = Readonly<{
+  defaultMethod: "local";
+  local: Readonly<{ shell: LocalShell; startDirectory: string }>;
+  ssm?: never;
+}>;
+type SsmMethod<T = SsmTarget> = Readonly<{ defaultMethod: "ssm"; ssm: T; local?: never }>;
+export type LocalProfileDraft = ProfileDraft<TargetIdentity & LocalMethod>;
+export type ConnectionProfileDraft = ProfileDraft<TargetIdentity & (LocalMethod | SsmMethod)>;
+type WizardDraft = ProfileDraft<TargetIdentity & (LocalMethod | SsmMethod<SsmTarget | null>)>;
 
 type DraftIdentity = Readonly<{ draftId: string; draftVersion: number }>;
 
-export type ConnectionTestDraft = DraftIdentity & Readonly<{ draft: LocalProfileDraft }>;
+export type ConnectionTestDraft = DraftIdentity & Readonly<{ draft: ConnectionProfileDraft }>;
 
 export type ConnectionTestRun = DraftIdentity & Readonly<{
   runId: string;
@@ -25,7 +32,7 @@ export type ConnectionTestRun = DraftIdentity & Readonly<{
 
 export type ConnectionRequest = Readonly<{
   run: ConnectionTestRun;
-  draft: LocalProfileDraft;
+  draft: ConnectionProfileDraft;
 }>;
 
 export type ConnectionClose =
@@ -47,7 +54,7 @@ type Status =
   | { kind: "passed" | "saving"; request: ConnectionRequest; attempt: ConnectionTestDraft }
   | { kind: "testFailed" | "closeFailed"; error: string }
   | { kind: "saveFailed"; request: ConnectionRequest; attempt: ConnectionTestDraft; error: string };
-type State = Readonly<{ step: Step; draft: LocalProfileDraft; status: Status }>;
+type State = Readonly<{ step: Step; draft: WizardDraft; status: Status }>;
 
 const steps = ["target", "method", "auth", "verify"] as const;
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
@@ -56,8 +63,9 @@ const CANCEL_RESPONSE_TIMEOUT = 2_000;
 export interface LocalConnectionWizardState {
   getSnapshot(): State;
   subscribe(listener: () => void): () => void;
-  go(delta: -1 | 1): void;
+  go(delta: -1 | 1, selection?: SsmTarget | null): void;
   edit(field: "groupName" | "targetName" | "startDirectory", value: string): void;
+  selectMethod(method: "local" | "ssm"): void;
   selectGroup(group: LocalProfileDraft["group"], revision: number | null): void;
   test(actions: LocalConnectionActions): Promise<void>;
   save(actions: LocalConnectionActions): Promise<void>;
@@ -65,8 +73,9 @@ export interface LocalConnectionWizardState {
   abandon(): void;
 }
 
-export function createLocalConnectionWizard(draftId: string, draft: LocalProfileDraft): LocalConnectionWizardState {
-  let state: State = { step: "target", draft, status: { kind: "idle" } };
+export function createLocalConnectionWizard(draftId: string, initialDraft: LocalProfileDraft): LocalConnectionWizardState {
+  let state: State = { step: "target", draft: initialDraft, status: { kind: "idle" } };
+  let local = initialDraft.target.local;
   let draftVersion = 0;
   const listeners = new Set<() => void>();
   const pending = new Map<ConnectionTestDraft, LocalConnectionActions["cancelTest"]>();
@@ -81,8 +90,17 @@ export function createLocalConnectionWizard(draftId: string, draft: LocalProfile
     return kind === "saving" || kind === "closing" || kind === "closed" || kind === "closeFailed";
   }
 
-  function go(delta: -1 | 1) {
+  function go(delta: -1 | 1, selection?: SsmTarget | null) {
     if (locked()) return;
+    const { draft } = state;
+    if (delta === 1 && state.step === "auth" && draft.target.defaultMethod === "ssm") {
+      if (!selection) return;
+      const { ssm } = draft.target;
+      if (!ssm || ssm.profile !== selection.profile || ssm.region !== selection.region || ssm.instanceId !== selection.instanceId) {
+        const { profile, region, instanceId } = selection;
+        updateDraft({ ...draft, target: { ...draft.target, ssm: { profile, region, instanceId } } });
+      }
+    }
     const step = steps[steps.indexOf(state.step) + delta];
     if (step) update({ step });
   }
@@ -100,10 +118,21 @@ export function createLocalConnectionWizard(draftId: string, draft: LocalProfile
         updateDraft({ ...draft, target: { ...draft.target, displayName: value } });
         break;
       case "startDirectory":
-        if (draft.target.local.startDirectory === value) return;
-        updateDraft({ ...draft, target: { ...draft.target, local: { ...draft.target.local, startDirectory: value } } });
+        if (draft.target.defaultMethod !== "local" || local.startDirectory === value) return;
+        local = { ...local, startDirectory: value };
+        updateDraft({ ...draft, target: { ...draft.target, local } });
         break;
     }
+  }
+
+  function selectMethod(defaultMethod: "local" | "ssm") {
+    const { draft } = state;
+    if (locked() || state.step !== "method" || draft.target.defaultMethod === defaultMethod) return;
+    const { id, groupId, displayName } = draft.target;
+    const method: LocalMethod | SsmMethod<null> = defaultMethod === "local"
+      ? { defaultMethod, local }
+      : { defaultMethod, ssm: null };
+    updateDraft({ ...draft, target: { id, groupId, displayName, ...method } });
   }
 
   function selectGroup(group: LocalProfileDraft["group"], groupRevision: number | null) {
@@ -112,7 +141,7 @@ export function createLocalConnectionWizard(draftId: string, draft: LocalProfile
     updateDraft({ ...draft, group, groupRevision, target: { ...draft.target, groupId: group.id } });
   }
 
-  function updateDraft(draft: LocalProfileDraft) {
+  function updateDraft(draft: WizardDraft) {
     draftVersion += 1;
     update({ draft, status: { kind: "idle" } });
     void cancelPending();
@@ -120,8 +149,12 @@ export function createLocalConnectionWizard(draftId: string, draft: LocalProfile
 
   async function test(actions: LocalConnectionActions) {
     if (locked() || state.step !== "verify" || state.status.kind === "testing") return;
+    const { draft } = state;
+    const { target } = draft;
+    const complete = target.defaultMethod === "local" ? target : target.ssm && { ...target, ssm: target.ssm };
+    if (!complete) return;
+    const attempt: ConnectionTestDraft = { draftId, draftVersion, draft: { ...draft, target: complete } };
     void cancelPending();
-    const attempt = { draftId, draftVersion, draft: state.draft };
     const testing = { kind: "testing", attempt } as const;
     pending.set(attempt, active => actions.cancelTest(active));
     update({ status: testing });
@@ -193,6 +226,7 @@ export function createLocalConnectionWizard(draftId: string, draft: LocalProfile
     },
     go,
     edit,
+    selectMethod,
     selectGroup,
     test,
     save,

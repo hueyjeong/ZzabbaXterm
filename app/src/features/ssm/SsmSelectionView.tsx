@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { SsmSelection } from "./ssm";
 
 const failureText = {
@@ -7,10 +8,24 @@ const failureText = {
   Unknown: "분류되지 않은 오류",
 };
 
-export function SsmSelectionView({ state, regions }: {
-  state: SsmSelection;
-  regions: readonly string[];
-}) {
+function RegionField({ profile, region, chooseRegion }: Pick<SsmSelection, "profile" | "region" | "chooseRegion">) {
+  const [value, setValue] = useState(region);
+  const candidate = value.trim();
+  const valid = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(candidate);
+  const canApply = !!profile && valid && candidate !== region;
+  return <div>
+    <label>리전{" "}<input value={value} disabled={!profile} spellCheck={false} onChange={(event) => {
+      setValue(event.currentTarget.value);
+    }} onKeyDown={(event) => {
+      if (event.key !== "Enter") return;
+      event.preventDefault();
+      if (canApply) chooseRegion(candidate);
+    }} /></label>
+    <button type="button" disabled={!canApply} onClick={() => chooseRegion(candidate)}>리전 적용</button>
+  </div>;
+}
+
+export function SsmSelectionView({ state }: { state: SsmSelection }) {
   const { profiles, step, profile, region, selection, chooseProfile, chooseRegion, chooseNode, requestRelogin } = state;
   return (
     <fieldset>
@@ -28,16 +43,7 @@ export function SsmSelectionView({ state, regions }: {
       {profiles.kind === "loading" && <p role="status">프로필 조회 중</p>}
       {profiles.kind === "ready" && profiles.values.length === 0 && <p role="status">AWS 프로필 없음</p>}
       {profiles.kind === "error" && <p role="alert">프로필 조회: {failureText[profiles.error]}</p>}
-      <div>
-        <label>
-          리전{" "}
-          <select value={region} disabled={!profile} onChange={(event) => chooseRegion(event.currentTarget.value)}>
-            <option value="">리전 선택</option>
-            {region && !regions.includes(region) && <option>{region}</option>}
-            {regions.map((value) => <option key={value}>{value}</option>)}
-          </select>
-        </label>
-      </div>
+      <RegionField key={JSON.stringify([profile, region])} profile={profile} region={region} chooseRegion={chooseRegion} />
       {step.kind === "region-loading" && <p role="status">기본 리전 조회 중</p>}
       {step.kind === "region-required" && <p role="status">선택된 리전 없음</p>}
       {step.kind === "region-error" && <p role="alert">기본 리전 조회: {failureText[step.error]}</p>}

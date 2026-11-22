@@ -32,7 +32,7 @@ function ok<T>(value: T): SsmResult<T> {
 async function render(adapter: SsmDiscovery) {
   function Fixture() {
     const state = useSsmSelection(adapter);
-    return createElement("div", null, createElement(SsmSelectionView, { state, regions: [east, west] }),
+    return createElement("div", null, createElement(SsmSelectionView, { state }),
       createElement("output", { "aria-label": "마법사에 전달할 대상" }, JSON.stringify(state.selection)));
   }
   await act(async () => root.render(createElement(Fixture)));
@@ -45,7 +45,29 @@ function field(label: string) {
   return select;
 }
 
+function regionField() {
+  const input = host.querySelector("label input");
+  if (!(input instanceof HTMLInputElement)) throw new Error("리전 입력 없음");
+  return input;
+}
+
+function reloginButton() {
+  return [...host.querySelectorAll("button")].find((button) => button.textContent === "SSO 재로그인");
+}
+
 async function choose(label: string, value: string) {
+  if (label === "리전") {
+    const input = regionField();
+    expect(input.disabled).toBe(false);
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, value);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    const apply = [...host.querySelectorAll("button")].find((button) => button.textContent === "리전 적용");
+    expect(apply?.disabled).toBe(false);
+    await act(async () => apply?.click());
+    return;
+  }
   const control = field(label);
   expect(control.disabled).toBe(false);
   await act(async () => {
@@ -93,7 +115,7 @@ describe("SSM 선택", () => {
       { profile: "beta", region: east }, { profile: "beta", region: west },
     ]);
     expect(adapter.listOnlineNodes.mock.calls[0][1].aborted).toBe(true);
-    expect(field("리전").value).toBe(west);
+    expect(regionField().value).toBe(west);
     expect(Array.from(field("온라인 노드").options, (option) => option.value)).toEqual(["", two.instanceId]);
   });
 
@@ -129,7 +151,7 @@ describe("SSM 선택", () => {
     await choose("리전", west);
     expect(error()).toBe("alpha: SSO 로그인 만료");
     expect(adapter.relogin).not.toHaveBeenCalled();
-    const button = host.querySelector("button");
+    const button = reloginButton();
     expect(button?.textContent).toBe("SSO 재로그인");
     await act(async () => { button?.click(); button?.click(); });
     expect(status()).toBe("alpha: SSO 재로그인 중");
@@ -154,7 +176,7 @@ describe("SSM 선택", () => {
     adapter.relogin.mockReturnValueOnce(login.promise);
     await render(adapter);
     await choose("프로필", "alpha");
-    await act(async () => host.querySelector("button")?.click());
+    await act(async () => reloginButton()?.click());
     await choose("프로필", "beta");
     await act(async () => login.resolve(ok(undefined)));
     expect(adapter.relogin.mock.calls[0][2].aborted).toBe(true);
@@ -180,13 +202,13 @@ describe("SSM 선택", () => {
     await choose("리전", west);
     expect(error()).toBe("alpha: IAM 권한 거부");
     expect(status()).toBeUndefined();
-    expect(host.querySelector("button")).toBeNull();
+    expect(reloginButton()).toBeUndefined();
     await choose("리전", east);
     expect(error()).toBe("alpha: Session Manager 플러그인 없음");
-    expect(host.querySelector("button")).toBeNull();
+    expect(reloginButton()).toBeUndefined();
     await choose("리전", west);
     expect(error()).toBe("alpha: 분류되지 않은 오류");
-    expect(host.querySelector("button")).toBeNull();
+    expect(reloginButton()).toBeUndefined();
     expect(adapter.listOnlineNodes.mock.calls.map(([scope]) => scope.region)).toEqual([east, west, east, west]);
     expect(adapter.relogin).not.toHaveBeenCalled();
     expect(selected()).toBeNull();
@@ -261,8 +283,8 @@ describe("SSM 검색 IPC", () => {
     await render(createSsmDiscovery());
     await choose("프로필", "alpha");
     expect(error()).toBe("alpha: SSO 로그인 만료");
-    const button = host.querySelector("button");
-    expect(button).not.toBeNull();
+    const button = reloginButton();
+    expect(button).toBeDefined();
     await act(async () => { button?.click(); button?.click(); });
     const operation = { kind: "listOnlineNodes", profile: "alpha", region: east };
     expect(invokeSsm.mock.calls.map(([, args]) => args.request)).toEqual([

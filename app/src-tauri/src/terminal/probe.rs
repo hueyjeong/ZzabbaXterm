@@ -145,6 +145,9 @@ impl Probe {
 }
 
 fn command(draft: &ValidatedDraft) -> Result<CommandBuilder, String> {
+    if matches!(draft.method(), crate::connections::profile::MethodRef::Ssm { .. }) {
+        return Err("SSM 연결 시험을 사용할 수 없습니다".into());
+    }
     let directory = draft.start_directory();
     super::validate_working_directory(directory)?;
     let mut command = match draft.shell() {

@@ -9,7 +9,7 @@ import { Splitter } from "./Splitter";
 import { macTitleBar, TitleBar } from "./TitleBar";
 import "./workspace.css";
 
-type Tab = { id: number; label: string; targetId?: string; status: TerminalStatus; sessionId?: string };
+type Tab = { id: number; label: string; targetId?: string; method?: "local" | "ssm"; status: TerminalStatus; sessionId?: string };
 type ProfileLoad = { kind: "loading" | "ready"; profiles?: SavedConnections }
   | { kind: "error"; profiles?: SavedConnections; error: string };
 const connections = createLocalConnectionIpc();
@@ -111,7 +111,7 @@ export function Workspace() {
   function openTab(target?: SavedConnections["targets"][number]["profile"]) {
     const id = nextTab.current++;
     setTabs((current) => [...current, {
-      id, label: target?.displayName ?? `로컬 ${id}`, targetId: target?.id, status: { kind: "opening" },
+      id, label: target?.displayName ?? `로컬 ${id}`, targetId: target?.id, method: target?.defaultMethod, status: { kind: "opening" },
     }]);
     selectTab(id);
   }
@@ -185,7 +185,7 @@ export function Workspace() {
         </>}
       </div>
       <footer className="workspace-status">
-        <span role="status">{current ? [current.targetId ? current.label : "내 PC", "로컬", current.sessionId, terminalStatus(current.status)].filter(Boolean).join(" · ") : "연결 없음"}</span>
+        <span role="status">{current ? [current.targetId ? current.label : "내 PC", current.method === "ssm" ? "SSM" : "로컬", current.sessionId, terminalStatus(current.status)].filter(Boolean).join(" · ") : "연결 없음"}</span>
         {windowError && <span role="alert">{windowError}</span>}
         <span>AI 전용 셸 · 대기</span>
       </footer>

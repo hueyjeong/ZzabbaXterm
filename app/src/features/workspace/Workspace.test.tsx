@@ -53,6 +53,7 @@ const starts = new Map<string, Promise<void>>();
 const emptyStore: SavedConnections = { version: 1, groups: [], targets: [] };
 let loadProfiles: () => Promise<SavedConnections>;
 let runConnectionCommand: (command: string, args: unknown) => Promise<unknown>;
+let runDiscovery: (args: unknown) => Promise<unknown>;
 
 beforeEach(async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
@@ -83,9 +84,11 @@ beforeEach(async () => {
   starts.clear();
   loadProfiles = async () => emptyStore;
   runConnectionCommand = async (command) => { throw new Error(`예상하지 않은 연결 명령: ${command}`); };
+  runDiscovery = async () => { throw new Error("예상하지 않은 SSM 검색"); };
   native.invoke.mockImplementation(async (command, args) => {
     if (command === "connections_load") return loadProfiles();
     if (command.startsWith("connection_")) return runConnectionCommand(command, args);
+    if (command === "ssm_discovery") return runDiscovery(args);
     if (command === "terminal_start") return starts.get(args.id);
     if (command !== "terminal_open") return;
     const id = `pty-${channels.size + 10}`;
@@ -485,7 +488,7 @@ describe("C01 저장된 로컬 연결", () => {
     runConnectionCommand = async (command, args) => {
       if (command === "connection_test_start") {
         const { draft, draftId, draftVersion } = args as ConnectionTestDraft;
-        failed = draft.target.local.startDirectory.endsWith("missing");
+        failed = draft.target.defaultMethod === "local" && draft.target.local.startDirectory.endsWith("missing");
         return { draftId, draftVersion, runId: failed ? "missing-run" : "good-run" };
       }
       if (command === "connection_test_wait") {
@@ -520,5 +523,88 @@ describe("C01 저장된 로컬 연결", () => {
     expect(connectionCalls("connections_load")).toHaveLength(loads);
     expect(connectionCalls("connection_save")).toHaveLength(0);
     expect(connectionCalls("connection_test_cancel").map(([, args]) => args.run.runId)).toEqual(["good-run", "missing-run"]);
+  });
+});
+
+describe("C02 SSM 연결", () => {
+  const node = { profile: "company", region: "ap-northeast-2", instanceId: "i-00000001" };
+
+  it("선택한 노드 참조만 시험하고 실패 후에도 선택을 보존하며 저장은 비활성화한다", async () => {
+    vi.stubGlobal("__ZZABBA_SSM_DOCUMENT__", "test-document");
+    let requestId = 0;
+    runDiscovery = async (args) => {
+      const { request } = args as { request: { action: string; operation?: { kind: string } } };
+      if (request.action === "reserve") return `request-${++requestId}`;
+      if (request.operation?.kind === "listProfiles") return [node.profile];
+      if (request.operation?.kind === "configuredRegion") return null;
+      if (request.operation?.kind === "listOnlineNodes") return [{ instanceId: node.instanceId }];
+      throw new Error("예상하지 않은 요청");
+    };
+    runConnectionCommand = async (command) => {
+      if (command === "connection_test_start") throw "SSM 연결 시험을 사용할 수 없습니다";
+      throw new Error(`예상하지 않은 연결 명령: ${command}`);
+    };
+    async function select(label: string, value: string) {
+      const control = [...find("dialog").querySelectorAll("label")]
+        .find((item) => item.firstChild?.textContent?.trim() === label)?.querySelector("select");
+      expect(control?.disabled).toBe(false);
+      await act(async () => {
+        if (!control) throw new Error(label);
+        control.value = value;
+        control.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      return control;
+    }
+
+    await press("연결 추가");
+    await changeInput("그룹", "개발");
+    await changeInput("표시명", "관리 노드");
+    await press("다음");
+    expect(connectionCalls("ssm_discovery")).toHaveLength(0);
+    await select("접속 방식", "ssm");
+    await press("다음");
+    expect(button("다음")?.disabled).toBe(true);
+    await select("프로필", node.profile);
+    await changeInput("리전", node.region);
+    await press("리전 적용");
+    const selected = await select("온라인 노드", node.instanceId);
+    expect(selected?.value).toBe(node.instanceId);
+    await press("다음");
+    expect(button("저장")?.disabled).toBe(true);
+    await press("연결 테스트");
+    const args = connectionCalls("connection_test_start")[0][1] as ConnectionTestDraft;
+    expect(args.draft.target).toEqual({
+      id: expect.any(String), groupId: args.draft.group.id,
+      displayName: "관리 노드", defaultMethod: "ssm", ssm: node
+    });
+    expect(find("dialog [role=alert]").textContent).toBe("SSM 연결 시험을 사용할 수 없습니다");
+    expect(button("저장")?.disabled).toBe(true);
+    await press("이전");
+    expect([...find("dialog").querySelectorAll("select")].map((control) => control.value)).toEqual([node.profile, node.instanceId]);
+    expect(find<HTMLInputElement>("dialog input").value).toBe(node.region);
+    await press("다음");
+    expect(find("dialog").textContent).toContain(`${node.profile} / ${node.region} / ${node.instanceId}`);
+    await press("취소");
+    expect(host.querySelector("dialog")).toBeNull();
+    expect(connectionCalls("connection_save")).toHaveLength(0);
+  });
+
+  it("저장된 SSM 행의 문맥 메뉴는 SSM만 제공하고 열기에는 저장 대상 ID만 전달한다", async () => {
+    loadProfiles = async () => ({
+      version: 1,
+      groups: [{ revision: 1, profile: { id: "dev", displayName: "개발" } }],
+      targets: [{ revision: 1, profile: { id: "saved-ssm", groupId: "dev", displayName: "관리 노드", defaultMethod: "ssm", ssm: node } }],
+    });
+    await restartWorkspace();
+    const row = [...tree().querySelectorAll<HTMLElement>('[role="treeitem"]')]
+      .find((item) => item.textContent === "관리 노드");
+    expect(row).toBeDefined();
+    await key(row!, "ContextMenu");
+    expect(find('[role="menu"]').textContent).toBe("AWS Systems Manager");
+    await press("AWS Systems Manager");
+    const [{ output, ...args }] = calls("open").slice(-1);
+    expect(output).toBeDefined();
+    expect(args).toEqual({ targetId: "saved-ssm", cols: 80, rows: 24 });
+    expect(status()).toContain("관리 노드 · SSM");
   });
 });

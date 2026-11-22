@@ -1,5 +1,8 @@
 import { useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
 import type { SavedConnections } from "./connectionIpc";
+import { SsmSelectionView } from "../ssm/SsmSelectionView";
+import { useSsmSelection } from "../ssm/ssm";
+import { createSsmDiscovery } from "../ssm/ssmDiscovery";
 import {
   createLocalConnectionWizard,
   type LocalConnectionActions,
@@ -24,9 +27,14 @@ const titles = {
   verify: "연결 테스트·저장",
 } as const;
 
+const discovery = createSsmDiscovery();
+
 function Wizard(props: LocalConnectionWizardProps) {
   const [wizard] = useState(() => createLocalConnectionWizard(props.draftId, props.initialDraft));
   const { step, draft, status } = useSyncExternalStore(wizard.subscribe, wizard.getSnapshot);
+  const { target } = draft;
+  const ssm = useSsmSelection(discovery, target.defaultMethod === "ssm" &&
+    status.kind !== "closing" && status.kind !== "closed" && status.kind !== "closeFailed");
   const dialog = useRef<HTMLDialogElement>(null);
   useLayoutEffect(() => {
     const modal = dialog.current;
@@ -40,7 +48,7 @@ function Wizard(props: LocalConnectionWizardProps) {
   const canSave = status.kind === "passed" || status.kind === "saveFailed";
 
   return (
-    <dialog ref={dialog} className="connection-wizard" aria-label="로컬 연결" onCancel={(event) => {
+    <dialog ref={dialog} className="connection-wizard" aria-label="연결 추가" onCancel={(event) => {
       event.preventDefault();
       void wizard.close(props);
     }}>
@@ -64,22 +72,32 @@ function Wizard(props: LocalConnectionWizardProps) {
         )}
         {step === "method" && (
           <>
-            <div>로컬</div>
-            <div>셸: {draft.target.local.shell === "powerShell" ? "PowerShell" : "Bash"}</div>
-            <div><label>시작 디렉터리 <input value={draft.target.local.startDirectory} onChange={event => wizard.edit("startDirectory", event.target.value)} /></label></div>
+            <div><label>접속 방식 <select value={target.defaultMethod} onChange={(event) => {
+              wizard.selectMethod(event.currentTarget.value === "ssm" ? "ssm" : "local");
+            }}>
+              <option value="local">로컬</option>
+              <option value="ssm">AWS Systems Manager</option>
+            </select></label></div>
+            {target.defaultMethod === "local" && <>
+              <div>셸: {target.local.shell === "powerShell" ? "PowerShell" : "Bash"}</div>
+              <div><label>시작 디렉터리 <input value={target.local.startDirectory} onChange={event => wizard.edit("startDirectory", event.target.value)} /></label></div>
+            </>}
           </>
         )}
-        {step === "auth" && <div>현재 사용자</div>}
+        {step === "auth" && (target.defaultMethod === "local" ? <div>현재 사용자</div> : <SsmSelectionView state={ssm} />)}
         {step === "verify" && (
           <>
             <div>{draft.group.displayName} / {draft.target.displayName}</div>
-            <div>{draft.target.local.startDirectory}</div>
+            <div>{target.defaultMethod === "local" ? target.local.startDirectory : target.ssm &&
+              `${target.ssm.profile} / ${target.ssm.region} / ${target.ssm.instanceId}`}</div>
             <button type="button" disabled={status.kind === "testing"} onClick={() => void wizard.test(props)}>연결 테스트</button>
             <button type="button" disabled={!canSave} onClick={() => void wizard.save(props)}>저장</button>
           </>
         )}
         {step !== "target" && <button type="button" onClick={() => wizard.go(-1)}>이전</button>}
-        {step !== "verify" && <button type="button" onClick={() => wizard.go(1)}>다음</button>}
+        {step !== "verify" && <button type="button"
+          disabled={step === "auth" && target.defaultMethod === "ssm" && !ssm.selection}
+          onClick={() => wizard.go(1, ssm.selection)}>다음</button>}
       </fieldset>
       <button type="button" disabled={locked && status.kind !== "closeFailed"} onClick={() => void wizard.close(props)}>취소</button>
       {status.kind === "testing" && <div role="status">테스트 중</div>}

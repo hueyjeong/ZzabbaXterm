@@ -47,7 +47,7 @@ async function resultOf<T>(request: () => Promise<SsmResult<T>>): Promise<SsmRes
   }
 }
 
-export function useSsmSelection(discovery: SsmDiscovery): SsmSelection {
+export function useSsmSelection(discovery: SsmDiscovery, enabled = true): SsmSelection {
   const { listProfiles, configuredRegion, listOnlineNodes, relogin } = discovery;
   const [profiles, setProfiles] = useState<Profiles>({ kind: "loading" });
   const [step, setStep] = useState<Step>({ kind: "idle" });
@@ -57,9 +57,16 @@ export function useSsmSelection(discovery: SsmDiscovery): SsmSelection {
   useEffect(() => () => {
     login.current?.abort();
     nodeLookup.current?.abort();
-  }, []);
+    login.current = null;
+    nodeLookup.current = null;
+  }, [enabled]);
 
   useEffect(() => {
+    setProfiles({ kind: "loading" });
+    if (!enabled) {
+      setStep({ kind: "idle" });
+      return;
+    }
     const controller = new AbortController();
     const { signal } = controller;
     void resultOf(() => listProfiles(signal)).then((result) => {
@@ -67,10 +74,10 @@ export function useSsmSelection(discovery: SsmDiscovery): SsmSelection {
       setProfiles(result.ok ? { kind: "ready", values: result.value } : { kind: "error", error: result.error });
     });
     return () => controller.abort();
-  }, [listProfiles]);
+  }, [enabled, listProfiles]);
 
   useEffect(() => {
-    if (step.kind !== "region-loading" && step.kind !== "nodes-loading") return;
+    if (!enabled || (step.kind !== "region-loading" && step.kind !== "nodes-loading")) return;
     const controller = new AbortController();
     const { signal } = controller;
     let retainExpired = false;
@@ -102,7 +109,7 @@ export function useSsmSelection(discovery: SsmDiscovery): SsmSelection {
       controller.abort();
       if (nodeLookup.current === controller) nodeLookup.current = null;
     };
-  }, [configuredRegion, listOnlineNodes, step]);
+  }, [enabled, configuredRegion, listOnlineNodes, step]);
 
   const scope = "scope" in step ? step.scope : null;
   const profile = scope?.profile ?? ("profile" in step ? step.profile : "");
