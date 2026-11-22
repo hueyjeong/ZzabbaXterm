@@ -162,7 +162,7 @@ async fn cancellation_and_closed_receivers_skip_unsent_work() {
             assert!(timeout(Duration::from_millis(10), peer.output.read(&mut [0])).await.is_err());
             cancel.cancel();
         };
-        let (result, ()) = tokio::join!(drive, relay);
+        let ((), result) = tokio::join!(drive, relay);
         assert!(result.is_ok());
     }
 
