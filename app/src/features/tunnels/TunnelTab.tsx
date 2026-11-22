@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import { tunnelIpc, type TunnelRequest, type TunnelStatus } from "./tunnelIpc";
+import { tunnelIpc, type DesktopTunnelSource, type TunnelRequest, type TunnelStatus } from "./tunnelIpc";
 import "./tunnel.css";
 
 type CloseState = { kind: "closing" } | { kind: "unconfirmed"; error: string };
@@ -9,13 +9,14 @@ type Props = Readonly<{
   method: "ssh" | "ssm";
   closeState?: CloseState;
   onShare(targetId: string, tab: string, id: string): Promise<void>;
+  onOpenDesktop(protocol: "rdp" | "vnc", source: DesktopTunnelSource): void;
 }>;
 
 const states = {
   starting: "준비 중", ready: "수신 준비됨", failed: "시작 실패", disconnected: "끊김",
 } satisfies Record<TunnelStatus["state"], string>;
 
-export function TunnelTab({ tab, targetId, method, closeState, onShare }: Props) {
+export function TunnelTab({ tab, targetId, method, closeState, onShare, onOpenDesktop }: Props) {
   const windows = /Windows/.test(navigator.userAgent);
   const [direction, setDirection] = useState<TunnelRequest["direction"]>("local");
   const [tunnels, setTunnels] = useState<readonly TunnelStatus[]>([]);
@@ -98,13 +99,20 @@ export function TunnelTab({ tab, targetId, method, closeState, onShare }: Props)
     {!closing && error && <div role="alert">{error}</div>}
     {!closing && statusError && <div role="alert">상태 확인 실패: {statusError}</div>}
     <ul aria-label="이 탭의 터널">
-      {tunnels.map(tunnel => <li key={tunnel.id}>
-        <strong>{tunnel.route}</strong> <span role="status">{states[tunnel.state]}</span>
-        <div>{tunnel.endpoint} · 소유 탭: {tunnel.owners.join(", ")}</div>
-        {tunnel.error && <div role="alert">{tunnel.error}</div>}
-        {(tunnel.state === "starting" || tunnel.state === "ready") &&
-          <button type="button" disabled={closing || pending} onClick={() => void run(() => onShare(targetId, tab, tunnel.id))}>새 탭에 공유</button>}
-      </li>)}
+      {tunnels.map(tunnel => {
+        const desktop = !closing && !statusError && tunnel.state === "ready" ? tunnel.desktop : undefined;
+        return <li key={tunnel.id}>
+          <strong>{tunnel.route}</strong> <span role="status">{states[tunnel.state]}</span>
+          <div>{tunnel.endpoint} · 소유 탭: {tunnel.owners.join(", ")}</div>
+          {tunnel.error && <div role="alert">{tunnel.error}</div>}
+          {(tunnel.state === "starting" || tunnel.state === "ready") &&
+            <button type="button" disabled={closing || pending} onClick={() => void run(() => onShare(targetId, tab, tunnel.id))}>새 탭에 공유</button>}
+          {(desktop?.protocol === "rdp" || desktop?.protocol === "vnc") &&
+            <button type="button" onClick={() => onOpenDesktop(desktop.protocol, {
+              tabHandle: tab, tunnelId: tunnel.id, targetId: desktop.targetId, destination: desktop.destination,
+            })}>{desktop.protocol === "rdp" ? "RDP로 열기" : "VNC로 열기"}</button>}
+        </li>;
+      })}
     </ul>
   </section>;
 }

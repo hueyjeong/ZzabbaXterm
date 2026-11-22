@@ -23,12 +23,14 @@ async function fixture() {
   const caps = vi.fn();
   const clipboard = { readText: vi.fn().mockResolvedValue("격리 문자열"), writeText: vi.fn().mockResolvedValue(undefined) };
   let notify: (ticket: string) => void = () => { throw new Error("output channel missing"); };
+  const sendInput = vi.fn().mockResolvedValue(true);
   invoke.mockImplementation((name, args) => {
     if (name === "rdp_prepare") return Promise.resolve(id);
     if (name === "rdp_connect") {
       notify = args.output.onmessage;
       return Promise.withResolvers<void>().promise;
     }
+    if (name === "rdp_input") return sendInput();
     return Promise.resolve();
   });
   const fetch = vi.fn();
@@ -44,7 +46,10 @@ async function fixture() {
     });
     notify("c".repeat(32));
   }
-  const header = (sequence: number, frameSequence: number, width = 1) => packet({ sequence, kind: "frame", full: true, frameSequence, width, height: 1, x: 0, y: 0, w: width, h: 1 });
+  const header = (sequence: number, frameSequence: number, width = 1, displayGeneration = 1) => packet({
+    sequence, kind: "frame", full: true, frameSequence, displayGeneration, width, height: 1, x: 0, y: 0, w: width, h: 1
+  });
+  const display = (sequence: number, displayGeneration = 1) => packet({ kind: "display", sequence, displayGeneration });
   const pixels = (sequence: number, width = 1) => {
     const buffer = new ArrayBuffer(12 + 4 * width);
     const binary = new DataView(buffer);
@@ -56,7 +61,7 @@ async function fixture() {
   const draw = vi.fn();
   vi.spyOn(canvas, "getContext").mockReturnValue({ putImageData: draw } as unknown as CanvasRenderingContext2D);
   vi.stubGlobal("ImageData", class { constructor(readonly rgba: Uint8ClampedArray) { } });
-  return { calls, packet, header, pixels, close, connection, ended, ready, caps, clipboard, canvas, draw };
+  return { calls, packet, header, pixels, display, sendInput, close, connection, ended, ready, caps, clipboard, canvas, draw };
 }
 
 it("Canvas 적용 ACK 뒤에만 키를 전달하고 서버가 보낸 크기와 클립보드 결과를 사용한다", async () => {
@@ -72,7 +77,7 @@ it("Canvas 적용 ACK 뒤에만 키를 전달하고 서버가 보낸 크기와 �
   expect(f.draw).toHaveBeenCalledOnce();
   expect(f.draw.mock.invocationCallOrder[0]).toBeLessThan(Math.max(...invoke.mock.invocationCallOrder));
   expect(f.ready).not.toHaveBeenCalled();
-  f.packet({ kind: "display", sequence: 2 });
+  f.display(2);
   await vi.waitFor(() => expect(f.ready).toHaveBeenCalledWith(true));
   view.send(input);
   await vi.waitFor(() => expect(f.calls("rdp_input")[1]).toMatchObject({ id, input: { sequence: 2, action: { kind: "key", code: 0x1e, down: true } } }));
@@ -80,20 +85,56 @@ it("Canvas 적용 ACK 뒤에만 키를 전달하고 서버가 보낸 크기와 �
   await vi.waitFor(() => expect(f.caps).toHaveBeenCalledWith({ copy: true, paste: true, resize: true }));
   f.connection.resize(800, 600);
   expect(f.canvas.width).toBe(1);
-  f.header(4, 2, 2);
+  f.header(4, 2, 2, 2);
   await vi.waitFor(() => expect(f.calls("rdp_ack")).toContainEqual({ id, sequence: 4, offset: 0 }));
   f.pixels(4, 2);
   await vi.waitFor(() => expect(f.canvas.width).toBe(2));
+  f.display(5, 2);
+  await vi.waitFor(() => expect(f.calls("rdp_input")[3]).toMatchObject({ input: { displayGeneration: 2, action: { kind: "active" } } }));
   f.connection.clipboard("paste");
   f.connection.clipboard("copy");
-  await vi.waitFor(() => expect(f.calls("rdp_input").map((call) => call.input.action.kind)).toEqual(["active", "key", "resize", "copy", "paste"]));
-  f.packet({ kind: "clipboard", sequence: 5, epoch: 1, text: "원격 시험 문자열" });
+  await vi.waitFor(() => expect(f.calls("rdp_input").map((call) => call.input.action.kind)).toEqual(["active", "key", "resize", "active", "copy", "paste"]));
+  f.packet({ kind: "clipboard", sequence: 6, epoch: f.calls("rdp_input")[4].input.epoch, text: "원격 시험 문자열" });
   await vi.waitFor(() => expect(f.clipboard.writeText).toHaveBeenCalledWith("원격 시험 문자열"));
   f.connection.setActive(false);
   view.send(input);
   await vi.waitFor(() => expect(f.calls("rdp_input").slice(-1)[0]).toMatchObject({ input: { action: { kind: "active", active: false } } }));
   expect(f.calls("rdp_input").filter((call) => call.input.action.kind === "key")).toHaveLength(1);
   f.close();
+  view.dispose();
+});
+
+it("이전 화면 입력은 폐기하고 같은 크기의 새 화면 ACK 후 입력을 재개한다", async () => {
+  const f = await fixture();
+  const view = createRemoteDesktopViewSession(f.connection, f.canvas, vi.fn());
+  f.connection.setActive(true);
+  f.header(1, 1);
+  await vi.waitFor(() => expect(f.calls("rdp_ack")).toHaveLength(1));
+  f.pixels(1);
+  await vi.waitFor(() => expect(f.calls("rdp_ack")).toHaveLength(2));
+  f.display(2);
+  await vi.waitFor(() => expect(f.calls("rdp_ack")).toHaveLength(3));
+  const discarded = Promise.withResolvers<boolean>();
+  f.sendInput.mockReturnValueOnce(discarded.promise);
+  view.send(input);
+  view.send(input);
+  discarded.resolve(false);
+  await discarded.promise;
+  view.send(input);
+  f.header(3, 2, 1, 2);
+  await vi.waitFor(() => expect(f.calls("rdp_ack")).toHaveLength(4));
+  view.send(input);
+  f.pixels(3);
+  await vi.waitFor(() => expect(f.calls("rdp_ack")).toHaveLength(5));
+  view.send(input);
+  expect(f.calls("rdp_input")).toHaveLength(2);
+  expect(f.ended).not.toHaveBeenCalled();
+  f.display(4, 2);
+  await vi.waitFor(() => expect(f.calls("rdp_input")[2]).toMatchObject({ input: { sequence: 3, displayGeneration: 2, action: { kind: "active" } } }));
+  f.sendInput.mockRejectedValueOnce("RDP 전송 연결이 끊겼습니다");
+  view.send(input);
+  await vi.waitFor(() => expect(f.ended).toHaveBeenCalledWith("RDP 전송 연결이 끊겼습니다", true));
+  expect(f.calls("rdp_input")[3]).toMatchObject({ input: { sequence: 4, displayGeneration: 2, action: { kind: "key" } } });
   view.dispose();
 });
 
@@ -122,4 +163,54 @@ it("폐기한 탭의 픽셀은 Canvas에 그리거나 ACK하지 않는다", asyn
   await vi.waitFor(() => expect(f.calls("rdp_close")).toEqual([{ id }]));
   expect(f.draw).not.toHaveBeenCalled();
   expect(f.calls("rdp_ack")).toEqual([{ id, sequence: 1, offset: 0 }]);
+});
+
+it("터널 연결 거부 시 목적지와 TLS DNS를 구분해 전달하고 직접 연결로 재시도하지 않는다", async () => {
+  vi.stubGlobal("__ZZABBA_RDP_DOCUMENT__", { proof });
+  const ended = vi.fn();
+  const source = { tabHandle: "owned-tab", tunnelId: "7", targetId: "ssh-server", destination: { host: "::1", port: 3390 } };
+  const draft = { host: "rdp.example.invalid", port: 3390, source };
+  invoke.mockImplementation((name) => {
+    if (name === "rdp_prepare") return Promise.resolve(id);
+    if (name === "rdp_connect") return Promise.reject("승인된 터널 목적지가 일치하지 않습니다");
+    return Promise.resolve();
+  });
+  connect(draft, vi.fn(), vi.fn(), vi.fn(), vi.fn(), ended);
+  await vi.waitFor(() => expect(ended).toHaveBeenCalledWith("승인된 터널 목적지가 일치하지 않습니다", true));
+  expect(invoke.mock.calls.map(([name]) => name)).toEqual(["rdp_prepare", "rdp_connect", "rdp_close"]);
+  expect(invoke.mock.calls[1]?.[1]).toMatchObject({ id, draft });
+  expect(invoke.mock.calls[1]?.[2]).toEqual({ headers: { "x-zzabba-rdp-document": proof } });
+});
+
+it("준비 중 닫기는 발급된 세션의 종료를 기다리고 연결을 시작하지 않는다", async () => {
+  vi.stubGlobal("__ZZABBA_RDP_DOCUMENT__", { proof });
+  const prepared = Promise.withResolvers<typeof id>();
+  const released = Promise.withResolvers<void>();
+  invoke.mockImplementation((name) => name === "rdp_prepare" ? prepared.promise : released.promise);
+  const opened = vi.fn();
+  const settled = vi.fn();
+  const close = connect({ host: "localhost", port: 3389 }, opened, vi.fn(), vi.fn(), vi.fn(), vi.fn());
+  const pending = close().then(settled);
+  expect(invoke.mock.calls.map(([name]) => name)).toEqual(["rdp_prepare"]);
+  prepared.resolve(id);
+  await vi.waitFor(() => expect(invoke.mock.calls.map(([name]) => name)).toEqual(["rdp_prepare", "rdp_close"]));
+  expect(settled).not.toHaveBeenCalled();
+  expect(opened).not.toHaveBeenCalled();
+  released.resolve();
+  await pending;
+  expect(settled).toHaveBeenCalledOnce();
+});
+
+it("종료 실패 후 다시 확인하면 같은 세션으로만 요청한다", async () => {
+  const f = await fixture();
+  const first = Promise.withResolvers<void>();
+  invoke.mockReturnValueOnce(first.promise);
+  const pending = f.close();
+  expect(f.close()).toBe(pending);
+  first.reject("RDP 종료 확인 불가");
+  await expect(pending).rejects.toBe("RDP 종료 확인 불가");
+  await f.close();
+  expect(f.calls("rdp_close")).toEqual([{ id }, { id }]);
+  expect(f.calls("rdp_prepare")).toHaveLength(1);
+  expect(f.calls("rdp_connect")).toHaveLength(1);
 });

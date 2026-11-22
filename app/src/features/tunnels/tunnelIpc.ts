@@ -6,6 +6,13 @@ export type TunnelRequest = Readonly<{ listen: number } & (
   | { direction: "dynamic" }
 )>;
 
+export type DesktopTunnelSource = Readonly<{
+  tabHandle: string;
+  tunnelId: string;
+  targetId: string;
+  destination: Readonly<{ host: string; port: number }>;
+}>;
+
 export type TunnelStatus = Readonly<{
   id: string;
   endpoint: string;
@@ -13,6 +20,7 @@ export type TunnelStatus = Readonly<{
   owners: readonly string[];
   state: "starting" | "ready" | "failed" | "disconnected";
   error: string | null;
+  desktop?: Readonly<Pick<DesktopTunnelSource, "targetId" | "destination"> & { protocol: "rdp" | "vnc" }>;
 }>;
 
 export const tunnelIpc = {

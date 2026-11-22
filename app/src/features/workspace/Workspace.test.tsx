@@ -7,6 +7,8 @@ import App from "../../App";
 import { editor } from "../editor/monaco";
 import type { SavedConnections } from "../connections/connectionIpc";
 import type { ConnectionRequest, ConnectionTestDraft, ConnectionTestRun } from "../connections/profiles";
+import * as rdp from "../rdp/RdpTab";
+import * as vnc from "../vnc/VncView";
 
 const native = vi.hoisted(() => ({
   invoke: vi.fn(),
@@ -455,7 +457,9 @@ describe("중앙 원격 화면", () => {
     Reflect.get(target, impl)._dispatch(state);
   }
 
-  it.each(["rdp", "vnc"] as const)("%s 엔진의 프레임·입력·종료가 탭 수명을 따른다", async (protocol) => {
+  it.each([
+    ["rdp", true], ["rdp", false], ["vnc", true], ["vnc", false],
+  ] as const)("%s 엔진의 프레임·입력·탭 종료가 수명을 따른다 (첫 종료 확인: %s)", async (protocol, confirmed) => {
     const label = `${protocol.toUpperCase()} 3`;
     const identity = { sessionId: "b".repeat(32), generation: 1 };
     const owner = { tab: identity.sessionId, document: 1 };
@@ -471,6 +475,7 @@ describe("중앙 원격 화면", () => {
     const pendingRdp = Promise.withResolvers<void>();
     const invoke = native.invoke.getMockImplementation()!;
     let output: { onmessage(ticket: string): void } | undefined;
+    let closeAttempts = 0;
     native.invoke.mockImplementation((command, args) => {
       if (command === "rdp_prepare") return Promise.resolve(identity);
       if (command === "vnc_create") return Promise.resolve(owner);
@@ -478,7 +483,12 @@ describe("중앙 원격 화면", () => {
         output = args.output;
         return protocol === "rdp" ? pendingRdp.promise : Promise.resolve();
       }
-      if (command === `${protocol}_close`) pendingRdp.resolve();
+      if (command === `${protocol}_close`) {
+        const closed = ++closeAttempts > 1 || confirmed;
+        if (protocol === "vnc") return Promise.resolve(closed);
+        if (!closed) return Promise.reject(new Error("RDP 종료 확인 불가"));
+        pendingRdp.resolve();
+      }
       return invoke(command, args);
     });
     let ticketSequence = 0;
@@ -525,12 +535,12 @@ describe("중앙 원격 화면", () => {
     expect(pane.textContent).not.toContain("연결됨");
 
     if (protocol === "rdp") {
-      await deliver({ sequence: 1, kind: "frame", full: true, frameSequence: 1, width: 1, height: 1, x: 0, y: 0, w: 1, h: 1 });
+      await deliver({ sequence: 1, kind: "frame", displayGeneration: 1, full: true, frameSequence: 1, width: 1, height: 1, x: 0, y: 0, w: 1, h: 1 });
       const chunk = new ArrayBuffer(16);
       new DataView(chunk).setBigUint64(0, 1n, true);
       new Uint8Array(chunk, 12).set([1, 2, 3, 255]);
       await deliver(chunk);
-      await deliver({ sequence: 2, kind: "display" });
+      await deliver({ sequence: 2, kind: "display", displayGeneration: 1 });
     } else {
       await deliver({ identity, kind: "waiting", value: 1, serial: 1 });
       const chunk = new ArrayBuffer(37);
@@ -587,12 +597,26 @@ describe("중앙 원격 화면", () => {
     });
     expect(keyCalls()).toHaveLength(2);
 
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const closeArgs = protocol === "rdp" ? { id: identity } : { owner, generation: null };
+    const closeOptions = { headers: { [`x-zzabba-${protocol}-document`]: proof } };
+    if (!confirmed) await press("로컬 2");
     await press(`${label} 닫기`);
+    expect(connectionCalls(`${protocol}_close`)).toEqual([[`${protocol}_close`, closeArgs, closeOptions]]);
+    if (!confirmed) {
+      expect(find(".workspace-session.workspace-desktop")).toBe(pane);
+      expect(pane.hidden).toBe(false);
+      const tab = button(label)!;
+      expect(tab.getAttribute("aria-pressed")).toBe("true");
+      expect(tab.parentElement?.querySelector('[role="alert"]')?.textContent).toBe("종료 확인 불가");
+      await press(`${label} 종료 다시 확인`);
+      expect(connectionCalls(`${protocol}_close`)).toEqual([
+        [`${protocol}_close`, closeArgs, closeOptions],
+        [`${protocol}_close`, protocol === "rdp" ? closeArgs : { ...closeArgs, retry: true }, closeOptions],
+      ]);
+    }
+    expect(confirm).not.toHaveBeenCalled();
     expect(pane.isConnected).toBe(false);
-    expect(connectionCalls(`${protocol}_close`)).toEqual([[
-      `${protocol}_close`, protocol === "rdp" ? { id: identity } : { owner, generation: null },
-      { headers: { [`x-zzabba-${protocol}-document`]: proof } },
-    ]]);
     expect(document.activeElement).toBe(terminal);
     expect(terminal.closest('[data-pane="left"]')).not.toBeNull();
     expect(find(".splitter-center")).toBe(boundary);
@@ -1920,6 +1944,34 @@ describe("현재 SSH 세션의 SFTP", () => {
     expect(button(title)).toBeUndefined();
     expect(button("서버 A · 터널 5")?.getAttribute("aria-pressed")).toBe("true");
     expect(find('select[aria-label="파일 연결"]')).toBe(fileConnection);
+  });
+
+  it.each(["rdp", "vnc"] as const)("Ready 터널의 %s 선택자를 중앙 탭에 전달한다", async protocol => {
+    const rdpTab = vi.spyOn(rdp, "RdpTab");
+    const vncView = vi.spyOn(vnc, "VncView");
+    const destination = { host: "private.example.invalid", port: 14444 };
+    runTunnel = async command => {
+      if (command === "tunnel_tab_open") return "rust-owned-handle";
+      if (command === "tunnel_status") return [{
+        id: "rust-forward-id", endpoint: "127.0.0.1:8090", route: "-L", owners: ["서버 A"], state: "ready", error: null,
+        desktop: { protocol, targetId: "rust-desktop-target", destination },
+      }];
+      throw new Error(command);
+    };
+    const row = [...tree().querySelectorAll<HTMLElement>('[role="treeitem"]')]
+      .find(item => item.querySelector(":scope > .tree-row > span")?.textContent === "서버 A");
+    expect(row).toBeDefined();
+    await act(async () => { row?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true })); });
+    await press("터널 열기");
+    const title = protocol.toUpperCase();
+    await press(`${title}로 열기`);
+    expect(button(`${title} 3`)?.getAttribute("aria-pressed")).toBe("true");
+    const props = protocol === "rdp" ? rdpTab.mock.lastCall?.[0] : vncView.mock.lastCall?.[0];
+    expect(props).toEqual(expect.objectContaining({ active: true, source: {
+      tabHandle: "rust-owned-handle", tunnelId: "rust-forward-id", targetId: "rust-desktop-target", destination,
+    } }));
+    expect(status()).toBe(`${title} 3 · SSH 터널${protocol === "rdp" ? " · NLA" : ""}`);
+    expect(find(".workspace-center .workspace-session.workspace-desktop").closest("[hidden]")).toBeNull();
   });
 
   it("채팅과 중앙 탭을 전환해도 SSH별 목록과 초안을 유지하고 종료된 세션만 분리한다", async () => {

@@ -1,10 +1,15 @@
+import type { DesktopTunnelSource } from "../tunnels/tunnelIpc";
 import { Channel } from "@tauri-apps/api/core";
 import { documentProof, invokeVnc, readPacket } from "./document";
 import type { RemoteDesktopEvent, RemoteDesktopIdentity, RemoteDesktopSession } from "../remoteDesktop/session";
 import { keysym } from "./keys";
 
 export interface Owner { readonly tab: string; readonly document: number }
-export interface Draft { readonly host: string; readonly port: number; readonly password: boolean }
+export type Draft = Readonly<{ password: boolean } & (
+  | { host: string; port: number; source?: never }
+  | { source: DesktopTunnelSource; host?: never; port?: never }
+)>;
+
 type Frame = Extract<RemoteDesktopEvent, { kind: "full" | "patch" }>;
 const HEADER = 33;
 const CHUNK = 256 * 1024;
@@ -15,7 +20,19 @@ type Action = { kind: "release" } | { kind: "key"; keysym: number; down: boolean
 { kind: "cutText"; text: string } | { kind: "resize"; width: number; height: number };
 
 export const createOwner = () => invokeVnc<Owner>("vnc_create");
-export const closeOwner = (owner: Owner) => invokeVnc("vnc_close", { owner, generation: null });
+export const CLOSE_UNCONFIRMED = "종료 확인 불가";
+
+export const closeOwner = (owner: Owner, retry = false) =>
+  closeVnc((args) => invokeVnc("vnc_close", args), owner, null, retry);
+
+async function closeVnc(invoke: (args: Record<string, unknown>) => Promise<unknown>, owner: Owner,
+                        generation: number | null, retry = false): Promise<boolean> {
+  try {
+    return await invoke({ owner, generation, ...(retry ? { retry } : {}) }) === true;
+  } catch {
+    return false;
+  }
+}
 
 export interface Connection extends RemoteDesktopSession {
   resize(width: number, height: number): void;
@@ -25,8 +42,14 @@ export function connect(
   owner: Owner, draft: Draft, started: (session: Connection) => void,
   notice: (message: string) => void, failed: (message: string) => void,
   clipboard: Pick<Clipboard, "readText" | "writeText"> = navigator.clipboard,
+  cleanup?: { readonly closeOpening: () => void; readonly unconfirmed: () => void },
 ): () => void {
   const proof = documentProof();
+  function onCloseResult(confirmed: boolean) {
+    if (confirmed) return;
+    if (cleanup) cleanup.unconfirmed();
+    else notice(CLOSE_UNCONFIRMED);
+  }
   const lifetime = new AbortController();
   const invoke = <T = void>(name: string, args: Record<string, unknown>) => invokeVnc<T>(name, args, proof);
   let identity: RemoteDesktopIdentity | undefined;
@@ -57,11 +80,14 @@ export function connect(
     ready = false;
     assembling = undefined;
     pendingFrame = undefined;
-    if (close) void invoke("vnc_close", { owner, generation: identity?.generation ?? null }).catch(() => { });
     queued.length = 0;
     clipboardText = undefined;
     if (identity) emit({ ...identity, sequence: lastFrame + 1, kind: "disconnected", message });
     else failed(message);
+    if (close) {
+      if (!identity && cleanup) cleanup.closeOpening();
+      else void closeVnc((args) => invoke("vnc_close", args), owner, identity?.generation ?? null).then(onCloseResult);
+    }
   }
 
   async function flush() {
@@ -247,7 +273,10 @@ export function connect(
       terminate("VNC 화면 데이터가 올바르지 않습니다", true);
     }
   }
-  void invoke("vnc_connect", { owner, draft, output }).catch((error) => terminate(String(error), false));
+  void invoke("vnc_connect", { owner, draft, output }).catch((error: unknown) => {
+    terminate(String(error), false);
+    if (error === CLOSE_UNCONFIRMED) onCloseResult(false);
+  });
   return dispose;
 }
 

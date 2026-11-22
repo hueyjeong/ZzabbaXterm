@@ -333,3 +333,40 @@ fn tunnels_close_window_retries_only_its_observed_cleanup() {
     assert!(tunnels.close_window(&b.window).is_empty());
     assert_eq!(other_closes.get(), 2);
 }
+
+#[cfg(target_os = "linux")]
+pub(super) mod loopback {
+    use crate::ssh::{ApprovedHost, Endpoint, TrustStore, TRUST_DIRECTORY};
+    use serde_json::json;
+    use std::{fs, path::Path};
+
+    pub(in crate::tunnels) const SERVER: &str = "test-server";
+
+    pub(in crate::tunnels) struct Fixture {
+        pub(in crate::tunnels) directory: tempfile::TempDir,
+        pub(in crate::tunnels) ssh: super::super::ssh::SavedSsh,
+    }
+
+    impl Fixture {
+        pub(in crate::tunnels) fn new() -> Self {
+            // 격리 서버의 일회 키와 루프백 리슨 포트만 받는다.
+            let root = std::env::var_os("ZZABBA_R01_LOOPBACK_FIXTURE").expect("격리 SSH 시험 디렉터리 필요");
+            let root = Path::new(&root);
+            let port = fs::read_to_string(root.join("port")).unwrap().trim().parse::<u16>().unwrap();
+            let key = fs::read_to_string(root.join("host.pub")).unwrap();
+            let fingerprint = ssh_key::PublicKey::from_openssh(&key).unwrap().fingerprint(ssh_key::HashAlg::Sha256).to_string();
+            let ssh = json!({"host":"127.0.0.1", "port":port, "hostKeyFingerprint":fingerprint,
+                "account":"r01-fixture", "transport":{"kind":"direct"},
+                "auth":{"kind":"keyFile", "privateKeyPath":root.join("client")}});
+            let directory = tempfile::tempdir().unwrap();
+            let store = TrustStore::create(&directory.path().join(TRUST_DIRECTORY)).unwrap();
+            let endpoint = Endpoint::new("127.0.0.1", port).unwrap();
+            store.register(&ApprovedHost::confirm(&endpoint, &endpoint, &fingerprint).unwrap(), &key).unwrap();
+            fs::write(directory.path().join("connections.json"), json!({"version":1,
+                "groups":[{"revision":1,"profile":{"id":"work","displayName":"작업"}}],
+                "targets":[{"revision":1,"profile":{"id":SERVER,"groupId":"work","displayName":"시험 서버",
+                    "defaultMethod":"ssh","ssh":ssh}}]}).to_string()).unwrap();
+            Self { directory, ssh: (std::num::NonZeroU64::MIN, serde_json::from_value(ssh).unwrap()) }
+        }
+    }
+}
