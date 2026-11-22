@@ -28,7 +28,7 @@ use aws_smithy_runtime_api::{
 };
 use aws_smithy_types::{checksum_config::ResponseChecksumValidation, config_bag::ConfigBag};
 use sha2::{Digest, Sha256};
-use crate::editor::storage_files::DownloadTarget;
+use crate::editor::storage_files::{DownloadPublicationError, DownloadTarget};
 use tokio::{fs::File, io::AsyncWriteExt, sync::watch};
 
 use super::{DownloadIntegrity, Downloaded, Error, Failure, Stage, sdk_error, single_attempt};
@@ -138,10 +138,18 @@ pub(super) async fn download(
     drop(file.into_std().await);
     result?;
     staged.commit(closed, digest.finalize().into())
-        .map_err(|err| if err.kind() == std::io::ErrorKind::Interrupted {
-            Error { stage: Stage::DownloadCommit, failure: Failure::Request, bytes }
-        } else {
-            local_error(Stage::DownloadCommit, err, bytes)
+        .map_err(|error| match error {
+            DownloadPublicationError::Io(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                Error { stage: Stage::DownloadCommit, failure: Failure::Request, bytes }
+            }
+            DownloadPublicationError::Io(error) => local_error(Stage::DownloadCommit, error, bytes),
+            DownloadPublicationError::Unconfirmed(path) => Error {
+                stage: Stage::DownloadCommit,
+                failure: Failure::RecoveryUnconfirmed {
+                    recovery_path: path.to_str().map_or_else(|| format!("{path:?}"), str::to_owned),
+                },
+                bytes,
+            },
         })?;
     Ok(Downloaded {
         bytes,

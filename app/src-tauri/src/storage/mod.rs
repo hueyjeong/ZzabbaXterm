@@ -79,6 +79,7 @@ pub(crate) enum Failure {
     Request,
     TimedOut,
     LocalIo { error_kind: String },
+    RecoveryUnconfirmed { recovery_path: String },
     BodyRead,
     Checksum,
     Length { expected: Option<u64> },

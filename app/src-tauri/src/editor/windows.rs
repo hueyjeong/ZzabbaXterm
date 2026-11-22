@@ -1,10 +1,10 @@
 use std::{
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fs::File,
     io,
     mem::{offset_of, size_of},
     os::windows::{
-        ffi::OsStrExt,
+        ffi::{OsStrExt, OsStringExt},
         fs::{MetadataExt, OpenOptionsExt},
         io::{AsRawHandle, FromRawHandle},
     },
@@ -17,9 +17,9 @@ use windows_sys::{
     Wdk::{Foundation::OBJECT_ATTRIBUTES, Storage::FileSystem::*},
     Win32::{
         Foundation::{
-            GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree, OBJ_CASE_INSENSITIVE,
-            RtlNtStatusToDosError, STATUS_FILE_IS_A_DIRECTORY, STATUS_NAME_TOO_LONG,
-            UNICODE_STRING,
+            GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree, MAX_PATH,
+            OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, STATUS_FILE_IS_A_DIRECTORY,
+            STATUS_NAME_TOO_LONG, UNICODE_STRING,
         },
         Security::{
             ACE_HEADER,
@@ -31,7 +31,7 @@ use windows_sys::{
     },
 };
 
-use super::temporary_name;
+use super::{storage_files::DownloadPublicationError, temporary_name};
 
 const SHARE: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 
@@ -103,20 +103,8 @@ impl Directory {
     }
 
     pub(super) fn check_replace_access(&self, _: &OsStr, file: &File) -> io::Result<()> {
-        let metadata = file.metadata()?;
-        if metadata.permissions().readonly() {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "original file is read-only",
-            ));
-        }
-        if metadata.file_attributes() & FILE_ATTRIBUTE_ENCRYPTED != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "encrypted file replacement",
-            ));
-        }
-        drop(reopen(file, FILE_WRITE_DATA)?);
+        check_writable_attributes(file.metadata()?.file_attributes())?;
+        drop(reopen(file, FILE_WRITE_DATA, SHARE)?);
         Ok(())
     }
     pub(super) fn entry_id(&self, name: &OsStr) -> io::Result<Option<FileId>> {
@@ -213,6 +201,22 @@ impl Directory {
 fn nt_error(status: i32) -> io::Error {
     // SAFETY: RtlNtStatusToDosError translates a status value without accessing a pointer.
     io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32)
+}
+
+fn check_writable_attributes(attributes: u32) -> io::Result<()> {
+    if attributes & FILE_ATTRIBUTE_READONLY != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "original file is read-only",
+        ));
+    }
+    if attributes & FILE_ATTRIBUTE_ENCRYPTED != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "encrypted file replacement",
+        ));
+    }
+    Ok(())
 }
 
 const ACCESS_INFO: u32 = OWNER_SECURITY_INFORMATION
@@ -346,9 +350,76 @@ fn reject_central_access_policy(sacl: *const ACL) -> io::Result<()> {
     Ok(())
 }
 
-fn reopen(file: &File, access: u32) -> io::Result<File> {
+fn check_auxiliary_data(file: &File) -> io::Result<()> {
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: the file handle and correctly sized output are valid.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    check_writable_attributes(info.dwFileAttributes)?;
+    if info.dwFileAttributes & !(FILE_ATTRIBUTE_NORMAL | FILE_ATTRIBUTE_ARCHIVE) != 0
+        || info.nNumberOfLinks != 1
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "file attributes or hard links cannot be preserved",
+        ));
+    }
+
+    const UNNAMED: [u16; 7] = [58, 58, 36, 68, 65, 84, 65]; // ::$DATA
+    // The aligned buffer has space for only the unnamed stream.
+    let mut buffer = [0u64; 5];
+    // SAFETY: the output buffer is writable and its byte size is supplied.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileStreamInfo,
+            buffer.as_mut_ptr().cast(),
+            size_of_val(&buffer) as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the buffer is aligned, initialized, and holds the header and seven UTF-16 units.
+    let (streams, name) = unsafe {
+        let ptr = buffer.as_ptr();
+        let name = ptr.cast::<u8>().add(offset_of!(FILE_STREAM_INFO, StreamName));
+        (
+            ptr.cast::<FILE_STREAM_INFO>().read(),
+            slice::from_raw_parts(name.cast::<u16>(), UNNAMED.len()),
+        )
+    };
+    let mut ea = FILE_EA_INFORMATION { EaSize: 0 };
+    // SAFETY: the synchronous file handle and fixed-size NT query output are live.
+    let status = unsafe {
+        NtQueryInformationFile(
+            file.as_raw_handle(),
+            &mut IO_STATUS_BLOCK::default(),
+            (&mut ea as *mut FILE_EA_INFORMATION).cast(),
+            size_of_val(&ea) as u32,
+            FileEaInformation,
+        )
+    };
+    if status < 0 {
+        return Err(nt_error(status));
+    }
+    if streams.NextEntryOffset != 0
+        || streams.StreamNameLength as usize != size_of_val(&UNNAMED)
+        || name != UNNAMED
+        || ea.EaSize != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "file streams or extended attributes cannot be preserved",
+        ));
+    }
+    Ok(())
+}
+
+fn reopen(file: &File, access: u32, share: u32) -> io::Result<File> {
     // SAFETY: ReOpenFile borrows a live handle and checks the requested access.
-    let handle = unsafe { ReOpenFile(file.as_raw_handle(), access, SHARE, 0) };
+    let handle = unsafe { ReOpenFile(file.as_raw_handle(), access, share, 0) };
     if handle == INVALID_HANDLE_VALUE {
         return Err(io::Error::last_os_error());
     }
@@ -383,40 +454,158 @@ impl Temporary<'_> {
         self.rename(name, true)
     }
 
-    fn rename(mut self, name: &OsStr, replace: bool) -> io::Result<File> {
-        let mut request = Rename {
-            flags: if replace { FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS } else { 0 },
-            root: self.directory.file.as_raw_handle(),
-            length: 0,
-            name: [0; 255],
-        };
-        for (index, ch) in name.encode_wide().enumerate() {
-            *request
-                .name
-                .get_mut(index)
-                .ok_or(io::ErrorKind::InvalidFilename)? = ch;
-            request.length += 2;
+    pub(super) fn publish_download(
+        self,
+        name: &OsStr,
+        current: &File,
+        verify: impl FnOnce(&mut File) -> io::Result<()>,
+    ) -> Result<(), DownloadPublicationError> {
+        self.publish_download_inner(name, current, verify, || {})
+    }
+
+    fn publish_download_inner(
+        mut self,
+        name: &OsStr,
+        current: &File,
+        verify: impl FnOnce(&mut File) -> io::Result<()>,
+        after_backup: impl FnOnce(),
+    ) -> Result<(), DownloadPublicationError> {
+        let directory = self.directory;
+        let backup = temporary_name()?;
+        let original_id = file_id(current)?;
+        // Deny other data writers and deleters while checking and moving the exact object.
+        let mut original = reopen(current, GENERIC_READ | FILE_WRITE_DATA | DELETE, FILE_SHARE_READ)?;
+        if file_id(&original)? != original_id {
+            return Err(io::Error::from(io::ErrorKind::AlreadyExists).into());
         }
-        // Keep only metadata access after save so the tab does not retain write/delete access.
-        let retained = reopen(self.file(), READ_CONTROL | FILE_READ_ATTRIBUTES)?;
-        let size = (offset_of!(Rename, name) as u32 + request.length)
-            .max(size_of::<FILE_RENAME_INFORMATION>() as u32);
-        // SAFETY: the synchronous handle and request are live; the destination is one component
-        // relative to the held directory. No copy/delete fallback is used.
-        let status = unsafe {
-            NtSetInformationFile(
-                self.file().as_raw_handle(),
-                &mut IO_STATUS_BLOCK::default(),
-                (&request as *const Rename).cast(),
-                size,
-                FileRenameInformationEx,
+        let access = Access::read(&original)?;
+        let staged_id = file_id(self.file())?;
+        check_auxiliary_data(&original)?;
+        verify(&mut original)?;
+        if directory.entry_id(name)? != Some(original_id) {
+            return Err(io::Error::from(io::ErrorKind::AlreadyExists).into());
+        }
+        access.finish_staging(self.file())?;
+        if !directory.still_at_path()? {
+            return Err(io::Error::from(io::ErrorKind::AlreadyExists).into());
+        }
+
+        rename_at(directory, &original, &backup, 0)?;
+        let unconfirmed = || {
+            let path = final_path(&original)
+                .filter(|path| path.file_name() == Some(backup.as_os_str()))
+                .unwrap_or_else(|| {
+                    final_path(&directory.file)
+                        .as_deref()
+                        .unwrap_or(&directory.path)
+                        .join(&backup)
+                });
+            DownloadPublicationError::Unconfirmed(path)
+        };
+        after_backup();
+        if directory.entry_id(&backup).ok() != Some(Some(original_id))
+            || !matches!(access.matches(&original), Ok(true))
+            || !matches!(directory.still_at_path(), Ok(true))
+        {
+            return Err(unconfirmed());
+        }
+        rename_at(directory, self.file(), name, 0).map_err(|_| unconfirmed())?;
+        // Retain the exclusive handle, but disarm staging cleanup as soon as the name is public.
+        let published = self.file.take().expect("temporary file is open");
+        if access.finish_staging(&published).is_err()
+            || !matches!(access.matches(&original), Ok(true))
+            || check_auxiliary_data(&original).is_err()
+            || directory.entry_id(name).ok() != Some(Some(staged_id))
+            || directory.entry_id(&backup).ok() != Some(Some(original_id))
+            || !matches!(directory.still_at_path(), Ok(true))
+        {
+            return Err(unconfirmed());
+        }
+
+        let disposition = FILE_DISPOSITION_INFO_EX {
+            Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+        };
+        // SAFETY: the verified backup handle still denies other data writers and deleters.
+        if unsafe {
+            SetFileInformationByHandle(
+                original.as_raw_handle(),
+                FileDispositionInfoEx,
+                (&disposition as *const FILE_DISPOSITION_INFO_EX).cast(),
+                size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
             )
-        };
-        if status < 0 {
-            return Err(nt_error(status));
+        } == 0
+        {
+            return Err(unconfirmed());
         }
+        drop(original);
+        Ok(())
+    }
+
+    fn rename(mut self, name: &OsStr, replace: bool) -> io::Result<File> {
+        // Keep only metadata access after save so the tab does not retain write/delete access.
+        let retained = reopen(self.file(), READ_CONTROL | FILE_READ_ATTRIBUTES, SHARE)?;
+        let directory = self.directory;
+        let flags = if replace {
+            FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS
+        } else {
+            0
+        };
+        rename_at(directory, self.file(), name, flags)?;
         self.file.take();
         Ok(retained)
+    }
+}
+
+fn rename_at(directory: &Directory, file: &File, name: &OsStr, flags: u32) -> io::Result<()> {
+    let mut request = Rename {
+        flags,
+        root: directory.file.as_raw_handle(),
+        length: 0,
+        name: [0; 255],
+    };
+    for (index, ch) in name.encode_wide().enumerate() {
+        *request
+            .name
+            .get_mut(index)
+            .ok_or(io::ErrorKind::InvalidFilename)? = ch;
+        request.length += 2;
+    }
+    let size = (offset_of!(Rename, name) as u32 + request.length)
+        .max(size_of::<FILE_RENAME_INFORMATION>() as u32);
+    // SAFETY: the synchronous handle and request are live; the destination is one component
+    // relative to the held directory. No copy/delete fallback is used.
+    let status = unsafe {
+        NtSetInformationFile(
+            file.as_raw_handle(),
+            &mut IO_STATUS_BLOCK::default(),
+            (&request as *const Rename).cast(),
+            size,
+            FileRenameInformationEx,
+        )
+    };
+    if status < 0 { Err(nt_error(status)) } else { Ok(()) }
+}
+
+fn final_path(file: &File) -> Option<PathBuf> {
+    // An ancestor may have moved after the directory was opened.
+    let mut path = vec![0; MAX_PATH as usize];
+    loop {
+        // SAFETY: the file handle and UTF-16 output buffer are live.
+        let len = unsafe {
+            GetFinalPathNameByHandleW(
+                file.as_raw_handle(),
+                path.as_mut_ptr(),
+                path.len() as u32,
+                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+            )
+        } as usize;
+        if len == 0 {
+            return None;
+        }
+        if len < path.len() {
+            return Some(OsString::from_wide(&path[..len]).into());
+        }
+        path.resize(len + 1, 0);
     }
 }
 
@@ -483,6 +672,50 @@ mod tests {
             } else {
                 result.unwrap();
             }
+        }
+    }
+
+    #[test]
+    fn download_publication_preserves_a_late_claim_and_cleans_up_only_on_success() {
+        use std::{
+            fs,
+            io::{Read, Write},
+        };
+
+        for claimed in [false, true] {
+            let sandbox = tempfile::tempdir().unwrap();
+            let directory = Directory::open(fs::canonicalize(sandbox.path()).unwrap()).unwrap();
+            let name = OsStr::new("target.txt");
+            let path = directory.path.join(name);
+            fs::write(&path, b"original").unwrap();
+            let current = directory.open_file(name).unwrap().unwrap();
+            let access = Access::read(&current).unwrap();
+            let mut stage = directory.stage(Some(&access)).unwrap();
+            stage.file().write_all(b"download").unwrap();
+            let verify = |file: &mut File| {
+                let mut actual = Vec::new();
+                file.read_to_end(&mut actual)?;
+                assert_eq!(actual, b"original");
+                Ok(())
+            };
+            let result = if claimed {
+                stage.publish_download_inner(name, &current, verify, || {
+                    File::create_new(&path).unwrap().write_all(b"external").unwrap();
+                })
+            } else {
+                stage.publish_download(name, &current, verify)
+            };
+            if claimed {
+                let Err(DownloadPublicationError::Unconfirmed(recovery)) = result else {
+                    panic!("{result:?}");
+                };
+                assert_eq!(fs::read(recovery).unwrap(), b"original");
+                assert_eq!(fs::read(&path).unwrap(), b"external");
+            } else {
+                result.unwrap();
+                assert_eq!(fs::read(&path).unwrap(), b"download");
+            }
+            assert_eq!(fs::read_dir(&directory.path).unwrap().count(), 1 + usize::from(claimed));
         }
     }
 }

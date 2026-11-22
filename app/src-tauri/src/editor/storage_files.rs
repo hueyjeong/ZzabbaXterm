@@ -89,36 +89,61 @@ pub(crate) struct DownloadStage<'a> {
     temp: os::Temporary<'a>,
 }
 
+#[derive(Debug)]
+pub(crate) enum DownloadPublicationError {
+    Io(io::Error),
+    Unconfirmed(PathBuf),
+}
+
+impl From<io::Error> for DownloadPublicationError {
+    fn from(error: io::Error) -> Self { Self::Io(error) }
+}
+
 impl DownloadStage<'_> {
     pub(crate) fn writer(&mut self) -> io::Result<File> { self.temp.file().try_clone() }
 
-    pub(crate) fn commit(mut self, closed: &tokio::sync::watch::Sender<bool>, digest: [u8; 32]) -> io::Result<()> {
-        use std::io::Seek;
+    pub(crate) fn commit(self, closed: &tokio::sync::watch::Sender<bool>, digest: [u8; 32]) -> Result<(), DownloadPublicationError> {
+        self.commit_inner(closed, digest, || {})
+    }
+
+    fn commit_inner(mut self, closed: &tokio::sync::watch::Sender<bool>, digest: [u8; 32], before_publish: impl FnOnce()) -> Result<(), DownloadPublicationError> {
         let target = &self.target.location;
         let _commit = COMMIT.lock().map_err(|_| io::Error::other("local file commit lock poisoned"))?;
         if let Some((original, _)) = &self.target.original {
             os::Access::read(original)?.finish_staging(self.temp.file())?;
         }
         self.temp.file().sync_all()?;
-        self.temp.file().rewind()?;
-        if version(self.temp.file())?.digest != digest { return Err(changed()); }
+        if version(self.temp.file())?.digest != digest { return Err(changed().into()); }
         target.check_parent()?;
-        if let Some((original, selected)) = &self.target.original {
-            let mut current = target.open_file()?.ok_or(io::ErrorKind::NotFound)?;
-            if version(&mut current)? != *selected { return Err(changed()); }
+        let replacement = if let Some((original, selected)) = &self.target.original {
+            let mut current = target.open_file()?.ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
             let access = os::Access::read(original)?;
-            if !access.matches(&current)? || !access.matches(self.temp.file())? { return Err(changed()); }
+            let verify = move |file: &mut File| {
+                if version(file)? != *selected || !access.matches(file)? { return Err(changed()); }
+                target.check_parent()
+            };
+            verify(&mut current)?;
+            if !access.matches(self.temp.file())? { return Err(changed().into()); }
             target.parent.check_replace_access(&target.name, &current)?;
             target.check_file(&selected.id)?;
-        }
+            Some((current, verify))
+        } else {
+            None
+        };
         let live = closed.borrow();
-        if *live { return Err(io::ErrorKind::Interrupted.into()); }
-        // The checked replacement shares the editor lock; external processes can still race OS rename.
-        self.temp.install(&target.name, self.target.replaces_existing())
+        if *live { return Err(io::Error::from(io::ErrorKind::Interrupted).into()); }
+        before_publish();
+        if let Some((current, verify)) = replacement {
+            self.temp.publish_download(&target.name, &current, verify)
+        } else {
+            Ok(self.temp.install(&target.name, false)?)
+        }
     }
 }
 
 fn version(file: &mut File) -> io::Result<Version> {
+    use std::io::Seek;
+    file.rewind()?;
     let id = os::file_id(file)?;
     let before = file.metadata()?;
     let mut hash = Sha256::new();
@@ -175,7 +200,7 @@ mod tests {
         let late = dir.path().join("late.bin");
         let approval = DownloadTarget::open(&late).unwrap();
         fs::write(&late, b"external").unwrap();
-        assert_eq!(transfer(&approval).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert!(matches!(transfer(&approval), Err(DownloadPublicationError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists));
         assert_eq!(fs::read(&late).unwrap(), b"external");
 
         let link = dir.path().join("link.bin");
@@ -247,6 +272,43 @@ mod tests {
                 assert_eq!(fs::read_dir(&moved_parent).unwrap().count(), 1);
             }
             assert_eq!(fs::read_dir(&parent).unwrap().count(), usize::from(expected.is_some()) + usize::from(action == "replace"));
+        }
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn storage_download_preserves_late_destination_changes() {
+        for action in ["create", "in-place", "replace"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("chosen.bin");
+            let moved = dir.path().join("original.bin");
+            if action != "create" { fs::write(&path, b"original").unwrap(); }
+            let target = DownloadTarget::open(&path).unwrap();
+            let mut stage = target.stage().unwrap();
+            stage.writer().unwrap().write_all(b"download").unwrap();
+            let closed = tokio::sync::watch::Sender::new(false);
+            let result = stage.commit_inner(&closed, Sha256::digest(b"download").into(), || {
+                if action == "replace" { fs::rename(&path, &moved).unwrap(); }
+                fs::write(&path, b"external").unwrap();
+            });
+            if cfg!(target_os = "linux") && action != "create" {
+                let Err(DownloadPublicationError::Unconfirmed(recovery)) = result else {
+                    panic!("{action}: expected a recovery path, got {result:?}");
+                };
+                assert!(!path.exists(), "{action}");
+                assert_eq!(fs::read(&recovery).unwrap(), b"external", "{action}");
+                assert_eq!(fs::read_dir(recovery.parent().unwrap()).unwrap().count(), 1);
+            } else {
+                let Err(DownloadPublicationError::Io(error)) = result else {
+                    panic!("{action}: expected a local IO error, got {result:?}");
+                };
+                if action == "create" {
+                    assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+                }
+                assert_eq!(fs::read(&path).unwrap(), b"external", "{action}");
+            }
+            if action == "replace" { assert_eq!(fs::read(&moved).unwrap(), b"original"); }
+            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1 + usize::from(action == "replace"));
         }
     }
 }

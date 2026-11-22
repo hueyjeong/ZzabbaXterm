@@ -21,6 +21,7 @@ type Failure =
   | Readonly<{ kind: "bucketRegionMismatch"; region: string }>
   | Readonly<{ kind: "service"; status: number; code: string | null }>
   | Readonly<{ kind: "localIo"; errorKind: string }>
+  | Readonly<{ kind: "recoveryUnconfirmed"; recoveryPath: string }>
   | Readonly<{ kind: "length"; expected: number | null }>;
 
 export type S3Error = Readonly<{ stage: Stage; failure: Failure; bytes: number }>;

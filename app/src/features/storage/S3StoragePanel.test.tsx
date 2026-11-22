@@ -83,6 +83,29 @@ it("승인 대기 중 탭과 객체를 바꿔도 최초 전체 키로 다운로�
   expect(host.textContent).toContain(key);
 });
 
+it("원래 이름으로 복구를 확인할 수 없으면 미완료와 보존 파일 경로를 표시한다", async () => {
+  const recoveryPath = "C:\\시험  폴더\\.zzabba-보존\\원본.txt";
+  await render({
+    listBuckets: unused,
+    listObjects: async () => ({ ok: true, value: { rows: [{ kind: "object", key, bytes: 7 }], nextToken: null } }),
+    selectLocalFile: async () => ({ kind: "approved", approvalId: "download-approval" }),
+    upload: unused,
+    download: async () => ({
+      ok: false, error: {
+        stage: "downloadCommit", failure: { kind: "recoveryUnconfirmed", recoveryPath }, bytes: 7,
+      },
+    }),
+  });
+  await fill("버킷", "direct-bucket");
+  await click("버킷 열기");
+  await click(key);
+  await click("다운로드");
+  expect(host.querySelector('[role="status"]')?.textContent).toContain("다운로드 미완료");
+  expect(host.querySelector('[role="alert"]')?.textContent).toContain("다운로드 파일 확정: 복구 확인 실패 · 7 바이트");
+  expect(host.querySelector('[role="alert"] code')?.textContent).toBe(recoveryPath);
+  expect(host.textContent).not.toContain("다운로드 완료");
+});
+
 it("버킷 권한이 없어도 지정 버킷을 열고, 다음 페이지 실패 시 같은 토큰과 선택을 유지한다", async () => {
   const error = { stage: "listObjects", failure: { kind: "service", status: 403, code: "AccessDenied" }, bytes: 0 } as const;
   const listBuckets = vi.fn<S3Actions["listBuckets"]>().mockResolvedValue({ ok: false, error: { ...error, stage: "listBuckets" } });

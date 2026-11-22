@@ -25,6 +25,7 @@ const failures = {
 
 export function StorageProblem({ problem, session }: { problem: Problem; session?: S3Session }) {
   let detail = "네이티브 요청 결과 수신 실패";
+  let recoveryPath: string | undefined;
   if (problem !== "unavailable") {
     const { failure, stage, bytes } = problem;
     let message: string;
@@ -37,13 +38,17 @@ export function StorageProblem({ problem, session }: { problem: Problem; session
         break;
       }
       case "localIo": message = `로컬 파일 오류 (${failure.errorKind})`; break;
+      case "recoveryUnconfirmed":
+        message = "복구 확인 실패";
+        recoveryPath = failure.recoveryPath;
+        break;
       case "length": message = failure.expected === null ? "예상 길이 없음" : `길이 불일치 (예상 ${failure.expected} 바이트)`; break;
       case "bucketRegionMismatch": message = `버킷 리전: ${failure.region}`; break;
       default: message = failures[failure.kind];
     }
     detail = `${stages[stage]}: ${message} · ${bytes} 바이트`;
   }
-  return <p role="alert">{detail}{session && ` · ${session.profile} · ${session.region} · ${session.endpoint}`}</p>;
+  return <p role="alert">{detail}{recoveryPath !== undefined && <> · 보존 파일: <code>{recoveryPath}</code></>}{session && ` · ${session.profile} · ${session.region} · ${session.endpoint}`}</p>;
 }
 
 export function TransferStatus({ transfer, session }: { transfer: Transfer; session: S3Session }) {
