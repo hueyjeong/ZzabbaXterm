@@ -90,6 +90,16 @@ pub(super) fn pin(path: &Path) -> Result<File, Error> {
     Ok(file)
 }
 
+pub(super) fn check_public_key_file(file: &File) -> Result<(), Error> {
+    let info = info(file)?;
+    if info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0
+        || info.nNumberOfLinks != 1
+    {
+        return Err(Error::InvalidPublicKey);
+    }
+    Ok(())
+}
+
 fn open(path: &Path, directory: bool, acl: bool) -> io::Result<File> {
     let flags = FILE_FLAG_OPEN_REPARSE_POINT | if directory { FILE_FLAG_BACKUP_SEMANTICS } else { 0 };
     let access = (if directory { FILE_READ_ATTRIBUTES } else { GENERIC_READ }) | if acl { READ_CONTROL } else { 0 };

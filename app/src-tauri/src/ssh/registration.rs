@@ -1,12 +1,7 @@
-use std::{
-    collections::HashMap,
-    fs::OpenOptions,
-    io::Read,
-    path::{Path, PathBuf},
-    sync::Mutex,
-};
+mod dialogs;
 
-use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult};
+use std::{path::{Path, PathBuf}, sync::Mutex};
+
 use serde::{Deserialize, Serialize};
 use ssh_key::{Fingerprint, HashAlg};
 use tauri::{Manager, ipc::{CommandArg, CommandItem, Invoke}};
@@ -15,7 +10,8 @@ use crate::{connections::profile::Draft, terminal::Sessions};
 use super::{ApprovedHost, Endpoint, Error, TrustStore, trust::plain_public_key};
 
 pub(crate) const COMMAND: &str = "verify_ssh_host";
-const MAX_KEY_BYTES: usize = 16 * 1024;
+pub(crate) const COMMIT: &str = "commit_ssh_host";
+pub(crate) const CANCEL: &str = "cancel_ssh_host";
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -24,6 +20,20 @@ struct Request {
     host: String,
     port: u16,
     expected_fingerprint: String,
+}
+
+#[derive(Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Attempt {
+    draft_id: String,
+    draft_version: u32,
+    attempt_id: String,
+}
+
+impl Attempt {
+    fn valid(&self) -> bool {
+        [&self.draft_id, &self.attempt_id].into_iter().all(|id| !id.is_empty() && id.len() <= 256)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -42,7 +52,7 @@ enum Rejection {
     StoreUnavailable,
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct VerifiedHost {
     host: String,
@@ -51,9 +61,25 @@ struct VerifiedHost {
     target_id: String,
 }
 
+#[derive(Serialize)]
+struct Confirmation {
+    ticket: String,
+    #[serde(flatten)]
+    host: VerifiedHost,
+}
+
+struct Reservation {
+    document: u64,
+    attempt: Attempt,
+    ticket: String,
+    cancelled: bool,
+    ready: Option<Prepared>,
+}
+
 pub(crate) struct Registration {
     store: TrustStore,
-    pending: Mutex<HashMap<String, bool>>,
+    // ACL과 IPC 진입점에서 기본 웹뷰 한 곳만 허용한다.
+    pending: Mutex<Option<Reservation>>,
 }
 
 impl Registration {
@@ -63,35 +89,99 @@ impl Registration {
 
     // 앱은 페이지 로드 시작과 웹뷰 종료 양쪽에서 호출한다.
     pub(crate) fn document_changed(&self, owner: &str) {
-        if let Ok(mut pending) = self.pending.lock()
-            && let Some(current) = pending.get_mut(owner)
-        {
-            *current = false;
+        if owner == "main" && let Ok(mut pending) = self.pending.lock() {
+            Self::invalidate(&mut pending);
         }
     }
 
-    fn begin(&self, owner: &str) -> Result<(), Rejection> {
-        use std::collections::hash_map::Entry;
-        let mut pending = self.pending.lock().map_err(|_| Rejection::StoreUnavailable)?;
-        match pending.entry(owner.into()) {
-            Entry::Occupied(_) => Err(Rejection::Busy),
-            Entry::Vacant(entry) => {
-                entry.insert(true);
-                Ok(())
-            }
+    fn invalidate(pending: &mut Option<Reservation>) {
+        if pending.as_ref().is_some_and(|slot| slot.ready.is_some()) {
+            pending.take();
+        } else if let Some(slot) = pending.as_mut() {
+            slot.cancelled = true;
         }
+    }
+
+    fn begin(&self, document: u64, attempt: Attempt) -> Result<String, Rejection> {
+        let mut pending = self.pending.lock().map_err(|_| Rejection::StoreUnavailable)?;
+        if pending.is_some() {
+            return Err(Rejection::Busy);
+        }
+        let mut random = [0u8; 16];
+        getrandom::fill(&mut random).map_err(|_| Rejection::StoreUnavailable)?;
+        let ticket: String = random.into_iter().map(|byte| format!("{byte:02x}")).collect();
+        *pending = Some(Reservation { document, attempt, ticket: ticket.clone(), cancelled: false, ready: None });
+        Ok(ticket)
+    }
+
+    fn cancel(&self, document: u64, attempt: &Attempt) -> Result<(), Rejection> {
+        let mut pending = self.pending.lock().map_err(|_| Rejection::StoreUnavailable)?;
+        if pending.as_ref().is_some_and(|slot| slot.document == document && &slot.attempt == attempt) {
+            Self::invalidate(&mut pending);
+        }
+        Ok(())
+    }
+
+    fn commit(&self, document: u64, attempt: &Attempt, ticket: &str, sessions: &Sessions) -> Result<VerifiedHost, Rejection> {
+        let mut pending = self.pending.lock().map_err(|_| Rejection::StoreUnavailable)?;
+        let slot = pending.as_ref().filter(|slot| {
+            !slot.cancelled && slot.document == document && &slot.attempt == attempt && slot.ticket == ticket && slot.ready.is_some()
+        }).ok_or(Rejection::Cancelled)?;
+        // 문서 세대와 예약을 모두 잠근 채 일회 예약을 소비하고 핀을 저장한다.
+        sessions.with_probes("main", slot.document, |_| {
+            let prepared = pending.take().and_then(|slot| slot.ready).ok_or("SSH 호스트 키 예약 없음")?;
+            Ok(prepared.commit(&self.store))
+        }).map_err(|_| Rejection::StaleDocument)?
     }
 }
 
-/// 동기 invoke에서 로컬 기본 창의 문서와 Rust가 검증한 초안을 예약한다.
-pub(crate) fn verify_ssh_host(invoke: Invoke) {
-    let Invoke { message, resolver, acl } = invoke;
-    let webview = message.webview_ref().clone();
-    if webview.label() != "main" || webview.window_ref().label() != "main" || acl.is_none() {
-        resolver.reject("앱의 로컬 기본 창에서만 SSH 호스트 키를 등록할 수 있습니다");
+pub(crate) fn dispatch(invoke: Invoke) {
+    let caller = invoke.message.webview_ref().clone();
+    if caller.label() != "main" || caller.window_ref().label() != "main" || invoke.acl.is_none() {
+        invoke.resolver.reject("앱의 로컬 기본 창에서만 SSH 호스트 키를 등록할 수 있습니다");
         return;
     }
-    let document = webview.state::<Sessions>().document(webview.label());
+    let Some(state) = caller.try_state::<Registration>() else {
+        invoke.resolver.invoke_error(Rejection::StoreUnavailable.into());
+        return;
+    };
+    let document = caller.state::<Sessions>().document(caller.label());
+    let name = match invoke.message.command() {
+        COMMIT => COMMIT,
+        CANCEL => CANCEL,
+        _ => COMMAND,
+    };
+    let attempt = match Attempt::from_command(CommandItem {
+        name, key: "attempt", plugin: None, message: &invoke.message, acl: &invoke.acl,
+    }) {
+        Ok(attempt) if attempt.valid() => attempt,
+        Ok(_) => { invoke.resolver.invoke_error(Rejection::InvalidTarget.into()); return; }
+        Err(error) => { invoke.resolver.invoke_error(error); return; }
+    };
+    if name == CANCEL {
+        match state.cancel(document, &attempt) {
+            Ok(()) => invoke.resolver.resolve(()),
+            Err(error) => invoke.resolver.invoke_error(error.into()),
+        }
+        return;
+    }
+    if name == COMMIT {
+        let ticket = match String::from_command(CommandItem {
+            name, key: "ticket", plugin: None, message: &invoke.message, acl: &invoke.acl,
+        }) {
+            Ok(ticket) => ticket,
+            Err(error) => { invoke.resolver.invoke_error(error); return; }
+        };
+        let caller = caller.clone();
+        invoke.resolver.respond_async(async move {
+            tauri::async_runtime::spawn_blocking(move || caller.state::<Registration>()
+                .commit(document, &attempt, &ticket, &caller.state::<Sessions>()))
+                .await.map_err(|_| Rejection::StoreUnavailable)?.map_err(Into::into)
+        });
+        return;
+    }
+    let webview = caller.clone();
+    let Invoke { message, resolver, acl } = invoke;
     let request = match Request::from_command(CommandItem {
         name: COMMAND, key: "request", plugin: None, message: &message, acl: &acl,
     }) {
@@ -107,57 +197,61 @@ pub(crate) fn verify_ssh_host(invoke: Invoke) {
         },
         Err(error) => { resolver.invoke_error(error); return; }
     };
-    let Some(state) = webview.try_state::<Registration>() else {
-        resolver.invoke_error(Rejection::StoreUnavailable.into());
-        return;
+    let ticket = match state.begin(document, attempt) {
+        Ok(ticket) => ticket,
+        Err(error) => { resolver.invoke_error(error.into()); return; }
     };
-    // 비동기 작업을 예약하기 전에 발신 문서의 요청을 예약한다.
-    if let Err(error) = state.begin(webview.label()) {
-        resolver.invoke_error(error.into());
-        return;
-    }
     resolver.respond_async(async move {
         tauri::async_runtime::spawn_blocking(move || {
             let state = webview.state::<Registration>();
-            let window = webview.window();
+            let reservation = Pending { state: &state, ticket: &ticket };
             let sessions = webview.state::<Sessions>();
-            let current = || sessions.with_probes(webview.label(), document, |_| Ok(())).is_ok();
+            sessions.with_probes("main", document, |_| Ok(())).map_err(|_| Rejection::StaleDocument)?;
+            let window = webview.window();
             let expected_fingerprint = request.expected_fingerprint.clone();
-            let resolve = |id: &str| {
-                current().then(|| draft.ssh_pin_endpoint(id, &expected_fingerprint)).flatten()
-            };
-            Pending { state: &state, owner: webview.label() }.verify(
+            let prepared = reservation.verify(
                 request,
-                resolve,
-                || FileDialog::new()
-                    .set_parent(&window)
-                    .set_title("SSH 서버 공개 키 선택")
-                    .add_filter("OpenSSH 공개 키", &["pub"])
-                    .pick_file(),
-                |endpoint, fingerprint| MessageDialog::new()
-                    .set_parent(&window)
-                    .set_title("SSH 서버 키 등록")
-                    .set_description(format!("서버: {}\n포트: {}\nSHA256 지문: {fingerprint}", endpoint.host, endpoint.port))
-                    .set_buttons(MessageButtons::OkCancel)
-                    .show() == MessageDialogResult::Ok,
-            )
+                |id| draft.ssh_pin_endpoint(id, &expected_fingerprint),
+                || dialogs::pick(&window),
+                |endpoint, fingerprint| dialogs::confirm(&window, format!(
+                    "서버: {}\n포트: {}\nSHA256 지문: {fingerprint}", endpoint.host, endpoint.port,
+                )),
+            )?;
+            let host = prepared.host.clone();
+            reservation.ready(prepared)?;
+            Ok::<_, Rejection>(Confirmation { ticket, host })
         }).await.map_err(|_| Rejection::StoreUnavailable)?.map_err(Into::into)
     });
 }
 
+struct Prepared {
+    host: VerifiedHost,
+    endpoint: Endpoint,
+    key: String,
+}
+
+impl Prepared {
+    fn commit(self, store: &TrustStore) -> Result<VerifiedHost, Rejection> {
+        let approved = ApprovedHost::confirm(&self.endpoint, &self.endpoint, &self.host.fingerprint)
+            .map_err(registration_error)?;
+        store.register(&approved, &self.key).map_err(registration_error)?;
+        Ok(self.host)
+    }
+}
+
 struct Pending<'a> {
     state: &'a Registration,
-    owner: &'a str,
+    ticket: &'a str,
 }
 
 impl Pending<'_> {
     fn verify(
-        self,
+        &self,
         request: Request,
         resolve: impl Fn(&str) -> Option<Endpoint>,
-        pick: impl FnOnce() -> Option<PathBuf>,
-        confirm: impl FnOnce(&Endpoint, &Fingerprint) -> bool,
-    ) -> Result<VerifiedHost, Rejection> {
+        pick: impl FnOnce() -> Result<Option<PathBuf>, Rejection>,
+        confirm: impl FnOnce(&Endpoint, &Fingerprint) -> Result<bool, Rejection>,
+    ) -> Result<Prepared, Rejection> {
         self.current()?;
         if request.target_id.is_empty() || request.target_id.len() > 256 {
             return Err(Rejection::InvalidTarget);
@@ -167,34 +261,36 @@ impl Pending<'_> {
         if request.expected_fingerprint.len() != 50 {
             return Err(Rejection::InvalidFingerprint);
         }
-        let approved = ApprovedHost::confirm(&endpoint, &shown, &request.expected_fingerprint)
-            .map_err(registration_error)?;
-        let path = pick().ok_or(Rejection::Cancelled)?;
+        ApprovedHost::confirm(&endpoint, &shown, &request.expected_fingerprint).map_err(registration_error)?;
+        let path = pick()?.ok_or(Rejection::Cancelled)?;
         self.current()?;
-        let bytes = read_public_key(&path)?;
-        let text = std::str::from_utf8(&bytes).map_err(|_| Rejection::InvalidPublicKey)?;
-        let fingerprint = plain_public_key(text).map_err(registration_error)?.fingerprint(HashAlg::Sha256);
+        let key = read_public_key(&path)?;
+        let fingerprint = plain_public_key(&key).map_err(registration_error)?.fingerprint(HashAlg::Sha256);
         if fingerprint.to_string() != request.expected_fingerprint {
             return Err(Rejection::FingerprintMismatch);
         }
         self.current()?;
-        if !confirm(&endpoint, &fingerprint) {
+        if !confirm(&endpoint, &fingerprint)? {
             return Err(Rejection::Cancelled);
         }
-        // 문서 취소와 핀 저장의 순서를 같은 잠금에서 확정한다.
-        let pending = self.lock_current()?;
+        self.current()?;
         if resolve(&request.target_id).as_ref() != Some(&endpoint) {
             return Err(Rejection::EndpointMismatch);
         }
-        self.state.store.register(&approved, text).map_err(registration_error)?;
-        drop(pending);
-        Ok(VerifiedHost { host: request.host, port: endpoint.port, fingerprint: request.expected_fingerprint, target_id: request.target_id })
+        let host = VerifiedHost { host: request.host, port: endpoint.port, fingerprint: request.expected_fingerprint, target_id: request.target_id };
+        Ok(Prepared { host, endpoint, key })
     }
 
-    fn lock_current(&self) -> Result<std::sync::MutexGuard<'_, HashMap<String, bool>>, Rejection> {
+    fn ready(self, prepared: Prepared) -> Result<(), Rejection> {
+        let mut pending = self.lock_current()?;
+        pending.as_mut().ok_or(Rejection::Cancelled)?.ready = Some(prepared);
+        Ok(())
+    }
+
+    fn lock_current(&self) -> Result<std::sync::MutexGuard<'_, Option<Reservation>>, Rejection> {
         let pending = self.state.pending.lock().map_err(|_| Rejection::StoreUnavailable)?;
-        if pending.get(self.owner) != Some(&true) {
-            return Err(Rejection::StaleDocument);
+        if !pending.as_ref().is_some_and(|slot| slot.ticket == self.ticket && !slot.cancelled) {
+            return Err(Rejection::Cancelled);
         }
         Ok(pending)
     }
@@ -206,51 +302,19 @@ impl Pending<'_> {
 
 impl Drop for Pending<'_> {
     fn drop(&mut self) {
-        if let Ok(mut pending) = self.state.pending.lock() {
-            pending.remove(self.owner);
+        if let Ok(mut pending) = self.state.pending.lock()
+            && pending.as_ref().is_some_and(|slot| slot.ticket == self.ticket && slot.ready.is_none())
+        {
+            pending.take();
         }
     }
 }
 
-fn read_public_key(path: &Path) -> Result<Vec<u8>, Rejection> {
-    use Rejection::InvalidPublicKey;
-    if !path.is_absolute() || !path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("pub")) {
-        return Err(InvalidPublicKey);
+fn read_public_key(path: &Path) -> Result<String, Rejection> {
+    if !path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("pub")) {
+        return Err(Rejection::InvalidPublicKey);
     }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    #[cfg(windows)]
-    let _parents = {
-        use std::os::windows::fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ};
-        super::config_path(path).map_err(|_| InvalidPublicKey)?;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).share_mode(FILE_SHARE_READ);
-        super::trust_windows::creation_parent(path).map_err(|_| InvalidPublicKey)?
-    };
-    let file = options.open(path).map_err(|_| InvalidPublicKey)?;
-    let metadata = file.metadata().map_err(|_| InvalidPublicKey)?;
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(InvalidPublicKey);
-        }
-    }
-    if !metadata.is_file() || metadata.len() > MAX_KEY_BYTES as u64 {
-        return Err(InvalidPublicKey);
-    }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take((MAX_KEY_BYTES + 1) as u64).read_to_end(&mut bytes).map_err(|_| InvalidPublicKey)?;
-    if bytes.len() > MAX_KEY_BYTES {
-        return Err(InvalidPublicKey);
-    }
-    Ok(bytes)
+    super::public_key_file::read(path).map_err(|_| Rejection::InvalidPublicKey)
 }
 
 fn registration_error(error: Error) -> Rejection {

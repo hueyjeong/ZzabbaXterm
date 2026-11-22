@@ -1,5 +1,6 @@
 use super::*;
 use std::{cell::Cell, fs};
+use super::super::public_key_file::MAX_KEY_BYTES;
 
 const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti";
 const SHA: &str = "SHA256:UCUiLr7Pjs9wFFJMDByLgc3NrtdU344OgUM45wZPcIQ";
@@ -28,9 +29,22 @@ fn request() -> Request {
     }
 }
 
-fn pending(state: &Registration) -> Pending<'_> {
-    state.begin(OWNER).unwrap();
-    Pending { state, owner: OWNER }
+fn attempt(version: u32) -> Attempt {
+    Attempt { draft_id: "draft".into(), draft_version: version, attempt_id: "1".into() }
+}
+
+fn verify(
+    state: &Registration,
+    request: Request,
+    resolve: impl Fn(&str) -> Option<Endpoint>,
+    pick: impl FnOnce() -> Option<PathBuf>,
+    confirm: impl FnOnce(&Endpoint, &Fingerprint) -> bool,
+) -> Result<String, Rejection> {
+    let ticket = state.begin(0, attempt(0))?;
+    let pending = Pending { state, ticket: &ticket };
+    let prepared = pending.verify(request, resolve, || Ok(pick()), |endpoint, sha| Ok(confirm(endpoint, sha)))?;
+    pending.ready(prepared)?;
+    Ok(ticket)
 }
 
 fn assert_no_pin(state: &Registration) {
@@ -50,7 +64,7 @@ fn checks_current_target_and_fingerprint_before_opening_the_picker() {
         (Request { host: "host\nInjectedOption".into(), ..request() }, Rejection::InvalidEndpoint),
         (Request { expected_fingerprint: "SHA256:invalid".into(), ..request() }, Rejection::InvalidFingerprint),
     ] {
-        assert_eq!(pending(&state).verify(request, target, || panic!("picker"), |_, _| panic!("confirm")), Err(error));
+        assert_eq!(verify(&state, request, target, || panic!("picker"), |_, _| panic!("confirm")), Err(error));
     }
     assert_no_pin(&state);
 }
@@ -68,7 +82,7 @@ fn rejects_non_public_input_and_fingerprint_mismatch_before_confirmation() {
     ] {
         let path = root.path().join(filename);
         fs::write(&path, data).unwrap();
-        assert_eq!(pending(&state).verify(request(), target, || Some(path), |_, _| panic!("confirm")), Err(error));
+        assert_eq!(verify(&state, request(), target, || Some(path), |_, _| panic!("confirm")), Err(error));
     }
     let directory = root.path().join("directory.pub");
     fs::create_dir(&directory).unwrap();
@@ -99,19 +113,19 @@ fn cancellation_navigation_and_changed_selection_cannot_commit_a_pin() {
     let path = root.path().join("host.pub");
     fs::write(&path, KEY).unwrap();
     let pick = || Some(path.clone());
-    assert_eq!(pending(&state).verify(request(), target, || None, |_, _| panic!("confirm")), Err(Rejection::Cancelled));
-    assert_eq!(pending(&state).verify(request(), target, pick, |_, _| false), Err(Rejection::Cancelled));
-    assert_eq!(pending(&state).verify(request(), target, || {
+    assert_eq!(verify(&state, request(), target, || None, |_, _| panic!("confirm")), Err(Rejection::Cancelled));
+    assert_eq!(verify(&state, request(), target, pick, |_, _| false), Err(Rejection::Cancelled));
+    assert_eq!(verify(&state, request(), target, || {
         state.document_changed(OWNER);
-        assert_eq!(state.begin(OWNER), Err(Rejection::Busy));
+        assert_eq!(state.begin(1, attempt(0)), Err(Rejection::Busy));
         pick()
-    }, |_, _| panic!("confirm")), Err(Rejection::StaleDocument));
-    assert_eq!(pending(&state).verify(request(), target, pick, |_, _| {
+    }, |_, _| panic!("confirm")), Err(Rejection::Cancelled));
+    assert_eq!(verify(&state, request(), target, pick, |_, _| {
         state.document_changed(OWNER);
         true
-    }), Err(Rejection::StaleDocument));
+    }), Err(Rejection::Cancelled));
     let changed = Cell::new(false);
-    assert_eq!(pending(&state).verify(request(), |id| {
+    assert_eq!(verify(&state, request(), |id| {
         if changed.get() { Endpoint::new("dev.example.invalid", 22).ok() } else { target(id) }
     }, pick, |_, _| {
         changed.set(true);
@@ -126,18 +140,40 @@ fn commits_exactly_the_confirmed_key_without_automatic_replacement() {
     let path = root.path().join("host.pub");
     fs::write(&path, format!("{KEY} administrator\r\n")).unwrap();
     let expected = VerifiedHost { host: request().host, port: 2222, fingerprint: SHA.into(), target_id: "dev".into() };
-    let result = pending(&state).verify(request(), target, || Some(path.clone()), |actual, fingerprint| {
+    let ticket = verify(&state, request(), target, || Some(path.clone()), |actual, fingerprint| {
         assert_eq!(actual, &endpoint());
         assert_eq!(fingerprint.to_string(), SHA);
         state.document_changed("another-webview");
         // 확인 뒤 파일을 다시 열면 다른 키가 읽힌다.
         fs::write(&path, OTHER_KEY).unwrap();
         true
-    });
-    assert_eq!(result, Ok(expected));
+    }).unwrap();
+    assert_no_pin(&state);
+    let sessions = Sessions::default();
+    assert_eq!(state.commit(0, &attempt(0), &ticket, &sessions), Ok(expected));
+    assert_eq!(state.commit(0, &attempt(0), &ticket, &sessions), Err(Rejection::Cancelled));
     let replacement = Request { expected_fingerprint: OTHER_SHA.into(), ..request() };
-    assert_eq!(pending(&state).verify(replacement, target, || Some(path), |_, _| true), Err(Rejection::ExistingPinConflict));
+    let replacement = verify(&state, replacement, target, || Some(path), |_, _| true).unwrap();
+    assert_eq!(state.commit(0, &attempt(0), &replacement, &sessions), Err(Rejection::ExistingPinConflict));
     let endpoint = endpoint();
     let approved = ApprovedHost::confirm(&endpoint, &endpoint, SHA).unwrap();
     assert_eq!(state.store.pin(&approved).unwrap_or_else(|error| panic!("{error:?}")).0, format!("[dev.example.invalid]:2222 {KEY}\n"));
+}
+
+#[test]
+fn commit_rechecks_cancellation_draft_ticket_and_document_before_writing() {
+    let (root, state) = setup();
+    let path = root.path().join("host.pub");
+    fs::write(&path, KEY).unwrap();
+    let sessions = Sessions::default();
+    let prepare = || verify(&state, request(), target, || Some(path.clone()), |_, _| true).unwrap();
+    let ticket = prepare();
+    assert_eq!(state.commit(0, &attempt(1), &ticket, &sessions), Err(Rejection::Cancelled));
+    assert_eq!(state.commit(0, &attempt(0), "wrong", &sessions), Err(Rejection::Cancelled));
+    state.cancel(0, &attempt(0)).unwrap();
+    assert_eq!(state.commit(0, &attempt(0), &ticket, &sessions), Err(Rejection::Cancelled));
+    let ticket = prepare();
+    sessions.navigate(OWNER);
+    assert_eq!(state.commit(0, &attempt(0), &ticket, &sessions), Err(Rejection::StaleDocument));
+    assert_no_pin(&state);
 }

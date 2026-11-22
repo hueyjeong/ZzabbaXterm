@@ -23,20 +23,35 @@ export function createLocalConnectionIpc(): Omit<LocalConnectionActions, "onClos
 
   return {
     load: () => invoke<SavedConnections>("connections_load", {}),
-    async verifySshHost({ targetId, host, port, hostKeyFingerprint }, draft) {
+    async verifySshHost({ targetId, host, port, hostKeyFingerprint }, draft, attempt, signal) {
+      type Reply = { targetId: string; host: string; port: number; fingerprint: string };
       const request = { targetId, host, port, expectedFingerprint: hostKeyFingerprint };
-      const result = await invoke<{ targetId: string; host: string; port: number; fingerprint: string }>("verify_ssh_host", { request, draft })
-        .catch((error: unknown) => {
-          switch (error) {
-            case "cancelled": throw new Error("SSH 호스트 키 등록이 취소되었습니다");
-            case "fingerprint_mismatch": throw new Error("선택한 SSH 호스트 키의 지문이 다릅니다");
-            case "existing_pin_conflict": throw new Error("다른 SSH 호스트 키가 이미 등록되어 있습니다");
-            case "store_unavailable": throw new Error("SSH 신뢰 저장소를 사용할 수 없습니다");
-            default: throw error;
-          }
-        });
-      if (result?.targetId !== targetId || result.port !== port || result.fingerprint !== hostKeyFingerprint || result.host !== host) {
-        throw new Error("SSH 호스트 키 확인 응답이 현재 초안과 일치하지 않습니다");
+      const cancel = () => { void invoke("cancel_ssh_host", { attempt }).catch(() => { }); };
+      const check = (result: Reply) => {
+        if (result?.targetId !== targetId || result.port !== port || result.fingerprint !== hostKeyFingerprint || result.host !== host) {
+          throw new Error("SSH 호스트 키 확인 응답이 현재 초안과 일치하지 않습니다");
+        }
+      };
+      signal.addEventListener("abort", cancel, { once: true });
+      try {
+        signal.throwIfAborted();
+        const result = await invoke<Reply & { ticket: string }>("verify_ssh_host", { request, draft, attempt });
+        signal.throwIfAborted();
+        check(result);
+        if (!/^[a-f0-9]{32}$/.test(result.ticket)) throw new Error("SSH 호스트 키 확인 예약이 올바르지 않습니다");
+        check(await invoke<Reply>("commit_ssh_host", { attempt, ticket: result.ticket }));
+      } catch (error) {
+        if (!signal.aborted && error !== "busy") cancel();
+        switch (error) {
+          case "cancelled": case "stale_document": throw new Error("SSH 호스트 키 등록이 취소되었습니다");
+          case "busy": throw new Error("열려 있는 SSH 호스트 키 창을 먼저 닫으세요");
+          case "fingerprint_mismatch": throw new Error("선택한 SSH 호스트 키의 지문이 다릅니다");
+          case "existing_pin_conflict": throw new Error("다른 SSH 호스트 키가 이미 등록되어 있습니다");
+          case "store_unavailable": throw new Error("SSH 신뢰 저장소를 사용할 수 없습니다");
+          default: throw error;
+        }
+      } finally {
+        signal.removeEventListener("abort", cancel);
       }
     },
     async test(attempt, interactive) {

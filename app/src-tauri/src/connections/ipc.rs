@@ -16,7 +16,9 @@ pub(crate) fn handle(invoke: Invoke, other: fn(Invoke) -> bool) -> bool {
                 probe::start(&caller.state::<Sessions>(), caller.label(), document, draft_id, draft_version, draft, config)
             })
         }),
-        crate::ssh::registration::COMMAND => crate::ssh::registration::verify_ssh_host(invoke),
+        crate::ssh::registration::COMMAND | crate::ssh::registration::COMMIT | crate::ssh::registration::CANCEL => {
+            crate::ssh::registration::dispatch(invoke)
+        }
         "connection_ssh_test_attach" => dispatch(invoke, "connection_ssh_test_attach", |args| {
             let run = args.get("run")?;
             let rows = args.get("rows")?;

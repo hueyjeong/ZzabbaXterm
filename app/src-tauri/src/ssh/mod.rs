@@ -1,3 +1,4 @@
+mod public_key_file;
 pub(crate) mod registration;
 pub(crate) mod terminal;
 mod trust;
@@ -118,16 +119,8 @@ impl ConnectionPlan {
         let agent_key;
         let auth = match auth {
             Authentication::AgentFile { public_key_path } => {
-                use std::io::Read as _;
-                config_path(public_key_path)?;
-                if !fs::metadata(public_key_path)?.is_file() {
-                    return Err(Error::InvalidPath);
-                }
-                let mut input = String::new();
-                fs::File::open(public_key_path)?.take(16385).read_to_string(&mut input)?;
-                if input.len() > 16384 { return Err(Error::InvalidPublicKey); }
-                agent_key = input;
-                Authentication::Agent { public_key: agent_key.trim() }
+                agent_key = public_key_file::read(public_key_path)?;
+                Authentication::Agent { public_key: &agent_key }
             }
             other => other,
         };

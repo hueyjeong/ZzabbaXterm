@@ -198,6 +198,21 @@ describe("C01 로컬 연결 IPC", () => {
 });
 
 describe("F01 SSH 마법사", () => {
+  it("모달 취소 뒤 도착한 네이티브 확인을 커밋하지 않는다", async () => {
+    const result = Promise.withResolvers<unknown>();
+    const peer = nativePeer();
+    ipc.mockReturnValueOnce(result.promise).mockResolvedValueOnce(null);
+    const controller = new AbortController();
+    const attempt = { draftId: "draft", draftVersion: 2, attemptId: "1" };
+    const request = { targetId: "server", host: "dev.example.invalid", port: 2222, hostKeyFingerprint: `SHA256:${"A".repeat(43)}` };
+    const verification = peer.verifySshHost!(request, draft, attempt, controller.signal);
+    controller.abort();
+    result.resolve({ ...request, fingerprint: request.hostKeyFingerprint, ticket: "a".repeat(32) });
+    await expect(verification).rejects.toMatchObject({ name: "AbortError" });
+    expect(ipc.mock.calls.map(([command]) => command)).toEqual(["verify_ssh_host", "cancel_ssh_host"]);
+    expect(ipc).toHaveBeenLastCalledWith("cancel_ssh_host", { attempt });
+  });
+
   it("이전 호스트 키 확인과 늦은 SSM 선택으로 직접 SSH 시험을 승인할 수 없다", async () => {
     const first = Promise.withResolvers<void>();
     const verifySshHost = vi.fn().mockReturnValueOnce(first.promise).mockResolvedValueOnce(undefined);
@@ -232,8 +247,10 @@ describe("F01 SSH 마법사", () => {
     expect(ipc).not.toHaveBeenCalled();
     await wizard.verifySshHost(peer);
     expect(verifySshHost.mock.calls).toEqual([
-      [{ targetId: draft.target.id, host: host.host, port: 2222, hostKeyFingerprint: host.hostKeyFingerprint }, expect.any(Object)],
-      [{ targetId: draft.target.id, host: "second.actual.test", port: 2222, hostKeyFingerprint: host.hostKeyFingerprint }, expect.any(Object)],
+      [{ targetId: draft.target.id, host: host.host, port: 2222, hostKeyFingerprint: host.hostKeyFingerprint }, expect.any(Object),
+      { draftId: "work-draft", draftVersion: expect.any(Number), attemptId: "1" }, expect.objectContaining({ aborted: true })],
+      [{ targetId: draft.target.id, host: "second.actual.test", port: 2222, hostKeyFingerprint: host.hostKeyFingerprint }, expect.any(Object),
+      { draftId: "work-draft", draftVersion: expect.any(Number), attemptId: "2" }, expect.objectContaining({ aborted: false })],
     ]);
     ipc.mockRejectedValueOnce("SSH 연결 시험을 실행할 수 없습니다");
     await wizard.test(peer);

@@ -51,6 +51,7 @@ export type SshHostApproval = Readonly<{
 }>;
 
 type DraftIdentity = Readonly<{ draftId: string; draftVersion: number }>;
+export type SshPinAttempt = DraftIdentity & Readonly<{ attemptId: string }>;
 
 export type ConnectionTestDraft = DraftIdentity & Readonly<{ draft: ConnectionProfileDraft }>;
 
@@ -68,7 +69,7 @@ export type ConnectionClose =
   | Readonly<{ kind: "saved"; draftId: string; targetId: string }>;
 
 export interface LocalConnectionActions {
-  verifySshHost?(approval: SshHostApproval, draft: ConnectionProfileDraft): Promise<void>;
+  verifySshHost?(approval: SshHostApproval, draft: ConnectionProfileDraft, attempt: SshPinAttempt, signal: AbortSignal): Promise<void>;
   test(attempt: ConnectionTestDraft, interactive?: (run: ConnectionTestRun) => void): Promise<ConnectionTestRun>;
   cancelTest(attempt: ConnectionTestDraft): Promise<void>;
   // Rust의 저장 성공만 이행하고 충돌과 저장 오류는 실제 메시지로 거절한다.
@@ -124,6 +125,8 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Local
   let state: State = { step: "target", draft: initialDraft, status: { kind: "idle" }, sshPin: { kind: "idle" } };
   let local = initialDraft.target.local;
   let draftVersion = 0;
+  let pinCheck: AbortController | undefined;
+  let nextPinAttempt = 0;
   const listeners = new Set<() => void>();
   const pending = new Map<ConnectionTestDraft, LocalConnectionActions["cancelTest"]>();
 
@@ -167,11 +170,14 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Local
       }
     }
     const step = steps[steps.indexOf(state.step) + delta];
-    if (step && state.step === "verify" && draft.target.defaultMethod === "ssh") {
-      update({ status: { kind: "idle" } });
-      void cancelPending();
+    if (step) {
+      pinCheck?.abort();
+      if (state.step === "verify" && draft.target.defaultMethod === "ssh") {
+        update({ status: { kind: "idle" } });
+        void cancelPending();
+      }
+      update({ step, sshPin: state.sshPin.kind === "checking" ? { kind: "idle" } : state.sshPin });
     }
-    if (step) update({ step, sshPin: state.sshPin.kind === "checking" ? { kind: "idle" } : state.sshPin });
   }
 
   function edit(field: "groupName" | "targetName" | "startDirectory", value: string) {
@@ -222,13 +228,18 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Local
     const ssh = completeSsh(draft.target.ssh);
     if (!ssh) return;
     const checking = { kind: "checking" } as const;
+    const controller = new AbortController();
+    const attempt = { draftId, draftVersion, attemptId: String(++nextPinAttempt) };
+    pinCheck = controller;
     update({ sshPin: checking });
     try {
       await actions.verifySshHost({ targetId: draft.target.id, host: ssh.host, port: ssh.port, hostKeyFingerprint: ssh.hostKeyFingerprint },
-        { ...draft, target: { ...draft.target, ssh } });
+        { ...draft, target: { ...draft.target, ssh } }, attempt, controller.signal);
       if (state.sshPin === checking && state.status.kind !== "closing" && state.status.kind !== "closed") update({ sshPin: { kind: "verified" } });
     } catch (error) {
       if (state.sshPin === checking && state.status.kind !== "closing" && state.status.kind !== "closed") update({ sshPin: { kind: "failed", error: errorText(error) } });
+    } finally {
+      if (pinCheck === controller) pinCheck = undefined;
     }
   }
 
@@ -249,6 +260,7 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Local
   }
 
   function updateDraft(draft: WizardDraft) {
+    pinCheck?.abort();
     draftVersion += 1;
     update({ draft, status: { kind: "idle" }, sshPin: { kind: "idle" } });
     void cancelPending();
@@ -345,6 +357,7 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Local
 
   async function close(actions: LocalConnectionActions) {
     if (locked() && state.status.kind !== "closeFailed") return;
+    pinCheck?.abort();
     const closing = { kind: "closing" } as const;
     update({ status: closing });
     const hasRemote = [...pending.keys()].some(attempt => attempt.draft.target.defaultMethod === "ssm");
@@ -394,6 +407,7 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Local
       if (state.remoteCleanup?.kind === "unconfirmed" && !locked()) void cancelPending();
     },
     abandon() {
+      pinCheck?.abort();
       if (state.status.kind === "closing") {
         state = { ...state, status: { kind: "closed" } };
       } else if (pending.size || state.status.kind === "saving" || state.sshPin.kind === "checking") {

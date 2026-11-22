@@ -5,7 +5,7 @@ fn main() {
         "connection_test_start", "connection_test_wait", "connection_test_cancel", "connection_save",
         "connection_ssh_test_attach",
         "connections_load",
-        "verify_ssh_host",
+        "verify_ssh_host", "commit_ssh_host", "cancel_ssh_host",
         "editor_local_open", "editor_local_save", "editor_local_compare", "editor_local_reload",
         "editor_local_close",
         "ssm_discovery",

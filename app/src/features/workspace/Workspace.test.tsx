@@ -97,7 +97,7 @@ beforeEach(async () => {
   saveFile = async () => null;
   native.invoke.mockImplementation(async (command, args) => {
     if (command === "connections_load") return loadProfiles();
-    if (command.startsWith("connection_") || command === "verify_ssh_host") return runConnectionCommand(command, args);
+    if (command.startsWith("connection_") || ["verify_ssh_host", "commit_ssh_host", "cancel_ssh_host"].includes(command)) return runConnectionCommand(command, args);
     if (command === "ssm_discovery") return runDiscovery(args);
     if (command === "editor_local_open") return openFile();
     if (command === "editor_local_save") return saveFile();
@@ -861,6 +861,7 @@ describe("F01 직접 SSH", () => {
     await press("호스트 키 선택 및 등록");
     expect(connectionCalls("verify_ssh_host")).toEqual([["verify_ssh_host", {
       request: { targetId: expect.any(String), host: "dev.example.invalid", port: 2222, expectedFingerprint: fingerprint },
+      attempt: { draftId: expect.any(String), draftVersion: expect.any(Number), attemptId: "1" },
       draft: expect.objectContaining({
         target: expect.objectContaining({
           ssh: {
@@ -880,12 +881,15 @@ describe("F01 직접 SSH", () => {
   it("시험 PTY만 입력을 받고 닫힌 시험의 늦은 성공은 저장할 수 없다", async () => {
     const waits = new Map<string, PromiseWithResolvers<unknown>>();
     let serial = 0;
+    let pin: { targetId: string; host: string; port: number; fingerprint: string } | undefined;
     runConnectionCommand = async (command, args) => {
       if (command === "verify_ssh_host") {
         const { request } = args as { request: { targetId: string; host: string; port: number } };
         const { targetId, host, port } = request;
-        return { targetId, host, port, fingerprint };
+        pin = { targetId, host, port, fingerprint };
+        return { ...pin, ticket: "a".repeat(32) };
       }
+      if (command === "commit_ssh_host") return pin;
       if (command === "connection_test_start") {
         const { draftId, draftVersion } = args as ConnectionTestDraft;
         const runId = `attempt-${++serial}`;
