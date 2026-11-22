@@ -1,4 +1,6 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties, type MouseEvent, type SyntheticEvent } from "react";
+import { invoke, isTauri } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { LocalAiPanel } from "../ai/LocalAiPanel";
 import { createLocalConnectionIpc, type SavedConnections } from "../connections/connectionIpc";
 import { LocalConnectionWizard } from "../connections/LocalConnectionWizard";
@@ -11,6 +13,7 @@ import { RdpTab, type RdpTabActions } from "../rdp/RdpTab";
 import { SftpPanel, type SftpPanelActions } from "../sftp/SftpPanel";
 import { sftpError } from "../sftp/sftpIpc";
 import type { SsmTarget } from "../ssm/ssm";
+import { CompatibleStorageTab } from "../storage/CompatibleStorageTab";
 import { StorageTab } from "../storage/StorageTab";
 import { TerminalView } from "../terminal/TerminalView";
 import type { TerminalStatus } from "../terminal/session";
@@ -32,7 +35,11 @@ type Tab = { id: number; label: string } & (
   | { kind: "rdp"; source?: DesktopTunnelSource; closeStatus?: CloseStatus }
   | { kind: "vnc"; source?: DesktopTunnelSource; closeStatus?: CloseStatus }
 );
-type StorageTarget = { targetId: string; label: string; closeStatus?: CloseStatus };
+const compatibleStorage = { kind: "compatible", targetId: "s3:compatible", label: "S3 호환 HTTPS" } as const;
+type StorageTarget = { closeStatus?: CloseStatus } & (
+  | { kind: "aws"; targetId: string; label: string }
+  | typeof compatibleStorage
+);
 type ProfileLoad = { kind: "loading" | "ready"; profiles?: SavedConnections }
   | { kind: "error"; profiles?: SavedConnections; error: string };
 const connections = createLocalConnectionIpc();
@@ -73,6 +80,8 @@ export function Workspace() {
   const editorActions = useRef(new Map<number, EditorTabActions>());
   const desktopActions = useRef(new Map<number, RdpTabActions | VncTabActions>());
   const cliMounts = useRef(new Map<number, (mounted: boolean) => void>());
+  const pendingEditorMounts = useRef(new Set<number>());
+  const closingWindow = useRef(false);
   const openingFile = useRef(false);
   const [filePickerBusy, setFilePickerBusy] = useState(false);
   const [fileError, setFileError] = useState("");
@@ -80,14 +89,23 @@ export function Workspace() {
   const liveTabs = useRef(tabs);
   const closingTabs = useRef(new Set<number>());
   const sessionClosers = useRef(new Map<number, { confirmClose(): Promise<void> }>());
+  const [closeBlock, setCloseBlock] = useState<{ kind: "picker" | "cli" | "mount"; message: string }
+    | { kind: "editor"; id: number; message: string }>();
   useLayoutEffect(() => {
     liveTabs.current = tabs;
+    const mountingEditors = pendingEditorMounts.current.size;
     for (const tab of tabs) {
-      if (tab.kind === "editor" && tab.attaching) cliMounts.current.get(tab.id)?.(editorActions.current.has(tab.id));
+      if (tab.kind !== "editor") continue;
+      pendingEditorMounts.current.delete(tab.id);
+      if (tab.attaching) cliMounts.current.get(tab.id)?.(editorActions.current.has(tab.id));
+    }
+    if (mountingEditors && !pendingEditorMounts.current.size) {
+      setCloseBlock(current => current?.kind === "mount" ? undefined : current);
     }
   }, [tabs]);
   const [focused, setFocused] = useState(false);
   const [windowError, setWindowError] = useState("");
+  const [closeError, setCloseError] = useState("");
   const [loadVersion, setLoadVersion] = useState(0);
   const [profileLoad, setProfileLoad] = useState<ProfileLoad>({ kind: "loading" });
   const [hostRegistration, setHostRegistration] = useState<{ kind: "status" | "alert"; message: string }>();
@@ -95,6 +113,7 @@ export function Workspace() {
   const [treeWidth, setTreeWidth] = useState(280);
   const [aiWidth, setAiWidth] = useState(360);
   const [bodyWidth, setBodyWidth] = useState(1200);
+  const workspace = useRef<HTMLElement>(null);
   const body = useRef<HTMLDivElement>(null);
   const activeButton = useRef<HTMLButtonElement>(null);
   const sideLimit = Math.min(640, Math.floor(bodyWidth * 0.32));
@@ -102,10 +121,108 @@ export function Workspace() {
   const right = Math.min(aiWidth, sideLimit);
 
   useEffect(() => {
+    if (closeBlock?.kind !== "editor") return;
+    // 숨은 편집 탭의 처리 상태도 부모 렌더링과 독립적으로 바뀐다.
+    const timer = window.setInterval(() => {
+      const tab = liveTabs.current.find(tab => tab.id === closeBlock.id);
+      if (!tab || (tab.kind === "editor" && !tab.attaching && editorActions.current.get(tab.id)?.closeState()?.pending === false)) {
+        setCloseBlock(current => current === closeBlock ? undefined : current);
+      }
+    }, 100);
+    return () => window.clearInterval(timer);
+  }, [closeBlock]);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let disposed = false;
+    let answeredId: string | undefined;
+    const target = { kind: "Webview", label: "main" } as const;
+    const registration = Promise.resolve().then(() => {
+      if (disposed) return;
+      return listen<{ requestId: string }>("workspace-close-requested", ({ payload }) => {
+        const requestId = payload?.requestId;
+        if (typeof requestId === "string" && requestId) void respond(requestId);
+      }, { target });
+    });
+
+    async function respond(requestId: string) {
+      if (disposed || closingWindow.current || requestId === answeredId) return;
+      answeredId = requestId;
+      setCloseError("");
+      let blocked: typeof closeBlock = openingFile.current ? { kind: "picker", message: "파일 선택 중 · 창 닫기 보류" } :
+        cliMounts.current.size ? { kind: "cli", message: "CLI 편집 탭 연결 중 · 창 닫기 보류" } :
+        pendingEditorMounts.current.size ? { kind: "mount", message: "편집 탭 여는 중 · 창 닫기 보류" } : undefined;
+      const element = blocked ? undefined : workspace.current;
+      // showModal()로 열린 대화상자는 상위 요소의 inert를 상속하지 않는다.
+      const dialog = element?.querySelector<HTMLDialogElement>("dialog[open]:not([inert])");
+      const focusedElement = element ? document.activeElement : null;
+      const blockCancel = (event: Event) => {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      };
+      let locked = false;
+      let destroyQueued = false;
+      function unlock() {
+        if (!locked) return;
+        locked = false;
+        closingWindow.current = false;
+        element?.removeAttribute("inert");
+        dialog?.removeAttribute("inert");
+        dialog?.removeEventListener("cancel", blockCancel, { capture: true });
+        if (!disposed && focusedElement instanceof HTMLElement && element?.contains(focusedElement)) focusedElement.focus();
+      }
+      try {
+        if (!blocked) {
+          locked = true;
+          closingWindow.current = true;
+          if (focusedElement instanceof HTMLElement && element?.contains(focusedElement)) focusedElement.blur();
+          element?.setAttribute("inert", "");
+          dialog?.setAttribute("inert", "");
+          dialog?.addEventListener("cancel", blockCancel, { capture: true });
+        }
+        // 포커스를 해제할 때 확정된 입력까지 닫기 판정에 포함한다.
+        const discard: string[] = [];
+        if (!blocked) {
+          for (const tab of liveTabs.current) {
+            if (tab.kind !== "editor") continue;
+            const state = editorActions.current.get(tab.id)?.closeState();
+            if (tab.attaching || !state || state.pending) {
+              blocked = { kind: "editor", id: tab.id, message: `${tab.label}: 편집 작업 중 · 창 닫기 보류` };
+              break;
+            }
+            if (state.dirty || state.uncertain) discard.push(tab.label);
+          }
+        }
+        setCloseBlock(blocked);
+        if (blocked) unlock();
+        const decision = blocked ? { kind: "blocked" } : discard.length ? { kind: "discard", files: discard } : { kind: "ready" };
+        destroyQueued = await invoke<boolean>("workspace_window", { action: "respondToClose", requestId, decision });
+      } catch (error) {
+        if (answeredId === requestId) {
+          if (!disposed) setCloseError(`닫기 실패: ${String(error)}`);
+        }
+      } finally {
+        if (!destroyQueued) unlock();
+      }
+    }
+    void registration.then(async () => {
+      if (disposed) return;
+      const requestId = await invoke<string | null>("workspace_window", { action: "pendingClose" });
+      if (typeof requestId === "string" && requestId) void respond(requestId);
+    }).catch((error: unknown) => {
+      if (!disposed) setCloseError(`창 닫기 연결 실패: ${String(error)}`);
+    });
+    return () => {
+      disposed = true;
+      void registration.then(unlisten => unlisten?.(), () => {});
+    };
+  }, []);
+
+  useEffect(() => {
     const attachingHandles = new Set<ApprovedEditorFile["handle"]>();
     const report = (error: unknown) => setFileError(`CLI 파일 열기 실패: ${localEditorError(error).message}`);
     const unsubscribe = subscribeLocalCliOpen(async (file, respond, signal) => {
-      if (signal.aborted || attachingHandles.has(file.handle) || liveTabs.current.some(tab =>
+      if (closingWindow.current || signal.aborted || attachingHandles.has(file.handle) || liveTabs.current.some(tab =>
         tab.kind === "editor" && tab.source === "local" && tab.file.handle === file.handle)) return;
       attachingHandles.add(file.handle);
       const id = nextTab.current++;
@@ -134,6 +251,7 @@ export function Workspace() {
         throw error;
       } finally {
         cliMounts.current.delete(id);
+        if (!cliMounts.current.size) setCloseBlock(current => current?.kind === "cli" ? undefined : current);
         attachingHandles.delete(file.handle);
         signal.removeEventListener("abort", abort);
       }
@@ -237,7 +355,7 @@ export function Workspace() {
 
   function openTab(target?: SavedConnections["targets"][number]["profile"]) {
     if (target?.defaultMethod === "s3") {
-      openStorageTarget(target.id, target.displayName);
+      openStorageTarget({ kind: "aws", targetId: target.id, label: target.displayName });
       return;
     }
     const id = nextTab.current++;
@@ -276,10 +394,10 @@ export function Workspace() {
     selectTab(id);
   }
 
-  function openStorageTarget(targetId: string, label: string) {
-    setStorageTargets((current) => current.some((target) => target.targetId === targetId)
-      ? current : [...current, { targetId, label }]);
-    setPinnedStorage(targetId);
+  function openStorageTarget(target: StorageTarget) {
+    setStorageTargets(current => current.some(open => open.targetId === target.targetId)
+      ? current : [...current, target]);
+    setPinnedStorage(target.targetId);
     setShowFiles(true);
   }
 
@@ -302,14 +420,27 @@ export function Workspace() {
     }
   }
 
+  function releaseEditorFile(source: EditorSource, close: () => Promise<void>) {
+    void close().catch((error: unknown) => {
+      const message = source === "local" ? localEditorError(error).message : source === "sftp" ? sftpError(error).message
+        : error instanceof Error ? error.message : String(error);
+      setFileError(`파일 닫기 실패: ${message}`);
+    });
+  }
+
   function openEditorTab(file: ApprovedEditorFile, transport: EditorTransport, close: () => Promise<void>, source: EditorSource) {
+    if (closingWindow.current) {
+      releaseEditorFile(source, close);
+      return;
+    }
     const id = nextTab.current++;
+    pendingEditorMounts.current.add(id);
     setTabs((current) => [...current, { id, label: file.label, kind: "editor", file, transport, close, source }]);
     selectTab(id);
   }
 
   async function openEditor() {
-    if (openingFile.current) return;
+    if (openingFile.current || closingWindow.current) return;
     openingFile.current = true;
     setFilePickerBusy(true);
     setFileError("");
@@ -322,6 +453,7 @@ export function Workspace() {
     } finally {
       openingFile.current = false;
       setFilePickerBusy(false);
+      setCloseBlock(current => current?.kind === "picker" ? undefined : current);
     }
   }
 
@@ -433,6 +565,7 @@ export function Workspace() {
       ? { ...tab, sftpSessionId: activeSftp } : tab));
   }, [active, activeSftp, attachedSftp]);
   const selectedStorage = storageTargets.find(target => target.targetId === pinnedStorage);
+  const openAwsStorage = storageTargets.filter(target => target.kind === "aws");
   const savedStorageTargets = profileLoad.profiles?.targets.filter(({ profile }) =>
     (profile.defaultMethod === "s3" || profile.defaultMethod === "ssm") &&
     !storageTargets.some(target => target.targetId === profile.id)) ?? [];
@@ -441,8 +574,16 @@ export function Workspace() {
     "--center-left": `${splitPosition}fr`, "--center-right": `${100 - splitPosition}fr`,
   } as CSSProperties;
 
+  function blockClosingInput(event: SyntheticEvent) {
+    if (!closingWindow.current) return;
+    event.preventDefault();
+    event.stopPropagation();
+  }
+
   return (
-    <main className={`workspace${macTitleBar ? " workspace-mac" : ""}${focused ? " workspace-focused" : ""}`} style={layout}
+    <main ref={workspace} className={`workspace${macTitleBar ? " workspace-mac" : ""}${focused ? " workspace-focused" : ""}`} style={layout}
+      onClickCapture={blockClosingInput} onMouseDownCapture={blockClosingInput}
+      onKeyDownCapture={blockClosingInput} onPointerMoveCapture={blockClosingInput}
       onFocusCapture={(event) => { if (!event.target.closest(".terminal-screen, .monaco-editor")) setFocusTab(null); }}>
       <TitleBar focused={focused} onToggle={() => setFocused(!focused)} onWindowError={setWindowError}
         onOpenRdp={() => openDesktop("rdp")} onOpenVnc={() => openDesktop("vnc")}>
@@ -560,11 +701,7 @@ export function Workspace() {
                   onClose={(handle) => {
                     if (tab.attaching || handle !== tab.file.handle) return;
                     void closeTab(id);
-                    void tab.close().catch((error: unknown) => {
-                      const message = tab.source === "local" ? localEditorError(error).message : tab.source === "sftp" ? sftpError(error).message
-                        : error instanceof Error ? error.message : String(error);
-                      setFileError(`파일 닫기 실패: ${message}`);
-                    });
+                    releaseEditorFile(tab.source, tab.close);
                   }} />
               )}
             </div>;
@@ -580,13 +717,18 @@ export function Workspace() {
                 <div className="workspace-file-connections">
                   <select aria-label="파일 연결" value={pinnedStorage} onChange={event => {
                     const targetId = event.target.value;
+                    if (targetId === compatibleStorage.targetId) {
+                      openStorageTarget(compatibleStorage);
+                      return;
+                    }
                     const saved = savedStorageTargets.find(({ profile }) => profile.id === targetId);
-                    if (saved) openStorageTarget(targetId, saved.profile.displayName);
+                    if (saved) openStorageTarget({ kind: "aws", targetId, label: saved.profile.displayName });
                     else setPinnedStorage(targetId);
                   }}>
                     <option value="">활성 SSH 따라가기</option>
-                    {storageTargets.length > 0 && <optgroup label="열린 S3">
-                      {storageTargets.map(({ targetId, label }) => <option key={targetId} value={targetId}>{label}</option>)}
+                    <option value={compatibleStorage.targetId}>{compatibleStorage.label}</option>
+                    {openAwsStorage.length > 0 && <optgroup label="열린 S3">
+                      {openAwsStorage.map(({ targetId, label }) => <option key={targetId} value={targetId}>{label}</option>)}
                     </optgroup>}
                     {savedStorageTargets.length > 0 && <optgroup label="저장된 S3 연결 열기">
                       {savedStorageTargets.map(({ profile }) => <option key={profile.id} value={profile.id}>{profile.displayName}</option>)}
@@ -610,20 +752,21 @@ export function Workspace() {
                       onEditFile={(file, transport, close) => openEditorTab(file, transport, close, "sftp")} />
                   </div>;
                 })}
-                {storageTargets.map(({ targetId, closeStatus }) => {
+                {storageTargets.map(({ kind, targetId, closeStatus }) => {
                   const visible = showFiles && !focused && targetId === pinnedStorage;
+                  const bindClose = (actions: { confirmClose(): Promise<void> } | null) => {
+                    if (actions) storageClosers.current.set(targetId, actions);
+                    else storageClosers.current.delete(targetId);
+                  };
                   return <div className="workspace-storage" key={targetId} hidden={!visible} inert={!visible}>
                     {closeStatus && <p className="workspace-file-status" role={closeStatus === "closing" ? "status" : "alert"}>
                       {closeStatus === "closing" ? "종료 중" : "종료 확인 불가"}
                     </p>}
                     <div inert={!!closeStatus}>
-                      <StorageTab profiles={profileLoad.profiles} targetId={targetId} active={visible} closing={!!closeStatus}
-                        closeRef={(actions) => {
-                          if (actions) storageClosers.current.set(targetId, actions);
-                          else storageClosers.current.delete(targetId);
-                        }}
-                        onRetest={retestStorageTarget}
-                        onEditFile={({ file, transport, close }) => openEditorTab(file, transport, close, "s3")} />
+                      {kind === "compatible" ? <CompatibleStorageTab closing={!!closeStatus} closeRef={bindClose} /> :
+                        <StorageTab profiles={profileLoad.profiles} targetId={targetId} active={visible} closing={!!closeStatus}
+                          closeRef={bindClose} onRetest={retestStorageTarget}
+                          onEditFile={({ file, transport, close }) => openEditorTab(file, transport, close, "s3")} />}
                     </div>
                   </div>;
                 })}
@@ -647,6 +790,8 @@ export function Workspace() {
             : current?.kind === "rdp" || current?.kind === "vnc"
               ? `${current.label} · ${current.source ? (current.kind === "rdp" ? "SSH 터널 · NLA" : "SSH 터널") : (current.kind === "rdp" ? "직접 · NLA" : "직접 · TLS")}`
               : current ? (current.source === "local" ? "내 PC · 로컬 파일" : current.source === "sftp" ? "SFTP" : "S3") : "연결 없음"}</span>
+        {closeBlock && <span role="status">{closeBlock.message}</span>}
+        {closeError && <span role="alert">{closeError}</span>}
         {windowError && <span role="alert">{windowError}</span>}
         {fileError && <span role="alert">{fileError}</span>}
         {hostRegistration && <span role={hostRegistration.kind}>{hostRegistration.message}</span>}
