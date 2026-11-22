@@ -61,6 +61,7 @@ let closeTerminal: (id: string) => Promise<unknown>;
 let runDiscovery: (args: unknown) => Promise<unknown>;
 let runStorage: (command: string, args: unknown) => Promise<unknown>;
 let openFile: () => Promise<unknown>;
+let saveFile: () => Promise<unknown>;
 
 beforeEach(async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
@@ -101,13 +102,15 @@ beforeEach(async () => {
   runDiscovery = async () => { throw new Error("예상하지 않은 SSM 검색"); };
   runStorage = async command => { throw new Error(`예상하지 않은 스토리지 명령: ${command}`); };
   openFile = async () => ({ status: "cancelled" });
+  saveFile = async () => null;
   native.invoke.mockImplementation(async (command, args) => {
     if (command === "connections_load") return loadProfiles();
     if (command === "ai_models" || command === "ai_targets") return [];
-    if (command.startsWith("connection_")) return runConnectionCommand(command, args);
+    if (command.startsWith("connection_") || ["verify_ssh_host", "commit_ssh_host", "cancel_ssh_host"].includes(command)) return runConnectionCommand(command, args);
     if (command === "ssm_discovery") return runDiscovery(args);
     if (command.startsWith("storage_")) return runStorage(command, args);
     if (command === "editor_local_open") return openFile();
+    if (command === "editor_local_save") return saveFile();
     if (command === "terminal_start") return starts.get(args.id);
     if (command === "terminal_close") return closeTerminal(args.id);
     if (command !== "terminal_open") return;
@@ -858,6 +861,8 @@ describe("C02 SSM 연결", () => {
 
   it("원격 종료 대기 중 편집 탭의 저장과 폐기 취소는 파일 핸들에만 적용된다", async () => {
     const ending = Promise.withResolvers<null>();
+    const saving = Promise.withResolvers<null>();
+    saveFile = () => saving.promise;
     loadProfiles = async () => ({
       version: 1,
       groups: [{ revision: 1, profile: { id: "dev", displayName: "개발" } }],
@@ -870,6 +875,7 @@ describe("C02 SSM 연결", () => {
     const [remoteId] = [...channels.keys()].slice(-1);
     const localInput = find('section[aria-label="로컬 1"] textarea');
     closeTerminal = () => ending.promise;
+    native.invoke.mockClear();
     await press("관리 노드 닫기");
     expect(calls("close").slice(-1)).toEqual([{ id: remoteId }]);
     await press("파일 열기");
@@ -878,24 +884,180 @@ describe("C02 SSM 연결", () => {
     await press("파일 열기");
     const model = editor.getModels().find((item) => item.uri.query === "selected-file")!;
     await act(async () => model.setValue("첫 편집"));
-    await press("저장");
-    expect(connectionCalls("editor_local_save")).toEqual([["editor_local_save", { handle: "selected-file", text: "첫 편집" }]]);
-    await act(async () => model.setValue("미저장"));
     await press("로컬 1");
     expect(document.activeElement).toBe(localInput);
     await press("시험.txt");
     expect(find('.editor-tab[aria-label="시험.txt"]').contains(document.activeElement)).toBe(true);
-    expect(model.getValue()).toBe("미저장");
-    vi.spyOn(window, "confirm").mockReturnValueOnce(false).mockReturnValueOnce(true);
+    expect(model.getValue()).toBe("첫 편집");
+    await press("저장");
+    expect(connectionCalls("editor_local_save")).toEqual([["editor_local_save", { handle: "selected-file", text: "첫 편집" }]]);
+    const confirm = vi.spyOn(window, "confirm").mockReturnValueOnce(false).mockReturnValueOnce(true);
     await press("시험.txt 닫기");
+    expect(confirm).not.toHaveBeenCalled();
     expect(connectionCalls("editor_local_close")).toHaveLength(0);
+    await act(async () => model.setValue("미저장"));
     await act(async () => ending.resolve(null));
     expect(button("관리 노드")).toBeUndefined();
     expect(button("시험.txt")?.getAttribute("aria-pressed")).toBe("true");
+    expect(document.activeElement).not.toBe(localInput);
+    expect(button("저장")?.disabled).toBe(true);
+    await act(async () => saving.resolve(null));
     expect(model.getValue()).toBe("미저장");
+    expect(button("저장")?.disabled).toBe(false);
+    await press("시험.txt 닫기");
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(connectionCalls("editor_local_close")).toHaveLength(0);
     await press("시험.txt 닫기");
     expect(connectionCalls("editor_local_close")).toEqual([["editor_local_close", { handle: "selected-file" }]]);
     expect(button("로컬 1")?.getAttribute("aria-pressed")).toBe("true");
     expect(find('section[aria-label="로컬 1"] textarea')).toBe(localInput);
+    expect(document.activeElement).toBe(localInput);
+    expect(calls("close")).toEqual([{ id: remoteId }]);
+  });
+});
+
+describe("F01 직접 SSH", () => {
+  const fingerprint = `SHA256:${"A".repeat(43)}`;
+
+  it("네이티브 PIN 등록을 취소하면 연결 시험과 저장을 차단한다", async () => {
+    runConnectionCommand = async () => { throw "cancelled"; };
+    const select = async (label: string, value: string) => {
+      const control = [...find("dialog").querySelectorAll("label")]
+        .find(item => item.firstChild?.textContent?.trim() === label)?.querySelector("select");
+      if (!control) throw new Error(label);
+      await act(async () => {
+        control.value = value;
+        control.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      return control;
+    };
+    await press("연결 추가");
+    await changeInput("그룹", "작업");
+    await changeInput("표시명", "개발 서버");
+    await press("다음");
+    await select("접속 방식", "ssh");
+    expect(find<HTMLOptionElement>('option[value="ssm"][disabled]').textContent).toContain("SSH-over-SSM");
+    await changeInput("서버 호스트", "dev.example.invalid");
+    await changeInput("SSH 포트", "2222");
+    await changeInput("SSH 계정", "deploy");
+    await changeInput("호스트 키 SHA256 지문", fingerprint);
+    await press("다음");
+    const auth = await select("SSH 인증 방식", "manualPassword");
+    expect(auth.querySelector<HTMLOptionElement>('option[value="storedPassword"]')?.disabled).toBe(true);
+    await press("다음");
+    expect(find('[aria-label="SSH 연결 대상"]').textContent).toContain("deploy");
+    await press("호스트 키 선택 및 등록");
+    expect(connectionCalls("verify_ssh_host")).toEqual([["verify_ssh_host", {
+      request: { targetId: expect.any(String), host: "dev.example.invalid", port: 2222, expectedFingerprint: fingerprint },
+      attempt: { draftId: expect.any(String), draftVersion: expect.any(Number), attemptId: "1" },
+      draft: expect.objectContaining({
+        target: expect.objectContaining({
+          ssh: {
+            host: "dev.example.invalid", port: 2222, account: "deploy", hostKeyFingerprint: fingerprint,
+            transport: { kind: "direct" }, auth: { kind: "manualPassword" },
+          }
+        })
+      }),
+    }]]);
+    expect(find("dialog [role=alert]").textContent).toBe("SSH 호스트 키 등록이 취소되었습니다");
+    expect(button("연결 테스트")?.disabled).toBe(true);
+    expect(button("저장")?.disabled).toBe(true);
+    expect(connectionCalls("connection_test_start")).toEqual([]);
+    expect(connectionCalls("ssm_discovery")).toEqual([]);
+  });
+
+  it("시험 PTY만 입력을 받고 닫힌 시험의 늦은 성공은 저장할 수 없다", async () => {
+    const waits = new Map<string, PromiseWithResolvers<unknown>>();
+    let serial = 0;
+    let pin: { targetId: string; host: string; port: number; fingerprint: string } | undefined;
+    runConnectionCommand = async (command, args) => {
+      if (command === "verify_ssh_host") {
+        const { request } = args as { request: { targetId: string; host: string; port: number } };
+        const { targetId, host, port } = request;
+        pin = { targetId, host, port, fingerprint };
+        return { ...pin, ticket: "a".repeat(32) };
+      }
+      if (command === "commit_ssh_host") return pin;
+      if (command === "connection_test_start") {
+        const { draftId, draftVersion } = args as ConnectionTestDraft;
+        const runId = `attempt-${++serial}`;
+        waits.set(runId, Promise.withResolvers());
+        return { draftId, draftVersion, runId };
+      }
+      const { run } = args as RunArgs;
+      if (command === "connection_ssh_test_attach") return `trial-${run.runId}`;
+      if (command === "connection_test_wait") return waits.get(run.runId)?.promise;
+      if (command === "connection_test_cancel") return null;
+      throw new Error(command);
+    };
+    const select = async (label: string, value: string) => {
+      const control = [...find("dialog").querySelectorAll("label")]
+        .find(item => item.firstChild?.textContent?.trim() === label)?.querySelector("select");
+      if (!control) throw new Error(label);
+      await act(async () => {
+        control.value = value;
+        control.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+    };
+    await press("연결 추가");
+    await changeInput("그룹", "작업");
+    await changeInput("표시명", "개발 서버");
+    await press("다음");
+    await select("접속 방식", "ssh");
+    await changeInput("서버 호스트", "dev.example.invalid");
+    await changeInput("SSH 계정", "deploy");
+    await changeInput("호스트 키 SHA256 지문", fingerprint);
+    await press("다음");
+    await select("SSH 인증 방식", "manualPassword");
+    await press("다음");
+    await press("호스트 키 선택 및 등록");
+    await press("연결 테스트");
+    const [[, { run: first }]] = connectionCalls("connection_ssh_test_attach");
+    expect(first.runId).toBe("attempt-1");
+    const field = find<HTMLTextAreaElement>('[aria-label="SSH 시험 터미널"] textarea');
+    expect(document.activeElement).toBe(field);
+    await type(field, "fixture");
+    expect(calls("input")).toEqual([{ id: "trial-attempt-1", bytes: Array.from(new TextEncoder().encode("fixture")) }]);
+    expect(button("저장")?.disabled).toBe(true);
+    await press("SSH 시험 닫기");
+    expect(connectionCalls("connection_test_cancel")).toEqual([["connection_test_cancel", { run: first }]]);
+    await press("연결 테스트");
+    await act(async () => waits.get(first.runId)?.resolve({ ...first, sessionId: "trial-attempt-1" }));
+    expect(button("저장")?.disabled).toBe(true);
+    await press("이전");
+    expect(connectionCalls("connection_test_cancel").map(([, args]) => args.run.runId)).toEqual(["attempt-1", "attempt-2"]);
+  });
+
+  it("SSH 종료가 미확인이면 탭을 남기고 같은 PTY ID로만 다시 확인한다", async () => {
+    loadProfiles = async () => ({
+      version: 1,
+      groups: [{ revision: 1, profile: { id: "work", displayName: "작업" } }],
+      targets: [{
+        revision: 1, profile: {
+          id: "server", groupId: "work", displayName: "개발 서버", defaultMethod: "ssh",
+          ssh: {
+            host: "dev.example.invalid", port: 2222, account: "deploy", hostKeyFingerprint: fingerprint,
+            transport: { kind: "direct" }, auth: { kind: "manualPassword" }
+          }
+        }
+      }],
+    });
+    await restartWorkspace();
+    const target = [...tree().querySelectorAll<HTMLElement>('[role="treeitem"]')].find(item => item.textContent === "개발 서버")!;
+    await key(target, "Enter");
+    await key(target, "Enter");
+    expect(calls("open").slice(-2).map(args => args.targetId)).toEqual(["server", "server"]);
+    const [first, second] = calls("start").slice(-2).map(args => args.id);
+    expect(first).not.toBe(second);
+    closeTerminal = vi.fn().mockRejectedValueOnce("SSH 자식 종료 확인 불가: wait").mockResolvedValue(null);
+    native.invoke.mockClear();
+    await press("개발 서버 닫기");
+    expect(calls("close")).toEqual([{ id: first }]);
+    expect(find(".workspace-tab [role=alert]").textContent?.trim()).toBe("종료 확인 불가");
+    expect(status()).toContain(`SSH · ${second}`);
+    await press("개발 서버 종료 다시 확인");
+    expect(calls("close")).toEqual([{ id: first }, { id: first }]);
+    expect(document.querySelector(".workspace-tab [role=alert]")).toBeNull();
+    expect(status()).toContain(`SSH · ${second}`);
   });
 });

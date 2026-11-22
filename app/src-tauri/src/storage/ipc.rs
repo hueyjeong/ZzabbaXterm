@@ -376,7 +376,7 @@ fn unavailable(stage: Stage) -> Error {
 fn verified_selection(directory: &std::path::Path, target_id: &str) -> Result<VerifiedSsoSelection, Error> {
     let (scope, account) = with_saved_method(directory, target_id, |method, account| match method {
         MethodRef::Ssm { profile, region, .. } => Ok((Scope::new(profile.to_owned(), region.to_owned()), account.map(str::to_owned))),
-        MethodRef::Local { .. } => Err("SSO 연결이 아닙니다".into()),
+        MethodRef::Local { .. } | MethodRef::Ssh { .. } => Err("SSO 연결이 아닙니다".into()),
     })
     .map_err(|_| Error::at(Stage::Profile, Failure::InvalidSsoProfile))?;
     let account = account.ok_or_else(|| Error::at(Stage::Profile, Failure::RetestRequired))?;

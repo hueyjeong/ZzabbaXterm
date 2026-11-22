@@ -51,6 +51,10 @@ impl Runs {
             .filter(|run| run.key == *key).ok_or_else(|| UNTESTED.into())
     }
 
+    pub(crate) fn attached_probe(&self, owner: &str, id: &str) -> Option<&Probe> {
+        self.active.get(owner)?.values().find(|run| run.session_id == id).map(|run| run.probe.as_ref())
+    }
+
     fn retire(&mut self, owner: &str, key: RunKey, probe: Arc<Probe>) {
         let entry = (owner.into(), key, probe);
         if !entry.2.finished() {
@@ -88,7 +92,7 @@ impl Runs {
     }
 }
 
-pub(super) fn start(sessions: &Sessions, owner: &str, document: u64, draft_id: String, draft_version: u64, draft: Draft) -> Result<RunKey, String> {
+pub(super) fn start(sessions: &Sessions, owner: &str, document: u64, draft_id: String, draft_version: u64, draft: Draft, config: std::path::PathBuf) -> Result<RunKey, String> {
     if draft_id.is_empty() || draft_version > (1 << 53) - 1 {
         return Err("초안 ID 또는 버전이 올바르지 않습니다".into());
     }
@@ -109,7 +113,7 @@ pub(super) fn start(sessions: &Sessions, owner: &str, document: u64, draft_id: S
         let tested = Arc::clone(&draft);
         let completed = sessions.probe_completion(owner.into(), document, key.run_id.clone());
         thread::Builder::new().name("connection-probe".into()).spawn(move || {
-            worker.run(&tested);
+            worker.run(&tested, &config);
             completed();
         })
             .map_err(|error| format!("연결 시험: {error}"))?;
@@ -117,6 +121,18 @@ pub(super) fn start(sessions: &Sessions, owner: &str, document: u64, draft_id: S
         runs.active.get_mut(owner).unwrap().insert(key.draft_id.clone(), run);
         Ok(key)
     })
+}
+
+pub(super) fn attach(sessions: &Sessions, owner: &str, document: u64, key: &RunKey, rows: u16, cols: u16,
+    output: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>) -> Result<String, String> {
+    let (probe, id) = sessions.with_probes(owner, document, |runs| {
+        let run = runs.get(owner, key)?;
+        let size = crate::terminal::probe_size(rows, cols)?;
+        run.probe.attach(size, output)?;
+        Ok((Arc::clone(&run.probe), run.session_id.clone()))
+    })?;
+    probe.wait_open()?;
+    sessions.with_probes(owner, document, |runs| { runs.get(owner, key)?; Ok(id) })
 }
 
 pub(super) fn wait(sessions: &Sessions, owner: &str, document: u64, key: &RunKey) -> Result<Passed, String> {
@@ -243,6 +259,136 @@ mod tests {
     use std::{sync::mpsc, time::Duration};
 
     #[test]
+    fn f01_interactive_trial_requires_the_exact_live_run() {
+        let dir = TestDir::new();
+        let sessions = Sessions::default();
+        let input = crate::connections::tests::ssh_draft(dir.path());
+        let begin = || start(&sessions, "main", 0, "draft".into(), 1,
+            serde_json::from_value(input.clone()).unwrap(), dir.path().into()).unwrap();
+        let first = begin();
+        let second = begin();
+        let output = || tauri::ipc::Channel::new(|_| Ok(()));
+        assert!(attach(&sessions, "main", 0, &first, 24, 80, output()).is_err());
+        assert!(attach(&sessions, "other", 0, &second, 24, 80, output()).is_err());
+        assert!(attach(&sessions, "main", 0, &second, 0, 80, output()).is_err());
+        sessions.navigate("main");
+        assert!(attach(&sessions, "main", 0, &second, 24, 80, output()).is_err());
+        assert!(wait(&sessions, "main", 1, &second).is_err());
+    }
+
+    #[test]
+    #[ignore = "루프백 SSH 검증에는 격리된 Python/Paramiko가 필요합니다"]
+    fn f01_interactive_loopback_saves_and_reopens() {
+        use std::{io::{BufRead, BufReader}, process::{Child, Command, Stdio}};
+        use crate::ssh::{ApprovedHost, Endpoint, TrustStore, TRUST_DIRECTORY};
+        use serde_json::json;
+        use tauri::ipc::{Channel, InvokeResponseBody};
+
+        // 이 검증은 테스트 전용 Python/Paramiko 경로를 명시한 환경에서 실행한다.
+        let python = std::env::var_os("ZZABBA_F01_FIXTURE_PYTHON").expect("격리된 Python 실행 파일을 지정합니다");
+        struct Server(Child);
+        impl Drop for Server {
+            fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+        }
+        let dir = TestDir::new();
+        let key_path = dir.path().join("encrypted-fixture-key");
+        #[cfg(windows)]
+        crate::ssh::terminal::restrict_fixture_key(&key_path);
+        let mut server = Server(Command::new(python)
+            .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ssh/terminal/loopback_fixture.py"))
+            .arg(&key_path).stdout(Stdio::piped()).spawn().unwrap());
+        let mut line = String::new();
+        BufReader::new(server.0.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        let (port, public) = line.trim_end().split_once(' ').expect("루프백 SSH 준비 출력");
+        let port = port.parse::<u16>().unwrap();
+        let fingerprint = ssh_key::PublicKey::from_openssh(public).unwrap().fingerprint(ssh_key::HashAlg::Sha256).to_string();
+        let endpoint = Endpoint::new("127.0.0.1", port).unwrap();
+        let trust = TrustStore::create(&dir.path().join(TRUST_DIRECTORY)).unwrap();
+        trust.register(&ApprovedHost::confirm(&endpoint, &endpoint, &fingerprint).unwrap(), public).unwrap();
+        let sessions = Sessions::default();
+        let store = Store::new(dir.path());
+        let mut input = crate::connections::tests::ssh_draft(dir.path());
+        input["target"]["ssh"]["host"] = json!("127.0.0.1");
+        input["target"]["ssh"]["port"] = json!(port);
+        input["target"]["ssh"]["account"] = json!("fixture-user");
+        input["target"]["ssh"]["hostKeyFingerprint"] = json!(fingerprint);
+        let terminal = |secret: &[u8], id: &str, rx: mpsc::Receiver<InvokeResponseBody>, close_after: Option<&str>| {
+            let mut output = Vec::new();
+            let mut cursor_sent = false;
+            let mut sent = false;
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            loop {
+                match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+                    Ok(InvokeResponseBody::Raw(bytes)) => {
+                        output.extend(bytes);
+                        let _ = sessions.ack("main", id, output.len() as u64);
+                        let text = String::from_utf8_lossy(&output);
+                        if !cursor_sent && text.contains("\x1b[6n") {
+                            sessions.input("main", id, b"\x1b[1;1R").unwrap();
+                            cursor_sent = true;
+                        }
+                        if !sent && (text.contains("password:") || text.contains("passphrase for key")) {
+                            sessions.input("main", id, secret).unwrap();
+                            sent = true;
+                        }
+                        if close_after.is_some_and(|marker| text.contains(marker)) {
+                            sessions.close_ssh_fixture(id);
+                            break;
+                        }
+                    }
+                    Ok(InvokeResponseBody::Json(event)) => {
+                        assert!(close_after.is_none(), "저장된 셸이 닫기 요청 전에 종료됐습니다: {event}");
+                        assert!(event.contains("exited") && event.contains("\"value\":0"), "{event}: {}", String::from_utf8_lossy(&output));
+                        break;
+                    }
+                    Err(error) => panic!("{error}: {}", String::from_utf8_lossy(&output)),
+                }
+            }
+            assert!(sent);
+        };
+        let cancelled = start(&sessions, "main", 0, "draft".into(), 0,
+            serde_json::from_value(input.clone()).unwrap(), dir.path().into()).unwrap();
+        let cancelled_id = attach(&sessions, "main", 0, &cancelled, 24, 100, Channel::new(|_| Ok(()))).unwrap();
+        sessions.start("main", &cancelled_id).unwrap();
+        cancel(&sessions, "main", 0, &cancelled).unwrap();
+        assert!(sessions.input("main", &cancelled_id, b"blocked").is_err());
+        assert!(wait(&sessions, "main", 0, &cancelled).is_err());
+        let request = serde_json::from_value(json!({"run":cancelled,"draft":input})).unwrap();
+        assert!(save_confirmed(&sessions, "main", 0, request, &store).is_err());
+
+        for (index, auth) in [json!({"kind":"manualPassword"}), json!({"kind":"keyFile", "privateKeyPath": key_path})].into_iter().enumerate() {
+            if index != 0 {
+                input["groupRevision"] = json!(1);
+                input["targetRevision"] = json!(1);
+            }
+            input["target"]["ssh"]["auth"] = auth;
+            let run = start(&sessions, "main", 0, "draft".into(), index as u64,
+                serde_json::from_value(input.clone()).unwrap(), dir.path().into()).unwrap();
+            let (sender, rx) = mpsc::channel();
+            let channel = Channel::new(move |body| { let _ = sender.send(body); Ok(()) });
+            let id = attach(&sessions, "main", 0, &run, 24, 100, channel.clone()).unwrap();
+            assert!(attach(&sessions, "main", 0, &run, 24, 100, channel).is_err());
+            assert!(sessions.input("other", &id, b"blocked").is_err());
+            let request = || serde_json::from_value(json!({"run":run,"draft":input})).unwrap();
+            assert!(save_confirmed(&sessions, "main", 0, request(), &store).is_err());
+            sessions.start("main", &id).unwrap();
+            terminal(b"fixture-password\r", &id, rx, None);
+            assert_eq!(wait(&sessions, "main", 0, &run).unwrap().session_id, id);
+            save_confirmed(&sessions, "main", 0, request(), &store).unwrap();
+            assert_eq!(serde_json::to_value(store.load().unwrap()).unwrap()["targets"][0]["profile"], input["target"]);
+            if index == 0 {
+                let (sender, rx) = mpsc::channel();
+                let reopened = sessions.reopen_ssh_fixture(dir.path(), "ssh-server", Channel::new(move |body| {
+                    let _ = sender.send(body); Ok(())
+                })).unwrap();
+                assert_ne!(reopened, id);
+                sessions.start("main", &reopened).unwrap();
+                terminal(b"fixture-password\r", &reopened, rx, Some("FIXTURE-REOPENED"));
+            }
+        }
+    }
+
+    #[test]
     fn c01_cancel_retires_a_blocked_probe_until_worker_completion() {
         let dir = TestDir::new();
         let sessions = Sessions::default();
@@ -268,7 +414,7 @@ mod tests {
             if retired {
                 crate::terminal::tests::assert_live_shell_progress(&sessions);
             }
-            probe.run(&draft);
+            probe.run(&draft, std::path::Path::new(""));
             completed();
             response.unwrap().unwrap();
             assert!(retired);

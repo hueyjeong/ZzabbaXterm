@@ -12,8 +12,19 @@ pub(crate) fn handle(invoke: Invoke, other: fn(Invoke) -> bool) -> bool {
             let draft_version = args.get("draftVersion")?;
             let draft = args.get("draft")?;
             Ok(move |caller: Webview, document| {
-                probe::start(&caller.state::<Sessions>(), caller.label(), document, draft_id, draft_version, draft)
+                let config = caller.path().app_config_dir().map_err(|error| format!("앱 설정 디렉터리: {error}"))?;
+                probe::start(&caller.state::<Sessions>(), caller.label(), document, draft_id, draft_version, draft, config)
             })
+        }),
+        crate::ssh::registration::COMMAND | crate::ssh::registration::COMMIT | crate::ssh::registration::CANCEL => {
+            crate::ssh::registration::dispatch(invoke)
+        }
+        "connection_ssh_test_attach" => dispatch(invoke, "connection_ssh_test_attach", |args| {
+            let run = args.get("run")?;
+            let rows = args.get("rows")?;
+            let cols = args.get("cols")?;
+            let output = args.channel("output")?;
+            Ok(move |caller: Webview, document| probe::attach(&caller.state::<Sessions>(), caller.label(), document, &run, rows, cols, output))
         }),
         "connection_test_wait" => dispatch(invoke, "connection_test_wait", |args| {
             let run = args.get("run")?;
@@ -51,6 +62,11 @@ impl Args<'_> {
         let Invoke { message, acl, .. } = self.0;
         T::from_command(CommandItem { name: self.1, key, plugin: None, message, acl })
     }
+
+    fn channel(&self, key: &'static str) -> Result<tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>, InvokeError> {
+        let Invoke { message, acl, .. } = self.0;
+        CommandArg::from_command(CommandItem { name: self.1, key, plugin: None, message, acl })
+    }
 }
 
 fn dispatch<T, Job>(invoke: Invoke, name: &'static str, parse: impl FnOnce(Args<'_>) -> Result<Job, InvokeError>)
@@ -80,6 +96,18 @@ where
 fn store(caller: &Webview) -> Result<Store, String> {
     let directory = caller.path().app_config_dir().map_err(|error| format!("앱 설정 디렉터리: {error}"))?;
     store_at(&directory)
+}
+
+pub(crate) fn initialize_ssh_registration(app: &tauri::App) -> Result<crate::ssh::registration::Registration, String> {
+    use crate::ssh::{Error, TrustStore, registration::Registration};
+    let config = app.path().app_config_dir().map_err(|error| format!("앱 설정 디렉터리: {error}"))?;
+    store_at(&config)?.load().map_err(|error| format!("프로필 읽기: {error:?}"))?;
+    let root = config.join(crate::ssh::TRUST_DIRECTORY);
+    let store = match TrustStore::open(&root) {
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => TrustStore::create(&root),
+        result => result,
+    }.map_err(|error| format!("SSH 신뢰 저장소: {error:?}"))?;
+    Ok(Registration::new(store))
 }
 
 fn store_at(directory: &Path) -> Result<Store, String> {

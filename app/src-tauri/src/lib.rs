@@ -2,6 +2,8 @@ pub mod ai;
 mod connections;
 mod editor;
 mod local_ipc;
+#[allow(dead_code, reason = "SFTP는 별도 통합 경계")]
+mod ssh;
 pub mod ssm;
 mod storage;
 mod terminal;
@@ -26,11 +28,17 @@ pub fn run() {
         .manage(ai::ipc::State::default())
         .plugin(ssm::ipc::lifecycle())
         .setup(|app| {
+            if let Ok(registration) = connections::ipc::initialize_ssh_registration(app) {
+                app.manage(registration);
+            }
             ai::cli::start(app.handle().clone());
             Ok(())
         })
         .on_page_load(|webview, payload| {
             if payload.event() == tauri::webview::PageLoadEvent::Started {
+                if let Some(registration) = webview.try_state::<ssh::registration::Registration>() {
+                    registration.document_changed(webview.label());
+                }
                 webview.state::<Sessions>().navigate(webview.label());
                 webview.state::<LocalEditors>().navigate(webview.label());
                 webview.state::<StorageIpc>().navigate(webview.label());
@@ -59,6 +67,9 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| match event {
             tauri::RunEvent::WindowEvent { label, event: tauri::WindowEvent::Destroyed, .. } => {
+                if let Some(registration) = app.try_state::<ssh::registration::Registration>() {
+                    registration.document_changed(&label);
+                }
                 app.state::<Sessions>().destroy(&label);
                 app.state::<LocalEditors>().destroy(&label);
                 app.state::<StorageIpc>().navigate(&label);

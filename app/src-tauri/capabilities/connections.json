@@ -6,7 +6,11 @@
   "webviews": ["main"],
   "permissions": [
     "allow-connection-test-start",
+    "allow-connection-ssh-test-attach",
     "allow-connection-test-wait",
+    "allow-verify-ssh-host",
+    "allow-commit-ssh-host",
+    "allow-cancel-ssh-host",
     "allow-connection-test-cancel",
     "allow-connection-save",
     "allow-connections-load",

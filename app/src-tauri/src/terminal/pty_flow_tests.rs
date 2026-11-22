@@ -74,9 +74,14 @@ impl<'a> Pty<'a> {
     }
 
     fn open_with(sessions: &'a Sessions, command: portable_pty::CommandBuilder) -> Self {
+        Self::open_launch(sessions, super::Launch::Local(command))
+    }
+
+    fn open_launch(sessions: &'a Sessions, launch: super::Launch) -> Self {
+        let document = sessions.document("main");
         let (tx, events) = mpsc::channel();
         let id = sessions
-            .open("main", size(24, 120), command, move |event| {
+            .open_document("main", document, size(24, 120), launch, move |event| {
                 tx.send(event).map_err(|error| error.to_string())
             })
             .expect("네이티브 PTY 열기");
@@ -137,6 +142,68 @@ impl<'a> Pty<'a> {
         let event = self.events.recv_timeout(QUIET);
         assert!(matches!(event, Err(RecvTimeoutError::Timeout)), "ACK를 보류했지만 PTY 이벤트가 도착함: {event:?}");
     }
+}
+
+#[test]
+fn f01_two_saved_ssh_launches_reap_only_the_owned_plan_and_child() {
+    use crate::ssh::{ApprovedHost, Endpoint, TrustStore, TRUST_DIRECTORY};
+    use serde_json::json;
+
+    bounded(|| {
+        let config = tempfile::tempdir().unwrap();
+        let config = config.path();
+        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti";
+        let sha = "SHA256:UCUiLr7Pjs9wFFJMDByLgc3NrtdU344OgUM45wZPcIQ";
+        let pin = json!({"host":"dev.example.invalid", "port":2222, "hostKeyFingerprint":sha});
+        let key_path = config.join("fixture.pub");
+        std::fs::write(&key_path, key).unwrap();
+        let mut ssh = pin;
+        ssh["account"] = json!("approved-user");
+        ssh["transport"] = json!({"kind":"direct"});
+        ssh["auth"] = json!({"kind":"agent", "publicKeyPath": key_path});
+        let mut file = json!({"version":1, "groups":[{"revision":1,"profile":{"id":"work","displayName":"작업"}}],
+            "targets":[{"revision":1,"profile":{"id":"ssh","groupId":"work","displayName":"개발 서버","defaultMethod":"ssh","ssh":ssh}}]});
+        let profile = config.join("connections.json");
+        let save = |file: &serde_json::Value| std::fs::write(&profile, serde_json::to_vec(file).unwrap()).unwrap();
+        save(&file);
+        assert!(matches!(super::saved::launch(config, "ssh"), Err(error) if error == "등록된 SSH 호스트 키가 없습니다"));
+        let store = TrustStore::create(&config.join(TRUST_DIRECTORY)).unwrap();
+        let endpoint = Endpoint::new("dev.example.invalid", 2222).unwrap();
+        store.register(&ApprovedHost::confirm(&endpoint, &endpoint, sha).unwrap(), key).unwrap();
+        let fingerprint = file.pointer_mut("/targets/0/profile/ssh/hostKeyFingerprint").unwrap();
+        let correct = std::mem::replace(fingerprint, json!(format!("SHA256:{}", "A".repeat(43))));
+        save(&file);
+        assert!(matches!(super::saved::launch(config, "ssh"), Err(error) if error.contains("지문이 다릅니다")));
+        file["targets"][0]["profile"]["ssh"]["hostKeyFingerprint"] = correct;
+        save(&file);
+
+        let fixture = config.join(format!("ssh fixture{}", std::env::consts::EXE_SUFFIX));
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ssh/terminal/fixture.rs");
+        let compiled = std::process::Command::new(option_env!("RUSTC").unwrap_or("rustc"))
+            .arg(source).arg("-o").arg(&fixture).output().unwrap();
+        assert!(compiled.status.success(), "{}", String::from_utf8_lossy(&compiled.stderr));
+        let sessions = Sessions::default();
+        let open = || {
+            let super::Launch::Ssh(mut launch) = super::saved::launch(config, "ssh").unwrap() else { panic!("SSH 계획 필요") };
+            let path = launch.fixture(&fixture);
+            let mut pty = Pty::open_launch(&sessions, super::Launch::Ssh(launch));
+            pty.until_bytes(b"F01-READY", 0, true);
+            (pty, path)
+        };
+        let (first, first_plan) = open();
+        let (mut second, second_plan) = open();
+        assert_ne!(first.id, second.id);
+        assert_ne!(first_plan, second_plan);
+        assert!(sessions.close("other", &first.id).is_err());
+        assert!(sessions.close("main", &first.id).unwrap().warning().is_none());
+        assert!(!first_plan.exists());
+        assert!(second_plan.exists());
+        second.input(b"fixture-input\r");
+        second.until_bytes(b"F01-INPUT-OK", 0, true);
+        assert!(sessions.close("main", &second.id).unwrap().warning().is_none());
+        assert!(!second_plan.exists());
+        assert_eq!(std::fs::read_dir(config.join("ssh-trust")).unwrap().count(), 1);
+    });
 }
 
 fn load(sessions: &Sessions) -> Pty<'_> {

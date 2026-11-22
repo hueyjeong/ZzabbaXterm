@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { LocalAiPanel } from "../ai/LocalAiPanel";
 import { createLocalConnectionIpc, type SavedConnections } from "../connections/connectionIpc";
 import { LocalConnectionWizard } from "../connections/LocalConnectionWizard";
-import type { ConnectionClose, ConnectionProfileDraft } from "../connections/profiles";
+import type { ConnectionClose, ReceivedConnectionDraft } from "../connections/profiles";
 import { EditorTab, type EditorTabActions } from "../editor/EditorTab";
 import type { ApprovedEditorFile, ConfirmEditorDiscard } from "../editor/contract";
 import { closeLocalFile, localEditorError, localEditorTransport, openLocalFile } from "../editor/localEditorIpc";
@@ -18,7 +18,7 @@ import "./workspace.css";
 
 type CloseStatus = "closing" | "unconfirmed";
 type Tab = { id: number; label: string } & (
-  | { kind: "terminal"; targetId?: string; ssm?: SsmTarget; status: TerminalStatus; sessionId?: string; closeStatus?: CloseStatus }
+  | { kind: "terminal"; targetId?: string; ssm?: SsmTarget; ssh?: true; status: TerminalStatus; sessionId?: string; closeStatus?: CloseStatus }
   | { kind: "storage"; closeStatus?: CloseStatus }
   | { kind: "editor"; file: ApprovedEditorFile }
 );
@@ -28,7 +28,7 @@ const connections = createLocalConnectionIpc();
 const confirmEditorDiscard: ConfirmEditorDiscard = async ({ label, reason }) => window.confirm(
   reason === "reload" ? `${label}: 디스크에서 다시 읽을까요? 현재 편집 내용은 사라집니다.` : `${label}: 미저장 편집 내용을 버리고 닫을까요?`,
 );
-type WizardRequest = { draftId: string; initialDraft: ConnectionProfileDraft; received?: boolean };
+type WizardRequest = { draftId: string; initialDraft: ReceivedConnectionDraft; received?: boolean };
 
 function terminalStatus(status: TerminalStatus) {
   switch (status.kind) {
@@ -105,9 +105,9 @@ export function Workspace() {
   function retestStorageTarget(id: string) {
     if (draftPending.current || wizard) return;
     const profiles = profileLoad.profiles;
-    const target = profiles?.targets.find(({ profile }) => profile.id === id && profile.defaultMethod === "ssm");
+    const target = profiles?.targets.find(({ profile }) => profile.id === id);
     const group = profiles?.groups.find(({ profile }) => profile.id === target?.profile.groupId);
-    if (!target || !group) return;
+    if (target?.profile.defaultMethod !== "ssm" || !group) return;
     setWizard({
       draftId: crypto.randomUUID(), initialDraft: {
         version: 1, groupRevision: group.revision, targetRevision: target.revision,
@@ -154,7 +154,8 @@ export function Workspace() {
     const id = nextTab.current++;
     setTabs((current) => [...current, {
       id, label: target?.displayName ?? `로컬 ${id}`, kind: "terminal", targetId: target?.id,
-      ssm: target?.defaultMethod === "ssm" ? target.ssm : undefined, status: { kind: "opening" },
+      ssm: target?.defaultMethod === "ssm" ? target.ssm : undefined,
+      ssh: target?.defaultMethod === "ssh" ? true : undefined, status: { kind: "opening" },
     }]);
     selectTab(id);
   }
@@ -197,7 +198,7 @@ export function Workspace() {
   async function closeTab(id: number) {
     const tab = liveTabs.current.find(item => item.id === id);
     if (!tab || closingTabs.current.has(id)) return;
-    if (tab.kind === "storage" || (tab.kind === "terminal" && tab.ssm)) {
+    if (tab.kind === "storage" || (tab.kind === "terminal" && (tab.ssm || tab.ssh))) {
       closingTabs.current.add(id);
       setTabs(current => current.map(item => item.id === id && item.kind !== "editor" ? { ...item, closeStatus: "closing" } : item));
       try {
@@ -289,7 +290,7 @@ export function Workspace() {
                 <StorageTab profiles={profileLoad.profiles} closing={!!tab.closeStatus} closeRef={bindClose} onRetest={retestStorageTarget} />
               ) : tab.kind === "terminal" ? (
                 <TerminalView active={id === active} focusRequested={id === focusTab} label={label} targetId={tab.targetId}
-                  remote={!!tab.ssm} closing={!!tab.closeStatus} closeRef={tab.ssm ? bindClose : undefined}
+                  remote={!!tab.ssm} ssh={tab.ssh} closing={!!tab.closeStatus} closeRef={tab.ssm || tab.ssh ? bindClose : undefined}
                   onStatus={(status, sessionId) => updateStatus(id, status, sessionId)} />
               ) : (
                 <EditorTab file={tab.file} active={id === active} transport={localEditorTransport} confirmDiscard={confirmEditorDiscard}
@@ -320,7 +321,7 @@ export function Workspace() {
       <footer className="workspace-status">
         <span role="status">{current?.kind === "terminal"
           ? [current.targetId ? current.label : "내 PC", current.ssm ?
-            `SSM · ${current.ssm.profile} / ${current.ssm.region} / ${current.ssm.instanceId}` : "로컬", current.sessionId,
+            `SSM · ${current.ssm.profile} / ${current.ssm.region} / ${current.ssm.instanceId}` : current.ssh ? "SSH" : "로컬", current.sessionId,
           !current.closeStatus && terminalStatus(current.status)].filter(Boolean).join(" · ")
           : current?.kind === "storage" ? `${current.label} · 스토리지`
             : current ? `내 PC · 로컬 파일 · ${current.label}` : "연결 없음"}</span>
@@ -329,6 +330,7 @@ export function Workspace() {
         <span>AI 전용 셸 · 대기</span>
       </footer>
       {wizard && <LocalConnectionWizard {...wizard} groups={profileLoad.profiles?.groups ?? []}
+        verifySshHost={connections.verifySshHost}
         test={connections.test} cancelTest={connections.cancelTest} save={connections.save} onClose={closeWizard} />}
     </main>
   );

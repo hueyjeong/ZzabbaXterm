@@ -68,6 +68,17 @@ async fn restricted_methods_and_exact_fields() {
     assert_eq!(requests.reviews.load(Ordering::Relaxed), 0);
 }
 
+#[test]
+fn ssh_drafts_do_not_reach_the_local_review() {
+    let root = connections::tests::TestDir::new();
+    let draft = connections::tests::ssh_draft(root.path());
+    assert!(matches!(parse("draft", draft.to_string().as_bytes()), Err(Error::InvalidRequest)));
+    let requests = State::default();
+    let request = Request::Draft { draft: serde_json::from_value(draft).unwrap() };
+    assert!(matches!(dispatch(request, &requests, Instant::now() + DEADLINE), Err(Error::InvalidRequest)));
+    assert_eq!(requests.drafts.load(Ordering::Relaxed), 0);
+}
+
 #[tokio::test]
 async fn invalid_frame_length_and_stalled_client() {
     let requests = Arc::new(State::default());
