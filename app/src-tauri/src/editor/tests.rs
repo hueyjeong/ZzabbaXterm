@@ -644,21 +644,9 @@ fn editor_verifies_the_original_again_at_publication() {
     assert_eq!(file.version.digest, original_digest);
     assert!(os::file_id(&file.original).unwrap() == original_id);
     match error {
-        #[cfg(target_os = "linux")]
-        SaveError::PublicationUnconfirmed { recovery_path } => {
-            assert_eq!(fs::read(&recovery_path).unwrap(), b"disk");
-            let wire = tauri::ipc::InvokeError::from(registry::EditorError::from(
-                SaveError::PublicationUnconfirmed { recovery_path },
-            )).0;
-            assert_eq!(wire["kind"], "publicationUnconfirmed");
-            let recovery = wire["recoveryPath"].as_str().unwrap();
-            assert_eq!(fs::read(recovery).unwrap(), b"disk");
-            assert!(!path.exists());
-            fs::rename(recovery, &path).unwrap();
-        }
-        #[cfg(windows)]
         SaveError::Io { stage: SaveStage::Replace, .. } => {
             assert_eq!(fs::read(&path).unwrap(), b"disk");
+            assert!(os::file_id(&File::open(&path).unwrap()).unwrap() == original_id);
             dir.cleanup_checked(1);
         }
         other => panic!("{other:?}"),

@@ -353,6 +353,17 @@ impl Temporary<'_> {
         expected: &File,
         verify: impl FnOnce(&File) -> io::Result<()>,
     ) -> Result<File, DownloadPublicationError> {
+        self.publish_editor_inner(name, expected, verify, || Ok(()))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn publish_editor_inner(
+        self,
+        name: &OsStr,
+        expected: &File,
+        verify: impl FnOnce(&File) -> io::Result<()>,
+        after_move: impl FnOnce() -> io::Result<()>,
+    ) -> Result<File, DownloadPublicationError> {
         let expected = file_id(expected)?;
         let original = self
             .parent
@@ -369,13 +380,15 @@ impl Temporary<'_> {
             return Err(io::Error::from(io::ErrorKind::AlreadyExists).into());
         }
 
+        verify(&original)?;
+
         let parent = self.parent;
         self.publish_existing(
             name,
             expected,
             Some(original),
             |original| {
-                verify(original)?;
+                after_move()?;
                 if !access.matches_editor(original)? {
                     return Err(io::ErrorKind::AlreadyExists.into());
                 }
@@ -664,7 +677,7 @@ mod tests {
         temp.file().write_all(b"edited").unwrap();
         access.finish_staging(temp.file()).unwrap();
 
-        let result = temp.publish_editor(name, &original, |_| {
+        let result = temp.publish_editor_inner(name, &original, |_| Ok(()), || {
             fs::rename(&selected, &moved)?;
             File::options()
                 .write(true)
