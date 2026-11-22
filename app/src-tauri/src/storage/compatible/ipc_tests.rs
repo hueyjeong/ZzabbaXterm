@@ -85,7 +85,8 @@ fn only_the_current_reservation_publishes_settings_and_tab() {
     assert!(!state.close(&state.document("main"), &id));
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
 
-    for existing in [false, true] {
+    // revision은 파일 바이트의 해시다. 기존 파일과 같은 별칭을 쓰면 먼저 게시한 쪽이 revision을 바꾸지 못해 두 번째 게시도 정당해진다.
+    for (existing, [first, second]) in [(false, ["first", "second"]), (true, ["revised-first", "revised-second"])] {
         if !existing {
             std::fs::remove_file(&path).unwrap();
         }
@@ -101,8 +102,8 @@ fn only_the_current_reservation_publishes_settings_and_tab() {
             }
             (state, document, id, closed, prepared)
         };
-        let first = race("first");
-        let second = race("second");
+        let first = race(first);
+        let second = race(second);
         let start = std::sync::Barrier::new(2);
         let finish = |(state, document, id, closed, prepared): (StorageIpc, _, _, _, _)| {
             start.wait();
