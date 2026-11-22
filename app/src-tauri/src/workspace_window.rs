@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     editor::registry::{CloseAttempt, CloseDecision, CloseReport, LocalEditors},
     terminal::Sessions,
+    tunnels::ipc::TunnelTabs,
 };
 
 pub(crate) const MAIN: &str = "main";
@@ -74,6 +75,7 @@ pub(crate) fn request_close(window: &Window, exit_code: Option<i32>) {
             return;
         }
     };
+    let tunnel_epoch = window.state::<TunnelTabs>().epoch();
 
     #[derive(Clone, Serialize)]
     #[serde(rename_all = "camelCase")]
@@ -84,11 +86,12 @@ pub(crate) fn request_close(window: &Window, exit_code: Option<i32>) {
     ).is_ok();
     let window = window.clone();
     tauri::async_runtime::spawn(async move {
-        run_close(window, key, document, attempt, emitted, exit_code).await;
+        run_close(window, key, document, attempt, emitted, exit_code, tunnel_epoch).await;
     });
 }
 
-async fn run_close(window: Window, key: WindowKey, document: u64, mut attempt: CloseAttempt, emitted: bool, exit_code: Option<i32>) {
+async fn run_close(window: Window, key: WindowKey, document: u64, mut attempt: CloseAttempt, emitted: bool,
+                   exit_code: Option<i32>, tunnel_epoch: u64) {
     let editors = window.state::<LocalEditors>();
     let report = if let Some(mut reply) = attempt.reply.take() {
         let received = if emitted {
@@ -120,7 +123,7 @@ async fn run_close(window: Window, key: WindowKey, document: u64, mut attempt: C
     let result = if attempt.revoked.is_cancelled() {
         Err(EXPIRED.into())
     } else {
-        complete_close(&window, key, document, &attempt, decision, exit_code).await
+        complete_close(&window, key, document, &attempt, decision, exit_code, tunnel_epoch).await
     };
     if !matches!(result, Ok(true)) { editors.clear_window_close(&attempt.id); }
     if let Some(completed) = completed {
@@ -130,7 +133,8 @@ async fn run_close(window: Window, key: WindowKey, document: u64, mut attempt: C
     }
 }
 
-async fn complete_close(window: &Window, key: WindowKey, document: u64, attempt: &CloseAttempt, decision: Option<CloseDecision>, exit_code: Option<i32>) -> Result<bool, String> {
+async fn complete_close(window: &Window, key: WindowKey, document: u64, attempt: &CloseAttempt,
+                        decision: Option<CloseDecision>, exit_code: Option<i32>, tunnel_epoch: u64) -> Result<bool, String> {
     let require_trusted_url = decision.is_some();
     let prompt = match decision {
         Some(CloseDecision::Ready) => None,
@@ -191,6 +195,7 @@ async fn complete_close(window: &Window, key: WindowKey, document: u64, attempt:
             if !sessions.close_ssh_probes_for_exit(MAIN, document, &id).ok_or(EXPIRED)? {
                 return Err("SSH 시험 자식 종료 확인 불가".into());
             }
+            app.state::<TunnelTabs>().confirm_desktop_cleanup(tunnel_epoch, &id, &revoked)?;
             Ok::<_, String>(report)
         }).await.map_err(|error| error.to_string())??;
 
@@ -214,6 +219,7 @@ async fn complete_close(window: &Window, key: WindowKey, document: u64, attempt:
         completed.await.map_err(|error| error.to_string())?
     }.await;
     if let Err(error) = result {
+        window.state::<TunnelTabs>().release_desktop_close_gate(tunnel_epoch, &attempt.id);
         window.state::<Sessions>().release_control_exit(MAIN, document, &attempt.id);
         if was_enabled {
             let (answer, restored) = oneshot::channel();

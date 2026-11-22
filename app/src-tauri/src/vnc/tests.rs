@@ -36,7 +36,7 @@ impl Fixture {
     }
 
     fn route(&self, owner: &'static str) -> Route<'_> {
-        Route::R01 {
+        Route::Fixture {
             registry: self,
             owner,
             tunnel_id: "vnc-tunnel",
@@ -616,6 +616,40 @@ async fn vnc_revoked_after_lookup_writes_no_challenge_response() {
     let (result, ()) = tokio::join!(handshake, peer);
     assert_eq!(result, Err(Error::Disconnected));
     assert_eq!(grant.reads.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn vnc_revocation_between_response_writes_discards_remainder() {
+    struct MidWrite(AtomicUsize);
+    impl Secrets for MidWrite {
+        async fn vnc_password(&self, _: &Target) -> Option<Zeroizing<Vec<u8>>> {
+            Some(Zeroizing::new(b"isolated".to_vec()))
+        }
+        fn while_live(&self, write: &mut dyn FnMut()) -> bool {
+            if self.0.fetch_add(1, Ordering::Relaxed) != 0 { return false; }
+            write();
+            true
+        }
+    }
+    let grant = MidWrite(AtomicUsize::new(0));
+    let target = Target { profile_id: "fixture".into(), host: "127.0.0.1".into(), port: 5900 };
+    let (mut client, mut server) = tokio::io::duplex(12);
+    let handshake = async {
+        let result = wire::handshake(&mut client, &target, Auth::VncPassword, &grant).await;
+        drop(client);
+        result
+    };
+    let peer = async {
+        offer(&mut server, &[2]).await;
+        expect(&mut server, [2]).await;
+        server.write_all(&[0; 16]).await.unwrap();
+        let mut response = Vec::new();
+        server.read_to_end(&mut response).await.unwrap();
+        assert_eq!(response.len(), 12);
+    };
+    let (result, ()) = tokio::join!(handshake, peer);
+    assert_eq!(result, Err(Error::Disconnected));
+    assert_eq!(grant.0.load(Ordering::Relaxed), 2);
 }
 
 #[cfg(windows)]
