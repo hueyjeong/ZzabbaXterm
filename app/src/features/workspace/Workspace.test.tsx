@@ -1693,6 +1693,73 @@ describe("현재 SSH 세션의 SFTP", () => {
     expect(draft.value).toBe("유지할 채팅 초안");
   });
 
+  it("활성 SSH와 호환 스토리지를 오가도 초안과 세션을 유지하고 같은 세션의 종료를 다시 확인한다", async () => {
+    runSftp = async command => {
+      if (command === "editor_sftp_attach") return { entries: [], parentEntryId: null };
+      throw new Error(command);
+    };
+    const target = { serviceId: "fixture", alias: "호환 설정", origin: "https://storage.example.test", region: "fixture-1", addressing: "path" };
+    let failClose = true;
+    runStorage = async (command, args) => {
+      const { request: { sessionId } } = args as { request: { sessionId: string } };
+      if (command === "storage_compatible_open") return { ok: true, value: { sessionId, target } };
+      if (command === "storage_list_buckets") return { ok: true, value: { rows: [{ name: "fixture-bucket", region: target.region }], nextToken: null } };
+      if (command === "storage_close") {
+        if (failClose) throw new Error("종료 응답 유실");
+        return true;
+      }
+      throw new Error(command);
+    };
+    const ssh = await openSsh("서버 A");
+    await press("파일");
+    const follow = find(".workspace-sftp:not([hidden])");
+    const select = find<HTMLSelectElement>('select[aria-label="파일 연결"]');
+    const compatible = [...select.options].filter(option => option.text === "S3 호환 HTTPS");
+    expect(compatible).toHaveLength(1);
+    const key = compatible[0].value;
+    await chooseFileConnection(key);
+    const panel = find(".workspace-storage:not([hidden])");
+    await changeInput("서비스 ID", target.serviceId);
+    const draft = panel.querySelector("input");
+    await chooseFileConnection("");
+    expect(find(".workspace-sftp:not([hidden])")).toBe(follow);
+    expect(panel.matches("[hidden][inert]")).toBe(true);
+    await chooseFileConnection(key);
+    expect(find(".workspace-storage:not([hidden])")).toBe(panel);
+    expect(panel.querySelector("input")).toBe(draft);
+    expect(draft?.value).toBe(target.serviceId);
+    expect(connectionCalls("storage_compatible_open")).toHaveLength(0);
+    await changeInput("별칭", target.alias);
+    await changeInput("HTTPS 출처", target.origin);
+    await changeInput("서명 리전", target.region);
+    await changeInput("키링 항목 ID", "fixture-key");
+    await press("설정 저장 및 연결");
+    const opens = connectionCalls("storage_compatible_open");
+    expect(opens).toHaveLength(1);
+    const { sessionId } = opens[0][1].request as { sessionId: string };
+    expect(sessionId).toBeTruthy();
+    await press("버킷 목록");
+    const bucket = button("fixture-bucket");
+    expect(bucket).toBeDefined();
+    await chooseFileConnection("");
+    await chooseFileConnection(key);
+    expect(button("fixture-bucket")).toBe(bucket);
+    expect(connectionCalls("storage_compatible_open")).toHaveLength(1);
+    expect(connectionCalls("storage_list_buckets")).toEqual([["storage_list_buckets", { request: { sessionId, token: null } }]]);
+    expect(connectionCalls("storage_close")).toHaveLength(0);
+    await press("S3 호환 HTTPS 닫기");
+    expect(panel.querySelector('[role="alert"]')?.textContent).toBe("종료 확인 불가");
+    failClose = false;
+    await press("S3 호환 HTTPS 종료 다시 확인");
+    const close = ["storage_close", { request: { sessionId } }];
+    expect(connectionCalls("storage_close")).toEqual([close, close]);
+    expect(panel.isConnected).toBe(false);
+    expect(select.value).toBe("");
+    expect(find(".workspace-sftp:not([hidden])")).toBe(follow);
+    expect(connectionCalls("editor_sftp_attach")).toEqual([["editor_sftp_attach", { sessionId: ssh.id }]]);
+    expect(connectionCalls("editor_sftp_detach")).toHaveLength(0);
+  });
+
   it("A에서 S3를 고정하고 B를 따라간 뒤 같은 S3의 경로와 선택으로 돌아온다", async () => {
     runSftp = async (command, args) => {
       const { sessionId } = args as { sessionId: string };
