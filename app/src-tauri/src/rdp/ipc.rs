@@ -240,8 +240,12 @@ pub(crate) fn dispatch(invoke: Invoke) {
             let command = read!(Command, "input");
             drop(state);
             invoke.resolver.respond_async(async move {
-                slot.controls.try_lock().map_err(|_| InvokeError::from(message(Error::Busy)))?
-                    .send(&slot.life, command).await.map_err(|e| InvokeError::from(message(e)))
+                match slot.controls.try_lock().map_err(|_| InvokeError::from(message(Error::Busy)))?
+                    .send(&slot.life, command).await {
+                    Ok(()) => Ok(true),
+                    Err(Error::StaleDisplay) => Ok(false),
+                    Err(error) => Err(InvokeError::from(message(error))),
+                }
             });
         }
         "rdp_connect" => {
@@ -326,6 +330,7 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
         let mut sequence = 0_u64;
         let mut frame_sequence = 0_u64;
         let mut size = (0, 0);
+        let mut display_generation = 0;
         let first = tokio::time::Instant::now() + Duration::from_secs(20);
         loop {
             let event = tokio::select! {
@@ -336,6 +341,8 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
             sequence = sequence.checked_add(1).filter(|n| *n <= MAX_SAFE).ok_or(Error::Bounds)?;
             match event {
                 Event::Frame(frame) => {
+                    let generation = session.display_generation;
+                    let new_display = generation != display_generation;
                     frame_sequence += 1;
                     let rect = frame.rect;
                     let length = super::frame::frame_len(frame.width, frame.height)?;
@@ -344,9 +351,11 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
                     if usize::from(rect.x) + usize::from(rect.width) > usize::from(frame.width) ||
                         usize::from(rect.y) + usize::from(rect.height) > usize::from(frame.height) ||
                         frame.rgba.is_empty() || frame.rgba.len() != usize::from(rect.width) * usize::from(rect.height) * 4 ||
-                        frame.rgba.len() > length || (size != next_size && !full) || frame.session != session.id() { return Err(Error::Bounds); }
+                        frame.rgba.len() > length || ((new_display || size != next_size) && !full) ||
+                        (!new_display && size != next_size) || frame.session != session.id() { return Err(Error::Bounds); }
                     slot.json(notify, sequence, serde_json::json!({"sequence": sequence, "frameSequence": frame_sequence, "kind": "frame", "full": full,
-                        "width": frame.width, "height": frame.height, "x": rect.x, "y": rect.y, "w": rect.width, "h": rect.height})).await?;
+                        "displayGeneration": generation, "width": frame.width, "height": frame.height,
+                        "x": rect.x, "y": rect.y, "w": rect.width, "h": rect.height})).await?;
                     for (i, chunk) in frame.rgba.chunks(CHUNK).enumerate() {
                         let offset = i * CHUNK;
                         let mut packet = Vec::with_capacity(chunk.len() + 12);
@@ -355,11 +364,12 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
                         packet.extend_from_slice(chunk);
                         slot.emit(notify, sequence, offset + 1, "application/octet-stream", packet).await?;
                     }
-                    if size != next_size {
+                    if new_display {
+                        display_generation = generation;
                         size = next_size;
-                        slot.controls.lock().await.display(session.id(), session.input_handle(), size);
+                        slot.controls.lock().await.display(session.id(), session.input_handle(), size, generation);
                         sequence = sequence.checked_add(1).filter(|n| *n <= MAX_SAFE).ok_or(Error::Bounds)?;
-                        slot.json(notify, sequence, serde_json::json!({"sequence": sequence, "kind": "display"})).await?;
+                        slot.json(notify, sequence, serde_json::json!({"sequence": sequence, "kind": "display", "displayGeneration": generation})).await?;
                     }
                 }
                 Event::Channels(next) => {
@@ -412,6 +422,7 @@ pub(super) fn message(error: Error) -> &'static str {
         Error::Authentication => "RDP NLA 계정 인증 실패",
         Error::Activation => "RDP 화면 초기화 실패",
         Error::Protocol => "RDP 응답 형식 오류",
+        Error::StaleDisplay => "RDP 화면 세대가 교체되었습니다",
         Error::Transport => "RDP 전송 연결이 끊겼습니다",
         Error::Timeout => "RDP 응답 시간 초과",
     }

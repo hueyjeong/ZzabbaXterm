@@ -23,12 +23,14 @@ async function fixture() {
   const caps = vi.fn();
   const clipboard = { readText: vi.fn().mockResolvedValue("격리 문자열"), writeText: vi.fn().mockResolvedValue(undefined) };
   let notify: (ticket: string) => void = () => { throw new Error("output channel missing"); };
+  const sendInput = vi.fn().mockResolvedValue(true);
   invoke.mockImplementation((name, args) => {
     if (name === "rdp_prepare") return Promise.resolve(id);
     if (name === "rdp_connect") {
       notify = args.output.onmessage;
       return Promise.withResolvers<void>().promise;
     }
+    if (name === "rdp_input") return sendInput();
     return Promise.resolve();
   });
   const fetch = vi.fn();
@@ -44,7 +46,10 @@ async function fixture() {
     });
     notify("c".repeat(32));
   }
-  const header = (sequence: number, frameSequence: number, width = 1) => packet({ sequence, kind: "frame", full: true, frameSequence, width, height: 1, x: 0, y: 0, w: width, h: 1 });
+  const header = (sequence: number, frameSequence: number, width = 1, displayGeneration = 1) => packet({
+    sequence, kind: "frame", full: true, frameSequence, displayGeneration, width, height: 1, x: 0, y: 0, w: width, h: 1
+  });
+  const display = (sequence: number, displayGeneration = 1) => packet({ kind: "display", sequence, displayGeneration });
   const pixels = (sequence: number, width = 1) => {
     const buffer = new ArrayBuffer(12 + 4 * width);
     const binary = new DataView(buffer);
@@ -56,7 +61,7 @@ async function fixture() {
   const draw = vi.fn();
   vi.spyOn(canvas, "getContext").mockReturnValue({ putImageData: draw } as unknown as CanvasRenderingContext2D);
   vi.stubGlobal("ImageData", class { constructor(readonly rgba: Uint8ClampedArray) { } });
-  return { calls, packet, header, pixels, close, connection, ended, ready, caps, clipboard, canvas, draw };
+  return { calls, packet, header, pixels, display, sendInput, close, connection, ended, ready, caps, clipboard, canvas, draw };
 }
 
 it("Canvas 적용 ACK 뒤에만 키를 전달하고 서버가 보낸 크기와 클립보드 결과를 사용한다", async () => {
@@ -72,7 +77,7 @@ it("Canvas 적용 ACK 뒤에만 키를 전달하고 서버가 보낸 크기와 �
   expect(f.draw).toHaveBeenCalledOnce();
   expect(f.draw.mock.invocationCallOrder[0]).toBeLessThan(Math.max(...invoke.mock.invocationCallOrder));
   expect(f.ready).not.toHaveBeenCalled();
-  f.packet({ kind: "display", sequence: 2 });
+  f.display(2);
   await vi.waitFor(() => expect(f.ready).toHaveBeenCalledWith(true));
   view.send(input);
   await vi.waitFor(() => expect(f.calls("rdp_input")[1]).toMatchObject({ id, input: { sequence: 2, action: { kind: "key", code: 0x1e, down: true } } }));
@@ -80,20 +85,56 @@ it("Canvas 적용 ACK 뒤에만 키를 전달하고 서버가 보낸 크기와 �
   await vi.waitFor(() => expect(f.caps).toHaveBeenCalledWith({ copy: true, paste: true, resize: true }));
   f.connection.resize(800, 600);
   expect(f.canvas.width).toBe(1);
-  f.header(4, 2, 2);
+  f.header(4, 2, 2, 2);
   await vi.waitFor(() => expect(f.calls("rdp_ack")).toContainEqual({ id, sequence: 4, offset: 0 }));
   f.pixels(4, 2);
   await vi.waitFor(() => expect(f.canvas.width).toBe(2));
+  f.display(5, 2);
+  await vi.waitFor(() => expect(f.calls("rdp_input")[3]).toMatchObject({ input: { displayGeneration: 2, action: { kind: "active" } } }));
   f.connection.clipboard("paste");
   f.connection.clipboard("copy");
-  await vi.waitFor(() => expect(f.calls("rdp_input").map((call) => call.input.action.kind)).toEqual(["active", "key", "resize", "copy", "paste"]));
-  f.packet({ kind: "clipboard", sequence: 5, epoch: 1, text: "원격 시험 문자열" });
+  await vi.waitFor(() => expect(f.calls("rdp_input").map((call) => call.input.action.kind)).toEqual(["active", "key", "resize", "active", "copy", "paste"]));
+  f.packet({ kind: "clipboard", sequence: 6, epoch: f.calls("rdp_input")[4].input.epoch, text: "원격 시험 문자열" });
   await vi.waitFor(() => expect(f.clipboard.writeText).toHaveBeenCalledWith("원격 시험 문자열"));
   f.connection.setActive(false);
   view.send(input);
   await vi.waitFor(() => expect(f.calls("rdp_input").slice(-1)[0]).toMatchObject({ input: { action: { kind: "active", active: false } } }));
   expect(f.calls("rdp_input").filter((call) => call.input.action.kind === "key")).toHaveLength(1);
   f.close();
+  view.dispose();
+});
+
+it("이전 화면 입력은 폐기하고 같은 크기의 새 화면 ACK 후 입력을 재개한다", async () => {
+  const f = await fixture();
+  const view = createRemoteDesktopViewSession(f.connection, f.canvas, vi.fn());
+  f.connection.setActive(true);
+  f.header(1, 1);
+  await vi.waitFor(() => expect(f.calls("rdp_ack")).toHaveLength(1));
+  f.pixels(1);
+  await vi.waitFor(() => expect(f.calls("rdp_ack")).toHaveLength(2));
+  f.display(2);
+  await vi.waitFor(() => expect(f.calls("rdp_ack")).toHaveLength(3));
+  const discarded = Promise.withResolvers<boolean>();
+  f.sendInput.mockReturnValueOnce(discarded.promise);
+  view.send(input);
+  view.send(input);
+  discarded.resolve(false);
+  await discarded.promise;
+  view.send(input);
+  f.header(3, 2, 1, 2);
+  await vi.waitFor(() => expect(f.calls("rdp_ack")).toHaveLength(4));
+  view.send(input);
+  f.pixels(3);
+  await vi.waitFor(() => expect(f.calls("rdp_ack")).toHaveLength(5));
+  view.send(input);
+  expect(f.calls("rdp_input")).toHaveLength(2);
+  expect(f.ended).not.toHaveBeenCalled();
+  f.display(4, 2);
+  await vi.waitFor(() => expect(f.calls("rdp_input")[2]).toMatchObject({ input: { sequence: 3, displayGeneration: 2, action: { kind: "active" } } }));
+  f.sendInput.mockRejectedValueOnce("RDP 전송 연결이 끊겼습니다");
+  view.send(input);
+  await vi.waitFor(() => expect(f.ended).toHaveBeenCalledWith("RDP 전송 연결이 끊겼습니다"));
+  expect(f.calls("rdp_input")[3]).toMatchObject({ input: { sequence: 4, displayGeneration: 2, action: { kind: "key" } } });
   view.dispose();
 });
 
