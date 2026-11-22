@@ -97,6 +97,7 @@ beforeEach(async () => {
   saveFile = async () => null;
   native.invoke.mockImplementation(async (command, args) => {
     if (command === "connections_load") return loadProfiles();
+    if (command === "ai_models" || command === "ai_targets") return [];
     if (command.startsWith("connection_") || ["verify_ssh_host", "commit_ssh_host", "cancel_ssh_host"].includes(command)) return runConnectionCommand(command, args);
     if (command === "ssm_discovery") return runDiscovery(args);
     if (command === "editor_local_open") return openFile();
@@ -801,6 +802,11 @@ describe("C02 SSM 연결", () => {
     await press("파일 열기");
     const model = editor.getModels().find((item) => item.uri.query === "selected-file")!;
     await act(async () => model.setValue("첫 편집"));
+    await press("로컬 1");
+    expect(document.activeElement).toBe(localInput);
+    await press("시험.txt");
+    expect(find('.editor-tab[aria-label="시험.txt"]').contains(document.activeElement)).toBe(true);
+    expect(model.getValue()).toBe("첫 편집");
     await press("저장");
     expect(connectionCalls("editor_local_save")).toEqual([["editor_local_save", { handle: "selected-file", text: "첫 편집" }]]);
     const confirm = vi.spyOn(window, "confirm").mockReturnValueOnce(false).mockReturnValueOnce(true);

@@ -13,6 +13,7 @@ export interface EditorTabProps {
   readonly ref?: Ref<EditorTabActions>;
   readonly file: ApprovedEditorFile;
   readonly active: boolean;
+  readonly focusRequested?: boolean;
   readonly transport: EditorTransport;
   readonly confirmDiscard: ConfirmEditorDiscard;
   /** 호출자가 해당 탭을 실제로 제거한다. 비활성 탭도 마운트 상태를 유지한다. */
@@ -48,7 +49,7 @@ export function EditorTab(props: EditorTabProps) {
   return <EditorTabContent key={props.file.handle} {...props} />;
 }
 
-function EditorTabContent({ ref, file, active, transport, confirmDiscard, onClose }: EditorTabProps) {
+function EditorTabContent({ ref, file, active, focusRequested, transport, confirmDiscard, onClose }: EditorTabProps) {
   const host = useRef<HTMLDivElement>(null);
   const diffHost = useRef<HTMLDivElement>(null);
   const mono = useRef<editor.IStandaloneCodeEditor | null>(null);
@@ -105,6 +106,12 @@ function EditorTabContent({ ref, file, active, transport, confirmDiscard, onClos
     if (showingDiff) diff.current?.layout();
     else mono.current?.layout();
   }, [active, showingDiff]);
+
+  useLayoutEffect(() => {
+    if (!active || !focusRequested) return;
+    if (showingDiff) diff.current?.getModifiedEditor().focus();
+    else mono.current?.focus();
+  }, [active, focusRequested, showingDiff]);
 
   return (
     <section className="editor-tab" aria-label={file.label} hidden={!active}>

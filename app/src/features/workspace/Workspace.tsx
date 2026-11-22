@@ -1,7 +1,9 @@
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { LocalAiPanel } from "../ai/LocalAiPanel";
 import { createLocalConnectionIpc, type SavedConnections } from "../connections/connectionIpc";
 import { LocalConnectionWizard } from "../connections/LocalConnectionWizard";
-import type { ConnectionClose, LocalProfileDraft } from "../connections/profiles";
+import type { ConnectionClose, ReceivedConnectionDraft } from "../connections/profiles";
 import { EditorTab, type EditorTabActions } from "../editor/EditorTab";
 import type { ApprovedEditorFile, ConfirmEditorDiscard } from "../editor/contract";
 import { closeLocalFile, localEditorError, localEditorTransport, openLocalFile } from "../editor/localEditorIpc";
@@ -23,6 +25,7 @@ const connections = createLocalConnectionIpc();
 const confirmEditorDiscard: ConfirmEditorDiscard = async ({ label, reason }) => window.confirm(
   reason === "reload" ? `${label}: 디스크에서 다시 읽을까요? 현재 편집 내용은 사라집니다.` : `${label}: 미저장 편집 내용을 버리고 닫을까요?`,
 );
+type WizardRequest = { draftId: string; initialDraft: ReceivedConnectionDraft; received?: boolean };
 
 function terminalStatus(status: TerminalStatus) {
   switch (status.kind) {
@@ -50,16 +53,17 @@ export function Workspace() {
   const remoteTerminals = useRef(new Map<number, { confirmClose(): Promise<void> }>());
   useLayoutEffect(() => { liveTabs.current = tabs; }, [tabs]);
   const [focused, setFocused] = useState(false);
-  const [draft, setDraft] = useState("");
   const [windowError, setWindowError] = useState("");
   const [loadVersion, setLoadVersion] = useState(0);
   const [profileLoad, setProfileLoad] = useState<ProfileLoad>({ kind: "loading" });
-  const [wizard, setWizard] = useState<{ draftId: string; initialDraft: LocalProfileDraft }>();
+  const [wizard, setWizard] = useState<WizardRequest>();
+  const [receivingDraft, setReceivingDraft] = useState(false);
   const [treeWidth, setTreeWidth] = useState(280);
   const [aiWidth, setAiWidth] = useState(360);
   const [chatHeight, setChatHeight] = useState(50);
   const [area, setArea] = useState({ width: 1200, height: 600 });
   const body = useRef<HTMLDivElement>(null);
+  const draftPending = useRef(false);
   const activeButton = useRef<HTMLButtonElement>(null);
   const sideLimit = Math.min(640, Math.floor(area.width * 0.32));
   const left = Math.min(treeWidth, sideLimit);
@@ -81,6 +85,7 @@ export function Workspace() {
   }
 
   function openWizard() {
+    if (draftPending.current || wizard) return;
     const groupId = crypto.randomUUID();
     setWizard({
       draftId: crypto.randomUUID(), initialDraft: {
@@ -202,7 +207,7 @@ export function Workspace() {
 
   return (
     <main className={`workspace${macTitleBar ? " workspace-mac" : ""}${focused ? " workspace-focused" : ""}`} style={layout}
-      onFocusCapture={(event) => { if (!event.target.closest(".terminal-screen")) setFocusTab(null); }}>
+      onFocusCapture={(event) => { if (!event.target.closest(".terminal-screen, .monaco-editor")) setFocusTab(null); }}>
       <TitleBar focused={focused} onToggle={() => setFocused(!focused)} onWindowError={setWindowError}>
         {tabs.map((tab) => {
           const { id, label, kind } = tab;
@@ -224,6 +229,22 @@ export function Workspace() {
         <aside className="workspace-tree" hidden={focused}>
           <button className="connection-add" type="button" aria-label="연결 추가" onClick={openWizard}>+</button>
           <button className="local-file-open" type="button" disabled={filePickerBusy} onClick={() => void openEditor()}>파일 열기</button>
+          <button type="button" disabled={!!wizard || receivingDraft} onClick={async () => {
+            if (draftPending.current || wizard) return;
+            draftPending.current = true;
+            setReceivingDraft(true);
+            setWindowError("");
+            try {
+              const draft = await invoke<WizardRequest | null>("ai_cli_draft", {});
+              if (draft) setWizard({ ...draft, received: true });
+              else setWindowError("접수된 CLI 초안이 없습니다");
+            } catch (error) {
+              setWindowError(String(error));
+            } finally {
+              draftPending.current = false;
+              setReceivingDraft(false);
+            }
+          }}>CLI 초안 열기</button>
           {profileLoad.kind === "loading" && <div className="connection-status" role="status">저장된 연결 불러오는 중</div>}
           {profileLoad.kind === "ready" && profileLoad.profiles?.targets.length === 0 &&
             <div className="connection-status" role="status">저장된 연결 없음</div>}
@@ -245,6 +266,7 @@ export function Workspace() {
                   onStatus={(status, sessionId) => updateStatus(tab.id, status, sessionId)} />
               ) : (
                 <EditorTab file={tab.file} active={tab.id === active} transport={localEditorTransport} confirmDiscard={confirmEditorDiscard}
+                  focusRequested={tab.id === focusTab}
                   ref={(actions) => {
                     if (actions) editorActions.current.set(tab.id, actions);
                     else editorActions.current.delete(tab.id);
@@ -259,14 +281,7 @@ export function Workspace() {
           ))}
         </div>
         <aside className="workspace-ai" hidden={focused} aria-label="AI">
-          <section className="workspace-chat">
-            <h2>AI 채팅</h2>
-            <textarea aria-label="메시지 입력" placeholder="메시지 입력" value={draft} onChange={(event) => setDraft(event.target.value)} />
-          </section>
-          <section className="workspace-ai-terminal">
-            <h2>AI 터미널 / 전용 셸</h2>
-            <span>대기</span>
-          </section>
+          <LocalAiPanel profilesVersion={loadVersion} />
           <Splitter edge="chat" label="AI 채팅 높이" value={chatHeight}
             min={20} max={80} units={100 / Math.max(1, area.height)} onChange={setChatHeight} />
         </aside>

@@ -163,7 +163,7 @@ fn valid_ssh_path(path: &Path) -> bool {
         && path.to_str().is_some_and(|value| !value.chars().any(|c| c.is_control() || "\"%$`*?[{".contains(c)))
 }
 
-#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Draft {
     version: u32,
@@ -193,10 +193,12 @@ pub(crate) enum ValidationError {
 }
 
 // 구조 검증과 실제 연결 시험은 별개다.
+#[derive(Serialize)]
+#[serde(transparent)]
 pub(crate) struct ValidatedDraft(Draft);
 
 impl ValidatedDraft {
-    pub(super) fn matches(&self, other: &Self) -> bool {
+    pub(crate) fn matches(&self, other: &Self) -> bool {
         self.0 == other.0 && match (self.method(), other.method()) {
             (MethodRef::Local { start_directory: left, .. }, MethodRef::Local { start_directory: right, .. }) => {
                 left.as_os_str() == right.as_os_str()
@@ -289,7 +291,7 @@ impl Target {
     }
 }
 
-fn valid_id(id: &str) -> bool {
+pub(crate) fn valid_id(id: &str) -> bool {
     !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 

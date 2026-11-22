@@ -1,5 +1,7 @@
+pub mod ai;
 mod connections;
 mod editor;
+mod local_ipc;
 #[allow(dead_code, reason = "SFTP는 별도 통합 경계")]
 mod ssh;
 pub mod ssm;
@@ -20,11 +22,13 @@ pub fn run() {
     tauri::Builder::default()
         .manage(Sessions::default())
         .manage(LocalEditors::default())
+        .manage(ai::ipc::State::default())
         .plugin(ssm::ipc::lifecycle())
         .setup(|app| {
             if let Ok(registration) = connections::ipc::initialize_ssh_registration(app) {
                 app.manage(registration);
             }
+            ai::cli::start(app.handle().clone());
             Ok(())
         })
         .on_page_load(|webview, payload| {
@@ -39,6 +43,9 @@ pub fn run() {
         .invoke_handler(move |invoke| {
             if invoke.message.command() == "terminal_open" {
                 terminal_open(invoke);
+                true
+            } else if ai::ipc::handles(invoke.message.command()) {
+                ai::ipc::dispatch(invoke);
                 true
             } else if invoke.message.command() == ssm::ipc::COMMAND {
                 ssm::ipc::dispatch(invoke);

@@ -10,10 +10,10 @@ use serde_json::{Value, json};
 
 use super::{profile::Draft, store::{SaveStatus, Store, StoreError}};
 
-pub(super) struct TestDir(PathBuf);
+pub(crate) struct TestDir(PathBuf);
 
 impl TestDir {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
             "zzabbaxterm-c01-{}-{}-{}",
@@ -25,7 +25,7 @@ impl TestDir {
         Self(path)
     }
 
-    pub(super) fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.0
     }
 
@@ -40,7 +40,7 @@ impl Drop for TestDir {
     }
 }
 
-pub(super) fn draft(dir: &Path, group: &str, target: &str) -> Value {
+pub(crate) fn draft(dir: &Path, group: &str, target: &str) -> Value {
     json!({
         "version": 1,
         "groupRevision": null,
@@ -118,7 +118,7 @@ fn c02_rejects_mixed_methods_forbidden_fields_and_invalid_references() {
     }
 }
 
-pub(super) fn ssh_draft(dir: &Path) -> Value {
+pub(crate) fn ssh_draft(dir: &Path) -> Value {
     let mut value = draft(dir, "work", "ssh-server");
     value["target"] = json!({
         "id": "ssh-server", "groupId": "work", "displayName": "개발 서버", "defaultMethod": "ssh",

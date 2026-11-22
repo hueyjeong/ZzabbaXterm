@@ -42,6 +42,7 @@ export type SshInput = Omit<SshSettings, "port" | "transport" | "auth"> & Readon
 }>;
 export type LocalProfileDraft = ProfileDraft<TargetIdentity & LocalMethod>;
 export type ConnectionProfileDraft = ProfileDraft<TargetIdentity & (LocalMethod | SsmMethod | SshMethod)>;
+export type ReceivedConnectionDraft = ProfileDraft<TargetIdentity & (LocalMethod | SsmMethod)>;
 type WizardDraft = ProfileDraft<TargetIdentity & (LocalMethod | SsmMethod<SsmTarget | null> | SshMethod<SshInput>)>;
 export type SshHostApproval = Readonly<{
   host: string;
@@ -121,9 +122,12 @@ export interface LocalConnectionWizardState {
   abandon(): void;
 }
 
-export function createLocalConnectionWizard(draftId: string, initialDraft: LocalProfileDraft): LocalConnectionWizardState {
+export function createLocalConnectionWizard(draftId: string, initialDraft: ReceivedConnectionDraft): LocalConnectionWizardState {
   let state: State = { step: "target", draft: initialDraft, status: { kind: "idle" }, sshPin: { kind: "idle" } };
-  let local = initialDraft.target.local;
+  let local = initialDraft.target.local ?? {
+    shell: /Windows/.test(navigator.userAgent) ? "powerShell" : "bash",
+    startDirectory: "",
+  } satisfies LocalMethod["local"];
   let draftVersion = 0;
   let pinCheck: AbortController | undefined;
   let nextPinAttempt = 0;

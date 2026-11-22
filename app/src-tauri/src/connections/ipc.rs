@@ -111,11 +111,15 @@ pub(crate) fn initialize_ssh_registration(app: &tauri::App) -> Result<crate::ssh
 }
 
 fn store_at(directory: &Path) -> Result<Store, String> {
+    prepare_config_parent(directory)?;
+    Ok(Store::new(directory))
+}
+
+pub(super) fn prepare_config_parent(directory: &Path) -> Result<(), String> {
     let parent = directory.parent().filter(|_| directory.is_absolute() && directory.file_name().is_some())
         .ok_or("앱 설정 디렉터리 경로가 올바르지 않습니다")?;
     // 설정 경로는 Tauri가 결정한다. 앱 디렉터리 자체는 Store가 생성하고 검사한다.
-    fs::create_dir_all(parent).map_err(|error| format!("사용자 설정 디렉터리: {error}"))?;
-    Ok(Store::new(directory))
+    fs::create_dir_all(parent).map_err(|error| format!("사용자 설정 디렉터리: {error}"))
 }
 
 #[cfg(test)]

@@ -9,13 +9,13 @@ import { sshTestIpc } from "../terminal/session";
 import {
   createLocalConnectionWizard,
   type LocalConnectionActions,
-  type LocalProfileDraft,
+  type ReceivedConnectionDraft,
 } from "./profiles";
 
 export type LocalConnectionWizardProps = LocalConnectionActions & Readonly<{
   draftId: string;
-  // 호출자가 현재 OS의 지원 셸을 initialDraft.target.local.shell에 넣는다.
-  initialDraft: LocalProfileDraft;
+  initialDraft: ReceivedConnectionDraft;
+  received?: boolean;
   groups: SavedConnections["groups"];
 }>;
 
@@ -38,6 +38,7 @@ function Wizard(props: LocalConnectionWizardProps) {
   const { target } = draft;
   const useSsm = target.defaultMethod === "ssm" || (target.defaultMethod === "ssh" && target.ssh.transport.kind === "ssm" && (step === "auth" || step === "verify"));
   const ssm = useSsmSelection(discovery, useSsm &&
+    (!props.received || step === "auth" || step === "verify") &&
     status.kind !== "closing" && status.kind !== "closed" && status.kind !== "closeFailed", wizard.invalidateSsmSelection);
   const dialog = useRef<HTMLDialogElement>(null);
   useLayoutEffect(() => {
@@ -82,11 +83,11 @@ function Wizard(props: LocalConnectionWizardProps) {
           <>
             <div><label>접속 방식 <select value={target.defaultMethod} onChange={(event) => {
               const method = event.currentTarget.value;
-              if (method === "local" || method === "ssm" || method === "ssh") wizard.selectMethod(method);
+              if (method === "local" || method === "ssm" || (method === "ssh" && !props.received)) wizard.selectMethod(method);
             }}>
               <option value="local">로컬</option>
               <option value="ssm">AWS Systems Manager</option>
-              <option value="ssh">SSH</option>
+              {!props.received && <option value="ssh">SSH</option>}
             </select></label></div>
             {target.defaultMethod === "local" && <>
               <div>셸: {target.local.shell === "powerShell" ? "PowerShell" : "Bash"}</div>
