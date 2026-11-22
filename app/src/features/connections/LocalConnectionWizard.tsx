@@ -1,15 +1,18 @@
 import { useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
 import type { SavedConnections } from "./connectionIpc";
+import { SsmSelectionView } from "../ssm/SsmSelectionView";
+import { useSsmSelection } from "../ssm/ssm";
+import { createSsmDiscovery } from "../ssm/ssmDiscovery";
 import {
   createLocalConnectionWizard,
   type LocalConnectionActions,
-  type LocalProfileDraft,
+  type ConnectionProfileDraft,
 } from "./profiles";
 
 export type LocalConnectionWizardProps = LocalConnectionActions & Readonly<{
   draftId: string;
-  // 호출자가 현재 OS의 지원 셸을 initialDraft.target.local.shell에 넣는다.
-  initialDraft: LocalProfileDraft;
+  initialDraft: ConnectionProfileDraft;
+  received?: boolean;
   groups: SavedConnections["groups"];
 }>;
 
@@ -24,9 +27,15 @@ const titles = {
   verify: "연결 테스트·저장",
 } as const;
 
+const discovery = createSsmDiscovery();
+
 function Wizard(props: LocalConnectionWizardProps) {
   const [wizard] = useState(() => createLocalConnectionWizard(props.draftId, props.initialDraft));
-  const { step, draft, status } = useSyncExternalStore(wizard.subscribe, wizard.getSnapshot);
+  const { step, draft, status, remoteCleanup } = useSyncExternalStore(wizard.subscribe, wizard.getSnapshot);
+  const { target } = draft;
+  const ssm = useSsmSelection(discovery, target.defaultMethod === "ssm" &&
+    (!props.received || step === "auth" || step === "verify") &&
+    status.kind !== "closing" && status.kind !== "closed" && status.kind !== "closeFailed", wizard.invalidateSsmSelection);
   const dialog = useRef<HTMLDialogElement>(null);
   useLayoutEffect(() => {
     const modal = dialog.current;
@@ -40,7 +49,7 @@ function Wizard(props: LocalConnectionWizardProps) {
   const canSave = status.kind === "passed" || status.kind === "saveFailed";
 
   return (
-    <dialog ref={dialog} className="connection-wizard" aria-label="로컬 연결" onCancel={(event) => {
+    <dialog ref={dialog} className="connection-wizard" aria-label="연결 추가" onCancel={(event) => {
       event.preventDefault();
       void wizard.close(props);
     }}>
@@ -64,29 +73,48 @@ function Wizard(props: LocalConnectionWizardProps) {
         )}
         {step === "method" && (
           <>
-            <div>로컬</div>
-            <div>셸: {draft.target.local.shell === "powerShell" ? "PowerShell" : "Bash"}</div>
-            <div><label>시작 디렉터리 <input value={draft.target.local.startDirectory} onChange={event => wizard.edit("startDirectory", event.target.value)} /></label></div>
+            <div><label>접속 방식 <select value={target.defaultMethod} onChange={(event) => {
+              wizard.selectMethod(event.currentTarget.value === "ssm" ? "ssm" : "local");
+            }}>
+              <option value="local">로컬</option>
+              <option value="ssm">AWS Systems Manager</option>
+            </select></label></div>
+            {target.defaultMethod === "local" && <>
+              <div>셸: {target.local.shell === "powerShell" ? "PowerShell" : "Bash"}</div>
+              <div><label>시작 디렉터리 <input value={target.local.startDirectory} onChange={event => wizard.edit("startDirectory", event.target.value)} /></label></div>
+            </>}
           </>
         )}
-        {step === "auth" && <div>현재 사용자</div>}
+        {step === "auth" && (target.defaultMethod === "local" ? <div>현재 사용자</div> : <SsmSelectionView state={ssm} />)}
         {step === "verify" && (
           <>
-            <div>{draft.group.displayName} / {draft.target.displayName}</div>
-            <div>{draft.target.local.startDirectory}</div>
-            <button type="button" disabled={status.kind === "testing"} onClick={() => void wizard.test(props)}>연결 테스트</button>
+            <div>{draft.group.displayName} / {target.displayName}</div>
+            {target.defaultMethod === "local" ? <div>{target.local.startDirectory}</div> : target.ssm && <dl aria-label="SSM 연결 대상">
+              <div><dt>SSO 프로필</dt><dd>{target.ssm.profile}</dd></div>
+              <div><dt>리전</dt><dd>{target.ssm.region}</dd></div>
+              <div><dt>인스턴스 ID</dt><dd>{target.ssm.instanceId}</dd></div>
+            </dl>}
+            <button type="button" disabled={status.kind === "testing" || !!remoteCleanup} onClick={() => void wizard.test(props)}>연결 테스트</button>
             <button type="button" disabled={!canSave} onClick={() => void wizard.save(props)}>저장</button>
           </>
         )}
         {step !== "target" && <button type="button" onClick={() => wizard.go(-1)}>이전</button>}
-        {step !== "verify" && <button type="button" onClick={() => wizard.go(1)}>다음</button>}
+        {step !== "verify" && <button type="button"
+          disabled={step === "auth" && target.defaultMethod === "ssm" && !ssm.selection}
+          onClick={() => wizard.go(1, ssm.selection)}>다음</button>}
       </fieldset>
-      <button type="button" disabled={locked && status.kind !== "closeFailed"} onClick={() => void wizard.close(props)}>취소</button>
+      <button type="button" disabled={locked && status.kind !== "closeFailed"} onClick={() => void wizard.close(props)}>
+        {status.kind === "closeFailed" && remoteCleanup ? "종료 다시 확인" : "취소"}
+      </button>
       {status.kind === "testing" && <div role="status">테스트 중</div>}
       {status.kind === "passed" && <div role="status">테스트 성공</div>}
       {status.kind === "saving" && <div role="status">저장 중</div>}
-      {status.kind === "closing" && <div role="status">취소 중</div>}
-      {"error" in status && <div role="alert">{status.error}</div>}
+      {status.kind === "closing" && !remoteCleanup && <div role="status">취소 중</div>}
+      {remoteCleanup && <div role={remoteCleanup.kind === "cancelling" ? "status" : "alert"}>
+        {remoteCleanup.kind === "cancelling" ? "시험 취소 중" : "종료 확인 불가"}: {remoteCleanup.target.profile} / {remoteCleanup.target.region} / {remoteCleanup.target.instanceId}
+        {remoteCleanup.kind === "unconfirmed" && !locked && <button type="button" onClick={wizard.retryCleanup}>종료 다시 확인</button>}
+      </div>}
+      {"error" in status && !(status.kind === "closeFailed" && remoteCleanup) && <div role="alert">{status.error}</div>}
     </dialog>
   );
 }

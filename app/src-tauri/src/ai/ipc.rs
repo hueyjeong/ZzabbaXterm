@@ -8,6 +8,8 @@ use crate::{connections, terminal::Sessions};
 use super::{ChatMessage, ChatRole, Ollama, Operation, SelectedTarget, UPTIME,
     approval::{Candidate, Card, Choice, DecisionRequest, LocalReview, Policy, Reviews}};
 use super::ReviewCandidate;
+use super::cli::{Proposal as CliProposal, Query, Rejected};
+use crate::connections::profile::ValidatedDraft;
 
 const POLICY: Policy = Policy { revision: NonZeroU64::MIN, blocked: false };
 const STALE: &str = "조회 대상 또는 문서가 바뀌었습니다";
@@ -17,11 +19,46 @@ type Result<T, E = String> = std::result::Result<T, E>;
 #[derive(Default)]
 pub(crate) struct State(Mutex<ReviewState>);
 
+impl State {
+    pub(super) fn receive_draft(&self, draft: ValidatedDraft) -> Result<String, Rejected> {
+        let mut state = self.0.lock().unwrap();
+        if state.draft.is_some() {
+            return Err(Rejected);
+        }
+        state.next_draft = state.next_draft.checked_add(1).ok_or(Rejected)?;
+        let draft_id = format!("cli-{}", state.next_draft);
+        state.draft = Some(ReceivedDraft { draft_id: draft_id.clone(), initial_draft: draft });
+        Ok(draft_id)
+    }
+
+    pub(super) fn receive_proposal(&self, targets: &[SelectedTarget], request: CliProposal) -> Result<String, Rejected> {
+        let CliProposal { target_id, generation, operation: Query::Uptime } = request;
+        let target = TargetRef { target_id, generation };
+        let selected = targets.iter().find(|saved| target.matches(saved)).ok_or(Rejected)?;
+        let mut state = self.0.lock().unwrap();
+        if let Some(id) = state.reviews.unopened_cli(selected) {
+            return Ok(id.to_string());
+        }
+        if state.reviews.at_capacity() { return Err(Rejected); }
+        state.reviews.propose(Candidate::Cli { target_id: &selected.profile_id, operation: UPTIME }, Some(selected), POLICY)
+            .map(|id| id.to_string()).map_err(|_| Rejected)
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReceivedDraft {
+    draft_id: String,
+    initial_draft: ValidatedDraft,
+}
+
 #[derive(Default)]
 struct ReviewState {
     selection: Option<Selection>,
     epoch: u64,
     reviews: Reviews,
+    next_draft: u64,
+    draft: Option<ReceivedDraft>,
 }
 
 struct Selection {
@@ -58,6 +95,13 @@ impl ReviewState {
         let id = self.reviews.propose(Candidate::Chat(candidate), Some(selected), POLICY).map_err(review_error)?;
         let card = self.reviews.open(local, id, Some(selected), POLICY).map_err(review_error)?;
         project_card(id, card)
+    }
+
+    fn open_cli(&mut self, document: u64, local: &LocalReview, targets: &[SelectedTarget]) -> Result<Option<Proposal>> {
+        let selected = self.selected(document, targets)?;
+        let Some(id) = self.reviews.unopened_cli(selected) else { return Ok(None) };
+        let card = self.reviews.open(local, id, Some(selected), POLICY).map_err(review_error)?;
+        project_card(id, card).map(Some)
     }
 
     fn decide(&mut self, document: u64, local: &LocalReview, targets: &[SelectedTarget], request: Decision) -> Result<()> {
@@ -178,7 +222,7 @@ fn project_card(id: u32, card: &Card) -> Result<Proposal> {
 }
 
 pub(crate) fn handles(command: &str) -> bool {
-    matches!(command, "ai_targets" | "ai_models" | "ai_select" | "ai_chat" | "ai_propose" | "ai_decide")
+    matches!(command, "ai_targets" | "ai_models" | "ai_select" | "ai_chat" | "ai_propose" | "ai_decide" | "ai_cli_review" | "ai_cli_draft")
 }
 
 pub(crate) fn dispatch(invoke: Invoke) {
@@ -205,6 +249,8 @@ enum Request {
     Chat(ChatRequest),
     Propose(ProposalRequest),
     Decide(Decision),
+    CliReview,
+    CliDraft,
 }
 
 fn parse(command: &str, body: &InvokeBody) -> Result<Request> {
@@ -212,6 +258,9 @@ fn parse(command: &str, body: &InvokeBody) -> Result<Request> {
     match command {
         "ai_models" | "ai_targets" if value.as_object().is_some_and(|fields| fields.is_empty()) => {
             Ok(if command == "ai_models" { Request::Models } else { Request::Targets })
+        }
+        "ai_cli_review" | "ai_cli_draft" if value.as_object().is_some_and(|fields| fields.is_empty()) => {
+            Ok(if command == "ai_cli_review" { Request::CliReview } else { Request::CliDraft })
         }
         "ai_select" => SelectRequest::deserialize(value).map(Request::Select),
         "ai_chat" => ChatRequest::deserialize(value).map(Request::Chat),
@@ -282,6 +331,14 @@ async fn handle(caller: Webview, document: u64, local: LocalReview, request: Req
             state.decide(document, &local, &targets, request)?;
             Ok(json!("recorded"))
         }).await,
+        Request::CliReview => stored(caller, document, move |state, targets| {
+            let card = state.open_cli(document, &local, &targets)?;
+            serde_json::to_value(card).map_err(|_| INVALID.into())
+        }).await,
+        Request::CliDraft => document_check(&caller, document, || {
+            let draft = caller.state::<State>().0.lock().unwrap().draft.take();
+            serde_json::to_value(draft).map_err(|_| INVALID.into())
+        }),
     }
 }
 

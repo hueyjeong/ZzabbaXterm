@@ -10,6 +10,8 @@
     "allow-ai-select",
     "allow-ai-chat",
     "allow-ai-propose",
-    "allow-ai-decide"
+    "allow-ai-decide",
+    "allow-ai-cli-review",
+    "allow-ai-cli-draft"
   ]
 }

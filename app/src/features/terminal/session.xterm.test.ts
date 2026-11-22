@@ -51,3 +51,48 @@ it("분할된 한글과 ANSI를 xterm 버퍼에 반영하고 파서 완료 위�
     terminal.dispose();
   }
 });
+
+it("SSM 시작 응답을 기다리는 동안 실제 xterm의 VT 응답과 ACK만 보낸다", async () => {
+  const size = { cols: 80, rows: 24 };
+  const terminal = new xterm.Terminal(size);
+  const starting = Promise.withResolvers<void>();
+  const open = vi.fn<LocalTerminalIpc["open"]>().mockResolvedValue("ssm-app");
+  const start = vi.fn<LocalTerminalIpc["start"]>().mockReturnValue(starting.promise);
+  const ack = vi.fn<LocalTerminalIpc["ack"]>().mockResolvedValue(undefined);
+  const input = vi.fn<LocalTerminalIpc["input"]>().mockResolvedValue(undefined);
+  const status = vi.fn();
+  const close = vi.fn().mockResolvedValue(null);
+  const session = connectLocalTerminal(size, (bytes, parsed) => terminal.write(bytes, parsed), status,
+    { open, start, ack, input, resize: async () => { }, close }, "saved-ssm", true);
+  const subscription = terminal.onData(data => session.input(data, "terminal"));
+  try {
+    await vi.waitFor(() => expect(start).toHaveBeenCalledWith("ssm-app"));
+    const [, receive] = open.mock.calls[0];
+    receive({ kind: "connecting" });
+    expect(status).toHaveBeenLastCalledWith({ kind: "connecting" }, "ssm-app");
+    session.input("준비 전 사용자 입력");
+    const query = new TextEncoder().encode("\x1b[6n");
+    receive(query.buffer);
+    await vi.waitFor(() => expect(ack).toHaveBeenCalledWith("ssm-app", query.byteLength));
+    const asText = () => input.mock.calls.map(([id, bytes]) => [id, new TextDecoder().decode(bytes)]);
+    expect(asText()).toEqual([["ssm-app", "\x1b[1;1R"]]);
+    starting.resolve();
+    await starting.promise;
+    expect(status).toHaveBeenLastCalledWith({ kind: "connecting" }, "ssm-app");
+    receive({ kind: "ready" });
+    receive({ kind: "connecting" });
+    expect(status).toHaveBeenLastCalledWith({ kind: "running" }, "ssm-app");
+    session.input("ready");
+    await vi.waitFor(() => expect(asText()).toEqual([["ssm-app", "\x1b[1;1R"], ["ssm-app", "ready"]]));
+    receive({ kind: "disconnected", value: "SSM 연결 끊김" });
+    receive({ kind: "ready" });
+    expect(status).toHaveBeenLastCalledWith({ kind: "disconnected", value: "SSM 연결 끊김" }, "ssm-app");
+    await session.confirmClose();
+    expect(close).toHaveBeenCalledExactlyOnceWith("ssm-app");
+  } finally {
+    starting.resolve();
+    session.close();
+    subscription.dispose();
+    terminal.dispose();
+  }
+});

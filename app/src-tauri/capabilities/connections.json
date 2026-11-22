@@ -9,6 +9,7 @@
     "allow-connection-test-wait",
     "allow-connection-test-cancel",
     "allow-connection-save",
-    "allow-connections-load"
+    "allow-connections-load",
+    "allow-ssm-discovery"
   ]
 }

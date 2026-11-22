@@ -1,11 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ConnectionRequest, ConnectionTestDraft, ConnectionTestRun, LocalConnectionActions, LocalProfileDraft } from "./profiles";
+import type { ConnectionProfileDraft, ConnectionRequest, ConnectionTestDraft, ConnectionTestRun, LocalConnectionActions } from "./profiles";
 
 type SavedEntry<T> = Readonly<{ revision: number; profile: T }>;
 export type SavedConnections = Readonly<{
   version: 1;
-  groups: readonly SavedEntry<LocalProfileDraft["group"]>[];
-  targets: readonly SavedEntry<LocalProfileDraft["target"]>[];
+  groups: readonly SavedEntry<ConnectionProfileDraft["group"]>[];
+  targets: readonly SavedEntry<ConnectionProfileDraft["target"]>[];
 }>;
 
 type WaitReply = ConnectionTestRun & Readonly<{ sessionId: string }>;
@@ -47,9 +47,13 @@ export function createLocalConnectionIpc(): Omit<LocalConnectionActions, "onClos
       if (!execution) return;
       execution.cancelled = true;
       execution.cancellation ??= execution.started.then(async ({ draftId, draftVersion, runId }) => {
-        if (typeof runId === "string" && runId) {
-          await invoke<null>("connection_test_cancel", { run: { draftId, draftVersion, runId } });
+        const remote = attempt.draft.target.defaultMethod === "ssm";
+        if (typeof runId !== "string" || !runId || (remote && (draftId !== attempt.draftId || draftVersion !== attempt.draftVersion))) {
+          if (remote) throw new Error("종료 확인 불가");
+          return;
         }
+        const result = await invoke<unknown>("connection_test_cancel", { run: { draftId, draftVersion, runId } });
+        if (remote && result !== null) throw new Error("종료 확인 불가");
       }, () => { /* 시작이 거절되면 회수할 실행이 없다. */ });
       try {
         await execution.cancellation;

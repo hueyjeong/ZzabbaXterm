@@ -1,4 +1,6 @@
 pub mod approval;
+#[doc(hidden)]
+pub mod cli;
 pub(crate) mod ipc;
 mod ollama;
 

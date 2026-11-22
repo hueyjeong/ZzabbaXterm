@@ -19,6 +19,8 @@ export function LocalAiPanel({ profilesVersion }: { profilesVersion: number }) {
   const [modelError, setModelError] = useState("");
   const [targetError, setTargetError] = useState("");
   const [retry, setRetry] = useState(0);
+  const [cliCard, setCliCard] = useState<Proposal>();
+  const opening = useRef(false);
   const selection = useRef<Promise<boolean>>(Promise.resolve(false));
 
   useEffect(() => {
@@ -50,6 +52,7 @@ export function LocalAiPanel({ profilesVersion }: { profilesVersion: number }) {
   }, [profilesVersion, retry]);
 
   function select(target: TargetRef | null) {
+    setCliCard(undefined);
     setTargetError("");
     const next = selection.current.then(() => invoke<boolean>("ai_select", { target })).catch((error: unknown) => {
       if (selection.current === next) setTargetError(String(error));
@@ -69,7 +72,26 @@ export function LocalAiPanel({ profilesVersion }: { profilesVersion: number }) {
     return invoke<Proposal>("ai_propose", request);
   };
 
-  return <AiPanel models={models} targets={targets} proposals={[]} onSelectTarget={select}
+  async function openCliReview() {
+    if (opening.current) return;
+    opening.current = true;
+    const selected = selection.current;
+    setTargetError("");
+    try {
+      if (!await selected || selection.current !== selected) return;
+      const card = await invoke<Proposal | null>("ai_cli_review", {});
+      if (selection.current !== selected) return;
+      if (card) setCliCard(card);
+      else setTargetError("접수된 CLI 제안이 없습니다");
+    } catch (error) {
+      if (selection.current === selected) setTargetError(String(error));
+    } finally {
+      opening.current = false;
+    }
+  }
+
+  return <AiPanel models={models} targets={targets} proposals={cliCard ? [cliCard] : []} onSelectTarget={select}
+    onOpenCliReview={openCliReview}
     modelError={modelError} targetError={targetError} onRefresh={() => setRetry((value) => value + 1)}
     onSendChat={sendChat} onRequestProposal={propose} onDecideProposal={decide} />;
 }

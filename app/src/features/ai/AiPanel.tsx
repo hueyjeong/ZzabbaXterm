@@ -47,6 +47,7 @@ export function AiPanel(props: AiPanelProps) {
           </option>)}
         </select>
       </label>
+      {target && props.onOpenCliReview && <button type="button" onClick={props.onOpenCliReview}>CLI 제안 열기</button>}
       {target ? <ProposalReview key={selected} model={model} target={target} proposals={props.proposals}
         attempted={attempted.current} onRequestProposal={props.onRequestProposal} onDecideProposal={props.onDecideProposal} />
         : <p role="status">대기</p>}

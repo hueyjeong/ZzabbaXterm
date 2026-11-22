@@ -5,6 +5,8 @@ fn main() {
         "connection_test_start", "connection_test_wait", "connection_test_cancel", "connection_save",
         "connections_load",
         "ai_targets", "ai_models", "ai_select", "ai_chat", "ai_propose", "ai_decide",
+        "ssm_discovery",
+        "ai_cli_review", "ai_cli_draft",
     ]);
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(app))
         .expect("failed to build app permissions");

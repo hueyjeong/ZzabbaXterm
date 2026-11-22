@@ -158,7 +158,19 @@ pub struct Reviews {
 
 impl Reviews {
     pub(super) fn clear(&mut self) {
-        self.pending.clear();
+        self.pending.retain(|_, pending| pending.opened_in.is_none());
+    }
+
+    pub(super) fn unopened_cli(&mut self, target: &SelectedTarget) -> Option<u32> {
+        let now = Instant::now();
+        self.pending.retain(|_, pending| pending.expires_at > now);
+        self.pending.iter().filter_map(|(&id, pending)| {
+            (pending.card.source == Source::Cli && pending.opened_in.is_none() && &pending.card.target == target).then_some(id)
+        }).min()
+    }
+
+    pub(super) fn at_capacity(&self) -> bool {
+        self.pending.len() >= 32
     }
 
     pub fn propose(

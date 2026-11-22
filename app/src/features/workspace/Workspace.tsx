@@ -1,8 +1,10 @@
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { LocalAiPanel } from "../ai/LocalAiPanel";
 import { createLocalConnectionIpc, type SavedConnections } from "../connections/connectionIpc";
 import { LocalConnectionWizard } from "../connections/LocalConnectionWizard";
-import type { ConnectionClose, LocalProfileDraft } from "../connections/profiles";
+import type { ConnectionClose, ConnectionProfileDraft } from "../connections/profiles";
+import type { SsmTarget } from "../ssm/ssm";
 import { TerminalView } from "../terminal/TerminalView";
 import type { TerminalStatus } from "../terminal/session";
 import { LocalTree } from "./LocalTree";
@@ -10,14 +12,19 @@ import { Splitter } from "./Splitter";
 import { macTitleBar, TitleBar } from "./TitleBar";
 import "./workspace.css";
 
-type Tab = { id: number; label: string; targetId?: string; status: TerminalStatus; sessionId?: string };
+type Tab = {
+  id: number; label: string; targetId?: string; ssm?: SsmTarget; status: TerminalStatus; sessionId?: string;
+  closeStatus?: "closing" | "unconfirmed"
+};
 type ProfileLoad = { kind: "loading" | "ready"; profiles?: SavedConnections }
   | { kind: "error"; profiles?: SavedConnections; error: string };
 const connections = createLocalConnectionIpc();
+type WizardRequest = { draftId: string; initialDraft: ConnectionProfileDraft; received?: boolean };
 
 function terminalStatus(status: TerminalStatus) {
   switch (status.kind) {
     case "opening": return "여는 중";
+    case "connecting": return "연결 중";
     case "running": return "연결됨";
     case "exited": return `종료 코드 ${status.value}`;
     case "disconnected": return `단절: ${status.value}`;
@@ -30,16 +37,23 @@ export function Workspace() {
   const [tabs, setTabs] = useState<Tab[]>([{ id: 1, label: "로컬 1", status: { kind: "opening" } }]);
   const [active, setActive] = useState(1);
   const [focusTab, setFocusTab] = useState<number | null>(1);
+  const liveTabs = useRef(tabs);
+  const activeTab = useRef(active);
+  const closingTabs = useRef(new Set<number>());
+  const remoteTerminals = useRef(new Map<number, { confirmClose(): Promise<void> }>());
+  useLayoutEffect(() => { liveTabs.current = tabs; }, [tabs]);
   const [focused, setFocused] = useState(false);
   const [windowError, setWindowError] = useState("");
   const [loadVersion, setLoadVersion] = useState(0);
   const [profileLoad, setProfileLoad] = useState<ProfileLoad>({ kind: "loading" });
-  const [wizard, setWizard] = useState<{ draftId: string; initialDraft: LocalProfileDraft }>();
+  const [wizard, setWizard] = useState<WizardRequest>();
+  const [receivingDraft, setReceivingDraft] = useState(false);
   const [treeWidth, setTreeWidth] = useState(280);
   const [aiWidth, setAiWidth] = useState(360);
   const [chatHeight, setChatHeight] = useState(50);
   const [area, setArea] = useState({ width: 1200, height: 600 });
   const body = useRef<HTMLDivElement>(null);
+  const draftPending = useRef(false);
   const activeButton = useRef<HTMLButtonElement>(null);
   const sideLimit = Math.min(640, Math.floor(area.width * 0.32));
   const left = Math.min(treeWidth, sideLimit);
@@ -61,6 +75,7 @@ export function Workspace() {
   }
 
   function openWizard() {
+    if (draftPending.current || wizard) return;
     const groupId = crypto.randomUUID();
     setWizard({
       draftId: crypto.randomUUID(), initialDraft: {
@@ -111,19 +126,38 @@ export function Workspace() {
   function openTab(target?: SavedConnections["targets"][number]["profile"]) {
     const id = nextTab.current++;
     setTabs((current) => [...current, {
-      id, label: target?.displayName ?? `로컬 ${id}`, targetId: target?.id, status: { kind: "opening" },
+      id, label: target?.displayName ?? `로컬 ${id}`, targetId: target?.id,
+      ssm: target?.defaultMethod === "ssm" ? target.ssm : undefined, status: { kind: "opening" },
     }]);
     selectTab(id);
   }
 
   function selectTab(id: number) {
+    activeTab.current = id;
     setActive(id);
     setFocusTab(id);
   }
 
-  function closeTab(id: number) {
-    const index = tabs.findIndex((tab) => tab.id === id);
-    if (id === active) selectTab(tabs[index + 1]?.id ?? tabs[index - 1]?.id ?? 0);
+  async function closeTab(id: number) {
+    const tab = liveTabs.current.find(item => item.id === id);
+    if (!tab || closingTabs.current.has(id)) return;
+    if (tab.ssm) {
+      closingTabs.current.add(id);
+      setTabs(current => current.map(item => item.id === id ? { ...item, closeStatus: "closing" } : item));
+      try {
+        const terminal = remoteTerminals.current.get(id);
+        if (!terminal) throw new Error("세션 종료 상태를 확인할 수 없습니다");
+        await terminal.confirmClose();
+      } catch {
+        setTabs(current => current.map(item => item.id === id ? { ...item, closeStatus: "unconfirmed" } : item));
+        return;
+      } finally {
+        closingTabs.current.delete(id);
+      }
+    }
+    const current = liveTabs.current;
+    const index = current.findIndex(item => item.id === id);
+    if (id === activeTab.current) selectTab(current[index + 1]?.id ?? current[index - 1]?.id ?? 0);
     setTabs((current) => current.filter((tab) => tab.id !== id));
   }
 
@@ -140,16 +174,36 @@ export function Workspace() {
     <main className={`workspace${macTitleBar ? " workspace-mac" : ""}${focused ? " workspace-focused" : ""}`} style={layout}
       onFocusCapture={(event) => { if (!event.target.closest(".terminal-screen")) setFocusTab(null); }}>
       <TitleBar focused={focused} onToggle={() => setFocused(!focused)} onWindowError={setWindowError}>
-        {tabs.map(({ id, label }) => (
+        {tabs.map(({ id, label, closeStatus }) => (
           <div className="workspace-tab" key={id}>
             <button ref={id === active ? activeButton : undefined} aria-pressed={id === active} onClick={() => selectTab(id)}>{label}</button>
-            <button aria-label={`${label} 닫기`} onClick={() => closeTab(id)}>×</button>
+            <button aria-label={`${label} ${closeStatus === "unconfirmed" ? "종료 다시 확인" : "닫기"}`}
+              disabled={closeStatus === "closing"} onClick={() => void closeTab(id)}>×</button>
+            {closeStatus && <span role={closeStatus === "closing" ? "status" : "alert"}>
+              {closeStatus === "closing" ? "종료 중" : "종료 확인 불가"}
+            </span>}
           </div>
         ))}
       </TitleBar>
       <div className="workspace-body" ref={body}>
         <aside className="workspace-tree" hidden={focused}>
           <button className="connection-add" type="button" aria-label="연결 추가" onClick={openWizard}>+</button>
+          <button type="button" disabled={!!wizard || receivingDraft} onClick={async () => {
+            if (draftPending.current || wizard) return;
+            draftPending.current = true;
+            setReceivingDraft(true);
+            setWindowError("");
+            try {
+              const draft = await invoke<WizardRequest | null>("ai_cli_draft", {});
+              if (draft) setWizard({ ...draft, received: true });
+              else setWindowError("접수된 CLI 초안이 없습니다");
+            } catch (error) {
+              setWindowError(String(error));
+            } finally {
+              draftPending.current = false;
+              setReceivingDraft(false);
+            }
+          }}>CLI 초안 열기</button>
           {profileLoad.kind === "loading" && <div className="connection-status" role="status">저장된 연결 불러오는 중</div>}
           {profileLoad.kind === "ready" && profileLoad.profiles?.targets.length === 0 &&
             <div className="connection-status" role="status">저장된 연결 없음</div>}
@@ -160,9 +214,13 @@ export function Workspace() {
           <LocalTree profiles={profileLoad.profiles} onOpen={openTab} />
         </aside>
         <div className="workspace-center">
-          {tabs.map(({ id, label, targetId }) => (
+          {tabs.map(({ id, label, targetId, ssm, closeStatus }) => (
             <div className="workspace-session" key={id} hidden={id !== active} inert={id !== active}>
               <TerminalView active={id === active} focusRequested={id === focusTab} label={label} targetId={targetId}
+                remote={!!ssm} closing={!!closeStatus} closeRef={ssm ? (handle) => {
+                  if (handle) remoteTerminals.current.set(id, handle);
+                  else remoteTerminals.current.delete(id);
+                } : undefined}
                 onStatus={(status, sessionId) => updateStatus(id, status, sessionId)} />
             </div>
           ))}
@@ -178,7 +236,9 @@ export function Workspace() {
         </>}
       </div>
       <footer className="workspace-status">
-        <span role="status">{current ? [current.targetId ? current.label : "내 PC", "로컬", current.sessionId, terminalStatus(current.status)].filter(Boolean).join(" · ") : "연결 없음"}</span>
+        <span role="status">{current ? [current.targetId ? current.label : "내 PC", current.ssm ?
+          `SSM · ${current.ssm.profile} / ${current.ssm.region} / ${current.ssm.instanceId}` : "로컬", current.sessionId,
+        !current.closeStatus && terminalStatus(current.status)].filter(Boolean).join(" · ") : "연결 없음"}</span>
         {windowError && <span role="alert">{windowError}</span>}
         <span>AI 전용 셸 · 대기</span>
       </footer>

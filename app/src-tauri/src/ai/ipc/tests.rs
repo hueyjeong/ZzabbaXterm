@@ -63,3 +63,41 @@ fn stored_generation_and_document_gate_late_results_and_decisions() {
     state.select(4, Some(target.clone())).unwrap();
     assert!(state.finish(4, &local, &targets, epoch, candidate()).is_err());
 }
+
+#[test]
+fn cli_receipt_requires_saved_revision_and_a_one_shot_local_review() {
+    let root = TestDir::new();
+    let draft = draft(root.path(), "work", "local-a");
+    fs::write(root.path().join("connections.json"), json!({
+        "version": 1,
+        "groups": [{"revision": 1,"profile": draft["group"]}],
+        "targets": [
+            {"revision": 1,"profile": draft["target"]},
+            {"revision": 4,"profile": {"id":"ssm-a", "groupId":"work", "displayName":"원격 시험",
+                "defaultMethod":"ssm", "ssm":{"profile":"fixture-secret", "region":"ap-northeast-2", "instanceId":"i-0123456789abcdef0"}}}
+        ]
+    }).to_string()).unwrap();
+    let aliases = serde_json::to_value(connections::ai_aliases(root.path()).unwrap()).unwrap();
+    assert_eq!(aliases[1], json!({"id":"ssm-a", "method":"ssm", "displayName":"원격 시험", "generation":"4"}));
+    assert!(!aliases.to_string().contains("fixture-secret"));
+    assert!(!aliases.to_string().contains("i-0123456789abcdef0"));
+    let targets = connections::with_ai_targets(root.path(), |targets| targets).unwrap();
+    let state = State::default();
+    let request = |generation: &str| CliProposal { target_id: "ssm-a".into(), generation: generation.into(), operation: Query::Uptime };
+    assert!(state.receive_proposal(&targets, request("3")).is_err());
+    let id = state.receive_proposal(&targets, request("4")).unwrap();
+    assert_eq!(state.receive_proposal(&targets, request("4")).unwrap(), id);
+    let local = LocalReview::check("main", "main", true, 7).unwrap();
+    let mut state = state.0.lock().unwrap();
+    state.select(7, Some(targets[0].clone())).unwrap();
+    assert!(state.open_cli(7, &local, &targets).unwrap().is_none());
+    state.select(7, Some(targets[1].clone())).unwrap();
+    let decision = || Decision { proposal_id: id.clone(), decision: PanelChoice::Approve };
+    // An unread receipt cannot approve, and an unread decision consumes that receipt.
+    let card = state.open_cli(7, &local, &targets).unwrap().unwrap();
+    assert_eq!(card.id, id);
+    assert_eq!(serde_json::to_value(card).unwrap()["node"], "i-0123456789abcdef0");
+    state.decide(7, &local, &targets, decision()).unwrap();
+    assert!(state.decide(7, &local, &targets, decision()).is_err());
+    assert!(state.open_cli(7, &local, &targets).unwrap().is_none());
+}

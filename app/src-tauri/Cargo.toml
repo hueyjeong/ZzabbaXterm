@@ -3,6 +3,7 @@ name = "zzabbaxterm"
 version = "0.1.0"
 description = "ZzabbaXterm"
 edition = "2024"
+default-run = "zzabbaxterm"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -23,15 +24,20 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
 thiserror = "2"
-
-[dev-dependencies]
-tokio = { version = "1", features = ["rt"] }
+getrandom = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+sha1 = "0.10"
+shlex = "2"
+tempfile = "3"
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
+tokio-util = "0.7"
+zeroize = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_JobObjects", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_UI_Shell"] }
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]
