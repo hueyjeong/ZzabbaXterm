@@ -1,9 +1,11 @@
 mod connections;
+mod editor;
 pub mod ssm;
 mod storage;
 mod terminal;
 mod workspace_window;
 
+use editor::registry::LocalEditors;
 use storage::ipc::{self as storage_ipc, StorageIpc};
 use tauri::Manager;
 use terminal::{Sessions, ipc::*};
@@ -17,11 +19,13 @@ pub fn run() {
     ];
     tauri::Builder::default()
         .manage(Sessions::default())
+        .manage(LocalEditors::default())
         .manage(StorageIpc::default())
         .plugin(ssm::ipc::lifecycle())
         .on_page_load(|webview, payload| {
             if payload.event() == tauri::webview::PageLoadEvent::Started {
                 webview.state::<Sessions>().navigate(webview.label());
+                webview.state::<LocalEditors>().navigate(webview.label());
                 webview.state::<StorageIpc>().navigate(webview.label());
             }
         })
@@ -35,7 +39,10 @@ pub fn run() {
             } else if invoke.message.command().starts_with("storage_") {
                 storage_ipc::dispatch(invoke)
             } else {
-                connections::ipc::handle(invoke, other_commands)
+                match editor::ipc::dispatch(invoke) {
+                    Ok(()) => true,
+                    Err(invoke) => connections::ipc::handle(invoke, other_commands),
+                }
             }
         })
         .build(tauri::generate_context!())
@@ -43,6 +50,7 @@ pub fn run() {
         .run(|app, event| match event {
             tauri::RunEvent::WindowEvent { label, event: tauri::WindowEvent::Destroyed, .. } => {
                 app.state::<Sessions>().destroy(&label);
+                app.state::<LocalEditors>().destroy(&label);
                 app.state::<StorageIpc>().navigate(&label);
             }
             tauri::RunEvent::Exit => {
