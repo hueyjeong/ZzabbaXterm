@@ -103,6 +103,8 @@ fn route_label(route: &Route) -> String {
         Route::SshLocal { listen, destination, .. } => format!("-L {}", forward(listen, destination)),
         Route::SshRemote { listen, destination, .. } => format!("-R {}", forward(listen, destination)),
         Route::SshDynamic { listen, .. } => format!("-D {listen} → SOCKS"),
+        #[cfg(test)]
+        Route::Ssm { listen, node, port } => format!("SSM {listen} → {node}:{port}"),
     }
 }
 
