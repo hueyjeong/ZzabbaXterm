@@ -86,5 +86,12 @@ async fn compatible_approval_stays_in_its_tab_and_close_recovers_staging() {
     assert_eq!(std::fs::read(&path).unwrap(), b"original");
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     assert_eq!(transport.actual_requests().count(), 3);
-    assert_eq!(transport.actual_requests().last().unwrap().uri(), "https://one.example.test/sample/object");
+    let request = transport.actual_requests().last().unwrap();
+    let uri: http::Uri = request.uri().parse().unwrap();
+    assert_eq!(uri.scheme_str(), Some("https"));
+    let authority = uri.authority().unwrap();
+    assert_eq!(authority.as_str(), "one.example.test");
+    assert_eq!(authority.port_u16().unwrap_or(443), 443);
+    assert_eq!(uri.path(), "/sample/object");
+    assert_eq!(uri.query(), Some("x-id=GetObject"));
 }
