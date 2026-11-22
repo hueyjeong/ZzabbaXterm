@@ -23,11 +23,19 @@
 4. **xterm.js를 입출력 끝점으로 붙인다.** `app/src/features/terminal/`에서 `@xterm/xterm`의 `Terminal`과 `@xterm/addon-fit`을 사용한다. 출력 수신기를 연결한 뒤 세션을 열어 첫 프롬프트도 받는다. xterm `onData`를 UTF-8 바이트로 변환해 해당 세션의 writer에 순서대로 쓰고, PTY 출력은 세션별 [Tauri Channel](https://v2.tauri.app/develop/calling-frontend/#channels)로 바이트 순서대로 `term.write(Uint8Array)`에 전달한다. 에코는 셸에 맡긴다. 크기 변경 시 보이는 터미널에 `fit()`을 적용한 실제 `cols`·`rows`로 master를 resize한다. 탭 전환·숨김은 닫기 요청이 아니다. IME와 연속 출력 부하의 합격 기준은 [L03](03-input.md)에 있다.
 5. **종료와 단절을 분리한다.** 정상 종료는 마지막 출력까지 보낸 뒤 자식 대기 결과를 한 번 전달한다. EOF 자체나 출력이 잠시 없는 상태를 종료 코드로 바꾸지 않는다. 읽기·쓰기·IPC 오류는 해당 세션의 단절로 처리한다. 탭 닫기와 창 파괴는 같은 정리 경로에서 입력을 막고, 앱 소유 PTY·자식 및 붙어 있는 전경 작업만 정리하고 자식을 회수한다. 막힌 읽기도 깨어나야 한다. 같은 닫기 요청이 겹쳐도 중복 종료나 다른 세션 종료가 없어야 한다. 셸 전체 이름으로 프로세스를 일괄 종료하지 않는다.
 
+## L02 터미널 뷰 계약
+
+탭마다 `TerminalView({ active, label })`를 고정된 React `key`로 마운트한다. `active`는 표시·포커스·크기 맞춤만 바꾸고 `label`은 접근성 이름에만 쓴다. 비활성 탭을 마운트 상태로 유지하면 그 탭의 셸·출력·입력 구독이 유지된다. 탭을 목록에서 제거하면 뷰가 세션을 닫는다. 열기 응답이 뒤늦게 오면 받은 ID를 시작 전에 닫는다.
+
+L02 상태줄은 `onStatus(status, sessionId?)`에서 현재 탭의 `TerminalStatus`와 Rust가 발급한 실제 ID를 받는다. 첫 `opening`과 ID를 발급받기 전의 열기 실패에는 ID가 없다. `opening`에서 ID가 생긴 뒤에는 `running`과 최종 상태에도 같은 ID가 전달된다. 탭이 닫히면 탭 목록과 함께 상태를 버린다. 상태줄에서 별도 셸이나 출력 구독을 열 필요가 없다.
+
+Rust는 `terminal_open`에서 초기 행·열과 채널을 받고 호출 창에 묶인 ID를 발급한다. ID를 받은 뒤 `terminal_start`로 출력을 시작한다. `terminal_input`·`terminal_resize`·`terminal_ack`·`terminal_close`는 같은 ID를 받는다. 채널은 최대 16 KiB의 생 바이트와 JSON 종료·단절 상태를 같은 순서로 전달한다. 파서 완료 위치를 누적 ACK로 돌려주면 세션별 256 KiB 읽기 한도가 열린다. 정상 탭 닫기는 종료 코드를 표시하는 자연 종료와 별개다.
+
 ## 자동 검증과 실기기 시연
 
 1. Rust 시험과 F00의 Vitest 실행 명령으로 `app/src/features/terminal/`의 입력·출력 연결 시험을 실행한다. 한 세션에서 나온 바이트가 다른 터미널에 전달되지 않는지, 닫기 뒤의 입력이 거부되는지 확인한다. PTY 통합 시험은 양쪽 OS에서 실제 셸로 실행한다.
 2. 각 OS에서 `npm run tauri dev`로 시험 창을 연다. 로컬 세션 두 개를 연다(L02 이전에는 같은 셸 뷰를 두 개 띄운 개발 시험 화면으로 검사). 양쪽의 PID를 확인한다(PowerShell: `$PID`, Bash: `echo $$`). 위 A/B 표식을 실행한다. Windows는 `$Host.UI.RawUI.WindowSize`, Linux는 `stty size`로 창을 가로·세로로 바꾸기 전후의 열과 행을 비교한다.
 3. A에서 Windows는 `Start-Sleep 60`, Linux는 `sleep 60` 중 `Ctrl+C`를 누른 뒤 인수 조건대로 다음 명령을 실행한다. `exit 7`로 A를 끝내고 B를 계속 쓴다. 새 A를 열어 대기 명령 중 탭을 닫는다. 작업 관리자 또는 `ps`에서 A의 기록한 셸 PID가 사라지고 B는 살아 있는지 확인한다. 시험 창도 닫아 B까지 정리되는지 본다.
-4. **완료 증거:** OS별 셸·버전, 두 PID, 리사이즈 전후 행·열, 인터럽트 후 출력, 종료 코드, 탭·창 닫기 결과와 자동 시험 결과를 티켓에 첨부한다. 오류는 실패 단계와 OS 메시지를 남긴다. 현재 상태는 두 OS 모두 `미실행`이다.
+4. **완료 증거:** OS별 셸·버전, 두 PID, 리사이즈 전후 행·열, 인터럽트 후 출력, 종료 코드, 탭·창 닫기 결과와 자동 시험 결과를 티켓에 첨부한다. Windows는 개발 WebView의 첫 PowerShell 프롬프트를 관찰했다. Windows 창에서 직접 조작하는 나머지 시연과 Ubuntu GNOME Wayland 실기기 시연은 미실행이다.
 
 참고: [portable-pty 생성·입출력 예제](https://docs.rs/portable-pty/latest/portable_pty/), [제품 설계의 로컬 터미널 기준](../../ops-shell-blueprint.md#개발-순서와-통과-기준).
