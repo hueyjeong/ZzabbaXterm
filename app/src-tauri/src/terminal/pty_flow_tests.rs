@@ -465,7 +465,7 @@ fn c02_native_start_outcomes() {
                             }
                         }
                         Event::Connecting => {}
-                        Event::Ready if mode == "connected" => {
+                        Event::Ready { .. } if mode == "connected" => {
                             ready = true;
                             pty.input(b"fixture-input\r");
                         }

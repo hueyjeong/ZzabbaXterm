@@ -7,7 +7,7 @@ use crate::connections::{profile::{MethodRef, Shell}, with_saved_method};
 use super::{process::Launch, remote};
 
 pub(super) fn launch(config: &Path, id: &str) -> Result<Launch, String> {
-    with_saved_method(config, id, |method| match method {
+    with_saved_method(config, id, |method, _| match method {
         MethodRef::Local { shell, start_directory } => local(shell, start_directory).map(Launch::Local),
         MethodRef::Ssm { profile, region, instance_id } => remote::Target::new(profile, region, instance_id).map(Launch::Ssm),
         MethodRef::Ssh { ssh } => crate::ssh::terminal::saved(config, ssh).map(Launch::Ssh),

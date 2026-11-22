@@ -9,12 +9,12 @@ import { sshTestIpc } from "../terminal/session";
 import {
   createLocalConnectionWizard,
   type LocalConnectionActions,
-  type LocalProfileDraft,
+  type InitialWizardDraft,
 } from "./profiles";
 
 export type LocalConnectionWizardProps = LocalConnectionActions & Readonly<{
   draftId: string;
-  initialDraft: LocalProfileDraft;
+  initialDraft: InitialWizardDraft;
   groups: SavedConnections["groups"];
 }>;
 

@@ -305,7 +305,9 @@ impl Session {
                         let cancel = self.cancel.as_ref().unwrap();
                         let result = remote.wait_connected(cancel).and_then(|()| {
                             *connected = true;
-                            if !cancel.is_cancelled() { send_event(Event::Ready)?; }
+                            if !cancel.is_cancelled() {
+                                send_event(Event::Ready { account_id: remote.account_id().into() })?;
+                            }
                             Ok(())
                         });
                         if let Err(error) = result && !cancel.is_cancelled() {

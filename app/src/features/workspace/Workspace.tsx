@@ -2,11 +2,12 @@ import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from
 import { LocalAiPanel } from "../ai/LocalAiPanel";
 import { createLocalConnectionIpc, type SavedConnections } from "../connections/connectionIpc";
 import { LocalConnectionWizard } from "../connections/LocalConnectionWizard";
-import type { ConnectionClose, LocalProfileDraft } from "../connections/profiles";
+import type { ConnectionClose, InitialWizardDraft } from "../connections/profiles";
 import { EditorTab, type EditorTabActions } from "../editor/EditorTab";
 import type { ApprovedEditorFile, ConfirmEditorDiscard } from "../editor/contract";
 import { closeLocalFile, localEditorError, localEditorTransport, openLocalFile } from "../editor/localEditorIpc";
 import type { SsmTarget } from "../ssm/ssm";
+import { StorageTab } from "../storage/StorageTab";
 import { TerminalView } from "../terminal/TerminalView";
 import type { TerminalStatus } from "../terminal/session";
 import { LocalTree } from "./LocalTree";
@@ -14,8 +15,10 @@ import { Splitter } from "./Splitter";
 import { macTitleBar, TitleBar } from "./TitleBar";
 import "./workspace.css";
 
+type CloseStatus = "closing" | "unconfirmed";
 type Tab = { id: number; label: string } & (
-  | { kind: "terminal"; targetId?: string; ssm?: SsmTarget; ssh?: true; status: TerminalStatus; sessionId?: string; closeStatus?: "closing" | "unconfirmed" }
+  | { kind: "terminal"; targetId?: string; ssm?: SsmTarget; ssh?: true; status: TerminalStatus; sessionId?: string; closeStatus?: CloseStatus }
+  | { kind: "storage"; closeStatus?: CloseStatus }
   | { kind: "editor"; file: ApprovedEditorFile }
 );
 type ProfileLoad = { kind: "loading" | "ready"; profiles?: SavedConnections }
@@ -24,7 +27,7 @@ const connections = createLocalConnectionIpc();
 const confirmEditorDiscard: ConfirmEditorDiscard = async ({ label, reason }) => window.confirm(
   reason === "reload" ? `${label}: 디스크에서 다시 읽을까요? 현재 편집 내용은 사라집니다.` : `${label}: 미저장 편집 내용을 버리고 닫을까요?`,
 );
-type WizardRequest = { draftId: string; initialDraft: LocalProfileDraft };
+type WizardRequest = { draftId: string; initialDraft: InitialWizardDraft };
 
 function terminalStatus(status: TerminalStatus) {
   switch (status.kind) {
@@ -49,7 +52,7 @@ export function Workspace() {
   const [focusTab, setFocusTab] = useState<number | null>(1);
   const liveTabs = useRef(tabs);
   const closingTabs = useRef(new Set<number>());
-  const remoteTerminals = useRef(new Map<number, { confirmClose(): Promise<void> }>());
+  const sessionClosers = useRef(new Map<number, { confirmClose(): Promise<void> }>());
   useLayoutEffect(() => { liveTabs.current = tabs; }, [tabs]);
   const [focused, setFocused] = useState(false);
   const [windowError, setWindowError] = useState("");
@@ -112,6 +115,20 @@ export function Workspace() {
     });
   }
 
+  function retestStorageTarget(id: string) {
+    if (wizard) return;
+    const profiles = profileLoad.profiles;
+    const target = profiles?.targets.find(({ profile }) => profile.id === id);
+    const group = profiles?.groups.find(({ profile }) => profile.id === target?.profile.groupId);
+    if (target?.profile.defaultMethod !== "ssm" || !group) return;
+    setWizard({
+      draftId: crypto.randomUUID(), initialDraft: {
+        version: 1, groupRevision: group.revision, targetRevision: target.revision,
+        group: group.profile, target: target.profile,
+      }
+    });
+  }
+
   function closeWizard(result: ConnectionClose) {
     setWizard(undefined);
     if (result.kind === "saved") reloadProfiles();
@@ -156,6 +173,12 @@ export function Workspace() {
     selectTab(id);
   }
 
+  function openStorageTab() {
+    const id = nextTab.current++;
+    setTabs(current => [...current, { kind: "storage", id, label: `S3 ${id}` }]);
+    selectTab(id);
+  }
+
   async function openEditor() {
     if (openingFile.current) return;
     openingFile.current = true;
@@ -188,15 +211,15 @@ export function Workspace() {
   async function closeTab(id: number) {
     const tab = liveTabs.current.find(item => item.id === id);
     if (!tab || closingTabs.current.has(id)) return;
-    if (tab.kind === "terminal" && (tab.ssm || tab.ssh)) {
+    if (tab.kind === "storage" || (tab.kind === "terminal" && (tab.ssm || tab.ssh))) {
       closingTabs.current.add(id);
-      setTabs(current => current.map(item => item.id === id && item.kind === "terminal" ? { ...item, closeStatus: "closing" } : item));
+      setTabs(current => current.map(item => item.id === id && item.kind !== "editor" ? { ...item, closeStatus: "closing" } : item));
       try {
-        const terminal = remoteTerminals.current.get(id);
-        if (!terminal) throw new Error("세션 종료 상태를 확인할 수 없습니다");
-        await terminal.confirmClose();
+        const session = sessionClosers.current.get(id);
+        if (!session) throw new Error("세션 종료 상태를 확인할 수 없습니다");
+        await session.confirmClose();
       } catch {
-        setTabs(current => current.map(item => item.id === id && item.kind === "terminal" ? { ...item, closeStatus: "unconfirmed" } : item));
+        setTabs(current => current.map(item => item.id === id && item.kind !== "editor" ? { ...item, closeStatus: "unconfirmed" } : item));
         return;
       } finally {
         closingTabs.current.delete(id);
@@ -224,7 +247,7 @@ export function Workspace() {
       <TitleBar focused={focused} onToggle={() => setFocused(!focused)} onWindowError={setWindowError}>
         {tabs.map((tab) => {
           const { id, label, kind } = tab;
-          const closeStatus = kind === "terminal" ? tab.closeStatus : undefined;
+          const closeStatus = kind === "editor" ? undefined : tab.closeStatus;
           return <div className="workspace-tab" key={id}>
             <button ref={id === active ? activeButton : undefined} aria-pressed={id === active} onClick={() => selectTab(id)}>{label}</button>
             <button aria-label={`${label} ${closeStatus === "unconfirmed" ? "종료 다시 확인" : "닫기"}`}
@@ -237,6 +260,7 @@ export function Workspace() {
             </span>}
           </div>
         })}
+        <button type="button" className="storage-add" onClick={openStorageTab}>스토리지 탭 추가</button>
       </TitleBar>
       <div className="workspace-body" ref={body}>
         <aside className="workspace-tree" hidden={focused}>
@@ -253,30 +277,34 @@ export function Workspace() {
           <LocalTree profiles={profileLoad.profiles} onOpen={openTab} onRegisterSshHost={(targetId) => void registerSavedSshHost(targetId)} />
         </aside>
         <div className="workspace-center">
-          {tabs.map((tab) => (
-            <div className="workspace-session" key={tab.id} hidden={tab.id !== active} inert={tab.id !== active}>
-              {tab.kind === "terminal" ? (
-                <TerminalView active={tab.id === active} focusRequested={tab.id === focusTab} label={tab.label} targetId={tab.targetId}
-                  remote={!!tab.ssm} ssh={tab.ssh} closing={!!tab.closeStatus} closeRef={tab.ssm || tab.ssh ? (handle) => {
-                    if (handle) remoteTerminals.current.set(tab.id, handle);
-                    else remoteTerminals.current.delete(tab.id);
-                  } : undefined}
-                  onStatus={(status, sessionId) => updateStatus(tab.id, status, sessionId)} />
+          {tabs.map(tab => {
+            const { id, label } = tab;
+            const bindClose = (handle: { confirmClose(): Promise<void> } | null) => {
+              if (handle) sessionClosers.current.set(id, handle);
+              else sessionClosers.current.delete(id);
+            };
+            return <div className="workspace-session" key={id} hidden={id !== active} inert={id !== active || (tab.kind === "storage" && !!tab.closeStatus)}>
+              {tab.kind === "storage" ? (
+                <StorageTab profiles={profileLoad.profiles} closing={!!tab.closeStatus} closeRef={bindClose} onRetest={retestStorageTarget} />
+              ) : tab.kind === "terminal" ? (
+                <TerminalView active={id === active} focusRequested={id === focusTab} label={label} targetId={tab.targetId}
+                  remote={!!tab.ssm} ssh={tab.ssh} closing={!!tab.closeStatus} closeRef={tab.ssm || tab.ssh ? bindClose : undefined}
+                  onStatus={(status, sessionId) => updateStatus(id, status, sessionId)} />
               ) : (
-                <EditorTab file={tab.file} active={tab.id === active} transport={localEditorTransport} confirmDiscard={confirmEditorDiscard}
-                  focusRequested={tab.id === focusTab}
+                <EditorTab file={tab.file} active={id === active} transport={localEditorTransport} confirmDiscard={confirmEditorDiscard}
+                  focusRequested={id === focusTab}
                   ref={(actions) => {
-                    if (actions) editorActions.current.set(tab.id, actions);
-                    else editorActions.current.delete(tab.id);
+                    if (actions) editorActions.current.set(id, actions);
+                    else editorActions.current.delete(id);
                   }}
                   onClose={(handle) => {
                     if (handle !== tab.file.handle) return;
-                    void closeTab(tab.id);
+                    void closeTab(id);
                     void closeLocalFile(handle).catch((error) => setFileError(`파일 닫기 실패: ${localEditorError(error).message}`));
                   }} />
               )}
-            </div>
-          ))}
+            </div>;
+          })}
         </div>
         <aside className="workspace-ai" hidden={focused} aria-label="AI">
           <LocalAiPanel profilesVersion={loadVersion} />
@@ -293,7 +321,8 @@ export function Workspace() {
           ? [current.targetId ? current.label : "내 PC", current.ssm ?
             `SSM · ${current.ssm.profile} / ${current.ssm.region} / ${current.ssm.instanceId}` : current.ssh ? "SSH" : "로컬", current.sessionId,
           !current.closeStatus && terminalStatus(current.status)].filter(Boolean).join(" · ")
-          : current ? `내 PC · 로컬 파일 · ${current.label}` : "연결 없음"}</span>
+          : current?.kind === "storage" ? `${current.label} · 스토리지`
+            : current ? `내 PC · 로컬 파일 · ${current.label}` : "연결 없음"}</span>
         {windowError && <span role="alert">{windowError}</span>}
         {fileError && <span role="alert">{fileError}</span>}
         {hostRegistration && <span role={hostRegistration.kind}>{hostRegistration.message}</span>}

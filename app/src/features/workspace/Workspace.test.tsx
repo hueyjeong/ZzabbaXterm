@@ -60,11 +60,18 @@ let loadProfiles: () => Promise<SavedConnections>;
 let runConnectionCommand: (command: string, args: unknown) => Promise<unknown>;
 let closeTerminal: (id: string) => Promise<unknown>;
 let runDiscovery: (args: unknown) => Promise<unknown>;
+let runStorage: (command: string, args: unknown) => Promise<unknown>;
 let openFile: () => Promise<unknown>;
 let saveFile: () => Promise<unknown>;
 
 beforeEach(async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  vi.stubGlobal("CSS", { escape: (value: string) => value.replace(/[^\w-]/g, "\\$&") });
+  vi.stubGlobal("matchMedia", vi.fn(() => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() })));
+  const canvas = HTMLCanvasElement.prototype;
+  vi.spyOn(canvas, "getContext").mockImplementation(() => ({
+    clearRect: vi.fn(), fillRect: vi.fn(), beginPath: vi.fn(), moveTo: vi.fn(), lineTo: vi.fn(), stroke: vi.fn(),
+  }) as unknown as CanvasRenderingContext2D);
   viewportWidth = 1200;
   const dialog = window.HTMLDialogElement.prototype;
   // jsdom에는 네이티브 모달 동작이 없다.
@@ -94,6 +101,7 @@ beforeEach(async () => {
   runConnectionCommand = async (command) => { throw new Error(`예상하지 않은 연결 명령: ${command}`); };
   closeTerminal = async () => null;
   runDiscovery = async () => { throw new Error("예상하지 않은 SSM 검색"); };
+  runStorage = async command => { throw new Error(`예상하지 않은 스토리지 명령: ${command}`); };
   openFile = async () => ({ status: "cancelled" });
   saveFile = async () => null;
   native.invoke.mockImplementation(async (command, args) => {
@@ -101,6 +109,7 @@ beforeEach(async () => {
     if (command === "ai_models" || command === "ai_targets" || command === "ai_decisions") return [];
     if (command.startsWith("connection_") || ["verify_ssh_host", "commit_ssh_host", "cancel_ssh_host", "register_saved_ssh_host"].includes(command)) return runConnectionCommand(command, args);
     if (command === "ssm_discovery") return runDiscovery(args);
+    if (command.startsWith("storage_")) return runStorage(command, args);
     if (command === "editor_local_open") return openFile();
     if (command === "editor_local_save") return saveFile();
     if (command === "terminal_start") return starts.get(args.id);
@@ -710,6 +719,150 @@ describe("C02 SSM 연결", () => {
     expect(host.querySelector("dialog")).toBeNull();
   });
 
+  it("구 SSO 연결의 스토리지 개설 거부에서 저장된 대상을 재시험할 수 있다", async () => {
+    loadProfiles = async () => ({
+      version: 1,
+      groups: [{ revision: 1, profile: { id: "dev", displayName: "개발" } }],
+      targets: [{ revision: 2, profile: { id: "legacy", groupId: "dev", displayName: "관리 노드", defaultMethod: "ssm", ssm: node } }],
+    });
+    runStorage = async () => ({ ok: false, error: { stage: "profile", failure: { kind: "retestRequired" }, bytes: 0 } });
+    await restartWorkspace();
+    await press("스토리지 탭 추가");
+    const select = find<HTMLSelectElement>('section[aria-label="AWS S3"] select');
+    await act(async () => {
+      select.value = "legacy";
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await press("스토리지 연결");
+    expect(find('section[aria-label="AWS S3"] [role="alert"]').textContent).toContain("다시 시험하고 저장");
+    await press("연결 재시험");
+    expect(find<HTMLInputElement>('dialog input').value).toBe("관리 노드");
+    expect(connectionCalls("connection_save")).toHaveLength(0);
+  });
+
+  it("개설 응답을 기다리지 않고 정확한 스토리지 탭을 취소한다", async () => {
+    loadProfiles = async () => ({
+      version: 1,
+      groups: [{ revision: 1, profile: { id: "dev", displayName: "개발" } }],
+      targets: [{ revision: 1, profile: { id: "saved-ssm", groupId: "dev", displayName: "관리 노드", defaultMethod: "ssm", ssm: node } }],
+    });
+    const opening = Promise.withResolvers<unknown>();
+    runStorage = async command => command === "storage_open" ? opening.promise : true;
+    await restartWorkspace();
+    await press("스토리지 탭 추가");
+    const select = find<HTMLSelectElement>('section[aria-label="AWS S3"] select');
+    await act(async () => {
+      select.value = "saved-ssm";
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await press("스토리지 연결");
+    const id = storageOpenId();
+    await press("S3 2 닫기");
+    expect(button("S3 2")).toBeUndefined();
+    expect(connectionCalls("storage_close")).toEqual([["storage_close", { request: { sessionId: id } }]]);
+    await act(async () => opening.resolve({ ok: true, value: { sessionId: id, profile: node.profile, region: node.region, endpoint: "https://s3.example.invalid" } }));
+    expect(button("S3 2")).toBeUndefined();
+    expect(connectionCalls("storage_list_objects")).toHaveLength(0);
+  });
+
+  it("SSO 만료 응답의 ID만 재로그인에 보내고 개설이나 전송을 재시도하지 않는다", async () => {
+    loadProfiles = async () => ({
+      version: 1,
+      groups: [{ revision: 1, profile: { id: "dev", displayName: "개발" } }],
+      targets: [{ revision: 1, profile: { id: "saved-ssm", groupId: "dev", displayName: "관리 노드", defaultMethod: "ssm", ssm: node } }],
+    });
+    runStorage = async command => {
+      if (command === "storage_open") return { ok: false, error: { stage: "identity", failure: { kind: "ssoLoginRequired" }, bytes: 0 } };
+      if (command === "storage_relogin") return { ok: true, value: null };
+      throw new Error(command);
+    };
+    await restartWorkspace();
+    await press("스토리지 탭 추가");
+    const select = find<HTMLSelectElement>('section[aria-label="AWS S3"] select');
+    await act(async () => {
+      select.value = "saved-ssm";
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await press("스토리지 연결");
+    expect(connectionCalls("storage_relogin")).toHaveLength(0);
+    await press("SSO 재로그인");
+    expect(connectionCalls("storage_relogin")).toEqual([["storage_relogin", { request: { id: storageOpenId() } }]]);
+    expect(select.value).toBe("saved-ssm");
+    expect(connectionCalls("storage_open")).toHaveLength(1);
+    expect(connectionCalls("storage_upload")).toHaveLength(0);
+    expect(connectionCalls("storage_download")).toHaveLength(0);
+  });
+
+  function storageOpenId() {
+    const calls = connectionCalls("storage_open");
+    const request: unknown = calls[calls.length - 1]?.[1]?.request;
+    if (!request || typeof request !== "object" || !("id" in request) || typeof request.id !== "string") throw new Error("개설 ID 없음");
+    return request.id;
+  }
+
+  it("S3 탭은 로컬 파일 편집과 터미널 전환 중에도 다운로드를 계속한다", async () => {
+    loadProfiles = async () => ({
+      version: 1,
+      groups: [{ revision: 1, profile: { id: "dev", displayName: "개발" } }],
+      targets: [{ revision: 1, profile: { id: "saved-ssm", groupId: "dev", displayName: "관리 노드", defaultMethod: "ssm", ssm: node } }],
+    });
+    await restartWorkspace();
+    const session = { sessionId: "storage-id", profile: node.profile, region: node.region, endpoint: "https://s3.example.invalid" };
+    const key = "실험//한글 +%2F.txt";
+    const picker = Promise.withResolvers<{ kind: "approved"; approvalId: string }>();
+    const downloaded = Promise.withResolvers<unknown>();
+    runStorage = async (command, args) => {
+      switch (command) {
+        case "storage_open": {
+          const request = args && typeof args === "object" && "request" in args ? args.request : undefined;
+          if (!request || typeof request !== "object" || !("id" in request) || typeof request.id !== "string") throw new Error("개설 ID 없음");
+          session.sessionId = request.id;
+          return { ok: true, value: session };
+        }
+        case "storage_list_objects": return { ok: true, value: { rows: [{ kind: "object", key, bytes: 9 }], nextToken: null } };
+        case "storage_select_local_file": return picker.promise;
+        case "storage_download": return downloaded.promise;
+        case "storage_close": return true;
+        default: throw new Error(command);
+      }
+    };
+    await press("스토리지 탭 추가");
+    const select = find<HTMLSelectElement>('section[aria-label="AWS S3"] select');
+    await act(async () => {
+      select.value = "saved-ssm";
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await press("스토리지 연결");
+    expect(connectionCalls("storage_open")).toEqual([["storage_open", { request: { targetId: "saved-ssm", id: session.sessionId } }]]);
+    await changeInput("버킷", "test-bucket");
+    await press("버킷 열기");
+    await press(key);
+    await press("다운로드");
+    openFile = async () => ({ status: "opened", handle: "local-fixture", name: "격리.txt", text: "원본" });
+    await press("파일 열기");
+    const model = editor.getModels().find(item => item.uri.query === "local-fixture")!;
+    await act(async () => model.setValue("미저장 편집"));
+    expect(button("격리.txt")?.getAttribute("aria-pressed")).toBe("true");
+    await act(async () => picker.resolve({ kind: "approved", approvalId: "approved-id" }));
+    expect(connectionCalls("storage_download")).toEqual([["storage_download", {
+      request: {
+        sessionId: session.sessionId, bucket: "test-bucket", region: node.region, key, approvalId: "approved-id",
+      }
+    }]]);
+    expect(connectionCalls("storage_close")).toHaveLength(0);
+    await press("로컬 1");
+    expect(find('section[aria-label="로컬 1"] textarea')).toBe(document.activeElement);
+    await act(async () => downloaded.resolve({ ok: true, value: { bytes: 7, integrity: "sdkChecksumVerified" } }));
+    await press("S3 2");
+    expect(find('section[aria-label="AWS S3"]').textContent).toContain("다운로드 완료: 7 바이트 · SDK 체크섬 검증됨");
+    await press("S3 2 닫기");
+    expect(connectionCalls("storage_close")).toEqual([["storage_close", { request: { sessionId: session.sessionId } }]]);
+    expect(button("S3 2")).toBeUndefined();
+    expect(button("격리.txt")?.getAttribute("aria-pressed")).toBe("true");
+    expect(model.getValue()).toBe("미저장 편집");
+    expect(connectionCalls("editor_local_close")).toHaveLength(0);
+  });
+
   it("SSM 탭은 종료 확인 전 남고 같은 앱 세션 ID로만 다시 확인한다", async () => {
     const close = Promise.withResolvers<null>();
     loadProfiles = async () => ({
@@ -776,12 +929,6 @@ describe("C02 SSM 연결", () => {
     const ending = Promise.withResolvers<null>();
     const saving = Promise.withResolvers<null>();
     saveFile = () => saving.promise;
-    vi.stubGlobal("CSS", { escape: (value: string) => value.replace(/[^\w-]/g, "\\$&") });
-    vi.stubGlobal("matchMedia", vi.fn(() => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() })));
-    const canvas = HTMLCanvasElement.prototype;
-    vi.spyOn(canvas, "getContext").mockImplementation(() => ({
-      clearRect: vi.fn(), fillRect: vi.fn(), beginPath: vi.fn(), moveTo: vi.fn(), lineTo: vi.fn(), stroke: vi.fn(),
-    }) as unknown as CanvasRenderingContext2D);
     loadProfiles = async () => ({
       version: 1,
       groups: [{ revision: 1, profile: { id: "dev", displayName: "개발" } }],

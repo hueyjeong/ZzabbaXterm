@@ -5,10 +5,12 @@ mod local_ipc;
 #[allow(dead_code, reason = "SFTP는 별도 통합 경계")]
 mod ssh;
 pub mod ssm;
+mod storage;
 mod terminal;
 mod workspace_window;
 
 use editor::registry::LocalEditors;
+use storage::ipc::{self as storage_ipc, StorageIpc};
 use tauri::Manager;
 use terminal::{Sessions, ipc::*};
 use workspace_window::workspace_window;
@@ -22,6 +24,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(Sessions::default())
         .manage(LocalEditors::default())
+        .manage(StorageIpc::default())
         .manage(ai::ipc::State::default())
         .plugin(ssm::ipc::lifecycle())
         .setup(|app| {
@@ -38,6 +41,7 @@ pub fn run() {
                 }
                 webview.state::<Sessions>().navigate(webview.label());
                 webview.state::<LocalEditors>().navigate(webview.label());
+                webview.state::<StorageIpc>().navigate(webview.label());
             }
         })
         .invoke_handler(move |invoke| {
@@ -50,6 +54,8 @@ pub fn run() {
             } else if invoke.message.command() == ssm::ipc::COMMAND {
                 ssm::ipc::dispatch(invoke);
                 true
+            } else if invoke.message.command().starts_with("storage_") {
+                storage_ipc::dispatch(invoke)
             } else {
                 match editor::ipc::dispatch(invoke) {
                     Ok(()) => true,
@@ -76,8 +82,12 @@ pub fn run() {
                 }
                 app.state::<Sessions>().destroy(&label);
                 app.state::<LocalEditors>().destroy(&label);
+                app.state::<StorageIpc>().navigate(&label);
             }
-            tauri::RunEvent::Exit => app.state::<Sessions>().shutdown(),
+            tauri::RunEvent::Exit => {
+                app.state::<StorageIpc>().shutdown();
+                app.state::<Sessions>().shutdown();
+            }
             _ => {}
         });
 }

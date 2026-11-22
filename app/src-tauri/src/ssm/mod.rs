@@ -10,6 +10,8 @@ mod session;
 mod windows_acl;
 
 pub use cli::{CliError, CommandSpec};
+pub(crate) use home::{sso_cache_entry, user_home};
+pub(crate) use profile::DirectSsoConfig;
 pub use session::{SessionLookup, StartPermit, StartRequest, VerificationError, VerifiedSession};
 pub(crate) use session::start_rejection;
 #[cfg(test)]
@@ -48,6 +50,10 @@ impl Scope {
 
     pub fn region(&self) -> &str {
         &self.region
+    }
+
+    pub(crate) fn direct_sso_config(&self) -> Result<DirectSsoConfig, CliError> {
+        Profiles::load()?.take_export_config(self.profile())
     }
 
     fn command(
@@ -123,8 +129,8 @@ impl AwsCli {
         let profiles = Profiles::load()?;
         let config = profiles.export_config(scope.profile())?;
         let home = home::CliHome::new()?;
-        home.import_sso_token(&home::user_home()?, &config.cache_key)?;
-        self.online_nodes_with(scope, &config.ini, Arc::new(home), |spec| async move {
+        home.import_sso_token(&home::user_home()?, config.cache_key())?;
+        self.online_nodes_with(scope, &config.cli_ini(), Arc::new(home), |spec| async move {
             spec.capture(cancel).await
         })
         .await
@@ -188,6 +194,17 @@ impl AwsCli {
         cancel: &CancellationToken,
     ) -> Result<(), CliError> {
         self.relogin_command(scope, cause)?.login(cancel).await
+    }
+
+    pub(crate) async fn relogin_saved(
+        &self, scope: &Scope, approved: &DirectSsoConfig, cancel: &CancellationToken,
+    ) -> Result<(), CliError> {
+        use std::io::Write;
+
+        if scope.direct_sso_config()? != *approved { return Err(CliError::CallerChanged); }
+        let mut snapshot = tempfile::NamedTempFile::new().map_err(|_| CliError::ProcessIo)?;
+        snapshot.write_all(approved.cli_ini_for(scope.profile()).as_bytes()).map_err(|_| CliError::ProcessIo)?;
+        self.login_command(scope.profile()).login_with_config(snapshot.path(), cancel).await
     }
 
     fn login_command(&self, profile: &str) -> CommandSpec {
