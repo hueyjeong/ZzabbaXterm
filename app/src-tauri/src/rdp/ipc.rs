@@ -9,7 +9,7 @@ use tauri::{Manager, UriSchemeContext, UriSchemeResponder, Webview, WebviewWindo
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::{connections::profile::valid_id, tunnels::{Destination, ipc::{Protocol, TunnelTabs}}};
+use crate::{connections::{profile::{SshTransport, valid_id}, with_saved_ssh}, tunnels::{Destination, ipc::{Protocol, TunnelTabs}}};
 use super::{Error, Event, Session, native, route};
 use input::{Command, Controls};
 
@@ -285,10 +285,19 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
     let _prompt_lifetime = prompt.clone().drop_guard();
     let dns = draft.host.to_ascii_lowercase();
     let description = draft.approval_text(&dns).map_err(message)?;
-    native::confirm(window.clone(), description, prompt.clone(), approval.clone()).await.map_err(message)?;
     let size = DesktopSize { width: 1024, height: 768 };
     let mut lease;
     let (target, loss, target_name) = if let Some(source) = draft.source {
+        let directory = window.path().app_config_dir().map_err(|error| error.to_string())?;
+        let load_directory = directory.clone();
+        let target_id = source.target_id.clone();
+        let (revision, ssh) = tauri::async_runtime::spawn_blocking(move || with_saved_ssh(&load_directory, &target_id, |saved| saved))
+            .await.map_err(|_| message(Error::Transport))??
+            .filter(|(_, ssh)| matches!(ssh.transport, SshTransport::Direct {}))
+            .ok_or("저장된 직접 SSH 접속 설정이 없습니다")?;
+        let description = format!("{description}\nSSH 서버: {}:{}\nSSH 계정: {}\nSSH 호스트 키: {}",
+            ssh.host, ssh.port, ssh.account, ssh.host_key_fingerprint);
+        native::confirm(window.clone(), description, prompt.clone(), approval.clone()).await.map_err(message)?;
         let destination = Destination { host: source.destination.host, port: source.destination.port };
         let target_name = format!("{dns} (TLS DNS)");
         let caller = window.clone();
@@ -296,9 +305,8 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
         // 발급 중 취소되어도 작업을 기다려 인계 소켓과 임대를 이 경로에서 정리한다.
         let (issued, approved_destination) = tauri::async_runtime::spawn_blocking(move || {
             if live.is_cancelled() { return Err(CLOSED.into()); }
-            let directory = caller.path().app_config_dir().map_err(|error| error.to_string())?;
             let lease = caller.state::<TunnelTabs>().open_desktop(tunnel_epoch, &directory,
-                (&source.tab_handle, &source.tunnel_id), &source.target_id, &destination, Protocol::Rdp)?;
+                (&source.tab_handle, &source.tunnel_id), &source.target_id, &destination, Protocol::Rdp, (revision, &ssh))?;
             Ok::<_, String>((lease, destination))
         }).await.map_err(|_| message(Error::Transport))??;
         lease = issued;
@@ -307,6 +315,7 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
         let target = route::forwarded(dns, &approved_destination, size, &mut lease).map_err(message)?;
         (target, Some(loss), target_name)
     } else {
+        native::confirm(window.clone(), description, prompt.clone(), approval.clone()).await.map_err(message)?;
         let target_name = format!("{dns}:{}", draft.port);
         (route::direct(dns, draft.port, size), None, target_name)
     };

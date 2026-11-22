@@ -335,7 +335,8 @@ impl TunnelTabs {
     /// 네이티브 승인과 문서 검증을 마친 그래픽 작업에만 연결 소켓을 인계한다.
     #[allow(dead_code, reason = "R02·R03의 네이티브 세션에서 사용")]
     pub(crate) fn open_desktop(&self, epoch: u64, directory: &Path, source: (&str, &str),
-                               target: &str, destination: &Destination, protocol: Protocol) -> Result<DesktopLease, String> {
+                               target: &str, destination: &Destination, protocol: Protocol,
+                               confirmed_ssh: (NonZeroU64, &Ssh)) -> Result<DesktopLease, String> {
         let (handle, id) = source;
         let id = TunnelId(id.parse().map_err(|_| "터널 ID가 올바르지 않습니다")?);
         let mut doc = self.document(epoch)?;
@@ -347,7 +348,9 @@ impl TunnelTabs {
         let document = Arc::downgrade(&self.0);
         // 읽기 잠금을 소켓 검증과 등록까지 유지해 저장 설정 변경과 발급을 직렬화한다.
         with_saved_ssh(directory, target, |current| {
-            if current.as_ref() != Some(approved.as_ref()) || !matches!(approved.1.transport, SshTransport::Direct {}) {
+            if confirmed_ssh != (approved.0, &approved.1) || current.as_ref() != Some(approved.as_ref())
+                || !matches!(approved.1.transport, SshTransport::Direct {})
+            {
                 return Err("승인된 SSH 접속 설정이 변경되었습니다".into());
             }
             if service != Some(protocol) { return Err("승인된 터널 서비스가 일치하지 않습니다".into()); }

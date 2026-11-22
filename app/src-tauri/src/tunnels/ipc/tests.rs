@@ -78,6 +78,7 @@ fn desktop_rejects_protocol_mismatch_and_changed_saved_ssh_before_connecting() {
     };
     profile["target"]["ssh"]["auth"] = key("original");
     save(profile.clone());
+    let original = with_saved_ssh(dir.path(), target, |saved| saved.unwrap()).unwrap();
     let epoch = tabs.epoch();
     let handle = tabs.open(epoch, dir.path(), target.into(), "시험 터널".into()).unwrap();
     let destination = Destination { host: "127.0.0.1".into(), port: 3389 };
@@ -91,23 +92,46 @@ fn desktop_rejects_protocol_mismatch_and_changed_saved_ssh_before_connecting() {
         id.0.to_string()
     };
     let outsider = tabs.open(epoch, dir.path(), target.into(), "별도 탭".into()).unwrap();
-    assert_eq!(tabs.open_desktop(epoch, dir.path(), (&outsider, &id), target, &destination, Protocol::Rdp)
+    assert_eq!(tabs.open_desktop(epoch, dir.path(), (&outsider, &id), target, &destination, Protocol::Rdp, (original.0, &original.1))
         .err().unwrap(), "이 탭이 소유한 터널이 아닙니다");
-    let issue = |protocol| tabs.open_desktop(epoch, dir.path(), (&handle, &id), target, &destination, protocol);
-    assert_eq!(issue(Protocol::Vnc).err().unwrap(), "승인된 터널 서비스가 일치하지 않습니다");
-    assert_eq!(issue(Protocol::Rdp).err().unwrap(), "터널 수신이 준비되지 않았습니다");
+    let issue = |handle: &str, protocol, approved: &SavedSsh| tabs.open_desktop(
+        epoch, dir.path(), (handle, &id), target, &destination, protocol, (approved.0, &approved.1),
+    );
+    assert_eq!(issue(&handle, Protocol::Vnc, &original).err().unwrap(), "승인된 터널 서비스가 일치하지 않습니다");
+    assert_eq!(issue(&handle, Protocol::Rdp, &original).err().unwrap(), "터널 수신이 준비되지 않았습니다");
 
     profile["targetRevision"] = json!(1);
     profile["target"]["ssh"]["auth"] = key("replacement");
     save(profile.clone());
-    assert_eq!(issue(Protocol::Rdp).err().unwrap(), "승인된 SSH 접속 설정이 변경되었습니다");
+    let replacement = with_saved_ssh(dir.path(), target, |saved| saved.unwrap()).unwrap();
+    assert_eq!(issue(&handle, Protocol::Rdp, &original).err().unwrap(), "승인된 SSH 접속 설정이 변경되었습니다");
     profile["targetRevision"] = json!(2);
     profile["target"]["ssh"]["auth"] = key("original");
     save(profile);
-    assert_eq!(issue(Protocol::Rdp).err().unwrap(), "승인된 SSH 접속 설정이 변경되었습니다");
+    assert_eq!(issue(&handle, Protocol::Rdp, &original).err().unwrap(), "승인된 SSH 접속 설정이 변경되었습니다");
+
+    let restored = with_saved_ssh(dir.path(), target, |saved| saved.unwrap()).unwrap();
+    assert_eq!(restored.1, original.1);
+    assert_ne!(restored.0, original.0);
+    let reopened = tabs.open(epoch, dir.path(), target.into(), "원복 후 터널".into()).unwrap();
+    let reopened_id = {
+        let mut doc = tabs.document(epoch).unwrap();
+        let owner = doc.tabs[&reopened].owner.clone();
+        let route = doc.tunnels.entries[&TunnelId(id.parse().unwrap())].route.clone();
+        let id = doc.tunnels.begin(owner, route).unwrap();
+        doc.tabs.get_mut(&reopened).unwrap().ids.push(id);
+        doc.entries.insert(id, Entry { endpoint: String::new(), protocol: Some(Protocol::Rdp) });
+        id.0.to_string()
+    };
+    let issue_reopened = |approved: &SavedSsh| tabs.open_desktop(epoch, dir.path(), (&reopened, &reopened_id),
+        target, &destination, Protocol::Rdp, (approved.0, &approved.1));
+    let different_ssh = (restored.0, replacement.1);
+    assert_eq!(issue_reopened(&original).err().unwrap(), "승인된 SSH 접속 설정이 변경되었습니다");
+    assert_eq!(issue_reopened(&different_ssh).err().unwrap(), "승인된 SSH 접속 설정이 변경되었습니다");
+    assert_eq!(issue_reopened(&restored).err().unwrap(), "터널 수신이 준비되지 않았습니다");
 
     tabs.navigate(false);
-    assert_eq!(issue(Protocol::Rdp).err().unwrap(), STALE);
+    assert_eq!(issue(&handle, Protocol::Rdp, &original).err().unwrap(), STALE);
 }
 
 #[test]
