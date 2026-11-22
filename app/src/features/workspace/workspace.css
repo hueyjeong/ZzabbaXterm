@@ -129,7 +129,7 @@
 .local-file-open { min-height: 36px; padding-inline: 8px; }
 .local-file-open:disabled { opacity: .5; cursor: default; }
 .connection-search { width: calc(100% - 24px); margin: 0 12px; }
-.connection-search, .connection-wizard :is(input, select) {
+.connection-search, .connection-wizard :is(input, select), .tunnel-panel :is(input, select) {
   box-sizing: border-box; padding: 6px; color: inherit; background: #12171b; border: 1px solid var(--border);
 }
 .connection-status { padding: 6px 12px; overflow-wrap: anywhere; }
