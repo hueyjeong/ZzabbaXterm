@@ -17,7 +17,7 @@ use std::{ffi::OsStr, io, path::Path, sync::Arc};
 #[derive(Clone, Copy)]
 pub(crate) enum SessionDocument<'a> {
     DefaultShell,
-    AiSharedControl { account_id: &'a str, target: &'a str },
+    AiSharedControl { role: &'a AssumedRole, target: &'a str },
 }
 
 // 각 요청을 앱 세션에 보관하고 start-session은 요청당 한 번만 호출한다.
@@ -27,6 +27,7 @@ pub struct StartRequest {
     document_name: Option<&'static str>,
     reason: String,
     owner: Arc<str>,
+    role: Option<Arc<AssumedRole>>,
     credentials: Arc<Credentials>,
     program: Arc<Path>,
     command_issued: bool,
@@ -92,6 +93,7 @@ pub(crate) fn fixture_start(program: &Path) -> (AwsCli, Scope, StartRequest, Sta
         document_name: None,
         reason: "zzabbaxterm-0123456789abcdef0123456789abcdef".into(),
         owner: "arn:aws:sts::123456789012:assumed-role/Sample/Sample".into(),
+        role: None,
         credentials: credentials.clone(),
         program: program.clone(),
         command_issued: true,
@@ -282,6 +284,10 @@ impl AwsCli {
 impl StartRequest {
     pub(crate) fn account_id(&self) -> &str {
         caller_account_id(&self.owner)
+    }
+
+    pub(crate) fn assumed_role(&self) -> Option<&Arc<AssumedRole>> {
+        self.role.as_ref()
     }
 
     async fn wait_connected_with(
@@ -628,11 +634,11 @@ fn caller_account_id(owner: &str) -> &str {
 fn prepare_start(scope: &Scope, node: &OnlineNode, document: SessionDocument<'_>) -> Result<StartRequest, CliError> {
     let document_name = match document {
         SessionDocument::DefaultShell => None,
-        SessionDocument::AiSharedControl { account_id, target } => {
+        SessionDocument::AiSharedControl { role, target } => {
             if target != node.instance_id() {
                 return Err(CliError::InvalidTarget);
             }
-            if account_id != caller_account_id(&node.owner) {
+            if node.role.as_deref() != Some(role) {
                 return Err(CliError::CallerChanged);
             }
             Some("ZzabbaAiSharedControl")
@@ -646,6 +652,7 @@ fn prepare_start(scope: &Scope, node: &OnlineNode, document: SessionDocument<'_>
         document_name,
         reason: format!("zzabbaxterm-{:032x}", u128::from_be_bytes(nonce)),
         owner: node.owner.clone(),
+        role: node.role.clone(),
         credentials: node.credentials.clone(),
         program: node.program.clone(),
         command_issued: false,
@@ -665,22 +672,46 @@ pub(super) fn identity_command(
         .with_credentials(scope, credentials)
 }
 
-pub(super) fn captured_caller_arn(captured: Captured) -> Result<String, CliError> {
-    parse_caller_arn(&captured.success()?)
+#[derive(PartialEq, Eq)]
+pub(crate) struct AssumedRole {
+    partition: Box<str>,
+    account: Box<str>,
+    id: Box<str>,
 }
 
-fn parse_caller_arn(bytes: &[u8]) -> Result<String, CliError> {
+impl std::fmt::Debug for AssumedRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AssumedRole(..)")
+    }
+}
+
+#[cfg(test)]
+impl AssumedRole {
+    pub(crate) fn fixture(account: &str) -> Arc<Self> {
+        Arc::new(Self { partition: "aws".into(), account: account.into(), id: "AROADBQP57FF2AEXAMPLE".into() })
+    }
+}
+
+pub(super) fn captured_caller(captured: Captured) -> Result<(Arc<str>, Option<Arc<AssumedRole>>), CliError> {
+    parse_caller(&captured.success()?)
+}
+
+fn parse_caller(bytes: &[u8]) -> Result<(Arc<str>, Option<Arc<AssumedRole>>), CliError> {
     #[derive(Deserialize)]
     #[serde(rename_all = "PascalCase")]
     struct Identity {
+        // 일반 셸은 ARN으로 소유자를 확인하고, A03만 추가 역할 증거를 요구한다.
         arn: String,
+        account: Option<serde_json::Value>,
+        user_id: Option<serde_json::Value>,
     }
-    let Identity { arn } = decode(bytes)?;
+    let identity: Identity = decode(bytes)?;
+    let arn = identity.arn;
     let mut fields = arn.splitn(6, ':');
     let [
         Some("arn"),
         Some(partition),
-        Some("iam" | "sts"),
+        Some(service @ ("iam" | "sts")),
         Some(""),
         Some(account),
         Some(resource),
@@ -697,7 +728,33 @@ fn parse_caller_arn(bytes: &[u8]) -> Result<String, CliError> {
     {
         return Err(CliError::InvalidResponse);
     }
-    Ok(arn)
+    let role = if service == "sts" && identity.account.as_ref().and_then(serde_json::Value::as_str) == Some(account) {
+        identity.user_id.as_ref().and_then(serde_json::Value::as_str)
+            .and_then(|user_id| assumed_role(partition, account, resource, user_id))
+    } else {
+        None
+    };
+    Ok((Arc::from(arn), role))
+}
+
+fn assumed_role(partition: &str, account: &str, resource: &str, user_id: &str) -> Option<Arc<AssumedRole>> {
+    if partition != "aws" && !partition.strip_prefix("aws-").is_some_and(|suffix| {
+        suffix.split('-').all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()))
+    }) {
+        return None;
+    }
+    let (name, session) = resource.strip_prefix("assumed-role/")?.split_once('/')?;
+    let (id, user_session) = user_id.split_once(':')?;
+    let valid_name = |name: &str, min: usize| {
+        (min..=64).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"_+=,.@-".contains(&b))
+    };
+    let suffix = id.strip_prefix("AROA")?;
+    if !valid_name(name, 1) || !valid_name(session, 2) || user_session != session
+        || !(16..=128).contains(&id.len()) || !suffix.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(Arc::new(AssumedRole { partition: partition.into(), account: account.into(), id: id.into() }))
 }
 
 fn valid_session_id(id: &str) -> bool {

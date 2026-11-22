@@ -57,7 +57,8 @@ impl Target {
         let document = match central {
             Some(identity) if self.scope.profile() == identity.profile && self.scope.region() == identity.region
                 && self.instance_id == identity.instance_id => SessionDocument::AiSharedControl {
-                    account_id: &identity.account_id, target: &identity.instance_id,
+                    role: identity.role.as_deref().ok_or_else(|| start_error(CliError::CallerChanged))?,
+                    target: &identity.instance_id,
                 },
             Some(_) => return Err(start_error(CliError::InvalidTarget)),
             None => SessionDocument::DefaultShell,
@@ -90,6 +91,7 @@ fn shared_control_rejects_mismatched_target_and_default_shell_fixture() {
     let mut target = Target::new("fixture", "us-west-2", "i-01234567").unwrap();
     let identity = LiveSsmIdentity {
         id: "0".into(), document: 0, account_id: "123456789012".into(),
+        role: Some(crate::ssm::AssumedRole::fixture("123456789012")),
         profile: "fixture".into(), region: "us-west-2".into(), instance_id: "i-01234567".into(),
     };
     let invalid = start_error(CliError::InvalidTarget);
@@ -105,6 +107,9 @@ fn shared_control_rejects_mismatched_target_and_default_shell_fixture() {
     ] {
         check(&target, &change);
     }
+    let no_role = LiveSsmIdentity { role: None, ..identity.clone() };
+    assert_eq!(tauri::async_runtime::block_on(target.prepare(Some(&no_role), &cancel)).err(),
+        Some(start_error(CliError::CallerChanged)));
     target.fixture = Some(std::path::PathBuf::new());
     check(&target, &identity);
 }
@@ -122,6 +127,7 @@ pub(super) struct Remote {
 
 pub(super) struct SsmIdentity {
     pub(super) account_id: String,
+    pub(super) role: Option<std::sync::Arc<crate::ssm::AssumedRole>>,
     pub(super) profile: String,
     pub(super) region: String,
     pub(super) instance_id: String,
@@ -157,6 +163,7 @@ impl Remote {
         if self.is_fixture { return Ok(None); }
         Ok(Some(SsmIdentity {
             account_id: self.account_id().into(),
+            role: self.request.assumed_role().cloned(),
             profile: self.scope.profile().into(),
             region: self.scope.region().into(),
             instance_id: self.request.target().into(),

@@ -73,6 +73,7 @@ pub(crate) struct LiveSsmIdentity {
     pub(crate) id: String,
     pub(crate) document: u64,
     pub(crate) account_id: String,
+    pub(crate) role: Option<Arc<crate::ssm::AssumedRole>>,
     pub(crate) profile: String,
     pub(crate) region: String,
     pub(crate) instance_id: String,
@@ -118,6 +119,7 @@ impl Sessions {
             id: id.into(),
             document,
             account_id: identity.account_id.clone(),
+            role: identity.role.clone(),
             profile: identity.profile.clone(),
             region: identity.region.clone(),
             instance_id: identity.instance_id.clone(),
@@ -129,7 +131,8 @@ impl Sessions {
         let registry = self.registry.lock().unwrap();
         registry.main_session(owner, identity.document, &identity.id)?.with_ssm_identity(|live| {
             (live.account_id == identity.account_id && live.profile == identity.profile
-                && live.region == identity.region && live.instance_id == identity.instance_id).then(check)
+                && live.region == identity.region && live.instance_id == identity.instance_id
+                && live.role == identity.role).then(check)
         }).flatten()
     }
 

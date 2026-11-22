@@ -67,6 +67,16 @@ fn rejects_stale_or_foreign_central_identity_without_starting_cli() {
 }
 
 #[test]
+fn rejects_live_central_session_without_verified_role_before_starting_cli() {
+    let sessions = Sessions::default();
+    let document = sessions.document(OWNER);
+    let selected = sessions.insert_live_ssm_fixture(OWNER, document, ACCOUNT, REGION, NODE).without_role();
+    assert!(require_live(&sessions, OWNER, &selected.identity).is_ok());
+    let cancel = CancellationToken::new();
+    assert!(matches!(ControlTransport::open(&sessions, OWNER, &selected.identity, &cancel), Err(error) if error == UNAVAILABLE));
+}
+
+#[test]
 fn enforces_frame_size_and_requires_an_observed_official_connection() {
     let sessions = Sessions::default();
     let selected = sessions.insert_live_ssm_fixture(OWNER, sessions.document(OWNER), ACCOUNT, REGION, NODE);

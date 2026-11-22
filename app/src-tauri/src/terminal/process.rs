@@ -863,6 +863,17 @@ pub(crate) struct LiveSsmFixture<'a> {
 }
 
 #[cfg(test)]
+impl LiveSsmFixture<'_> {
+    pub(crate) fn without_role(mut self) -> Self {
+        self.identity.role = None;
+        let registry = self.sessions.registry.lock().unwrap();
+        registry.sessions[&self.id].flow.lock().unwrap().ssm_identity.as_mut().unwrap().role = None;
+        drop(registry);
+        self
+    }
+}
+
+#[cfg(test)]
 impl Drop for LiveSsmFixture<'_> {
     fn drop(&mut self) {
         self.sessions.registry.lock().unwrap().sessions.remove(&self.id);
@@ -874,10 +885,12 @@ impl super::Sessions {
     pub(crate) fn insert_live_ssm_fixture(&self, owner: &str, document: u64, account_id: &str, region: &str, instance_id: &str) -> super::LiveSsmFixture<'_> {
         let mut session = Session::new(owner, true);
         session.document = Some(document);
+        let role = Some(crate::ssm::AssumedRole::fixture(account_id));
         *session.flow.get_mut().unwrap() = Flow {
             started: true,
             ssm_identity: Some(remote::SsmIdentity {
                 account_id: account_id.into(), profile: "fixture".into(), region: region.into(), instance_id: instance_id.into(),
+                role: role.clone(),
             }),
             ..Flow::default()
         };
@@ -885,6 +898,7 @@ impl super::Sessions {
         self.registry.lock().unwrap().sessions.insert(id.clone(), Arc::new(session));
         let identity = super::LiveSsmIdentity {
             id: id.clone(), document, account_id: account_id.into(), profile: "fixture".into(), region: region.into(), instance_id: instance_id.into(),
+            role,
         };
         LiveSsmFixture { sessions: self, id, identity }
     }
@@ -918,6 +932,9 @@ fn live_ssm_identity_is_checked_under_registry_and_flow_locks() {
     let wrong_profile = sessions.with_live_ssm_session("main", &LiveSsmIdentity {
         profile: "another-profile".into(), ..expected.clone()
     }, || 7);
+    let wrong_role = sessions.with_live_ssm_session("main", &LiveSsmIdentity {
+        role: None, ..expected.clone()
+    }, || 7);
     session.flow.lock().unwrap().child_exited = true;
     let exited = check();
     session.flow.lock().unwrap().child_exited = false;
@@ -939,6 +956,7 @@ fn live_ssm_identity_is_checked_under_registry_and_flow_locks() {
     assert_eq!(locked, Some((true, true)));
     assert_eq!(wrong_node, None);
     assert_eq!(wrong_profile, None);
+    assert_eq!(wrong_role, None);
     assert_eq!(exited, None);
     assert_eq!(cancelled, None);
     assert_eq!(stopped, None);

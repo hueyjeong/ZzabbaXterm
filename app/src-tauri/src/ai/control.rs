@@ -59,6 +59,9 @@ impl<'a> ControlTransport<'a> {
             return Err(CANCELLED.into());
         }
         require_live(sessions, owner, identity)?;
+        if identity.role.is_none() {
+            return Err(UNAVAILABLE.into());
+        }
         let target = Target::new(&identity.profile, &identity.region, &identity.instance_id)?;
         let session = Arc::new(Session::dedicated(cancel.child_token()));
         // 미확인 PTY 출력 크레딧이 바이트 큐를 제한한다. 블로킹 전송은 종료를 막을 수 있다.
