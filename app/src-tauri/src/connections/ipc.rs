@@ -17,6 +17,13 @@ pub(crate) fn handle(invoke: Invoke, other: fn(Invoke) -> bool) -> bool {
             })
         }),
         crate::ssh::registration::COMMAND => crate::ssh::registration::verify_ssh_host(invoke),
+        "connection_ssh_test_attach" => dispatch(invoke, "connection_ssh_test_attach", |args| {
+            let run = args.get("run")?;
+            let rows = args.get("rows")?;
+            let cols = args.get("cols")?;
+            let output = args.channel("output")?;
+            Ok(move |caller: Webview, document| probe::attach(&caller.state::<Sessions>(), caller.label(), document, &run, rows, cols, output))
+        }),
         "connection_test_wait" => dispatch(invoke, "connection_test_wait", |args| {
             let run = args.get("run")?;
             Ok(move |caller: Webview, document| probe::wait(&caller.state::<Sessions>(), caller.label(), document, &run))
@@ -52,6 +59,11 @@ impl Args<'_> {
     fn get<T: DeserializeOwned>(&self, key: &'static str) -> Result<T, InvokeError> {
         let Invoke { message, acl, .. } = self.0;
         T::from_command(CommandItem { name: self.1, key, plugin: None, message, acl })
+    }
+
+    fn channel(&self, key: &'static str) -> Result<tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>, InvokeError> {
+        let Invoke { message, acl, .. } = self.0;
+        CommandArg::from_command(CommandItem { name: self.1, key, plugin: None, message, acl })
     }
 }
 

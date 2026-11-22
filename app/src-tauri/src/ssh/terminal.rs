@@ -30,8 +30,10 @@ impl DirectLaunch {
         (self.command, self.plan)
     }
 
-    pub(crate) fn for_probe(mut self) -> Self {
-        self.command.arg("printf 'ZZABBA-F01:%d\\n' \"$((314000+159))\"");
+    pub(crate) fn for_probe(mut self, nonce: u128) -> Self {
+        self.command.get_argv_mut().insert(1, "-T".into());
+        // 원격 명령의 출력에만 완성된 표식이 나타난다.
+        self.command.arg(format!("printf 'ZZABBA-F01:%s%s\\n' '{:016x}' '{:016x}'", (nonce >> 64) as u64, nonce as u64));
         self
     }
 
@@ -41,6 +43,11 @@ impl DirectLaunch {
         self.command.env("ZZABBA_F01_FIXTURE_WAIT", "1");
         self.plan.config.clone()
     }
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn restrict_fixture_key(path: &Path) {
+    super::trust_windows::create_file(path).unwrap();
 }
 
 

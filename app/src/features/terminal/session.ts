@@ -1,4 +1,5 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
+import type { ConnectionTestRun } from "../connections/profiles";
 
 export type TerminalStatus =
   | { kind: "opening" | "connecting" | "running" }
@@ -28,6 +29,14 @@ const tauriIpc: LocalTerminalIpc = {
   ack: (id, position) => invoke("terminal_ack", { id, position }),
   close: (id) => invoke("terminal_close", { id }),
 };
+
+export function sshTestIpc(run: ConnectionTestRun, cancel: () => Promise<void>): LocalTerminalIpc {
+  return {
+    ...tauriIpc,
+    open: (size, receive) => invoke("connection_ssh_test_attach", { run, ...size, output: new Channel(receive) }),
+    close: cancel,
+  };
+}
 
 export interface LocalTerminal {
   input(data: string, source?: "user" | "terminal"): void;

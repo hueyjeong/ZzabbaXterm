@@ -148,21 +148,30 @@ impl Sessions {
         }
         Ok(id)
     }
+    #[cfg(test)]
+    pub(crate) fn reopen_ssh_fixture(&self, config: &std::path::Path, id: &str, output: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>) -> Result<String, String> {
+        self.open_document("main", self.document("main"), size(24, 100), saved::launch(config, id)?,
+            move |event| event.send(&output).map_err(|error| error.to_string()))
+    }
+
 
     fn get(&self, owner: &str, id: &str) -> Result<Arc<Session>, String> {
-        let session = self.registry.lock().unwrap().sessions.get(id).cloned()
-            .ok_or(CLOSED)?;
+        let registry = self.registry.lock().unwrap();
+        let session = registry.sessions.get(id).cloned().or_else(|| {
+            let probe = registry.probes.attached_probe(owner, id)?;
+            probe.attached().then(|| probe.session())
+        }).ok_or(CLOSED)?;
         if session.owner != owner {
             return Err("다른 창의 세션입니다".into());
         }
         Ok(session)
     }
 
-    fn start(&self, owner: &str, id: &str) -> Result<(), String> {
+    pub(crate) fn start(&self, owner: &str, id: &str) -> Result<(), String> {
         self.get(owner, id)?.start()
     }
 
-    fn input(&self, owner: &str, id: &str, bytes: &[u8]) -> Result<(), String> {
+    pub(crate) fn input(&self, owner: &str, id: &str, bytes: &[u8]) -> Result<(), String> {
         self.get(owner, id)?.input(bytes)
     }
 
@@ -171,7 +180,7 @@ impl Sessions {
         self.get(owner, id)?.resize(size)
     }
 
-    fn ack(&self, owner: &str, id: &str, position: u64) -> Result<(), String> {
+    pub(crate) fn ack(&self, owner: &str, id: &str, position: u64) -> Result<(), String> {
         self.get(owner, id)?.ack(position)
     }
 
@@ -248,6 +257,12 @@ fn validate_size(size: PtySize) -> Result<(), String> {
 
 fn stage(name: &str, error: impl std::fmt::Display) -> String {
     format!("{name}: {error}")
+}
+
+pub(crate) fn probe_size(rows: u16, cols: u16) -> Result<PtySize, String> {
+    let size = size(rows, cols);
+    validate_size(size)?;
+    Ok(size)
 }
 
 fn size(rows: u16, cols: u16) -> PtySize {
