@@ -536,24 +536,34 @@ pub(crate) fn start_rejection(output: &[u8]) -> Option<CliError> {
 
 #[cfg(windows)]
 fn conpty_diagnostic(mut output: &[u8]) -> Option<&[u8]> {
-    // ConPTY는 같은 스트림에 초기 모드·창 제목과 종료 모드 변경을 보낸다.
+    const SHUTDOWN_MODES: [&[u8]; 2] = [b"\x1b[?9001l", b"\x1b[?1004l"]];
+    // ConPTY 종료 모드 제어열은 같은 스트림의 진단문 앞이나 뒤에 올 수 있다.
     while output.starts_with(b"\x1b") {
         if let Some(title) = output.strip_prefix(b"\x1b]0;") {
             output = &title[title.iter().position(|&byte| byte == 7)? + 1..];
         } else if let Some(rest) = [b"\x1b[6n".as_slice(), b"\x1b[?9001h", b"\x1b[?1004h", b"\x1b[m", b"\x1b[?25h"]
-            .into_iter().find_map(|control| output.strip_prefix(control))
+            .into_iter().chain(SHUTDOWN_MODES)
+            .find_map(|control| output.strip_prefix(control))
         {
             output = rest;
         } else {
             return None;
         }
     }
-    while let Some(rest) = [b"\x1b[?9001l".as_slice(), b"\x1b[?1004l"]
+    while let Some(rest) = SHUTDOWN_MODES
         .into_iter().find_map(|control| output.strip_suffix(control))
     {
         output = rest;
     }
     (!output.contains(&0x1b)).then_some(output)
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn start_rejection_accepts_conpty_shutdown_modes_before_diagnostic() {
+    let output = b"\x1b[6n\x1b[?9001h\x1b[?1004h\x1b[m\x1b]0;fixture\x07\x1b[?25h\x1b[?9001l\x1b[?1004l\
+        An error occurred (TargetNotConnected) when calling the StartSession operation: offline\n";
+    assert!(matches!(start_rejection(output), Some(CliError::TargetNotConnected)));
 }
 
 fn apply_start_environment(
