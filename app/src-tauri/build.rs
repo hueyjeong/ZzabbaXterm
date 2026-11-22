@@ -18,6 +18,8 @@ fn main() {
         "register_saved_ssh_host",
         "editor_local_open", "editor_local_save", "editor_local_compare", "editor_local_reload",
         "editor_local_close",
+        "editor_sftp_attach", "editor_sftp_list", "editor_sftp_open", "editor_sftp_compare",
+        "editor_sftp_reload", "editor_sftp_save", "editor_sftp_close", "editor_sftp_detach",
         "ai_targets", "ai_models", "ai_select", "ai_chat", "ai_propose", "ai_decide",
         "ai_cancel_proposal",
         "ai_decisions",

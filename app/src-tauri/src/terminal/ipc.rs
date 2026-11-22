@@ -68,5 +68,10 @@ pub(crate) fn terminal_ack(webview: WebviewWindow, id: String, position: u64) ->
 
 #[tauri::command]
 pub(crate) async fn terminal_close(webview: WebviewWindow, id: String) -> Result<(), String> {
-    blocking(move || webview.state::<Sessions>().close(webview.label(), &id)?.warning().map_or(Ok(()), Err)).await
+    let document = webview.state::<Sessions>().document(webview.label());
+    blocking(move || {
+        let result = webview.state::<Sessions>().close(webview.label(), &id)?;
+        webview.state::<crate::editor::sftp_ipc::SftpIpc>().close_parent(webview.label(), document, &id);
+        result.warning().map_or(Ok(()), Err)
+    }).await
 }

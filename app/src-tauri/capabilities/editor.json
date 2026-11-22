@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "local-editor",
-  "description": "Local editor commands for the bundled main webview",
+  "description": "Editor commands for the bundled main webview",
   "local": true,
   "webviews": ["main"],
   "permissions": [
@@ -9,6 +9,14 @@
     "allow-editor-local-save",
     "allow-editor-local-compare",
     "allow-editor-local-reload",
-    "allow-editor-local-close"
+    "allow-editor-local-close",
+    "allow-editor-sftp-attach",
+    "allow-editor-sftp-list",
+    "allow-editor-sftp-open",
+    "allow-editor-sftp-compare",
+    "allow-editor-sftp-reload",
+    "allow-editor-sftp-save",
+    "allow-editor-sftp-close",
+    "allow-editor-sftp-detach"
   ]
 }
