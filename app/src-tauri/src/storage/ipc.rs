@@ -64,6 +64,7 @@ struct Tab {
     selection: Option<Selection>,
     binding: Option<LoginBinding>,
     expired: bool,
+    logging_in: bool,
     listing: bool,
     verified_bucket: Option<(String, String)>,
     edits: Edits,
@@ -228,6 +229,7 @@ impl StorageIpc {
                 selection: None,
                 binding,
                 expired: false,
+                logging_in: false,
                 listing: false,
                 verified_bucket,
                 edits: Edits::default(),
@@ -410,7 +412,8 @@ impl StorageIpc {
         let (client, closed) = {
             let mut registry = self.0.lock().unwrap();
             let tab = registry.tab(document, &request.session_id).ok_or_else(|| unavailable(stage))?;
-            if tab.listing || tab.expired { return Err(unavailable(stage)); }
+            if tab.listing || tab.logging_in { return Err(unavailable(stage)); }
+            if tab.expired { return Err(Error::at(stage, Failure::SsoLoginRequired)); }
             if request.token.is_none() {
                 tab.verified_bucket = None;
                 tab.selection = None;
@@ -491,15 +494,15 @@ impl StorageIpc {
                 (binding, opening.cancel.clone(), None)
             } else {
                 let tab = registry.tab(document, &id.to_string()).ok_or_else(|| unavailable(Stage::Profile))?;
-                let binding = tab.binding.as_ref().filter(|_| tab.expired && !tab.listing).ok_or_else(|| unavailable(Stage::Profile))?.clone();
-                tab.expired = false;
-                tab.verified_bucket = None;
-                tab.edits.clear_rows();
+                let binding = tab.binding.as_ref().filter(|_| tab.expired && !tab.listing && !tab.logging_in)
+                    .ok_or_else(|| unavailable(Stage::Profile))?.clone();
+                tab.logging_in = true;
                 (binding, Arc::new(CancellationToken::new()), Some(tab.closed.subscribe()))
             }
         };
         let operation = async {
-            let current = tauri::async_runtime::spawn_blocking(move || verified_selection(&directory, &binding.target_id))
+            let target_id = binding.target_id.clone();
+            let current = tauri::async_runtime::spawn_blocking(move || verified_selection(&directory, &target_id))
                 .await.map_err(|_| unavailable(Stage::Profile))??;
             if current != *binding.selection { return Err(Error::at(Stage::Profile, Failure::AccountMismatch)); }
             login(current.sso, (*cancel).clone()).await.map_err(|error| Error::at(Stage::Profile, match error {
@@ -510,7 +513,19 @@ impl StorageIpc {
         };
         if let Some(closed) = closed {
             let _cancel_on_drop = (*cancel).clone().drop_guard();
-            until_closed(&closed, Stage::Profile, operation).await
+            let result = until_closed(&closed, Stage::Profile, operation).await;
+            let mut registry = self.0.lock().unwrap();
+            let tab = registry.tab(document, &id.to_string())
+                .filter(|tab| closed.same_channel(&tab.closed.subscribe()))
+                .ok_or_else(|| unavailable(Stage::Profile))?;
+            tab.logging_in = false;
+            if result.is_ok() {
+                tab.expired = false;
+                tab.verified_bucket = None;
+                tab.selection = None;
+                tab.edits.clear_rows();
+            }
+            result
         } else {
             let result = tokio::select! {
                 biased;
@@ -518,10 +533,15 @@ impl StorageIpc {
                 result = operation => result,
             };
             let mut registry = self.0.lock().unwrap();
-            if !registry.active(document) || !registry.openings.get(&id).is_some_and(|entry| Arc::ptr_eq(&entry.cancel, &cancel)) {
-                return Err(unavailable(Stage::Profile));
+            if !registry.active(document) { return Err(unavailable(Stage::Profile)); }
+            let opening = registry.openings.get_mut(&id)
+                .filter(|entry| entry.document == *document && Arc::ptr_eq(&entry.cancel, &cancel))
+                .ok_or_else(|| unavailable(Stage::Profile))?;
+            if result.is_ok() {
+                registry.openings.remove(&id);
+            } else {
+                opening.expired = Some(binding);
             }
-            registry.openings.remove(&id);
             result
         }
     }
@@ -536,6 +556,7 @@ impl StorageIpc {
         let tab = registry
             .tab(document, session_id)
             .ok_or_else(|| unavailable(stage))?;
+        if tab.logging_in { return Err(unavailable(stage)); }
         Ok((tab.client.clone(), tab.closed.subscribe()))
     }
 
@@ -1398,6 +1419,13 @@ mod tests {
             let session_id = Uuid::parse_str(&session.session_id).unwrap();
             let unexpected = |_, _| async { panic!("재로그인 권한 없음"); };
             assert!(state.relogin_with(&state.document("other"), session_id, directory.clone(), unexpected).await.is_err());
+            let failed = state.relogin_with(&document, session_id, directory.clone(), |_, _| async {
+                assert!(state.relogin_with(&document, session_id, directory.clone(), unexpected).await.is_err());
+                assert!(state.begin_selection(&document, regional(), Direction::Upload).is_none());
+                assert!(objects("us-west-2").await.is_err());
+                Err(CliError::TimedOut)
+            }).await.unwrap_err();
+            assert_eq!(failed.failure, Failure::TimedOut);
             state.relogin_with(&document, session_id, directory.clone(), |current, _| async move {
                 assert_eq!(current.scope.profile(), "chosen team");
                 assert_eq!(current.config.account, "123456789012");
@@ -1412,6 +1440,10 @@ mod tests {
             write_config("000000000000");
             assert_eq!(state.relogin_with(&document, expired_id, directory.clone(), unexpected).await.unwrap_err().failure, Failure::AccountMismatch);
             write_config("123456789012");
+            state.relogin_with(&document, expired_id, directory.clone(), |_, _| async {
+                assert!(state.relogin_with(&document, expired_id, directory.clone(), unexpected).await.is_err());
+                Ok(())
+            }).await.unwrap();
             assert!(state.relogin_with(&document, expired_id, directory.clone(), unexpected).await.is_err());
             assert_eq!(replay.actual_requests().count(), 13);
 
@@ -1423,6 +1455,8 @@ mod tests {
             std::fs::write(directory.join("connections.json"), serde_json::to_vec(&stored).unwrap()).unwrap();
             let s3_replay = super::super::tests::replay([
                 head(301, "us-west-2"),
+                head(200, "eu-west-1"),
+                response(200, "<ListBucketResult><EncodingType>url</EncodingType><IsTruncated>false</IsTruncated></ListBucketResult>"),
                 head(200, "eu-west-1"),
                 response(200, "<ListBucketResult><EncodingType>url</EncodingType><IsTruncated>false</IsTruncated></ListBucketResult>"),
             ]);
@@ -1437,10 +1471,25 @@ mod tests {
             };
             assert_eq!(open_s3().await.err().unwrap().failure, Failure::BucketRegionMismatch { region: "us-west-2".into() });
             let saved_s3 = open_s3().await.unwrap();
-            assert_eq!(serde_json::to_value(saved_s3).unwrap()["location"], json!({
+            assert_eq!(serde_json::to_value(&saved_s3).unwrap()["location"], json!({
                 "bucket": "selected-bucket", "prefix": "실험//", "region": "eu-west-1"
             }));
             assert!(s3_replay.actual_requests().nth(2).unwrap().uri().contains("prefix=%EC%8B%A4%ED%97%98%2F%2F"));
+            let saved_s3_id = Uuid::parse_str(&saved_s3.session_id).unwrap();
+            let saved_target = self::target(&saved_s3);
+            {
+                let mut registry = state.0.lock().unwrap();
+                let tab = registry.tab(&document, &saved_s3.session_id).unwrap();
+                tab.expired = true;
+                tab.verified_bucket = Some((saved_target.bucket.clone(), saved_target.region.clone()));
+            }
+            state.relogin_with(&document, saved_s3_id, directory.clone(), |_, _| async { Ok(()) }).await.unwrap();
+            assert!(state.begin_selection(&document, self::target(&saved_s3), Direction::Upload).is_none());
+            state.list_objects(&document, ObjectPageRequest {
+                session_id: saved_s3.session_id.clone(), bucket: saved_target.bucket.clone(),
+                region: saved_target.region.clone(), prefix: "실험//".into(), token: None,
+            }).await.unwrap();
+            assert!(state.begin_selection(&document, saved_target, Direction::Upload).is_some());
             let expired_s3 = request("saved-s3");
             let expired_s3_id = expired_s3.id;
             let cancel = state.reserve_open(&document, expired_s3_id).unwrap();
@@ -1457,7 +1506,15 @@ mod tests {
             std::fs::write(root.join("credentials"), "[chosen team]\naws_access_key_id=fixture\n").unwrap();
             let changed = open(request("saved-sso")).await.err().unwrap();
             assert_eq!(changed.failure, Failure::InvalidSsoProfile);
-            state.navigate("main");
+            std::fs::remove_file(root.join("credentials")).unwrap();
+            state.0.lock().unwrap().tab(&document, &saved_s3.session_id).unwrap().expired = true;
+            let interrupted = state.relogin_with(&document, saved_s3_id, directory.clone(), |_, _| async {
+                state.navigate("main");
+                Ok(())
+            }).await.unwrap_err();
+            assert_eq!(interrupted.failure, Failure::Request);
+            assert!(!state.0.lock().unwrap().tabs.contains_key(&saved_s3.session_id));
+            assert!(state.0.lock().unwrap().openings.is_empty());
             assert!(!state.close(&state.document("main"), &session.session_id));
             assert!(state.reserve_open(&document, Uuid::new_v4()).is_err());
         });
