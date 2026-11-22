@@ -177,7 +177,7 @@ impl Directory {
         let result = next.publish_editor_guarded(source, &original, |original, staged| {
             verify(original)?;
             verify(staged)
-        }, verify, || true);
+        }, &verify, || true);
         match result {
             Ok(published) => {
                 scope.file = Some(published);
@@ -498,7 +498,7 @@ impl Temporary<'_> {
         let original = if before_move.is_some() {
             open_regular_at(&self.parent.file, &c_name(name), libc::O_RDONLY)?
         } else {
-            self.parent.open_file(name)?.ok_or(io::ErrorKind::AlreadyExists)?
+            self.parent.open_file(name)?.ok_or_else(|| io::Error::from(io::ErrorKind::AlreadyExists))?
         };
         if file_id(&original)? != expected {
             return Err(io::Error::from(io::ErrorKind::AlreadyExists).into());
@@ -516,7 +516,7 @@ impl Temporary<'_> {
             self.check_named()?;
             let named = open_regular_at(&self.directory, c"body", libc::O_RDONLY)?;
             if file_id(&named)? != file_id(self.file())? {
-                return Err(io::ErrorKind::AlreadyExists.into());
+                return Err(io::Error::from(io::ErrorKind::AlreadyExists).into());
             }
             self.file = Some(named);
             set_read_lease(self.file())?;
@@ -615,12 +615,12 @@ impl Temporary<'_> {
                     || self.parent.stat_id(&target)? != Some(expected)
                     || metadata_stamp(original)? != stamp || metadata_stamp(staged)? != staged_stamp
                 {
-                    return Err(io::ErrorKind::AlreadyExists.into());
+                    return Err(io::Error::from(io::ErrorKind::AlreadyExists).into());
                 }
             }
         }
         if !authorize_move() {
-            return Err(io::ErrorKind::Interrupted.into());
+            return Err(io::Error::from(io::ErrorKind::Interrupted).into());
         }
         // SAFETY: the held directory descriptors and single-component names are valid.
         if unsafe {
