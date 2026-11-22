@@ -541,7 +541,7 @@ fn c02_native_pty_creation_failure_stays_local() {
     let mut target = super::remote::Target::new("fixture", "us-west-2", "i-01234567").unwrap();
     target.fixture = Some(program);
     let cancel = crate::ssm::CancellationToken::new();
-    let mut remote = tauri::async_runtime::block_on(target.prepare(&cancel)).unwrap();
+    let mut remote = tauri::async_runtime::block_on(target.prepare(None, &cancel)).unwrap();
     #[cfg(windows)]
     let size = size(0, 0);
     #[cfg(unix)]

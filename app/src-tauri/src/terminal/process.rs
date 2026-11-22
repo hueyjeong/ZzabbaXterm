@@ -1,13 +1,13 @@
 use super::remote;
 use crate::ssm::CancellationToken;
 use crate::ssh::{ConnectionPlan, terminal::DirectLaunch};
-use super::{CHUNK, CLOSED, CloseResult, Event, LocalClose, WINDOW, stage};
+use super::{CHUNK, CLOSED, CloseResult, Event, LiveSsmIdentity, LocalClose, WINDOW, stage};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::{
     io::{self, Read, Write},
     sync::{Arc, Condvar, Mutex, mpsc},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio_util::task::{TaskTracker, task_tracker::TaskTrackerToken};
 
@@ -15,14 +15,16 @@ const POLL: Duration = Duration::from_millis(10);
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 const ACK_TIMEOUT: Duration = Duration::from_secs(15);
 const ACK_STALLED: &str = "ack: 출력 처리 확인 시간이 초과되었습니다";
+const WRITE_TIMED_OUT: &str = "제어 세션 쓰기 시간이 초과되었습니다";
 
-pub(super) enum Stop {
+pub(crate) enum Stop {
     Closed,
     Disconnected(String),
 }
 
 #[derive(Default)]
 struct Flow {
+    connected: bool,
     started: bool,
     attached: bool,
     attach_error: Option<String>,
@@ -35,6 +37,7 @@ struct Flow {
     sent: u64,
     acked: u64,
     ack_deadline: Option<std::time::Instant>,
+    write_deadline: Option<Instant>,
 }
 
 struct SftpOwner {
@@ -56,6 +59,12 @@ impl Flow {
         }
     }
 
+    fn expire_write(&mut self) {
+        if self.stop.is_none() && self.write_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            self.stop = Some(Stop::Disconnected(WRITE_TIMED_OUT.into()));
+        }
+    }
+
     fn live(&self) -> Result<(), String> {
         if !self.started || self.child_exited || self.stop.is_some() {
             return Err(CLOSED.into());
@@ -64,21 +73,23 @@ impl Flow {
     }
 }
 
-pub(super) enum Launch {
+pub(crate) enum Launch {
     Local(CommandBuilder),
     Ssm(remote::Target),
+    AiControl(remote::Target, LiveSsmIdentity),
     Ssh(DirectLaunch),
 }
 
 impl Launch {
     pub(super) fn is_ssm(&self) -> bool {
-        matches!(self, Self::Ssm(_))
+        matches!(self, Self::Ssm(_) | Self::AiControl(..))
     }
 }
 
-pub(super) struct Session {
+pub(crate) struct Session {
     pub(super) owner: String,
     pub(super) document: Option<u64>,
+    control: bool,
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     cancel: Option<CancellationToken>,
     close_result: Mutex<CloseResult>,
@@ -96,10 +107,19 @@ struct OwnedSsh {
 
 impl Session {
     pub(super) fn new(owner: &str, ssm: bool) -> Self {
+        Self::with_cancel(owner, ssm.then(CancellationToken::new), false)
+    }
+
+    pub(crate) fn dedicated(cancel: CancellationToken) -> Self {
+        Self::with_cancel("", Some(cancel), true)
+    }
+
+    fn with_cancel(owner: &str, cancel: Option<CancellationToken>, control: bool) -> Self {
         Self {
             owner: owner.into(),
             document: None,
-            cancel: ssm.then(CancellationToken::new),
+            control,
+            cancel,
             close_result: Mutex::new(CloseResult::default()),
             unconfirmed: Mutex::new(None),
             ssh_pending: Mutex::new(None),
@@ -129,7 +149,7 @@ impl Session {
         Some((Arc::clone(&sftp.plan), sftp.cancel.child_token(), worker))
     }
 
-    pub(super) fn launch(
+    pub(crate) fn launch(
         self: &Arc<Self>,
         size: PtySize,
         command: Launch,
@@ -147,6 +167,10 @@ impl Session {
         send: impl Fn(Event) -> Result<(), String> + Send + 'static,
         retired: impl FnOnce(&Arc<Session>) + Send + 'static,
     ) -> Result<mpsc::Receiver<Result<(), String>>, String> {
+        if self.control != matches!(command, Launch::AiControl(..)) || self.control && self.document.is_some() {
+            self.finish();
+            return Err(stage("open", "제어 세션에는 전용 PTY가 필요합니다"));
+        }
         let this = Arc::clone(self);
         let (ready, opened) = mpsc::sync_channel(1);
         let ssm = command.is_ssm();
@@ -199,7 +223,8 @@ impl Session {
             if flow.stop.is_some() { return Err(CLOSED.into()); }
         }
         let mut remote = match &command {
-            Launch::Ssm(target) => Some(tauri::async_runtime::block_on(target.prepare(self.cancel.as_ref().unwrap()))?),
+            Launch::Ssm(target) => Some(tauri::async_runtime::block_on(target.prepare(None, self.cancel.as_ref().unwrap()))?),
+            Launch::AiControl(target, identity) => Some(tauri::async_runtime::block_on(target.prepare(Some(identity), self.cancel.as_ref().unwrap()))?),
             Launch::Local(_) | Launch::Ssh(_) => None,
         };
         if self.flow.lock().unwrap().stop.is_some() {
@@ -287,7 +312,7 @@ impl Session {
                 }
             };
             let command = match command {
-                Launch::Ssm(_) => None,
+                Launch::Ssm(_) | Launch::AiControl(..) => None,
                 Launch::Local(command) => Some(command),
                 Launch::Ssh(launch) => {
                     let (command, plan) = launch.into_parts();
@@ -339,9 +364,12 @@ impl Session {
                         let result = remote.wait_connected(cancel, self.document.is_some()).and_then(|identity| {
                             *connected = true;
                             if !cancel.is_cancelled() {
-                                if let Some(identity) = identity {
+                                {
                                     let mut flow = self.flow.lock().unwrap();
-                                    if flow.live().is_ok() { flow.ssm_identity = Some(identity); }
+                                    if flow.live().is_ok() {
+                                        flow.connected = self.control;
+                                        flow.ssm_identity = identity;
+                                    }
                                 }
                                 send_event(Event::Ready { account_id: remote.account_id().into() })?;
                             }
@@ -422,7 +450,7 @@ impl Session {
         }
     }
 
-    pub(super) fn close_result(&self) -> CloseResult {
+    pub(crate) fn close_result(&self) -> CloseResult {
         self.close_result.lock().unwrap().clone()
     }
 
@@ -488,6 +516,12 @@ impl Session {
             let mut flow = self.flow.lock().unwrap();
             flow.expire_start();
             flow.expire_ack();
+            if self.control {
+                flow.expire_write();
+                if flow.stop.is_none() && self.cancel.as_ref().unwrap().is_cancelled() {
+                    flow.stop = Some(Stop::Closed);
+                }
+            }
             if flow.stop.is_some() {
                 self.wake.notify_all();
                 drop(flow);
@@ -657,7 +691,7 @@ impl Session {
         self.start_until(None)
     }
 
-    pub(super) fn start_until(&self, deadline: Option<std::time::Instant>) -> Result<(), String> {
+    pub(crate) fn start_until(&self, deadline: Option<Instant>) -> Result<(), String> {
         let mut flow = self.flow.lock().unwrap();
         flow.expire_start();
         if flow.stop.is_some() || flow.finished || (!flow.started && flow.start_deadline.is_none()) {
@@ -683,7 +717,7 @@ impl Session {
         Ok(())
     }
 
-    pub(super) fn ack(&self, position: u64) -> Result<(), String> {
+    pub(crate) fn ack(&self, position: u64) -> Result<(), String> {
         let mut flow = self.flow.lock().unwrap();
         if flow.stop.is_some() { return Err(CLOSED.into()); }
         if position > flow.sent { return Err("ack: 전송 범위를 넘었습니다".into()); }
@@ -701,12 +735,47 @@ impl Session {
             .map_err(|error| stage("resize", error))
     }
 
+    pub(crate) fn connected(&self) -> bool {
+        let flow = self.flow.lock().unwrap();
+        flow.connected && !flow.finished && flow.live().is_ok()
+            && self.cancel.as_ref().is_some_and(|cancel| !cancel.is_cancelled())
+    }
+
+    pub(crate) fn control_input(&self, bytes: &[u8], deadline: Instant) -> Result<(), String> {
+        if !self.control { return Err(CLOSED.into()); }
+        let cancel = self.cancel.as_ref().unwrap();
+        {
+            let mut flow = self.flow.lock().unwrap();
+            flow.live()?;
+            if cancel.is_cancelled() || flow.write_deadline.is_some() { return Err(CLOSED.into()); }
+            flow.write_deadline = Some(deadline);
+            self.wake.notify_all();
+        }
+        let result = self.input(bytes);
+        let mut flow = self.flow.lock().unwrap();
+        flow.expire_write();
+        flow.write_deadline = None;
+        self.wake.notify_all();
+        match &flow.stop {
+            Some(Stop::Disconnected(error)) => Err(error.clone()),
+            _ if cancel.is_cancelled() => Err(CLOSED.into()),
+            _ => result.and_then(|()| flow.live()),
+        }
+    }
+
     pub(super) fn input(&self, mut bytes: &[u8]) -> Result<(), String> {
         self.flow.lock().unwrap().live()?;
         let mut writer = self.writer.lock().unwrap();
         let writer = writer.as_mut().ok_or(CLOSED)?;
         while !bytes.is_empty() {
-            self.flow.lock().unwrap().live()?;
+            {
+                let mut flow = self.flow.lock().unwrap();
+                if self.control {
+                    flow.expire_write();
+                    if self.cancel.as_ref().unwrap().is_cancelled() { return Err(CLOSED.into()); }
+                }
+                flow.live()?;
+            }
             let error: io::Error = match writer.write(bytes) {
                 Ok(0) => io::ErrorKind::WriteZero.into(),
                 Ok(count) => { bytes = &bytes[count..]; continue; }
@@ -727,7 +796,7 @@ impl Session {
         Ok(())
     }
 
-    pub(super) fn stop(&self, reason: Stop) {
+    pub(crate) fn stop(&self, reason: Stop) {
         if let Some(cancel) = &self.cancel { cancel.cancel(); }
         let mut flow = self.flow.lock().unwrap();
         if let Some(sftp) = &flow.sftp { sftp.cancel.cancel(); }
@@ -742,7 +811,7 @@ impl Session {
         self.wake.notify_all();
     }
 
-    pub(super) fn wait_finished(&self) {
+    pub(crate) fn wait_finished(&self) {
         drop(self.wake.wait_while(self.flow.lock().unwrap(), |flow| !flow.finished).unwrap());
     }
 }
@@ -808,14 +877,14 @@ impl super::Sessions {
         *session.flow.get_mut().unwrap() = Flow {
             started: true,
             ssm_identity: Some(remote::SsmIdentity {
-                account_id: account_id.into(), region: region.into(), instance_id: instance_id.into(),
+                account_id: account_id.into(), profile: "fixture".into(), region: region.into(), instance_id: instance_id.into(),
             }),
             ..Flow::default()
         };
         let id = self.next_id();
         self.registry.lock().unwrap().sessions.insert(id.clone(), Arc::new(session));
         let identity = super::LiveSsmIdentity {
-            id: id.clone(), document, account_id: account_id.into(), region: region.into(), instance_id: instance_id.into(),
+            id: id.clone(), document, account_id: account_id.into(), profile: "fixture".into(), region: region.into(), instance_id: instance_id.into(),
         };
         LiveSsmFixture { sessions: self, id, identity }
     }
@@ -846,6 +915,9 @@ fn live_ssm_identity_is_checked_under_registry_and_flow_locks() {
     let wrong_node = sessions.with_live_ssm_session("main", &LiveSsmIdentity {
         instance_id: "i-76543210".into(), ..expected.clone()
     }, || 7);
+    let wrong_profile = sessions.with_live_ssm_session("main", &LiveSsmIdentity {
+        profile: "another-profile".into(), ..expected.clone()
+    }, || 7);
     session.flow.lock().unwrap().child_exited = true;
     let exited = check();
     session.flow.lock().unwrap().child_exited = false;
@@ -866,10 +938,27 @@ fn live_ssm_identity_is_checked_under_registry_and_flow_locks() {
     assert_eq!(other_document, None);
     assert_eq!(locked, Some((true, true)));
     assert_eq!(wrong_node, None);
+    assert_eq!(wrong_profile, None);
     assert_eq!(exited, None);
     assert_eq!(cancelled, None);
     assert_eq!(stopped, None);
     assert_eq!(old_document, None);
     assert_eq!(current_document, None);
     assert_eq!(removed, None);
+}
+
+#[cfg(test)]
+#[test]
+fn control_input_is_dedicated_and_checks_deadline_before_writing() {
+    let central = Session::new("main", true);
+    assert_eq!(central.control_input(b"frame", Instant::now()), Err(CLOSED.into()));
+
+    let control = Session::dedicated(CancellationToken::new());
+    assert_eq!(control.document, None);
+    assert!(!control.connected());
+    control.flow.lock().unwrap().started = true;
+    control.flow.lock().unwrap().connected = true;
+    assert!(control.connected());
+    assert_eq!(control.control_input(b"frame", Instant::now()), Err(WRITE_TIMED_OUT.into()));
+    assert!(!control.connected());
 }

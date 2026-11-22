@@ -6,9 +6,9 @@ use std::{
 };
 
 pub(crate) mod ipc;
-mod process;
+pub(crate) mod process;
 pub(crate) mod probe;
-mod remote;
+pub(crate) mod remote;
 mod saved;
 #[cfg(all(test, any(windows, unix)))]
 mod pty_flow_tests;
@@ -40,7 +40,7 @@ pub(crate) struct CloseResult {
 }
 
 impl CloseResult {
-    fn warning(&self) -> Option<String> {
+    pub(crate) fn warning(&self) -> Option<String> {
         if self.remote == RemoteClose::Unconfirmed {
             return self.target.as_ref().map(|target| format!("종료 확인 불가: {target}"));
         }
@@ -73,6 +73,7 @@ pub(crate) struct LiveSsmIdentity {
     pub(crate) id: String,
     pub(crate) document: u64,
     pub(crate) account_id: String,
+    pub(crate) profile: String,
     pub(crate) region: String,
     pub(crate) instance_id: String,
 }
@@ -117,6 +118,7 @@ impl Sessions {
             id: id.into(),
             document,
             account_id: identity.account_id.clone(),
+            profile: identity.profile.clone(),
             region: identity.region.clone(),
             instance_id: identity.instance_id.clone(),
         })
@@ -126,8 +128,8 @@ impl Sessions {
     pub(crate) fn with_live_ssm_session<T>(&self, owner: &str, identity: &LiveSsmIdentity, check: impl FnOnce() -> T) -> Option<T> {
         let registry = self.registry.lock().unwrap();
         registry.main_session(owner, identity.document, &identity.id)?.with_ssm_identity(|live| {
-            (live.account_id == identity.account_id && live.region == identity.region && live.instance_id == identity.instance_id)
-                .then(check)
+            (live.account_id == identity.account_id && live.profile == identity.profile
+                && live.region == identity.region && live.instance_id == identity.instance_id).then(check)
         }).flatten()
     }
 
@@ -414,7 +416,7 @@ impl Event {
 }
 
 #[derive(Debug)]
-enum Event {
+pub(crate) enum Event {
     Bytes(Vec<u8>),
     Exited(u32),
     Disconnected(String),

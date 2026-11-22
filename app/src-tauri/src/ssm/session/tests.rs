@@ -12,6 +12,7 @@ fn request() -> StartRequest {
     StartRequest {
         scope: Scope::new("team".into(), "us-west-2".into()).unwrap(),
         target: TARGET.into(),
+        document_name: None,
         reason: REASON.into(),
         owner: OWNER.into(),
         credentials: fixture_credentials(),
@@ -327,9 +328,24 @@ async fn start_requires_an_online_node_from_the_same_scope() {
         require_node_scope(&other_program, &scope, node),
         Err(CliError::InvalidTarget)
     );
+    let cancel = CancellationToken::new();
+    let shared = SessionDocument::AiSharedControl { account_id: "123456789012", target: TARGET };
+    for (scope, document, error) in [
+        (&other, shared, CliError::InvalidTarget),
+        (&scope, SessionDocument::AiSharedControl { account_id: "999999999999", target: TARGET }, CliError::CallerChanged),
+        (&scope, SessionDocument::AiSharedControl { account_id: "123456789012", target: "i-11111111" }, CliError::InvalidTarget),
+    ] {
+        assert_eq!(cli.prepare_document_start(scope, node, document, &cancel).err(), Some(error));
+    }
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    assert_eq!(cli.prepare_document_start(&scope, node, shared, &cancelled).err(), Some(CliError::Cancelled));
+
     let mut reasons = Vec::new();
-    for _ in 0..2 {
-        let mut start = prepare_start(&scope, node).unwrap();
+    for (document, mut start) in [
+        (false, cli.prepare_start(&scope, node, &cancel).await.unwrap()),
+        (true, cli.prepare_document_start(&scope, node, shared, &cancel).unwrap()),
+    ] {
         for (program, scope) in [(other_program.as_path(), &scope), (cli.0.as_ref(), &other)] {
             let invalid = start
                 .authorize_with(program, scope, async |_| panic!("unexpected command"))
@@ -350,6 +366,14 @@ async fn start_requires_an_online_node_from_the_same_scope() {
             .unwrap()
             .unwrap();
         assert_eq!(permit.0.get_argv()[0], cli.0.as_os_str());
+        let args = ["ssm", "start-session", "--region", "us-west-2", "--output", "json",
+            "--target", TARGET, "--reason", start.reason.as_str(),
+            "--document-name", "ZzabbaAiSharedControl"];
+        let expected = if document { &args[..] } else { &args[..10] };
+        assert!(permit.0.get_argv()[1..]
+            .iter()
+            .map(|arg| arg.as_os_str())
+            .eq(expected.iter().map(|arg| OsStr::new(*arg))));
         assert_eq!(
             permit.0.get_env("PATH"),
             Some(OsStr::new("fixture-plugin-path"))
@@ -577,6 +601,25 @@ async fn readiness_retries_only_reads_after_timeout() {
         results.next().expect("unexpected read")
     }).await, Ok(()));
     assert!(results.next().is_none());
+}
+
+#[tokio::test]
+async fn shared_control_rejects_unowned_session_records() {
+    let mut request = request();
+    request.document_name = Some("ZzabbaAiSharedControl");
+    let scope = request.scope.clone();
+    for (field, value) in [("Target", "i-11111111"), ("Owner", "another-owner")] {
+        let mut wrong = active_session();
+        wrong[field] = json!(value);
+        let mut reply = Some(inventory(vec![wrong.clone()]));
+        assert_eq!(request.wait_connected_with(&CancellationToken::new(), async |_, _| {
+            Ok(reply.take().expect("unexpected lookup"))
+        }).await, Err(VerificationError::Unconfirmed));
+        assert_eq!(check_close(&mut request, &scope, [
+            (HISTORY, Ok(inventory(vec![]))),
+            (ACTIVE, Ok(inventory(vec![wrong]))),
+        ]).await, Err(VerificationError::Unconfirmed));
+    }
 }
 
 #[tokio::test]
