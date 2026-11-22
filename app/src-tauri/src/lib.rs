@@ -15,6 +15,7 @@ pub fn run() {
     ];
     tauri::Builder::default()
         .manage(Sessions::default())
+        .manage(ai::ipc::State::default())
         .on_page_load(|webview, payload| {
             if payload.event() == tauri::webview::PageLoadEvent::Started {
                 webview.state::<Sessions>().navigate(webview.label());
@@ -23,6 +24,9 @@ pub fn run() {
         .invoke_handler(move |invoke| {
             if invoke.message.command() == "terminal_open" {
                 terminal_open(invoke);
+                true
+            } else if ai::ipc::handles(invoke.message.command()) {
+                ai::ipc::dispatch(invoke);
                 true
             } else {
                 connections::ipc::handle(invoke, other_commands)

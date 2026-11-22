@@ -27,12 +27,20 @@ export function AiPanel(props: AiPanelProps) {
   return <>
     <section className="workspace-chat a01-chat" aria-labelledby={chatTitle}>
       <h2 id={chatTitle}>AI 채팅</h2>
+      {props.modelError && <p role="alert">{props.modelError}</p>}
+      {props.onRefresh && <button type="button" onClick={props.onRefresh}>모델 및 대상 새로고침</button>}
       <Chat models={props.models} model={model} onModelChange={setModelName} onSendChat={props.onSendChat} />
     </section>
     <section className="workspace-ai-terminal a01-proposals" aria-labelledby={proposalTitle}>
       <h2 id={proposalTitle}>작업 제안</h2>
+      {props.targetError && <p role="alert">{props.targetError}</p>}
       <label className="a01-field">조회 대상
-        <select value={target ? selected : ""} onChange={(event) => setSelected(event.target.value)}>
+        <select value={target ? selected : ""} onChange={(event) => {
+          const key = event.target.value;
+          setSelected(key);
+          const next = props.targets.find((candidate) => targetKey(candidate) === key);
+          props.onSelectTarget?.(next ? { targetId: next.targetId, generation: next.generation } : null);
+        }}>
           <option value="">대상 선택</option>
           {props.targets.map((candidate) => <option key={targetKey(candidate)} value={targetKey(candidate)}>
             {visibleText(candidate.label)} ({visibleText(candidate.targetId)})

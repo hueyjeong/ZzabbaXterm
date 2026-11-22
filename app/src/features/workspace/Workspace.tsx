@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
+import { LocalAiPanel } from "../ai/LocalAiPanel";
 import { createLocalConnectionIpc, type SavedConnections } from "../connections/connectionIpc";
 import { LocalConnectionWizard } from "../connections/LocalConnectionWizard";
 import type { ConnectionClose, LocalProfileDraft } from "../connections/profiles";
@@ -30,7 +31,6 @@ export function Workspace() {
   const [active, setActive] = useState(1);
   const [focusTab, setFocusTab] = useState<number | null>(1);
   const [focused, setFocused] = useState(false);
-  const [draft, setDraft] = useState("");
   const [windowError, setWindowError] = useState("");
   const [loadVersion, setLoadVersion] = useState(0);
   const [profileLoad, setProfileLoad] = useState<ProfileLoad>({ kind: "loading" });
@@ -168,14 +168,7 @@ export function Workspace() {
           ))}
         </div>
         <aside className="workspace-ai" hidden={focused} aria-label="AI">
-          <section className="workspace-chat">
-            <h2>AI 채팅</h2>
-            <textarea aria-label="메시지 입력" placeholder="메시지 입력" value={draft} onChange={(event) => setDraft(event.target.value)} />
-          </section>
-          <section className="workspace-ai-terminal">
-            <h2>AI 터미널 / 전용 셸</h2>
-            <span>대기</span>
-          </section>
+          <LocalAiPanel profilesVersion={loadVersion} />
           <Splitter edge="chat" label="AI 채팅 높이" value={chatHeight}
             min={20} max={80} units={100 / Math.max(1, area.height)} onChange={setChatHeight} />
         </aside>

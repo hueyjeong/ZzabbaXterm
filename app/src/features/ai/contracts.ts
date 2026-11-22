@@ -18,6 +18,10 @@ export type AiPanelProps = Readonly<{
   models: readonly string[];
   targets: readonly ProposalTarget[];
   proposals: readonly Proposal[];
+  onSelectTarget?: (target: TargetRef | null) => void;
+  modelError?: string;
+  targetError?: string;
+  onRefresh?: () => void;
   onSendChat: (request: ChatRequest) => Promise<ChatReply>;
   onRequestProposal: (request: ProposalRequest) => Promise<Proposal>;
   onDecideProposal: (decision: ProposalDecision) => Promise<"recorded" | "rejected">;

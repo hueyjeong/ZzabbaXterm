@@ -6,6 +6,7 @@ use std::time::Duration;
 use thiserror::Error;
 
 const CHAT_URL: &str = "http://127.0.0.1:11434/api/chat";
+const MODELS_URL: &str = "http://127.0.0.1:11434/api/tags";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_MODEL_BYTES: usize = 256;
 const MAX_MESSAGES: usize = 256;
@@ -45,6 +46,18 @@ struct ChatRequest<'a> {
 struct ChatResponse {
     done: bool,
     message: AssistantMessage,
+}
+
+#[derive(Deserialize)]
+struct Models {
+    models: Vec<Model>,
+}
+
+#[derive(Deserialize)]
+struct Model {
+    name: String,
+    remote_host: Option<String>,
+    remote_model: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -110,6 +123,31 @@ impl Ollama {
             #[cfg(test)]
             test_url: None,
         })
+    }
+
+    pub(crate) async fn models(&self) -> Result<Vec<String>, OllamaError> {
+        let url = MODELS_URL;
+        #[cfg(test)]
+        let url = self.test_url.as_deref().unwrap_or(url);
+        let response = self.client.get(url).send().await.map_err(transport_error)?;
+        let mut names: Vec<_> = read_response::<Models>(response)
+            .await?
+            .models
+            .into_iter()
+            .filter(|model| {
+                model.remote_host.as_deref().is_none_or(str::is_empty)
+                    && model.remote_model.as_deref().is_none_or(str::is_empty)
+                    && model.name.len() <= MAX_MODEL_BYTES
+                    && valid_model(&model.name)
+            })
+            .map(|model| model.name)
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        if names.is_empty() {
+            return Err(OllamaError::ModelNotInstalled);
+        }
+        Ok(names)
     }
 
     pub async fn chat(
@@ -196,7 +234,7 @@ impl Ollama {
         let url = CHAT_URL;
         #[cfg(test)]
         let url = self.test_url.as_deref().unwrap_or(url);
-        let mut response = self
+        let response = self
             .client
             .post(url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -207,22 +245,7 @@ impl Ollama {
         if response.status() == StatusCode::NOT_FOUND {
             return Err(OllamaError::ModelNotInstalled);
         }
-        if !response.status().is_success() {
-            return Err(OllamaError::Http(response.status()));
-        }
-        let length = response.content_length().unwrap_or(0);
-        if length > MAX_RESPONSE_BYTES as u64 {
-            return Err(OllamaError::ResponseTooLarge);
-        }
-        let mut body = Vec::with_capacity(length as usize);
-        while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
-            if chunk.len() > MAX_RESPONSE_BYTES - body.len() {
-                return Err(OllamaError::ResponseTooLarge);
-            }
-            body.extend_from_slice(&chunk);
-        }
-        let response: ChatResponse =
-            serde_json::from_slice(&body).map_err(|_| OllamaError::InvalidResponse)?;
+        let response: ChatResponse = read_response(response).await?;
         if !response.done || !matches!(response.message.role, ChatRole::Assistant) {
             return Err(OllamaError::InvalidResponse);
         }
@@ -230,7 +253,33 @@ impl Ollama {
     }
 }
 
+async fn read_response<T: serde::de::DeserializeOwned>(mut response: reqwest::Response) -> Result<T, OllamaError> {
+    if !response.status().is_success() {
+        return Err(OllamaError::Http(response.status()));
+    }
+    let length = response.content_length().unwrap_or(0);
+    if length > MAX_RESPONSE_BYTES as u64 {
+        return Err(OllamaError::ResponseTooLarge);
+    }
+    let mut body = Vec::with_capacity(length as usize);
+    while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
+        if chunk.len() > MAX_RESPONSE_BYTES - body.len() {
+            return Err(OllamaError::ResponseTooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|_| OllamaError::InvalidResponse)
+}
+
 fn local_model_ref(model: &str) -> Result<String, OllamaError> {
+    if !valid_model(model) {
+        return Err(OllamaError::InvalidModel);
+    }
+    // Ollama에서 로컬 이름을 가진 클라우드 모델도 추론 전에 거부하게 합니다.
+    Ok(format!("{model}:local"))
+}
+
+fn valid_model(model: &str) -> bool {
     let (name, tag) = model.split_once(':').unwrap_or((model, "latest"));
     let valid_part = |part: &str| {
         part.starts_with(|c: char| c.is_ascii_alphanumeric())
@@ -238,18 +287,13 @@ fn local_model_ref(model: &str) -> Result<String, OllamaError> {
                 .bytes()
                 .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
     };
-    if !name.split('/').all(valid_part)
-        || !valid_part(tag)
-        || tag.eq_ignore_ascii_case("cloud")
-        || tag.eq_ignore_ascii_case("local")
-        || tag
+    name.split('/').all(valid_part)
+        && !tag.eq_ignore_ascii_case("cloud")
+        && valid_part(tag)
+        && !tag.eq_ignore_ascii_case("local")
+        && !tag
             .rsplit_once('-')
             .is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case("cloud"))
-    {
-        return Err(OllamaError::InvalidModel);
-    }
-    // Ollama에서 로컬 이름을 가진 클라우드 모델도 추론 전에 거부하게 합니다.
-    Ok(format!("{model}:local"))
 }
 
 fn transport_error(error: reqwest::Error) -> OllamaError {

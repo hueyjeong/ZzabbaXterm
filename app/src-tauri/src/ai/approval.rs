@@ -44,23 +44,23 @@ enum Mode {
 pub struct Card {
     proposal_id: u32,
     source: Source,
-    target: SelectedTarget,
-    operation: Operation,
+    pub(super) target: SelectedTarget,
+    pub(super) operation: Operation,
     mode: Mode,
-    command: Option<&'static str>,
-    explanation: &'static str,
+    pub(super) command: Option<&'static str>,
+    pub(super) explanation: &'static str,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DecisionRequest {
-    proposal_id: u32,
-    choice: Choice,
+    pub(super) proposal_id: u32,
+    pub(super) choice: Choice,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
-enum Choice {
+pub(super) enum Choice {
     Approve,
     Reject,
     Cancel,
@@ -109,7 +109,7 @@ impl LocalReview {
         )
     }
 
-    fn check(
+    pub(super) fn check(
         webview: &str,
         window: &str,
         has_acl: bool,
@@ -157,6 +157,10 @@ pub struct Reviews {
 }
 
 impl Reviews {
+    pub(super) fn clear(&mut self) {
+        self.pending.clear();
+    }
+
     pub fn propose(
         &mut self,
         candidate: Candidate<'_>,

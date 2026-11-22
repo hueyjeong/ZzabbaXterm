@@ -1,4 +1,5 @@
 pub mod approval;
+pub(crate) mod ipc;
 mod ollama;
 
 pub use ollama::{ChatMessage, ChatRole, Ollama, OllamaError};

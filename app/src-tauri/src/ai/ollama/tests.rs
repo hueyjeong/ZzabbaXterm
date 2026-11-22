@@ -23,9 +23,24 @@ fn run<T>(future: impl Future<Output = T>) -> T {
 
 fn bind_loopback() -> TcpListener {
     static BIND: Mutex<()> = Mutex::new(());
-    // Windows 시험이 동시에 시작해도 루프백 소켓은 차례로 초기화합니다.
-    let _bind = BIND.lock().unwrap();
-    TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap()
+    let result = {
+        let _bind = BIND.lock().unwrap();
+        let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
+        let result = TcpListener::bind(addr);
+        #[cfg(windows)]
+        let mut result = result;
+        #[cfg(windows)]
+        for _ in 0..3 {
+            // 테스트 호스트의 간헐적인 Winsock WSAEFAULT만 다시 시도한다.
+            if !result.as_ref().is_err_and(|error| error.raw_os_error() == Some(10014)) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+            result = TcpListener::bind(addr);
+        }
+        result
+    };
+    result.unwrap()
 }
 
 fn server(
@@ -76,6 +91,43 @@ fn response(body: Value) -> (Ollama, thread::JoinHandle<Value>) {
         )
         .unwrap();
     })
+}
+
+#[test]
+fn models_excludes_cloud_descriptors_and_errors_when_empty() {
+    for (rows, expected) in [
+        (json!([
+            {"name":"remote:latest", "remote_host":"https://ollama.com"},
+            {"name":"alias:latest", "remote_model":"another-model"},
+            {"name":"unsafe:cloud"}, {"name":"fixture:latest"}, {"name":"fixture:latest"}
+        ]), Some("fixture:latest")),
+        (json!([{"name":"remote:cloud"}]), None),
+    ] {
+        let listener = bind_loopback();
+        let addr = listener.local_addr().unwrap();
+        let mut ollama = Ollama::with_timeout(Duration::from_secs(5)).unwrap();
+        ollama.test_url = Some(format!("http://{addr}/api/tags"));
+        let handle = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut reader = BufReader::new(socket);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line.trim_end(), "GET /api/tags HTTP/1.1");
+            while line != "\r\n" {
+                line.clear();
+                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+            }
+            let body = json!({"models":rows}).to_string();
+            write!(reader.get_mut(), "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+        });
+        let models = run(ollama.models());
+        match expected {
+            Some(name) => assert_eq!(models.unwrap(), [name]),
+            None => assert!(matches!(models, Err(OllamaError::ModelNotInstalled))),
+        }
+        handle.join().unwrap();
+    }
 }
 
 fn reply(content: &str) -> Value {

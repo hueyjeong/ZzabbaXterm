@@ -85,6 +85,7 @@ beforeEach(async () => {
   runConnectionCommand = async (command) => { throw new Error(`예상하지 않은 연결 명령: ${command}`); };
   native.invoke.mockImplementation(async (command, args) => {
     if (command === "connections_load") return loadProfiles();
+    if (command === "ai_models" || command === "ai_targets") return [];
     if (command.startsWith("connection_")) return runConnectionCommand(command, args);
     if (command === "terminal_start") return starts.get(args.id);
     if (command !== "terminal_open") return;
