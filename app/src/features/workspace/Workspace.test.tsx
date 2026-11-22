@@ -95,6 +95,7 @@ beforeEach(async () => {
   openFile = async () => ({ status: "cancelled" });
   native.invoke.mockImplementation(async (command, args) => {
     if (command === "connections_load") return loadProfiles();
+    if (command === "ai_models" || command === "ai_targets") return [];
     if (command.startsWith("connection_")) return runConnectionCommand(command, args);
     if (command === "ssm_discovery") return runDiscovery(args);
     if (command === "editor_local_open") return openFile();

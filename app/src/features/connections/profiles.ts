@@ -76,9 +76,12 @@ export interface LocalConnectionWizardState {
   abandon(): void;
 }
 
-export function createLocalConnectionWizard(draftId: string, initialDraft: LocalProfileDraft): LocalConnectionWizardState {
+export function createLocalConnectionWizard(draftId: string, initialDraft: ConnectionProfileDraft): LocalConnectionWizardState {
   let state: State = { step: "target", draft: initialDraft, status: { kind: "idle" } };
-  let local = initialDraft.target.local;
+  let local = initialDraft.target.local ?? {
+    shell: /Windows/.test(navigator.userAgent) ? "powerShell" : "bash",
+    startDirectory: "",
+  } satisfies LocalMethod["local"];
   let draftVersion = 0;
   const listeners = new Set<() => void>();
   const pending = new Map<ConnectionTestDraft, LocalConnectionActions["cancelTest"]>();
