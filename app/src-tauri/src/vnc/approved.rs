@@ -52,8 +52,9 @@ enum Password {
 }
 
 impl Draft {
-    pub(super) async fn approve(self, window: &WebviewWindow, life: Arc<Lifetime>, epoch: u64) -> Result<Approved, String> {
-        let (target, auth, password, lease) = match self {
+    pub(super) async fn approve(self, window: &WebviewWindow, life: Arc<Lifetime>, epoch: u64,
+                                held: &mut Option<DesktopLease>) -> Result<Approved, String> {
+        let (target, auth, password) = match self {
             Self::Direct { host, port, password } => {
                 let auth = auth_for(password);
                 let host = host.parse::<std::net::IpAddr>().map_or_else(|_| host.to_ascii_lowercase(), |ip| ip.to_string());
@@ -63,13 +64,13 @@ impl Draft {
                 let service = password.as_ref().map_or_else(|| "없음".into(), |source| source.label(&target));
                 let description = format!("대상: [{}]:{}\n경로: 직접 TLS (서버 인증서 이름 확인)\n서비스 인증: {service}", target.host, target.port);
                 if !confirm(window, description, &life, None).await { return Err(CANCELLED.into()); }
-                (target, auth, password, None)
+                (target, auth, password)
             }
             Self::Routed { source, password } => {
                 let auth = auth_for(password);
                 #[cfg(not(any(windows, target_os = "linux")))]
                 if password { return Err("이 운영체제는 VNC 비밀번호 연결을 지원하지 않습니다".into()); }
-                let lease = source.lease(window, &life, epoch, auth).await?;
+                let lease = source.lease(window, &life, epoch, auth, held).await?;
                 let (_, ssh) = lease.ssh();
                 let destination = lease.destination();
                 let target = Target { profile_id: routed_scope(ssh, destination), host: destination.host.clone(), port: destination.port };
@@ -93,10 +94,10 @@ impl Draft {
                     Some(password)
                 } else { None };
                 lease.while_live(|| ()).ok_or(ROUTE_LOST)?;
-                (target, auth, password, Some(lease))
+                (target, auth, password)
             }
         };
-        Ok(Approved { target, auth, life, lease, password, used: AtomicBool::new(false) })
+        Ok(Approved { target, auth, life, lease: held.take(), password, used: AtomicBool::new(false) })
     }
 }
 
@@ -111,7 +112,8 @@ fn routed_scope(ssh: &Ssh, destination: &Destination) -> String {
 }
 
 impl Source {
-    async fn lease(self, window: &WebviewWindow, life: &Arc<Lifetime>, epoch: u64, auth: Auth) -> Result<DesktopLease, String> {
+    async fn lease<'a>(self, window: &WebviewWindow, life: &Arc<Lifetime>, epoch: u64, auth: Auth,
+                       held: &'a mut Option<DesktopLease>) -> Result<&'a DesktopLease, String> {
         let Self { tab_handle, tunnel_id, target_id, destination: Remote { host, port } } = self;
         if tab_handle.len() != 32 || !tab_handle.bytes().all(|b| b.is_ascii_hexdigit()) ||
             !tunnel_id.parse::<u64>().is_ok_and(|id| id > 0 && id.to_string() == tunnel_id)
@@ -138,18 +140,19 @@ impl Source {
         if !confirm(window, description, life, None).await {
             return Err(CANCELLED.into());
         }
-        let life = life.clone();
-        tauri::async_runtime::spawn_blocking(move || {
-            if life.revoked() { return Err(CANCELLED.into()); }
+        let grant = life.clone();
+        let (lease, verified) = tauri::async_runtime::spawn_blocking(move || {
+            if grant.revoked() { return Err(CANCELLED); }
             let lease = app.state::<TunnelTabs>().open_desktop(epoch, &directory, (&tab_handle, &tunnel_id),
                 &target_id, &destination, Protocol::Vnc, (snapshot.0, &snapshot.1))
                 .map_err(|_| "승인된 VNC SSH 터널을 열 수 없습니다")?;
-            if lease.ssh() != (snapshot.0, &snapshot.1) || lease.target() != target_id || lease.destination() != &destination {
-                return Err("승인된 VNC 터널 신원이 변경되었습니다".into());
-            }
-            if life.revoked() { return Err(CANCELLED.into()); }
-            Ok(lease)
-        }).await.map_err(|_| "VNC SSH 터널을 열 수 없습니다")?
+            let verified = lease.ssh() == (snapshot.0, &snapshot.1) && lease.target() == target_id && lease.destination() == &destination;
+            Ok((lease, verified))
+        }).await.map_err(|_| "VNC SSH 터널을 열 수 없습니다")??;
+        let lease = held.insert(lease);
+        if !verified { return Err("승인된 VNC 터널 신원이 변경되었습니다".into()); }
+        if life.revoked() { return Err(CANCELLED.into()); }
+        Ok(lease)
     }
 }
 

@@ -3,13 +3,15 @@ use std::{collections::HashMap, sync::{Arc, Mutex}};
 use serde::{Deserialize, Serialize};
 use tauri::{Manager, Webview, WebviewWindow, ipc::{Channel, CommandArg, CommandItem, Invoke, InvokeError}};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
+use tokio_util::sync::{CancellationToken, DropGuard};
 
-use crate::tunnels::ipc::TunnelTabs;
+use crate::tunnels::ipc::{DesktopCleanupError, DesktopLease, TunnelTabs};
 
 use super::{Change, Error, Event, Input, ResizeResult, Size, Tab, approved::{Draft, route_lost}, lifetime::Lifetime, output::{Mailbox, Output}, presentation::{CHUNK, Image, Surface}};
 
 pub(crate) const COMMANDS: [&str; 5] = ["vnc_create", "vnc_connect", "vnc_input", "vnc_ack", "vnc_close"];
 const CLOSED: &str = "VNC 세션이 닫혔습니다";
+const CLEANUP_UNCONFIRMED: &str = "종료 확인 불가";
 const MAX_SAFE: u64 = (1 << 53) - 1;
 
 #[derive(Default)]
@@ -26,9 +28,17 @@ struct Registry {
 
 #[derive(Default)]
 struct Slot {
-    gate: Arc<AsyncMutex<()>>,
+    close_gate: Arc<AsyncMutex<()>>,
+    finished: Option<CancellationToken>,
     generation: u64,
     current: Option<Running>,
+    closing_owner: bool,
+    cleanup: Option<Cleanup>,
+}
+
+enum Cleanup {
+    Ticket(DesktopCleanupError),
+    WorkerFailed,
 }
 
 struct Running {
@@ -200,42 +210,84 @@ pub(crate) fn dispatch(invoke: Invoke) {
         }
         return;
     }
+    if command == "vnc_close" {
+        let generation = read!(Option<u64>, "generation");
+        let retry = read!(Option<bool>, "retry").unwrap_or(false);
+        let gate = match begin_close(&sessions, &owner, document, generation) {
+            Ok(gate) => gate,
+            Err(error) => { invoke.resolver.reject(error); return; }
+        };
+        invoke.resolver.respond_async(async move {
+            close(&window.state::<Sessions>(), &owner, document, generation, retry, gate).await.map_err(InvokeError::from)
+        });
+        return;
+    }
     let sessions = window.state::<Sessions>();
     let mut state = sessions.0.lock().unwrap();
     let result = state.slot(&owner, document).and_then(|slot| match command {
-        "vnc_close" => {
-            match Option::<u64>::from_command(arg("generation")).map_err(|_| CLOSED)? {
-                Some(generation) if slot.generation == generation => { slot.current = None; Ok(false) }
-                Some(_) => Err(CLOSED),
-                None => Ok(true),
-            }
-        }
         "vnc_ack" => {
             let generation = u64::from_command(arg("generation")).map_err(|_| CLOSED)?;
             let sequence = u64::from_command(arg("sequence")).map_err(|_| CLOSED)?;
             let offset = u32::from_command(arg("offset")).map_err(|_| CLOSED)?;
             slot.current.as_ref().filter(|_| slot.generation == generation).ok_or(CLOSED)?
                 .mailbox.ack(sequence, offset).ok_or(CLOSED)?;
-            Ok(false)
+            Ok(())
         }
         "vnc_input" => {
             let input = Command::from_command(arg("input")).map_err(|_| CLOSED)?;
             let running = slot.current.as_ref().filter(|_| slot.generation == input.generation).ok_or(CLOSED)?;
-            running.input.try_send(input).map(|()| false).map_err(|_| "VNC 입력 큐가 가득 찼거나 닫혔습니다")
+            running.input.try_send(input).map_err(|_| "VNC 입력 큐가 가득 찼거나 닫혔습니다")
         }
         _ => Err(CLOSED),
     });
     match result {
-        Ok(remove) => {
-            if remove { state.tabs.remove(&owner.tab); }
-            invoke.resolver.resolve(());
-        }
+        Ok(()) => invoke.resolver.resolve(()),
         Err(error) => invoke.resolver.reject(error),
     }
 }
 
+fn begin_close(sessions: &Sessions, owner: &Owner, document: u64, generation: Option<u64>) -> Result<Arc<AsyncMutex<()>>, &'static str> {
+    let mut state = sessions.0.lock().unwrap();
+    let slot = state.slot(owner, document)?;
+    if generation.is_some_and(|generation| slot.generation != generation) { return Err(CLOSED); }
+    if generation.is_none() { slot.closing_owner = true; }
+    slot.current = None;
+    Ok(slot.close_gate.clone())
+}
+
+async fn close(sessions: &Sessions, owner: &Owner, document: u64, generation: Option<u64>, retry: bool,
+               gate: Arc<AsyncMutex<()>>) -> Result<bool, &'static str> {
+    let _guard = gate.lock_owned().await;
+    let (finished, retry) = {
+        let mut state = sessions.0.lock().unwrap();
+        let slot = state.slot(owner, document)?;
+        if generation.is_some_and(|generation| slot.generation != generation) { return Err(CLOSED); }
+        let retry = if retry && generation.is_none() && matches!(slot.cleanup, Some(Cleanup::Ticket(_))) { slot.cleanup.take() } else { None };
+        (slot.finished.clone(), retry)
+    };
+    if let Some(finished) = finished { finished.cancelled().await; }
+    let retry = if let Some(Cleanup::Ticket(mut ticket)) = retry {
+        Some(tauri::async_runtime::spawn_blocking(move || {
+            ticket.retry().err().map(|_| Cleanup::Ticket(ticket))
+        }).await.unwrap_or(Some(Cleanup::WorkerFailed)))
+    } else { None };
+    let mut state = sessions.0.lock().unwrap();
+    let slot = state.slot(owner, document)?;
+    if let Some(retry) = retry { slot.cleanup = retry; }
+    if slot.cleanup.is_some() { return Ok(false); }
+    if generation.is_none() { state.tabs.remove(&owner.tab); }
+    Ok(true)
+}
+
+async fn release(lease: Option<DesktopLease>) -> Option<Cleanup> {
+    let lease = lease?;
+    tauri::async_runtime::spawn_blocking(move || lease.release().err().map(Cleanup::Ticket))
+        .await.unwrap_or(Some(Cleanup::WorkerFailed))
+}
+
 struct Work {
-    gate: Arc<AsyncMutex<()>>,
+    previous: Option<CancellationToken>,
+    finished: DropGuard,
     generation: u64,
     life: Arc<Lifetime>,
     approval: Arc<()>,
@@ -247,6 +299,7 @@ fn prepare(sessions: &Sessions, owner: &Owner, document: u64) -> Result<Work, &'
     let mut state = sessions.0.lock().unwrap();
     if state.approving.is_some() { return Err("VNC 연결 승인 대기 중입니다"); }
     let slot = state.slot(owner, document)?;
+    if slot.closing_owner || slot.cleanup.is_some() { return Err(CLEANUP_UNCONFIRMED); }
     slot.current = None;
     slot.generation = slot.generation.checked_add(1).filter(|n| *n <= MAX_SAFE).ok_or(CLOSED)?;
     let (input, inputs) = mpsc::channel(8);
@@ -254,56 +307,74 @@ fn prepare(sessions: &Sessions, owner: &Owner, document: u64) -> Result<Work, &'
     let approval = Arc::new(());
     let mailbox = Arc::new(Mailbox::default());
     slot.current = Some(Running { life: life.clone(), approval: approval.clone(), input, mailbox: mailbox.clone() });
-    let work = Work { gate: slot.gate.clone(), generation: slot.generation, life, approval: approval.clone(), inputs, mailbox };
+    let finished = CancellationToken::new();
+    // 교체 작업도 앞 세대의 소켓 종료와 임대 정리가 끝난 뒤에만 열린다.
+    let previous = slot.finished.replace(finished.clone());
+    let work = Work { previous, finished: finished.drop_guard(), generation: slot.generation, life, approval: approval.clone(), inputs, mailbox };
     state.approving = Some(approval);
     Ok(work)
 }
 
 async fn connect(window: &WebviewWindow, owner: Owner, draft: Draft, notify: Channel<String>, work: Work,
                  tunnel_epoch: u64) -> Result<(), String> {
-    let Work { gate, generation, life, approval, inputs, mailbox } = work;
+    let Work { previous, finished: _finished, generation, life, approval, inputs, mailbox } = work;
     let output = Output { life: life.clone(), mailbox, notify };
     let sessions = window.state::<Sessions>();
-    let guard = gate.lock_owned().await;
+    if let Some(previous) = previous { previous.cancelled().await; }
     let mut tab = Tab::default();
-    let approved = if life.revoked() { Err(CLOSED.into()) } else { draft.approve(window, life.clone(), tunnel_epoch).await };
-    let finish = |failure| {
+    let mut lease = None;
+    let ready = {
         let mut state = sessions.0.lock().unwrap();
-        if let Ok(slot) = state.slot(&owner, owner.document) {
-            if slot.current.as_ref().is_some_and(|current| Arc::ptr_eq(&current.approval, &approval)) { slot.current = None; }
-        }
-        failure
+        state.slot(&owner, owner.document).map(|slot| slot.cleanup.is_none())
     };
-    let opened = match approved {
-        Err(error) => Err(error),
-        Ok(mut approved) => {
-            let loss = approved.loss();
-            let result = tokio::select! {
-                biased;
-                _ = life.cancelled() => Err(CLOSED.into()),
-                _ = route_lost(loss.as_ref()) => Err(message(&Error::Disconnected)),
-                result = approved.open(&mut tab) => result.map_err(|error| message(&error)),
-            };
-            result.map(|id| (id, approved.into_lease()))
+    let opened = match ready {
+        Err(error) => Err(error.into()),
+        Ok(false) => Err(CLEANUP_UNCONFIRMED.into()),
+        Ok(true) if life.revoked() => Err(CLOSED.into()),
+        Ok(true) => match draft.approve(window, life.clone(), tunnel_epoch, &mut lease).await {
+            Err(error) => Err(error),
+            Ok(mut approved) => {
+                let loss = approved.loss();
+                let result = tokio::select! {
+                    biased;
+                    _ = life.cancelled() => Err(CLOSED.into()),
+                    _ = route_lost(loss.as_ref()) => Err(message(&Error::Disconnected)),
+                    result = approved.open(&mut tab) => result.map_err(|error| message(&error)),
+                };
+                lease = approved.into_lease();
+                result
+            }
         },
     };
     {
         let mut state = sessions.0.lock().unwrap();
         if state.approving.as_ref().is_some_and(|current| Arc::ptr_eq(current, &approval)) { state.approving = None; }
     }
-    let (id, lease) = opened.map_err(finish)?;
-    let loss = lease.as_ref().map(|lease| lease.loss());
-    let identity = Identity { session_id: id.get().to_string(), generation };
-    let started = control(&output, &identity, "started", serde_json::Value::Null, 0);
-    let result = tokio::select! {
-        biased;
-        _ = life.cancelled() => None,
-        _ = route_lost(loss.as_ref()) => Some(Err(Error::Disconnected)),
-        result = async { started.await?; drive(&mut tab, id, &identity, &output, inputs).await } => Some(result),
+    let mut disconnected = None;
+    let result = match opened {
+        Err(error) => Err(error),
+        Ok(id) => {
+            let loss = lease.as_ref().map(DesktopLease::loss);
+            let identity = Identity { session_id: id.get().to_string(), generation };
+            let started = control(&output, &identity, "started", serde_json::Value::Null, 0);
+            let result = tokio::select! {
+                biased;
+                _ = life.cancelled() => Ok(()),
+                _ = route_lost(loss.as_ref()) => Err(Error::Disconnected),
+                result = async { started.await?; drive(&mut tab, id, &identity, &output, inputs).await } => result,
+            };
+            if let Err(error) = result { disconnected = Some((identity, error)); }
+            Ok(())
+        }
     };
     tab.stop().await;
-    drop(lease);
-    if let Some(Err(error)) = result {
+    let cleanup = release(lease).await;
+    let unconfirmed = cleanup.is_some();
+    if unconfirmed {
+        let mut state = sessions.0.lock().unwrap();
+        if let Ok(slot) = state.slot(&owner, owner.document) { slot.cleanup = cleanup; }
+    }
+    if let Some((identity, error)) = disconnected {
         if !life.revoked() {
             output.mailbox.clear();
             tokio::select! {
@@ -313,9 +384,11 @@ async fn connect(window: &WebviewWindow, owner: Owner, draft: Draft, notify: Cha
             }
         }
     }
-    finish(String::new());
-    drop(guard);
-    Ok(())
+    let mut state = sessions.0.lock().unwrap();
+    if let Ok(slot) = state.slot(&owner, owner.document) {
+        if slot.current.as_ref().is_some_and(|current| Arc::ptr_eq(&current.approval, &approval)) { slot.current = None; }
+    }
+    if unconfirmed { Err(CLEANUP_UNCONFIRMED.into()) } else { result }
 }
 
 async fn drive(tab: &mut Tab, id: super::SessionId, identity: &Identity, output: &Output, mut inputs: mpsc::Receiver<Command>) -> Result<(), Error> {
@@ -453,6 +526,41 @@ mod tests {
         sessions.retire(false);
         assert!(new.life.revoked());
         assert!(sessions.0.lock().unwrap().slot(&owner, 1).is_err());
+    }
+
+    #[tokio::test]
+    async fn vnc_owner_close_waits_for_worker_and_retains_unconfirmed_slot() {
+        let sessions = Sessions::default();
+        let owner = Owner { tab: "viewer".into(), document: 0 };
+        let other = Owner { tab: "other".into(), document: 0 };
+        {
+            let mut state = sessions.0.lock().unwrap();
+            state.tabs.insert(owner.tab.clone(), Slot::default());
+            state.tabs.insert(other.tab.clone(), Slot::default());
+        }
+        let work = prepare(&sessions, &owner, 0).unwrap();
+        assert!(begin_close(&sessions, &owner, 0, Some(work.generation + 1)).is_err());
+        assert!(!work.life.revoked());
+        let gate = begin_close(&sessions, &owner, 0, None).unwrap();
+        assert!(work.life.revoked());
+        let close_pending = close(&sessions, &owner, 0, None, false, gate);
+        tokio::pin!(close_pending);
+        tokio::select! {
+            biased;
+            _ = &mut close_pending => panic!("작업 종료 확인 전에 닫힘"),
+            () = std::future::ready(()) => {},
+        }
+        {
+            let mut state = sessions.0.lock().unwrap();
+            state.approving = None;
+            state.slot(&owner, 0).unwrap().cleanup = Some(Cleanup::WorkerFailed);
+        }
+        drop(work);
+        assert_eq!(close_pending.await, Ok(false));
+        assert_eq!(prepare(&sessions, &owner, 0).err(), Some(CLEANUP_UNCONFIRMED));
+        let other_gate = begin_close(&sessions, &other, 0, None).unwrap();
+        assert_eq!(close(&sessions, &other, 0, None, true, other_gate).await, Ok(true));
+        assert!(sessions.0.lock().unwrap().slot(&owner, 0).unwrap().cleanup.is_some());
     }
 
     #[cfg(windows)]
