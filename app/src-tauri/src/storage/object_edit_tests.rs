@@ -111,7 +111,7 @@ async fn saves_exact_key_and_preserved_headers_then_uses_the_new_revision() {
         assert_eq!(requests[put].method(), "PUT");
         let uri: http::Uri = requests[put].uri().parse().unwrap();
         assert_eq!(uri.path(), PATH);
-        assert_eq!(uri.query(), None);
+        assert_eq!(uri.query(), Some("x-id=PutObject"));
         let headers = requests[put].headers();
         for (name, value) in [
             ("if-match", tag),

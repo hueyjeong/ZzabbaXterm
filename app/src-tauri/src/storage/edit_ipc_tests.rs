@@ -157,7 +157,17 @@ async fn 저장은_목록_리전과_키를_유지하고_확정된_응답에서�
     }).await, EditResult::Saved);
     let after = state.begin_edit(&document, &request, Action::Compare).ok().unwrap();
     assert!(!Arc::ptr_eq(&before, &after.revision));
-    let requests: Vec<_> = fixture.actual_requests().map(|request| request.uri().parse::<http::Uri>().unwrap()).collect();
+    let requests: Vec<_> = fixture.actual_requests().collect();
     assert_eq!(requests.len(), 13);
-    assert_eq!(requests[12], requests[3]);
+    let get = requests[3].uri().parse::<http::Uri>().unwrap();
+    let put = requests[12].uri().parse::<http::Uri>().unwrap();
+    assert_eq!(get.host(), Some("s3.eu-west-2.amazonaws.com"));
+    assert_eq!(put.host(), get.host());
+    assert_eq!(put.path(), get.path());
+    assert_eq!(get.query(), Some("x-id=GetObject"));
+    assert_eq!(put.query(), Some("x-id=PutObject"));
+    assert_eq!(requests[3].method(), "GET");
+    assert_eq!(requests[12].method(), "PUT");
+    assert_eq!(requests[12].headers().get("if-match"), Some("\"v1\""));
+    assert_eq!(requests[12].headers().get("x-amz-server-side-encryption"), Some("AES256"));
 }
