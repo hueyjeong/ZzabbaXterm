@@ -3,6 +3,8 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../../App";
+import type { SavedConnections } from "../connections/connectionIpc";
+import type { ConnectionRequest, ConnectionTestDraft, ConnectionTestRun } from "../connections/profiles";
 
 const native = vi.hoisted(() => ({
   invoke: vi.fn(),
@@ -48,10 +50,21 @@ let observeWorkspace: () => void;
 let observeTabs: () => void;
 const channels = new Map<string, (message: unknown) => void>();
 const starts = new Map<string, Promise<void>>();
+const emptyStore: SavedConnections = { version: 1, groups: [], targets: [] };
+let loadProfiles: () => Promise<SavedConnections>;
+let runConnectionCommand: (command: string, args: unknown) => Promise<unknown>;
 
 beforeEach(async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   viewportWidth = 1200;
+  const dialog = window.HTMLDialogElement.prototype;
+  // jsdom에는 네이티브 모달 동작이 없다.
+  for (const [name, method] of Object.entries({
+    showModal(this: HTMLDialogElement) { this.setAttribute("open", ""); },
+    close(this: HTMLDialogElement) { this.removeAttribute("open"); },
+  })) {
+    Object.defineProperty(dialog, name, { configurable: true, value: method });
+  }
   vi.stubGlobal("ResizeObserver", class {
     constructor(private readonly callback: () => void) { }
     observe(element: HTMLElement) {
@@ -68,7 +81,11 @@ beforeEach(async () => {
   });
   channels.clear();
   starts.clear();
+  loadProfiles = async () => emptyStore;
+  runConnectionCommand = async (command) => { throw new Error(`예상하지 않은 연결 명령: ${command}`); };
   native.invoke.mockImplementation(async (command, args) => {
+    if (command === "connections_load") return loadProfiles();
+    if (command.startsWith("connection_")) return runConnectionCommand(command, args);
     if (command === "terminal_start") return starts.get(args.id);
     if (command !== "terminal_open") return;
     const id = `pty-${channels.size + 10}`;
@@ -79,6 +96,8 @@ beforeEach(async () => {
   root = createRoot(host);
   await act(async () => { root.render(<App />); });
 });
+
+type RunArgs = { run: ConnectionTestRun };
 
 afterEach(async () => {
   await act(async () => { root.unmount(); });
@@ -117,6 +136,25 @@ async function type(field: HTMLTextAreaElement, value: string, inserted = value)
 
 function calls(operation: string) {
   return native.invoke.mock.calls.flatMap(([command, args]) => command === `terminal_${operation}` ? [args] : []);
+}
+
+function connectionCalls(command: string) {
+  return native.invoke.mock.calls.filter(([name]) => name === command);
+}
+
+async function changeInput(label: string, value: string) {
+  const field = [...host.querySelectorAll("label")].find((item) => item.textContent?.trim() === label)?.querySelector("input");
+  expect(field, label).toBeDefined();
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(field, value);
+    field!.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+}
+
+async function restartWorkspace() {
+  await act(async () => { root.unmount(); });
+  root = createRoot(host);
+  await act(async () => { root.render(<App />); });
 }
 
 const status = () => find("footer").textContent;
@@ -339,5 +377,148 @@ describe("L02", () => {
       ["workspace_window", { action: "drag" }],
       ["workspace_window", { action: "toggleMaximize" }],
     ]);
+  });
+});
+
+describe("C01 저장된 로컬 연결", () => {
+  it("동명 그룹의 동명 대상을 검색해 Enter·더블클릭·문맥 메뉴로 정확한 저장 ID를 연다", async () => {
+    loadProfiles = async () => ({
+      version: 1,
+      groups: ["alpha", "beta"].map((id) => ({ revision: 1, profile: { id, displayName: "회사 개발" } })),
+      targets: ["alpha", "beta"].map((groupId) => ({
+        revision: 1, profile: {
+          id: `work-${groupId}`, groupId, displayName: "작업 셸", defaultMethod: "local",
+          local: { shell: "powerShell", startDirectory: `C:\\test\\${groupId}` },
+        }
+      })),
+    });
+    await restartWorkspace();
+    const search = find<HTMLInputElement>('[aria-label="연결 검색"]');
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(search, "작업");
+      search.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    const groups = [...tree().querySelectorAll<HTMLElement>('[aria-expanded]')];
+    expect(groups.map((group) => group.firstElementChild?.textContent)).toEqual(["▾ 회사 개발alpha", "▾ 회사 개발beta"]);
+    await act(async () => { groups[1].focus(); });
+    await key(groups[1], "ArrowRight");
+    expect(document.activeElement?.textContent).toBe("작업 셸");
+    await key(document.activeElement as HTMLElement, "Enter");
+    expect(calls("open").slice(-1)[0]).toMatchObject({ targetId: "work-beta", rows: 24, cols: 80 });
+    const alpha = groups[0].querySelector<HTMLElement>('[role="treeitem"]')!;
+    await act(async () => { alpha.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); });
+    expect(calls("open").slice(-1)[0]).toMatchObject({ targetId: "work-alpha" });
+    await key(alpha, "ContextMenu");
+    expect([...find('[role="menu"]').querySelectorAll('[role="menuitem"]')].map((item) => item.textContent)).toEqual(["로컬"]);
+    await press("로컬");
+    expect(calls("open").filter((args) => args.targetId).map((args) => args.targetId))
+      .toEqual(["work-beta", "work-alpha", "work-alpha"]);
+    expect(calls("start").slice(-3).map((args) => args.id)).toEqual(["pty-12", "pty-13", "pty-14"]);
+  });
+
+  it("빈 저장소에서 + 마법사로 시험한 뒤 Rust 저장 응답 이후에만 다시 읽고 재시작 시 표시한다", async () => {
+    expect(find(".workspace-tree").textContent).toContain("저장된 연결 없음");
+    const save = Promise.withResolvers<void>();
+    const reload = Promise.withResolvers<SavedConnections>();
+    let store = emptyStore;
+    let tested: ConnectionTestDraft | undefined;
+    loadProfiles = () => reload.promise;
+    runConnectionCommand = async (command, args) => {
+      if (command === "connection_test_start") {
+        tested = args as ConnectionTestDraft;
+        return { draftId: tested.draftId, draftVersion: tested.draftVersion, runId: "run-approved" };
+      }
+      if (command === "connection_test_wait") {
+        const { run } = args as RunArgs;
+        return { ...run, sessionId: "probe-pty" };
+      }
+      if (command === "connection_save") {
+        const { request } = args as { request: ConnectionRequest };
+        expect(request).toEqual({
+          draft: tested?.draft,
+          run: { draftId: tested?.draftId, draftVersion: tested?.draftVersion, runId: "run-approved" },
+        });
+        await save.promise;
+        const { group, target } = request.draft;
+        store = { version: 1, groups: [{ revision: 1, profile: group }], targets: [{ revision: 1, profile: target }] };
+        return null;
+      }
+      throw command;
+    };
+    await press("연결 추가");
+    expect(find("dialog[open]").textContent).toContain("대상");
+    await changeInput("그룹", "회사 개발");
+    await changeInput("표시명", "작업 셸");
+    await press("다음");
+    await changeInput("시작 디렉터리", "C:\\c01-test");
+    await press("다음");
+    expect(find("dialog").textContent).toContain("현재 사용자");
+    await press("다음");
+    expect(button("저장")?.disabled).toBe(true);
+    await press("연결 테스트");
+    expect(find("dialog").textContent).toContain("테스트 성공");
+    await press("저장");
+    expect(connectionCalls("connections_load")).toHaveLength(1);
+    expect(tree().textContent).not.toContain("작업 셸");
+    await act(async () => { save.resolve(); });
+    expect(host.querySelector("dialog")).toBeNull();
+    expect(connectionCalls("connections_load")).toHaveLength(2);
+    expect(tree().textContent).not.toContain("작업 셸");
+    await act(async () => { reload.resolve(store); });
+    expect(tree().textContent).toContain("회사 개발작업 셸");
+    loadProfiles = async () => store;
+    await restartWorkspace();
+    expect(tree().textContent).toContain("회사 개발작업 셸");
+    expect(calls("open").every((args) => !("targetId" in args))).toBe(true);
+  });
+
+  it("로드 오류를 빈 목록과 구분하고 성공한 초안의 경로를 바꿔 실패 후 취소하면 트리를 보존한다", async () => {
+    loadProfiles = async () => { throw "설정 읽기 실패"; };
+    await restartWorkspace();
+    expect(find(".workspace-tree [role=alert]").textContent).toContain("설정 읽기 실패");
+    expect(find(".workspace-tree").textContent).not.toContain("저장된 연결 없음");
+    loadProfiles = async () => emptyStore;
+    await press("다시 불러오기");
+    const before = tree().textContent;
+    const loads = connectionCalls("connections_load").length;
+    let failed = false;
+    runConnectionCommand = async (command, args) => {
+      if (command === "connection_test_start") {
+        const { draft, draftId, draftVersion } = args as ConnectionTestDraft;
+        failed = draft.target.local.startDirectory.endsWith("missing");
+        return { draftId, draftVersion, runId: failed ? "missing-run" : "good-run" };
+      }
+      if (command === "connection_test_wait") {
+        if (failed) throw "시작 디렉터리를 찾을 수 없습니다";
+        const { run } = args as RunArgs;
+        return { ...run, sessionId: "test-pty" };
+      }
+      if (command === "connection_test_cancel") return null;
+      throw command;
+    };
+    await press("연결 추가");
+    await changeInput("그룹", "회사 개발");
+    await changeInput("표시명", "작업 셸");
+    await press("다음");
+    await changeInput("시작 디렉터리", "C:\\c01-test");
+    await press("다음");
+    await press("다음");
+    await press("연결 테스트");
+    expect(button("저장")?.disabled).toBe(false);
+    await press("이전");
+    await press("이전");
+    await changeInput("시작 디렉터리", "C:\\c01-test\\missing");
+    await press("다음");
+    await press("다음");
+    expect(button("저장")?.disabled).toBe(true);
+    await press("연결 테스트");
+    expect(find("dialog [role=alert]").textContent).toBe("시작 디렉터리를 찾을 수 없습니다");
+    expect(find("dialog").textContent).toContain("C:\\c01-test\\missing");
+    await press("취소");
+    expect(host.querySelector("dialog")).toBeNull();
+    expect(tree().textContent).toBe(before);
+    expect(connectionCalls("connections_load")).toHaveLength(loads);
+    expect(connectionCalls("connection_save")).toHaveLength(0);
+    expect(connectionCalls("connection_test_cancel").map(([, args]) => args.run.runId)).toEqual(["good-run", "missing-run"]);
   });
 });

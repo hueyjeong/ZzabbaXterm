@@ -1,4 +1,7 @@
-import { useLayoutEffect, useRef, useState, type CSSProperties } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
+import { createLocalConnectionIpc, type SavedConnections } from "../connections/connectionIpc";
+import { LocalConnectionWizard } from "../connections/LocalConnectionWizard";
+import type { ConnectionClose, LocalProfileDraft } from "../connections/profiles";
 import { TerminalView } from "../terminal/TerminalView";
 import type { TerminalStatus } from "../terminal/session";
 import { LocalTree } from "./LocalTree";
@@ -6,7 +9,10 @@ import { Splitter } from "./Splitter";
 import { macTitleBar, TitleBar } from "./TitleBar";
 import "./workspace.css";
 
-type Tab = { id: number; status: TerminalStatus; sessionId?: string };
+type Tab = { id: number; label: string; targetId?: string; status: TerminalStatus; sessionId?: string };
+type ProfileLoad = { kind: "loading" | "ready"; profiles?: SavedConnections }
+  | { kind: "error"; profiles?: SavedConnections; error: string };
+const connections = createLocalConnectionIpc();
 
 function terminalStatus(status: TerminalStatus) {
   switch (status.kind) {
@@ -20,12 +26,15 @@ function terminalStatus(status: TerminalStatus) {
 
 export function Workspace() {
   const nextTab = useRef(2);
-  const [tabs, setTabs] = useState<Tab[]>([{ id: 1, status: { kind: "opening" } }]);
+  const [tabs, setTabs] = useState<Tab[]>([{ id: 1, label: "로컬 1", status: { kind: "opening" } }]);
   const [active, setActive] = useState(1);
   const [focusTab, setFocusTab] = useState<number | null>(1);
   const [focused, setFocused] = useState(false);
   const [draft, setDraft] = useState("");
   const [windowError, setWindowError] = useState("");
+  const [loadVersion, setLoadVersion] = useState(0);
+  const [profileLoad, setProfileLoad] = useState<ProfileLoad>({ kind: "loading" });
+  const [wizard, setWizard] = useState<{ draftId: string; initialDraft: LocalProfileDraft }>();
   const [treeWidth, setTreeWidth] = useState(280);
   const [aiWidth, setAiWidth] = useState(360);
   const [chatHeight, setChatHeight] = useState(50);
@@ -35,6 +44,40 @@ export function Workspace() {
   const sideLimit = Math.min(640, Math.floor(area.width * 0.32));
   const left = Math.min(treeWidth, sideLimit);
   const right = Math.min(aiWidth, sideLimit);
+
+  useEffect(() => {
+    let active = true;
+    void connections.load().then((profiles) => {
+      if (active) setProfileLoad({ kind: "ready", profiles });
+    }, (error: unknown) => {
+      if (active) setProfileLoad(({ profiles }) => ({ kind: "error", profiles, error: String(error) }));
+    });
+    return () => { active = false; };
+  }, [loadVersion]);
+
+  function reloadProfiles() {
+    setProfileLoad(({ profiles }) => ({ kind: "loading", profiles }));
+    setLoadVersion((version) => version + 1);
+  }
+
+  function openWizard() {
+    const groupId = crypto.randomUUID();
+    setWizard({
+      draftId: crypto.randomUUID(), initialDraft: {
+        version: 1, groupRevision: null, targetRevision: null,
+        group: { id: groupId, displayName: "" },
+        target: {
+          id: crypto.randomUUID(), groupId, displayName: "", defaultMethod: "local",
+          local: { shell: /Windows/.test(navigator.userAgent) ? "powerShell" : "bash", startDirectory: "" },
+        },
+      }
+    });
+  }
+
+  function closeWizard(result: ConnectionClose) {
+    setWizard(undefined);
+    if (result.kind === "saved") reloadProfiles();
+  }
 
   useLayoutEffect(() => {
     const element = body.current!;
@@ -65,9 +108,11 @@ export function Workspace() {
     return () => observer.disconnect();
   }, [active, left, focused]);
 
-  function openTab() {
+  function openTab(target?: SavedConnections["targets"][number]["profile"]) {
     const id = nextTab.current++;
-    setTabs((current) => [...current, { id, status: { kind: "opening" } }]);
+    setTabs((current) => [...current, {
+      id, label: target?.displayName ?? `로컬 ${id}`, targetId: target?.id, status: { kind: "opening" },
+    }]);
     selectTab(id);
   }
 
@@ -84,7 +129,7 @@ export function Workspace() {
 
   function updateStatus(id: number, status: TerminalStatus, sessionId?: string) {
     setTabs((current) => current.some((tab) => tab.id === id) ? current.map((tab) => tab.id === id
-      ? { id, status, sessionId: sessionId ?? tab.sessionId }
+      ? { ...tab, status, sessionId: sessionId ?? tab.sessionId }
       : tab) : current);
   }
 
@@ -95,21 +140,29 @@ export function Workspace() {
     <main className={`workspace${macTitleBar ? " workspace-mac" : ""}${focused ? " workspace-focused" : ""}`} style={layout}
       onFocusCapture={(event) => { if (!event.target.closest(".terminal-screen")) setFocusTab(null); }}>
       <TitleBar focused={focused} onToggle={() => setFocused(!focused)} onWindowError={setWindowError}>
-        {tabs.map(({ id }) => (
+        {tabs.map(({ id, label }) => (
           <div className="workspace-tab" key={id}>
-            <button ref={id === active ? activeButton : undefined} aria-pressed={id === active} onClick={() => selectTab(id)}>로컬 {id}</button>
-            <button aria-label={`로컬 ${id} 닫기`} onClick={() => closeTab(id)}>×</button>
+            <button ref={id === active ? activeButton : undefined} aria-pressed={id === active} onClick={() => selectTab(id)}>{label}</button>
+            <button aria-label={`${label} 닫기`} onClick={() => closeTab(id)}>×</button>
           </div>
         ))}
       </TitleBar>
       <div className="workspace-body" ref={body}>
         <aside className="workspace-tree" hidden={focused}>
-          <LocalTree onOpen={openTab} />
+          <button className="connection-add" type="button" aria-label="연결 추가" onClick={openWizard}>+</button>
+          {profileLoad.kind === "loading" && <div className="connection-status" role="status">저장된 연결 불러오는 중</div>}
+          {profileLoad.kind === "ready" && profileLoad.profiles?.targets.length === 0 &&
+            <div className="connection-status" role="status">저장된 연결 없음</div>}
+          {profileLoad.kind === "error" && <div className="connection-status">
+            <div role="alert">연결 불러오기 실패: {profileLoad.error}</div>
+            <button onClick={reloadProfiles}>다시 불러오기</button>
+          </div>}
+          <LocalTree profiles={profileLoad.profiles} onOpen={openTab} />
         </aside>
         <div className="workspace-center">
-          {tabs.map(({ id }) => (
+          {tabs.map(({ id, label, targetId }) => (
             <div className="workspace-session" key={id} hidden={id !== active} inert={id !== active}>
-              <TerminalView active={id === active} focusRequested={id === focusTab} label={`로컬 ${id}`}
+              <TerminalView active={id === active} focusRequested={id === focusTab} label={label} targetId={targetId}
                 onStatus={(status, sessionId) => updateStatus(id, status, sessionId)} />
             </div>
           ))}
@@ -132,10 +185,12 @@ export function Workspace() {
         </>}
       </div>
       <footer className="workspace-status">
-        <span role="status">{current ? ["내 PC", "로컬", current.sessionId, terminalStatus(current.status)].filter(Boolean).join(" · ") : "연결 없음"}</span>
+        <span role="status">{current ? [current.targetId ? current.label : "내 PC", "로컬", current.sessionId, terminalStatus(current.status)].filter(Boolean).join(" · ") : "연결 없음"}</span>
         {windowError && <span role="alert">{windowError}</span>}
         <span>AI 전용 셸 · 대기</span>
       </footer>
+      {wizard && <LocalConnectionWizard {...wizard} groups={profileLoad.profiles?.groups ?? []}
+        test={connections.test} cancelTest={connections.cancelTest} save={connections.save} onClose={closeWizard} />}
     </main>
   );
 }
