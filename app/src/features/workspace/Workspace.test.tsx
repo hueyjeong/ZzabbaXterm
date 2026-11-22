@@ -799,6 +799,11 @@ describe("C02 SSM 연결", () => {
     await press("저장");
     expect(connectionCalls("editor_local_save")).toEqual([["editor_local_save", { handle: "selected-file", text: "첫 편집" }]]);
     await act(async () => model.setValue("미저장"));
+    await press("로컬 1");
+    expect(document.activeElement).toBe(localInput);
+    await press("시험.txt");
+    expect(find('.editor-tab[aria-label="시험.txt"]').contains(document.activeElement)).toBe(true);
+    expect(model.getValue()).toBe("미저장");
     vi.spyOn(window, "confirm").mockReturnValueOnce(false).mockReturnValueOnce(true);
     await press("시험.txt 닫기");
     expect(connectionCalls("editor_local_close")).toHaveLength(0);

@@ -206,7 +206,7 @@ export function Workspace() {
 
   return (
     <main className={`workspace${macTitleBar ? " workspace-mac" : ""}${focused ? " workspace-focused" : ""}`} style={layout}
-      onFocusCapture={(event) => { if (!event.target.closest(".terminal-screen")) setFocusTab(null); }}>
+      onFocusCapture={(event) => { if (!event.target.closest(".terminal-screen, .monaco-editor")) setFocusTab(null); }}>
       <TitleBar focused={focused} onToggle={() => setFocused(!focused)} onWindowError={setWindowError}>
         {tabs.map((tab) => {
           const { id, label, kind } = tab;
@@ -265,6 +265,7 @@ export function Workspace() {
                   onStatus={(status, sessionId) => updateStatus(tab.id, status, sessionId)} />
               ) : (
                 <EditorTab file={tab.file} active={tab.id === active} transport={localEditorTransport} confirmDiscard={confirmEditorDiscard}
+                  focusRequested={tab.id === focusTab}
                   ref={(actions) => {
                     if (actions) editorActions.current.set(tab.id, actions);
                     else editorActions.current.delete(tab.id);
