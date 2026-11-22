@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import type { EventCallback } from "@tauri-apps/api/event";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -9,13 +10,20 @@ import type { ConnectionRequest, ConnectionTestDraft, ConnectionTestRun } from "
 
 const native = vi.hoisted(() => ({
   invoke: vi.fn(),
+  listen: vi.fn(),
   fit: vi.fn(),
 }));
 vi.mock("@tauri-apps/api/core", () => ({
   isTauri: () => true,
   invoke: native.invoke,
-  Channel: class { constructor(readonly receive: (message: unknown) => void) { } },
+  convertFileSrc: (path: string, protocol: string) => `${protocol}:${path}`,
+  Channel: class {
+    constructor(public onmessage: (message: unknown) => void) { }
+    receive = (message: unknown) => this.onmessage(message);
+  },
 }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: native.listen }));
+vi.mock("@tauri-apps/api/webview", () => ({ getCurrentWebview: () => ({ label: "main" }) }));
 vi.mock("@xterm/addon-fit", () => ({ FitAddon: class { fit = native.fit; } }));
 vi.mock("@xterm/xterm", () => ({
   Terminal: class {
@@ -63,6 +71,8 @@ let runDiscovery: (args: unknown) => Promise<unknown>;
 let runStorage: (command: string, args: unknown) => Promise<unknown>;
 let runSftp: (command: string, args: unknown) => Promise<unknown>;
 let runTunnel: (command: string, args: unknown) => Promise<unknown>;
+let receiveCliOpen: EventCallback<{ requestId: string }> | undefined;
+let runCliEditor: (command: string, args: { attached?: boolean }) => Promise<unknown>;
 let openFile: () => Promise<unknown>;
 let saveFile: () => Promise<unknown>;
 
@@ -106,16 +116,25 @@ beforeEach(async () => {
   runStorage = async command => { throw new Error(`예상하지 않은 스토리지 명령: ${command}`); };
   runSftp = async command => { throw new Error(`예상하지 않은 SFTP 명령: ${command}`); };
   runTunnel = async command => { throw new Error(`예상하지 않은 터널 명령: ${command}`); };
+  receiveCliOpen = undefined;
+  native.listen.mockImplementation(async (event, receive) => {
+    if (event === "editor-local-cli-open") receiveCliOpen = receive;
+    return () => { receiveCliOpen = undefined; };
+  });
+  runCliEditor = async command => { throw new Error(`예상하지 않은 CLI 편집 명령: ${command}`); };
   openFile = async () => ({ status: "cancelled" });
   saveFile = async () => null;
   native.invoke.mockImplementation(async (command, args) => {
     if (command === "connections_load") return loadProfiles();
-    if (command === "ai_models" || command === "ai_targets" || command === "ai_decisions") return [];
+    if (command === "ai_models") return ["local:latest"];
+    if (command === "ai_targets" || command === "ai_decisions") return [];
     if (command.startsWith("connection_") || ["verify_ssh_host", "commit_ssh_host", "cancel_ssh_host", "register_saved_ssh_host"].includes(command)) return runConnectionCommand(command, args);
     if (command === "ssm_discovery") return runDiscovery(args);
     if (command.startsWith("storage_")) return runStorage(command, args);
     if (command.startsWith("editor_sftp_")) return runSftp(command, args);
     if (command.startsWith("tunnel_")) return runTunnel(command, args);
+    if (command === "editor_local_cli_pending") return [];
+    if (command.startsWith("editor_local_cli_")) return runCliEditor(command, args);
     if (command === "editor_local_open") return openFile();
     if (command === "editor_local_save") return saveFile();
     if (command === "terminal_start") return starts.get(args.id);
@@ -207,6 +226,242 @@ async function openSecond() {
   expect(document.activeElement).toBe(find('[role="treeitem"]:not([aria-expanded])'));
   await key(document.activeElement as HTMLElement, "Enter");
 }
+
+describe("중앙 원격 화면", () => {
+  function dispatchTrusted(target: HTMLElement, event: Event) {
+    // jsdom의 공개 dispatchEvent는 항상 isTrusted를 지운다. 실제 컴포넌트의 신뢰 검사는 유지한다.
+    const impl = Object.getOwnPropertySymbols(event).find(symbol => symbol.description === "impl");
+    if (!impl) throw new Error("jsdom 이벤트 구현을 찾을 수 없습니다");
+    const state = Reflect.get(event, impl);
+    state.isTrusted = true;
+    Reflect.get(target, impl)._dispatch(state);
+  }
+
+  it.each(["rdp", "vnc"] as const)("%s 엔진의 프레임·입력·종료가 탭 수명을 따른다", async (protocol) => {
+    const label = `${protocol.toUpperCase()} 3`;
+    const identity = { sessionId: "b".repeat(32), generation: 1 };
+    const owner = { tab: identity.sessionId, document: 1 };
+    const proof = "a".repeat(32);
+    vi.stubGlobal(`__ZZABBA_${protocol.toUpperCase()}_DOCUMENT__`, { proof });
+    const fetchPacket = vi.fn<(url: string) => Promise<Pick<Response, "ok" | "headers" | "arrayBuffer" | "json">>>();
+    vi.stubGlobal("fetch", fetchPacket);
+    vi.stubGlobal("ImageData", class {
+      constructor(readonly data: Uint8ClampedArray, readonly width: number, readonly height: number) { }
+    });
+    const draw = vi.fn();
+    vi.mocked(HTMLCanvasElement.prototype.getContext).mockReturnValue({ putImageData: draw } as unknown as CanvasRenderingContext2D);
+    const pendingRdp = Promise.withResolvers<void>();
+    const invoke = native.invoke.getMockImplementation()!;
+    let output: { onmessage(ticket: string): void } | undefined;
+    native.invoke.mockImplementation((command, args) => {
+      if (command === "rdp_prepare") return Promise.resolve(identity);
+      if (command === "vnc_create") return Promise.resolve(owner);
+      if (command === `${protocol}_connect`) {
+        output = args.output;
+        return protocol === "rdp" ? pendingRdp.promise : Promise.resolve();
+      }
+      if (command === `${protocol}_close`) pendingRdp.resolve();
+      return invoke(command, args);
+    });
+    let ticketSequence = 0;
+    async function deliver(packet: object | ArrayBuffer) {
+      const binary = packet instanceof ArrayBuffer;
+      const ticket = (++ticketSequence).toString(16).padStart(32, "0");
+      fetchPacket.mockResolvedValueOnce({
+        ok: true, headers: new Headers({ "content-type": binary ? "application/octet-stream" : "application/json" }),
+        arrayBuffer: async () => {
+          if (!binary) throw new Error("바이너리 패킷이 아닙니다");
+          return packet;
+        },
+        json: async () => JSON.parse(JSON.stringify(packet)),
+      });
+      await act(async () => { output!.onmessage(ticket); });
+      expect(fetchPacket).toHaveBeenLastCalledWith(`${protocol}-packet:${proof}-${ticket}`, expect.anything());
+    }
+
+    await openSecond();
+    const terminal = find<HTMLTextAreaElement>('section[aria-label="로컬 2"] textarea');
+    await press(`${protocol.toUpperCase()} 탭 열기`);
+    expect(button(label)?.getAttribute("aria-pressed")).toBe("true");
+    expect(status()).toBe(`${label} · 직접 · ${protocol === "rdp" ? "NLA" : "TLS"}`);
+    const pane = find(".workspace-session.workspace-desktop");
+    const form = pane.querySelector("form")!;
+    const server = form.querySelector("input")!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(server, "desktop.example.invalid");
+      server.dispatchEvent(new Event("input", { bubbles: true }));
+      form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    });
+    expect(output).toBeUndefined();
+    await act(async () => form.requestSubmit());
+    expect(connectionCalls(`${protocol}_connect`)).toEqual([[
+      `${protocol}_connect`, protocol === "rdp"
+        ? { id: identity, draft: { host: "desktop.example.invalid", port: 3389 }, output }
+        : { owner, draft: { host: "desktop.example.invalid", port: 5900, password: true }, output },
+      { headers: { [`x-zzabba-${protocol}-document`]: proof } },
+    ]]);
+    if (protocol === "vnc") await deliver({ identity, kind: "started", serial: 0 });
+    const canvas = find<HTMLCanvasElement>('canvas[aria-label="원격 화면"]');
+    expect(canvas.tabIndex).toBe(-1);
+    expect(pane.textContent).toContain("첫 화면 대기 중");
+    expect(pane.textContent).not.toContain("연결됨");
+
+    if (protocol === "rdp") {
+      await deliver({ sequence: 1, kind: "frame", full: true, frameSequence: 1, width: 1, height: 1, x: 0, y: 0, w: 1, h: 1 });
+      const chunk = new ArrayBuffer(16);
+      new DataView(chunk).setBigUint64(0, 1n, true);
+      new Uint8Array(chunk, 12).set([1, 2, 3, 255]);
+      await deliver(chunk);
+      await deliver({ sequence: 2, kind: "display" });
+    } else {
+      await deliver({ identity, kind: "waiting", value: 1, serial: 1 });
+      const chunk = new ArrayBuffer(37);
+      const header = new DataView(chunk);
+      header.setUint8(0, 1);
+      header.setBigUint64(1, 1n, true);
+      header.setBigUint64(9, 1n, true);
+      for (const offset of [17, 19, 25, 27]) header.setUint16(offset, 1, true);
+      new Uint8Array(chunk, 33).set([1, 2, 3, 255]);
+      await deliver(chunk);
+    }
+    expect(draw).toHaveBeenCalledOnce();
+    expect(draw).toHaveBeenCalledWith(expect.objectContaining({ data: Uint8ClampedArray.of(1, 2, 3, 255) }), 0, 0);
+    expect(pane.textContent).toContain("연결됨 · 1 × 1");
+
+    const input = () => new KeyboardEvent("keydown", { code: "KeyA", key: "a", bubbles: true, cancelable: true });
+    const keyCalls = () => connectionCalls(`${protocol}_input`).filter(([, args]) => args.input.action.kind === "key");
+    await act(async () => dispatchTrusted(canvas, input()));
+    expect(keyCalls()).toHaveLength(0);
+    await act(async () => {
+      canvas.focus();
+      canvas.dispatchEvent(input());
+    });
+    expect(keyCalls()).toHaveLength(0);
+    await act(async () => dispatchTrusted(canvas, input()));
+    expect(keyCalls()).toEqual([[`${protocol}_input`, expect.objectContaining({
+      input: expect.objectContaining({ action: expect.objectContaining({ kind: "key", down: true }) }),
+    }), expect.anything()]]);
+
+    await press("로컬 2");
+    expect(document.activeElement).toBe(terminal);
+    expect(canvas.closest("[hidden][inert]")).not.toBeNull();
+    await act(async () => dispatchTrusted(canvas, input()));
+    expect(keyCalls()).toHaveLength(1);
+    const choice = find<HTMLSelectElement>(".workspace-center-actions select");
+    expect([...choice.options].map(option => option.text)).toEqual(["선택", "로컬 1"]);
+    await act(async () => {
+      choice.selectedIndex = 1;
+      choice.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(terminal.closest('[data-pane="left"]')).not.toBeNull();
+    const boundary = find(".splitter-center");
+    await press(label);
+    expect(find(".splitter-center")).toBe(boundary);
+    expect(host.querySelector(".workspace-center-split")).toBeNull();
+    expect(terminal.closest("[hidden][inert]")).not.toBeNull();
+    expect(pane.querySelector("canvas")).toBe(canvas);
+    expect(pane.textContent).toContain("연결됨 · 1 × 1");
+    expect(connectionCalls(`${protocol}_connect`)).toHaveLength(1);
+    expect(connectionCalls(`${protocol}_close`)).toEqual([]);
+    await act(async () => {
+      canvas.focus();
+      dispatchTrusted(canvas, input());
+    });
+    expect(keyCalls()).toHaveLength(2);
+
+    await press(`${label} 닫기`);
+    expect(pane.isConnected).toBe(false);
+    expect(connectionCalls(`${protocol}_close`)).toEqual([[
+      `${protocol}_close`, protocol === "rdp" ? { id: identity } : { owner, generation: null },
+      { headers: { [`x-zzabba-${protocol}-document`]: proof } },
+    ]]);
+    expect(document.activeElement).toBe(terminal);
+    expect(terminal.closest('[data-pane="left"]')).not.toBeNull();
+    expect(find(".splitter-center")).toBe(boundary);
+    expect(boundary.parentElement?.classList.contains("workspace-center-split")).toBe(true);
+    expect(calls("open")).toHaveLength(2);
+    expect(calls("close")).toEqual([]);
+  });
+});
+
+describe("CLI 로컬 파일 열기", () => {
+  const requestId = "1".repeat(32);
+  const handle = "a".repeat(32);
+  const file = { status: "opened", handle, name: "CLI 문서.txt", text: "CLI 원본" };
+  const preview = '.editor-tab[aria-label="CLI 문서.txt"]';
+
+  async function openFromCli(respond: () => Promise<void>) {
+    runCliEditor = async (command, args) => {
+      if (command === "editor_local_cli_claim") return file;
+      if (args.attached) await respond();
+    };
+    await act(async () => receiveCliOpen!({ event: "editor-local-cli-open", id: 1, payload: { requestId } }));
+  }
+
+  it("마운트한 편집 탭의 정확한 핸들을 부착하고 해당 탭을 닫을 때만 파일을 닫는다", async () => {
+    const attached = Promise.withResolvers<void>();
+    let textAtAttach: string | undefined;
+    await openSecond();
+    await press("로컬 1");
+    await openFromCli(() => {
+      textAtAttach = editor.getModels().find(item => item.uri.query === handle)?.getValue();
+      return attached.promise;
+    });
+
+    expect(textAtAttach).toBe(file.text);
+    expect(connectionCalls("editor_local_cli_respond")).toEqual([
+      ["editor_local_cli_respond", { requestId, handle, attached: true }],
+    ]);
+    expect(find(preview).hidden).toBe(true);
+    expect(button("로컬 1")?.getAttribute("aria-pressed")).toBe("true");
+    await press("로컬 2");
+    const input = find<HTMLTextAreaElement>('section[aria-label="로컬 2"] textarea');
+    expect(document.activeElement).toBe(input);
+    await type(input, "READY");
+    expect(calls("input")).toEqual([{ id: "pty-11", bytes: Array.from(new TextEncoder().encode("READY")) }]);
+
+    await act(async () => attached.resolve());
+    expect(button(file.name)?.getAttribute("aria-pressed")).toBe("true");
+    expect(find(preview).hidden).toBe(false);
+    expect(status()).toBe("내 PC · 로컬 파일");
+    await press("로컬 2");
+    expect(find('section[aria-label="로컬 2"] textarea')).toBe(input);
+    expect(input.value).toBe("READY");
+    await press("로컬 1 닫기");
+    expect(connectionCalls("editor_local_close")).toEqual([]);
+    await press(`${file.name} 닫기`);
+    expect(connectionCalls("editor_local_close")).toEqual([["editor_local_close", { handle }]]);
+    expect(button(file.name)).toBeUndefined();
+    expect(calls("close")).toEqual([{ id: "pty-10" }]);
+    expect(button("로컬 2")?.getAttribute("aria-pressed")).toBe("true");
+  });
+
+  it.each(["수신 종료", "부착 응답 실패"])("%s 시 임시 편집 탭만 사라진다", async (failure) => {
+    const attached = Promise.withResolvers<void>();
+    await openSecond();
+    const input = find<HTMLTextAreaElement>('section[aria-label="로컬 2"] textarea');
+    await openFromCli(() => attached.promise);
+    expect(button(file.name)?.disabled).toBe(true);
+
+    if (failure === "수신 종료") {
+      await act(async () => { window.dispatchEvent(new Event("pagehide")); });
+      expect(button(file.name)).toBeUndefined();
+      await act(async () => attached.resolve());
+    } else {
+      await act(async () => attached.reject(new Error("응답 연결 끊김")));
+    }
+
+    expect(button(file.name)).toBeUndefined();
+    expect(editor.getModels().some(item => item.uri.query === handle)).toBe(false);
+    expect(button("로컬 1")).toBeDefined();
+    expect(button("로컬 2")?.getAttribute("aria-pressed")).toBe("true");
+    expect(document.activeElement).toBe(input);
+    await type(input, "STILL_READY");
+    expect(calls("input")).toEqual([{ id: "pty-11", bytes: Array.from(new TextEncoder().encode("STILL_READY")) }]);
+    expect(calls("close")).toEqual([]);
+    expect(connectionCalls("editor_local_close")).toEqual([]);
+  });
+});
 
 describe("L02", () => {
   it("셸이 준비되기 전에는 입력을 받지 않고 준비되면 선택한 터미널로 포커스가 이동한다", async () => {
@@ -363,6 +618,7 @@ describe("L02", () => {
     await press("모델 및 대상 새로고침");
     const aiTarget = find<HTMLSelectElement>(".a01-proposals select");
     await act(async () => {
+      aiTarget.closest("details:not([open])")?.querySelector("summary")?.click();
       aiTarget.selectedIndex = 1;
       aiTarget.dispatchEvent(new Event("change", { bubbles: true }));
     });
@@ -384,6 +640,8 @@ describe("L02", () => {
     expect(right.closest('[data-pane="right"]')).not.toBeNull();
     expect(right.closest("[hidden], [inert]")).toBeNull();
     expect(document.activeElement).toBe(left);
+    await type(right, "UNFOCUSED");
+    expect(calls("input")).toEqual([{ id: "pty-10", bytes: Array.from(new TextEncoder().encode("echo ")) }]);
     const boundary = find('[role="separator"][aria-label="중앙 터미널 분할"]');
     expect(boundary.getAttribute("aria-orientation")).toBe("vertical");
     await act(async () => boundary.focus());
@@ -473,7 +731,7 @@ describe("L02", () => {
 
   it("창 이동은 핸들과 여백에서만 시작하며 오류를 표시한다", async () => {
     native.invoke.mockClear();
-    for (const selector of ['.workspace-tab button', '.workspace-mode', '.window-control.close']) {
+    for (const selector of ['.workspace-tab button', '.workspace-desktop-actions button', '.workspace-mode', '.window-control.close']) {
       await act(async () => {
         find(selector).dispatchEvent(new MouseEvent("mousedown", { bubbles: true, detail: 1 }));
       });
@@ -532,7 +790,7 @@ describe("C01 저장된 로컬 연결", () => {
   });
 
   it("빈 저장소에서 + 마법사로 시험한 뒤 Rust 저장 응답 이후에만 다시 읽고 재시작 시 표시한다", async () => {
-    expect(find(".workspace-tree").textContent).toContain("저장된 연결 없음");
+    expect([...tree().querySelectorAll('[role="treeitem"] > .tree-row > span:not([aria-hidden])')].map(item => item.textContent)).toEqual(["로컬", "내 PC"]);
     const save = Promise.withResolvers<void>();
     const reload = Promise.withResolvers<SavedConnections>();
     let store = emptyStore;
@@ -591,7 +849,6 @@ describe("C01 저장된 로컬 연결", () => {
     loadProfiles = async () => { throw "설정 읽기 실패"; };
     await restartWorkspace();
     expect(find(".workspace-tree [role=alert]").textContent).toContain("설정 읽기 실패");
-    expect(find(".workspace-tree").textContent).not.toContain("저장된 연결 없음");
     loadProfiles = async () => emptyStore;
     await press("다시 불러오기");
     const before = tree().textContent;
@@ -991,6 +1248,12 @@ describe("C02 SSM 연결", () => {
     await act(async () => receive({ kind: "ready" }));
     expect(status()).toContain("연결됨");
     expect(screen.hasAttribute("inert")).toBe(false);
+    expect(document.activeElement).toBe(field);
+    const aiSession = find<HTMLSelectElement>(`.workspace-chat select:has(option[value="${sessionId}"])`);
+    expect([...aiSession.options].map(option => option.value)).toEqual(["", sessionId]);
+    await press("RDP 탭 열기");
+    expect([...aiSession.options].map(option => option.value)).toEqual(["", sessionId]);
+    await press("RDP 3 닫기");
     expect(document.activeElement).toBe(field);
     await press("파일");
     expect(find(".workspace-file-status").textContent).toBe("활성 SSH 연결 없음");
@@ -1483,6 +1746,12 @@ describe("현재 SSH 세션의 SFTP", () => {
     expect(visible(pinned)).toBe(true);
     expect(visible(firstPath)).toBe(false);
     expect(button("서버 A")?.getAttribute("aria-pressed")).toBe("true");
+    await press("VNC 탭 열기");
+    expect(visible(pinned)).toBe(true);
+    expect(visible(firstPath)).toBe(false);
+    expect(right.closest("[hidden][inert]")).not.toBeNull();
+    await press("서버 A");
+    expect(find(".workspace-storage")).toBe(pinned);
     await act(async () => right.focus());
     expect(visible(pinned)).toBe(true);
     expect(status()).toContain(second.id);
@@ -1603,7 +1872,7 @@ describe("현재 SSH 세션의 SFTP", () => {
     await key(button("원격.txt")!, "ContextMenu");
     await press("편집");
     expect(connectionCalls("editor_sftp_open")).toEqual([["editor_sftp_open", { sessionId: ssh.id, entryId: "file" }]]);
-    expect(status()).toContain("SFTP · 원격.txt");
+    expect(status()).toBe("SFTP");
     const model = editor.getModels().find(item => item.uri.query === "remote-file")!;
     await act(async () => model.setValue("원격 저장"));
     await press("저장");

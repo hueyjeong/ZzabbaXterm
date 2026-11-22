@@ -116,17 +116,19 @@ export function SessionSelection({ candidates, visible = true, actions }: Sessio
   }
 
   return <div hidden={!visible}>
-    <label className="a01-field">AI 작업 세션
+    {candidates.length > 0 && <label className="a01-field">AI 작업 세션
       <select value={candidate && !(state.kind === "selecting" && state.closed) ? candidate.id : ""}
-        disabled={!candidates.length || state.kind === "selecting" || state.kind === "clearing"}
+        disabled={state.kind === "selecting" || state.kind === "clearing"}
         onChange={(event) => void select(event.currentTarget.value)}>
         <option value="">세션 선택</option>
         {candidates.map(({ id, label }) => <option key={id} value={id}>
           {label.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, "�")} (세션 {id})
         </option>)}
       </select>
-    </label>
+    </label>}
     {!candidates.length && <p role="status">선택할 SSM 세션 없음</p>}
+    {state.kind === "selecting" && <p role="status">세션 선택 중</p>}
+    {state.kind === "clearing" && <p role="status">세션 선택 해제 중</p>}
     {selected && <>
       <p>{selected.region} / {selected.node}</p>
       <div className="a01-actions">

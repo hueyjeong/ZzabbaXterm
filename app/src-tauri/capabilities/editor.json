@@ -5,6 +5,11 @@
   "local": true,
   "webviews": ["main"],
   "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "allow-editor-local-cli-pending",
+    "allow-editor-local-cli-claim",
+    "allow-editor-local-cli-respond",
     "allow-editor-local-open",
     "allow-editor-local-save",
     "allow-editor-local-compare",

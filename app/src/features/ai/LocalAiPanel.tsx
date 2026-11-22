@@ -180,11 +180,9 @@ export function LocalAiPanel({ profilesVersion, topTabs, sessionCandidates, focu
     history={history} policyVersion={policyVersion} onReadDecision={readDecision}
     onOpenCliReview={openCliReview} topTabs={topTabs}
     sessionSelection={sessionCandidates && { candidates: sessionCandidates, visible: !focused, actions: sessionActions }}
-    policyControl={<>
-      {blocked !== undefined && <label><input type="checkbox" checked={blocked} disabled={savingPolicy}
-        onChange={(event) => void updatePolicy(event.currentTarget.checked)} /> 조회 승인 차단</label>}
-      {policyError && <p role="alert">{policyError}</p>}
-    </>}
+    policyControl={blocked !== undefined && <label><input type="checkbox" checked={blocked} disabled={savingPolicy}
+      onChange={(event) => void updatePolicy(event.currentTarget.checked)} /> 조회 승인 차단</label>}
+    policyStatus={policyError ? <p role="alert">{policyError}</p> : savingPolicy ? <p role="status">설정 저장 중</p> : undefined}
     modelError={modelError} targetError={targetError} onRefresh={() => setRetry((value) => value + 1)}
     onSendChat={sendChat} onRequestProposal={propose} onDecideProposal={decide} />;
 }

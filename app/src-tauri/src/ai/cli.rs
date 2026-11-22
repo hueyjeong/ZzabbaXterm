@@ -1,5 +1,6 @@
 use std::{
     fmt,
+    future::Future,
     io::{self, Read, Write},
     path::Path,
     sync::Arc,
@@ -9,12 +10,13 @@ use std::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::Semaphore,
+    sync::{OwnedSemaphorePermit, Semaphore},
     time::{Instant, timeout, timeout_at},
 };
 
 use crate::{
     connections::{self, profile::{Draft, MethodRef, SshAuth, SshTransport, ValidatedDraft, valid_id}},
+    editor::{self, cli as edit},
     local_ipc::{self, DEADLINE, Endpoint, Listener, MAX_FRAME, SERVICE, encode_frame, read_frame, write_frame},
 };
 use tauri::{AppHandle, Manager};
@@ -22,6 +24,7 @@ use tauri::{AppHandle, Manager};
 use super::ipc::State;
 
 const MAX_STDIN: usize = MAX_FRAME - 64;
+const MAX_EDITS: usize = 32;
 const USAGE: &str = "사용법: zzabba list | zzabba register | zzabba propose";
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -96,6 +99,7 @@ impl Proposal {
 enum Request {
     List {},
     Propose { proposal: Proposal },
+    Edit(edit::Request),
 }
 
 #[derive(Serialize)]
@@ -147,7 +151,7 @@ enum Receipt {
     },
 }
 
-// 리스너는 조회와 제안 접수만 담당한다. 저장·결정·실행은 이 경계 밖이다.
+// 연결 조회와 제안 접수에는 승인이나 실행 권한이 없다.
 pub(crate) trait Requests {
     fn list(&self) -> Result<Vec<Alias>, Rejected>;
     fn request_review(&self, proposal: Proposal, deadline: Instant) -> Result<String, Rejected>;
@@ -175,7 +179,12 @@ impl Requests for AppRequests {
 pub(crate) fn start(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let result = match bind() {
-            Ok(listener) => serve(listener, AppRequests(app)).await,
+            Ok(listener) => {
+                let editor_app = app.clone();
+                serve(listener, AppRequests(app), move |pending| {
+                    editor::prepare_cli(editor_app.clone(), pending)
+                }).await
+            }
             Err(error) => Err(error),
         };
         if let Err(error) = result {
@@ -188,14 +197,40 @@ pub(crate) fn bind() -> io::Result<Listener> {
     Listener::bind(&Endpoint::for_service(SERVICE)?)
 }
 
-pub(crate) async fn serve(listener: Listener, requests: impl Requests + Send + Sync + 'static) -> io::Result<()> {
+pub(crate) async fn serve<F, Work>(
+    listener: Listener,
+    requests: impl Requests + Send + Sync + 'static,
+    confirm: F,
+) -> io::Result<()>
+where
+    F: Fn(edit::Pending) -> Work + Clone + Send + 'static,
+    Work: Future<Output = ()> + Send + 'static,
+{
     let requests = Arc::new(requests);
     let blocking = Arc::new(Semaphore::new(4));
+    let edits = Arc::new(Semaphore::new(MAX_EDITS));
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let _cancel_edits = shutdown.clone().drop_guard();
     local_ipc::serve(listener, move |mut stream| {
         let requests = Arc::clone(&requests);
         let blocking = Arc::clone(&blocking);
+        let edits = Arc::clone(&edits);
+        let confirm = confirm.clone();
+        let shutdown = shutdown.clone();
         async move {
-            let _ = serve_connection(&mut stream, requests, blocking).await;
+            if let Ok(Some((request, permit))) =
+                serve_connection(&mut stream, requests, blocking, &edits).await
+            {
+                // 접수된 편집은 일반 연결 슬롯을 반환하고 전용 슬롯만 유지한다.
+                tokio::spawn(async move {
+                    tokio::select! {
+                        _ = shutdown.cancelled() => {},
+                        _ = edit::serve_edit(&mut stream, request, confirm) => {},
+                    }
+                    drop(permit);
+                    drop(stream);
+                });
+            }
         }
     }).await
 }
@@ -204,11 +239,29 @@ async fn serve_connection(
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
     requests: Arc<impl Requests + Send + Sync + 'static>,
     blocking: Arc<Semaphore>,
-) -> io::Result<()> {
+    edits: &Arc<Semaphore>,
+) -> io::Result<Option<(edit::Request, OwnedSemaphorePermit)>> {
     let deadline = Instant::now() + DEADLINE;
     let result = timeout_at(deadline, read_frame(stream, MAX_FRAME)).await?;
     let receipt = match result {
         Ok(bytes) => match decode(&bytes) {
+            Ok(Request::Edit(request)) => {
+                if !request.is_valid() {
+                    edit::send_edit(stream, edit::Response::InvalidRequest, deadline).await?;
+                    return Ok(None);
+                }
+                #[cfg(windows)]
+                if !matches!(Listener::current_process_is_elevated(), Ok(false)) {
+                    edit::send_edit(stream, edit::Response::OpenFailed, deadline).await?;
+                    return Ok(None);
+                }
+                let Ok(permit) = Arc::clone(edits).try_acquire_owned() else {
+                    edit::send_edit(stream, edit::Response::OpenFailed, deadline).await?;
+                    return Ok(None);
+                };
+                edit::send_edit(stream, edit::Response::Accepted, deadline).await?;
+                return Ok(Some((request, permit)));
+            }
             Ok(request) => match blocking.try_acquire_owned() {
                 Ok(permit) => {
                     let worker = tokio::task::spawn_blocking(move || {
@@ -235,7 +288,8 @@ async fn serve_connection(
     .unwrap_or_else(|error| Receipt::Failed { error });
     let encoded = encode_frame(&receipt, MAX_FRAME)
         .unwrap_or_else(|_| br#"{"error":"rejected"}"#.to_vec());
-    timeout_at(deadline, write_frame(stream, &encoded, MAX_FRAME)).await?
+    timeout_at(deadline, write_frame(stream, &encoded, MAX_FRAME)).await??;
+    Ok(None)
 }
 
 fn dispatch(request: Request, requests: &impl Requests, deadline: Instant) -> Result<Receipt> {
@@ -249,6 +303,7 @@ fn dispatch(request: Request, requests: &impl Requests, deadline: Instant) -> Re
                 .request_review(proposal, deadline)
                 .map(|proposal_id| Receipt::Proposed { proposal_id })
         }
+        Request::Edit(_) => return Err(Error::InvalidRequest),
     };
     result.map_err(|_| Error::Rejected)
 }

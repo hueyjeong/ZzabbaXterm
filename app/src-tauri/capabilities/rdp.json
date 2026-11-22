@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "local-rdp",
+  "local": true,
+  "webviews": ["main"],
+  "permissions": ["allow-rdp-prepare", "allow-rdp-connect", "allow-rdp-input", "allow-rdp-ack", "allow-rdp-close"]
+}

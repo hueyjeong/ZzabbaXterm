@@ -134,14 +134,24 @@ it("선택했던 세션이 닫히면 숨겨진 상태에서도 정확한 선택�
 
 it("선택 응답 전에 세션이 닫혀도 도착한 선택을 해제한다", async () => {
   const port = actions();
+  const clearing = Promise.withResolvers<null>();
   const late = Promise.withResolvers<SessionSelectionSnapshot>();
   port.select.mockReturnValueOnce(late.promise);
+  port.clear.mockReturnValueOnce(clearing.promise);
   await render(port);
   await choose(alpha.id);
-  await render(port, [beta]);
-  await act(async () => late.resolve(snapshot(alpha)));
+  await render(port, []);
+  expect(field()).toBeNull();
+  expect([...host.querySelectorAll('[role="status"]')].map((status) => status.textContent)).toEqual([
+    "선택할 SSM 세션 없음", "세션 선택 중",
+  ]);
+  await act(async () => { late.resolve(snapshot(alpha)); });
   expect(port.clear).toHaveBeenCalledExactlyOnceWith(snapshot(alpha).selectionId);
-  expect(field().value).toBe("");
+  expect(field()).toBeNull();
+  expect(host.textContent).toContain("세션 선택 해제 중");
+  await act(async () => { clearing.reject(new Error("해제 실패")); });
+  expect(host.querySelector('[role="alert"]')?.textContent).toBe("세션 선택 해제 실패");
+  expect(field()).toBeNull();
   expect(port.confirm).not.toHaveBeenCalled();
 });
 

@@ -42,6 +42,7 @@ async function select(label: string, option: string) {
   const field = [...host.querySelectorAll("label")].find((element) => element.firstChild?.textContent === label)!
     .querySelector("select")!;
   await act(async () => {
+    field.closest("details:not([open])")?.querySelector("summary")?.click();
     field.value = [...field.options].find((element) => element.textContent?.trim() === option)!.value;
     field.dispatchEvent(new Event("change", { bubbles: true }));
   });
@@ -82,7 +83,6 @@ describe("일반 대화", () => {
     expect(document.activeElement).toBe(input());
     expect(host.querySelector('[role="log"]')?.textContent).toContain(reply);
     expect(host.querySelector("img, article")).toBeNull();
-    expect(host.querySelector(".a01-proposals [role=status]")?.textContent).toBe("대기");
     await type("무슨 말을 했지?");
     await click("전송");
     expect(props.onSendChat.mock.calls).toEqual([[{
@@ -245,11 +245,11 @@ describe("제안 검토", () => {
       await click("요청 취소");
     }
     expect(props.onRequestProposal.mock.calls[0][1].aborted).toBe(true);
-    expect(host.querySelector(".a01-proposals [role=status]")?.textContent).toBe("대기");
+    expect(button("요청 취소")).toBeUndefined();
     if (change === "removed") await render(props);
     await act(async () => { pending.resolve(card); });
     expect(host.querySelector("article")).toBeNull();
-    expect(host.querySelector(".a01-proposals [role=status]")?.textContent).toBe("대기");
+    expect(host.querySelector(".a01-proposals [role=alert]")).toBeNull();
     expect(input().value).toBe("채팅 초안");
     expect(props.onSendChat).not.toHaveBeenCalled();
     expect(props.onDecideProposal).not.toHaveBeenCalled();

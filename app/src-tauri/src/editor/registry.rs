@@ -1,12 +1,15 @@
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    collections::HashMap,
     path::Path,
     sync::{Arc, Mutex},
 };
 
 use serde::Serialize;
+use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 use super::{LocalConflict, LocalFile, LocalVersion, OpenError, SaveError, SaveStage};
+use super::cli::{Pending, WaitForClose};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct Document(u64);
@@ -17,8 +20,24 @@ pub(crate) struct LocalEditors(Mutex<Registry>);
 #[derive(Default)]
 struct Registry {
     next_document: u64,
-    documents: HashMap<String, Document>,
-    files: HashMap<String, (Document, Arc<Mutex<LocalFile>>)>,
+    documents: HashMap<String, (Document, CancellationToken)>,
+    files: HashMap<String, OpenFile>,
+    offers: HashMap<String, Offer>,
+}
+
+struct OpenFile {
+    document: Document,
+    file: Arc<Mutex<LocalFile>>,
+    wait: Option<WaitForClose>,
+}
+
+struct Offer {
+    document: Document,
+    handle: String,
+    file: LocalFile,
+    text: Option<String>,
+    pending: Pending,
+    _done: oneshot::Sender<()>,
 }
 
 #[derive(Debug, Serialize)]
@@ -102,7 +121,7 @@ impl LocalEditors {
         registry.revoke(label);
         registry.next_document += 1;
         let document = Document(registry.next_document);
-        registry.documents.insert(label.into(), document);
+        registry.documents.insert(label.into(), (document, CancellationToken::new()));
     }
 
     pub(crate) fn destroy(&self, label: &str) {
@@ -110,7 +129,11 @@ impl LocalEditors {
     }
 
     pub(super) fn document(&self, label: &str) -> Result<Document, EditorError> {
-        self.0.lock().unwrap().documents.get(label).copied().ok_or(EditorError::DocumentClosed)
+        self.0.lock().unwrap().documents.get(label).map(|(document, _)| *document).ok_or(EditorError::DocumentClosed)
+    }
+
+    pub(super) fn scope(&self, label: &str) -> Result<(Document, CancellationToken), EditorError> {
+        self.0.lock().unwrap().documents.get(label).cloned().ok_or(EditorError::DocumentClosed)
     }
 
     pub(super) fn selected(
@@ -125,16 +148,73 @@ impl LocalEditors {
         let name = file.display_name();
         let mut registry = self.0.lock().unwrap();
         registry.check_document(label, document)?;
-        let handle = loop {
-            let mut random = [0; 16];
-            getrandom::fill(&mut random).map_err(|_| EditorError::Unavailable)?;
-            let handle = format!("{:032x}", u128::from_ne_bytes(random));
-            if let Entry::Vacant(entry) = registry.files.entry(handle.clone()) {
-                entry.insert((document, Arc::new(Mutex::new(file))));
-                break handle;
+        let handle = registry.new_handle()?;
+        registry.files.insert(handle.clone(), OpenFile { document, file: Arc::new(Mutex::new(file)), wait: None });
+        Ok(Selected::Opened { handle, name, text })
+    }
+
+    pub(super) fn offer(
+        &self, label: &str, document: Document, pending: Pending, file: LocalFile, text: String,
+    ) -> Result<(String, oneshot::Receiver<()>), EditorError> {
+        let mut registry = self.0.lock().unwrap();
+        registry.check_document(label, document)?;
+        if pending.is_inactive() { return Err(EditorError::Unavailable); }
+        let (id, handle) = match (registry.new_handle(), registry.new_handle()) {
+            (Ok(id), Ok(handle)) if id != handle => (id, handle),
+            _ => {
+                pending.open_failed();
+                return Err(EditorError::Unavailable);
             }
         };
-        Ok(Selected::Opened { handle, name, text })
+        let (done, completed) = oneshot::channel();
+        registry.offers.insert(id.clone(), Offer { document, handle, file, text: Some(text), pending, _done: done });
+        Ok((id, completed))
+    }
+
+    pub(super) fn pending_offers(&self, label: &str, document: Document) -> Result<Vec<String>, EditorError> {
+        let registry = self.0.lock().unwrap();
+        registry.check_document(label, document)?;
+        Ok(registry.offers.iter()
+            .filter(|(_, offer)| offer.document == document && offer.text.is_some() && !offer.pending.is_inactive())
+            .map(|(id, _)| id.clone())
+            .collect())
+    }
+
+    pub(super) fn claim(&self, label: &str, document: Document, id: &str) -> Result<Selected, EditorError> {
+        let mut registry = self.0.lock().unwrap();
+        registry.check_document(label, document)?;
+        let offer = registry.offers.get_mut(id).filter(|offer| offer.document == document && !offer.pending.is_inactive())
+            .ok_or(EditorError::InvalidHandle)?;
+        let text = offer.text.take().ok_or(EditorError::InvalidHandle)?;
+        Ok(Selected::Opened { handle: offer.handle.clone(), name: offer.file.display_name(), text })
+    }
+
+    pub(super) fn respond_to_offer(
+        &self, label: &str, document: Document, id: &str, handle: &str, attached: bool,
+    ) -> Result<(), EditorError> {
+        let mut registry = self.0.lock().unwrap();
+        registry.check_document(label, document)?;
+        let valid = registry.offers.get(id).is_some_and(|offer| {
+            offer.document == document && offer.handle == handle && offer.text.is_none() && !offer.pending.is_inactive()
+        });
+        if !valid { return Err(EditorError::InvalidHandle); }
+        let Offer { handle, file, pending, _done, .. } = registry.offers.remove(id).unwrap();
+        if !attached {
+            pending.open_failed();
+            return Ok(());
+        }
+        // 문서 폐기와 탭 닫기는 대기 토큰이 설치된 뒤에만 이 항목을 볼 수 있다.
+        let wait = pending.opened().map_err(|()| EditorError::Unavailable)?;
+        registry.files.insert(handle, OpenFile { document, file: Arc::new(Mutex::new(file)), wait: Some(wait) });
+        Ok(())
+    }
+
+    pub(super) fn discard_offer(&self, document: Document, id: &str, failed: bool) {
+        let mut registry = self.0.lock().unwrap();
+        if registry.offers.get(id).is_some_and(|offer| offer.document == document) {
+            let offer = registry.offers.remove(id).unwrap();
+            if failed { offer.pending.open_failed(); }
+        }
     }
 
     pub(super) fn save(&self, label: &str, document: Document, handle: &str, text: &str) -> Result<(), EditorError> {
@@ -152,7 +232,9 @@ impl LocalEditors {
     pub(super) fn close(&self, label: &str, document: Document, handle: &str) -> Result<(), EditorError> {
         let mut registry = self.0.lock().unwrap();
         registry.file(label, document, handle)?;
-        registry.files.remove(handle);
+        if let Some(wait) = registry.files.remove(handle).and_then(|file| file.wait) {
+            wait.closed();
+        }
         Ok(())
     }
 
@@ -174,8 +256,21 @@ impl LocalEditors {
 }
 
 impl Registry {
+    fn new_handle(&self) -> Result<String, EditorError> {
+        loop {
+            let mut random = [0; 16];
+            getrandom::fill(&mut random).map_err(|_| EditorError::Unavailable)?;
+            let handle = format!("{:032x}", u128::from_ne_bytes(random));
+            if !self.files.contains_key(&handle) && !self.offers.contains_key(&handle)
+                && !self.offers.values().any(|offer| offer.handle == handle)
+            {
+                return Ok(handle);
+            }
+        }
+    }
+
     fn check_document(&self, label: &str, document: Document) -> Result<(), EditorError> {
-        if self.documents.get(label) != Some(&document) {
+        if self.documents.get(label).map(|(owner, _)| *owner) != Some(document) {
             return Err(EditorError::DocumentClosed);
         }
         Ok(())
@@ -184,14 +279,16 @@ impl Registry {
     fn file(&self, label: &str, document: Document, handle: &str) -> Result<&Arc<Mutex<LocalFile>>, EditorError> {
         self.check_document(label, document)?;
         match self.files.get(handle) {
-            Some((owner, file)) if *owner == document => Ok(file),
+            Some(file) if file.document == document => Ok(&file.file),
             _ => Err(EditorError::InvalidHandle),
         }
     }
 
     fn revoke(&mut self, label: &str) {
-        if let Some(document) = self.documents.remove(label) {
-            self.files.retain(|_, (owner, _)| *owner != document);
+        if let Some((document, lifetime)) = self.documents.remove(label) {
+            lifetime.cancel();
+            self.offers.retain(|_, offer| offer.document != document);
+            self.files.retain(|_, file| file.document != document);
         }
     }
 }

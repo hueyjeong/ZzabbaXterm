@@ -10,10 +10,12 @@ const windowControls = [
 ] as const;
 type WindowAction = (typeof windowControls)[number]["action"] | "drag";
 
-export function TitleBar({ focused, onToggle, onWindowError, children }: {
+export function TitleBar({ focused, onToggle, onWindowError, onOpenRdp, onOpenVnc, children }: {
   focused: boolean;
   onToggle: () => void;
   onWindowError: (message: string) => void;
+  onOpenRdp: () => void;
+  onOpenVnc: () => void;
   children: ReactNode;
 }) {
   async function run(action: WindowAction, label: string) {
@@ -39,9 +41,13 @@ export function TitleBar({ focused, onToggle, onWindowError, children }: {
       </div>
       <nav className="workspace-tabs" aria-label="작업 탭">{children}</nav>
       <div className="workspace-drag-gap" onMouseDown={moveWindow} />
+      <div className="workspace-desktop-actions">
+        <button type="button" aria-label="RDP 탭 열기" onClick={onOpenRdp}>RDP</button>
+        <button type="button" aria-label="VNC 탭 열기" onClick={onOpenVnc}>VNC</button>
+      </div>
       <button className="workspace-mode" aria-label={focused ? "기본 보기" : "집중 보기"}
         onMouseDown={(event) => {
-          if (event.button === 0 && document.activeElement?.closest(".terminal-screen")) event.preventDefault();
+          if (event.button === 0 && document.activeElement?.closest(".terminal-screen, .remote-desktop-view canvas")) event.preventDefault();
         }}
         onClick={onToggle}>{focused ? "기본 보기" : "집중 보기"}</button>
       {native && !macTitleBar && windowControls.map((control) => (

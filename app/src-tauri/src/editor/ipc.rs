@@ -23,6 +23,9 @@ pub(crate) fn dispatch(invoke: Invoke) -> Result<(), Invoke> {
     const COMPARE: &str = "editor_local_compare";
     const RELOAD: &str = "editor_local_reload";
     const CLOSE: &str = "editor_local_close";
+    const PENDING: &str = "editor_local_cli_pending";
+    const CLAIM: &str = "editor_local_cli_claim";
+    const RESPOND: &str = "editor_local_cli_respond";
 
     let command = match invoke.message.command() {
         OPEN => OPEN,
@@ -30,6 +33,9 @@ pub(crate) fn dispatch(invoke: Invoke) -> Result<(), Invoke> {
         COMPARE => COMPARE,
         RELOAD => RELOAD,
         CLOSE => CLOSE,
+        PENDING => PENDING,
+        CLAIM => CLAIM,
+        RESPOND => RESPOND,
         _ => return Err(invoke),
     };
     let Invoke {
@@ -38,6 +44,12 @@ pub(crate) fn dispatch(invoke: Invoke) -> Result<(), Invoke> {
         acl,
     } = invoke;
     let webview = message.webview_ref();
+    if matches!(command, PENDING | CLAIM | RESPOND)
+        && (webview.label() != super::cli_open::MAIN || webview.window().label() != super::cli_open::MAIN)
+    {
+        resolver.reject(EditorError::DocumentClosed);
+        return Ok(());
+    }
     let editors = webview.state::<LocalEditors>();
     // 비동기 작업을 시작하기 전에 Tauri가 전달한 호출 문서를 묶는다.
     let document = match editors.document(webview.label()) {
@@ -47,6 +59,11 @@ pub(crate) fn dispatch(invoke: Invoke) -> Result<(), Invoke> {
             return Ok(());
         }
     };
+
+    if command == PENDING {
+        resolver.respond(editors.pending_offers(webview.label(), document).map_err(InvokeError::from));
+        return Ok(());
+    }
 
     if command == OPEN {
         let InvokeBody::Json(body) = message.payload() else {
@@ -85,6 +102,26 @@ pub(crate) fn dispatch(invoke: Invoke) -> Result<(), Invoke> {
         message: &message,
         acl: &acl,
     };
+    if matches!(command, CLAIM | RESPOND) {
+        let request_id = match String::from_command(argument("requestId")) {
+            Ok(id) => id,
+            Err(error) => {
+                resolver.invoke_error(error);
+                return Ok(());
+            }
+        };
+        if command == CLAIM {
+            resolver.respond(editors.claim(webview.label(), document, &request_id).map_err(InvokeError::from));
+        } else {
+            let result = (|| {
+                let handle = String::from_command(argument("handle"))?;
+                let attached = bool::from_command(argument("attached"))?;
+                editors.respond_to_offer(webview.label(), document, &request_id, &handle, attached).map_err(InvokeError::from)
+            })();
+            resolver.respond(result);
+        }
+        return Ok(());
+    }
     let handle = match String::from_command(argument("handle")) {
         Ok(handle) => handle,
         Err(error) => {

@@ -18,7 +18,7 @@ use windows_sys::{
     Win32::{
         Foundation::{
             GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree, MAX_PATH,
-            OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, STATUS_FILE_IS_A_DIRECTORY,
+            OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, RtlNtStatusToDosError, STATUS_FILE_IS_A_DIRECTORY,
             STATUS_NAME_TOO_LONG, UNICODE_STRING,
         },
         Security::{
@@ -27,7 +27,10 @@ use windows_sys::{
             *,
         },
         Storage::FileSystem::*,
-        System::IO::IO_STATUS_BLOCK,
+        System::{
+            IO::IO_STATUS_BLOCK,
+            WindowsProgramming::{DRIVE_CDROM, DRIVE_FIXED, DRIVE_RAMDISK, DRIVE_REMOVABLE},
+        },
     },
 };
 
@@ -81,17 +84,77 @@ impl Directory {
         Ok(Self { path, file, id })
     }
 
+    pub(super) fn open_cli(path: &Path) -> io::Result<Self> {
+        let disk = match path.components().next() {
+            Some(Component::Prefix(prefix)) => match prefix.kind() {
+                Prefix::Disk(disk) | Prefix::VerbatimDisk(disk) => disk,
+                _ => return Err(io::ErrorKind::InvalidInput.into()),
+            },
+            _ => return Err(io::ErrorKind::InvalidInput.into()),
+        };
+        let drive = [u16::from(disk), b':' as u16, b'\\' as u16, 0];
+        // SAFETY: 드라이브 루트를 가리키는 UTF-16 문자열은 NUL로 끝난다.
+        if !matches!(
+            unsafe { GetDriveTypeW(drive.as_ptr()) },
+            DRIVE_FIXED | DRIVE_REMOVABLE | DRIVE_CDROM | DRIVE_RAMDISK
+        ) {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+
+        let path = std::path::absolute(path)?;
+        let mut components = path.components();
+        components.next(); // 위에서 검사한 드라이브 접두어.
+        if components.next() != Some(Component::RootDir)
+            || !components.clone().all(|part| matches!(part, Component::Normal(name) if valid_name(name)))
+        {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let root = Self::open_path(Path::new(&OsString::from_wide(&drive[..3])))?;
+        let relative = components.as_path();
+        // 전체 하위 경로를 한 번에 열어 검사와 열기 사이의 경로 바꿔치기를 피한다.
+        let file = if relative.as_os_str().is_empty() {
+            root
+        } else {
+            let file = Self::open_at(
+                &root,
+                relative.as_os_str(),
+                FILE_OPEN,
+                FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
+                null(),
+                true,
+            )
+            .map_err(nt_error)?;
+            Self::check_directory(&file)?;
+            file
+        };
+        let path = final_path(&file)
+            .filter(|path| valid_path(path))
+            .ok_or(io::ErrorKind::InvalidInput)?;
+        let id = file_id(&file)?;
+        Ok(Self { path, file, id })
+    }
+
+    pub(super) fn still_at_cli_path(&self, path: &Path) -> io::Result<bool> {
+        let current = Self::open_cli(path)?;
+        Ok(current.id == self.id && current.path == self.path)
+    }
+
     fn open_path(path: &Path) -> io::Result<File> {
         let file = File::options()
             .access_mode(FILE_READ_ATTRIBUTES | FILE_TRAVERSE)
             .share_mode(SHARE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)?;
+        Self::check_directory(&file)?;
+        Ok(file)
+    }
+
+    fn check_directory(file: &File) -> io::Result<()> {
         let metadata = file.metadata()?;
         if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err(io::ErrorKind::NotADirectory.into());
         }
-        Ok(file)
+        Ok(())
     }
 
     pub(super) fn still_at_path(&self) -> io::Result<bool> {
@@ -115,7 +178,7 @@ impl Directory {
     }
 
     fn open_regular(&self, name: &OsStr, access: u32) -> io::Result<Option<File>> {
-        let file = match self.open_at(name, FILE_OPEN, access, null()) {
+        let file = match Self::open_at(&self.file, name, FILE_OPEN, access, null(), false) {
             Err(STATUS_FILE_IS_A_DIRECTORY) => return Ok(None),
             result => result.map_err(nt_error)?,
         };
@@ -128,14 +191,15 @@ impl Directory {
 
     pub(super) fn stage(&self, access: Option<&Access>) -> io::Result<Temporary<'_>> {
         let name = temporary_name()?;
-        let file = self
-            .open_at(
-                &name,
-                FILE_CREATE,
-                GENERIC_READ | GENERIC_WRITE | DELETE,
-                access.map_or(null(), |access| access.descriptor.cast()),
-            )
-            .map_err(nt_error)?;
+        let file = Self::open_at(
+            &self.file,
+            &name,
+            FILE_CREATE,
+            GENERIC_READ | GENERIC_WRITE | DELETE,
+            access.map_or(null(), |access| access.descriptor.cast()),
+            false,
+        )
+        .map_err(nt_error)?;
         let temp = Temporary {
             directory: self,
             file: Some(file),
@@ -151,11 +215,12 @@ impl Directory {
     }
 
     fn open_at(
-        &self,
+        directory: &File,
         name: &OsStr,
         disposition: u32,
         access: u32,
         descriptor: *const SECURITY_DESCRIPTOR,
+        cli_directory: bool,
     ) -> Result<File, i32> {
         let mut wide: Vec<_> = name.encode_wide().collect();
         let bytes = u16::try_from(wide.len() * 2).map_err(|_| STATUS_NAME_TOO_LONG)?;
@@ -166,9 +231,9 @@ impl Directory {
         };
         let attributes = OBJECT_ATTRIBUTES {
             Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
-            RootDirectory: self.file.as_raw_handle(),
+            RootDirectory: directory.as_raw_handle(),
             ObjectName: &name,
-            Attributes: OBJ_CASE_INSENSITIVE,
+            Attributes: OBJ_CASE_INSENSITIVE | if cli_directory { OBJ_DONT_REPARSE } else { 0 },
             SecurityDescriptor: descriptor,
             SecurityQualityOfService: null(),
         };
@@ -185,7 +250,8 @@ impl Directory {
                 // Deny data opens until the staged handle is closed after publication.
                 if disposition == FILE_CREATE { 0 } else { SHARE },
                 disposition,
-                FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
+                FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT
+                    | if cli_directory { FILE_DIRECTORY_FILE } else { FILE_NON_DIRECTORY_FILE },
                 null(),
                 0,
             )
@@ -632,6 +698,21 @@ mod tests {
     use windows_sys::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
     };
+
+    #[test]
+    fn cli_rejects_directory_reparse_points_in_the_parent_path() {
+        use std::{fs, os::windows::fs::symlink_dir};
+
+        let sandbox = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(sandbox.path()).unwrap();
+        let target = base.join("target");
+        let alias = base.join("alias");
+        fs::create_dir_all(target.join("nested")).unwrap();
+        symlink_dir(&target, &alias).unwrap();
+        assert!(Directory::open_cli(&target.join("nested")).is_ok());
+        assert!(Directory::open_cli(&alias).is_err());
+        assert!(Directory::open_cli(&alias.join("nested")).is_err());
+    }
 
     #[test]
     fn central_access_policy_is_rejected_even_with_a_mandatory_label() {

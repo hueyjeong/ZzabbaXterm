@@ -1,0 +1,25 @@
+.remote-desktop-view {
+  min-width: 0;
+  background: #12171b;
+  color: #e3e9e6;
+}
+
+.remote-desktop-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem;
+}
+
+.remote-desktop-view canvas {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  touch-action: none;
+}
+
+.remote-desktop-view canvas:focus-visible {
+  outline: 2px solid #9cd9bf;
+  outline-offset: -2px;
+}
