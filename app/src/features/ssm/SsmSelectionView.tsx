@@ -4,6 +4,7 @@ const failureText = {
   SsoLoginRequired: "SSO 로그인 만료",
   AccessDenied: "IAM 권한 거부",
   PluginMissing: "Session Manager 플러그인 없음",
+  InvalidConfiguration: "AWS 구성 또는 설치 오류. Linux에서는 AWS CLI v2와 Session Manager 플러그인의 관리자 관리 시스템 설치가 필요합니다.",
   Unknown: "분류되지 않은 오류",
 };
 

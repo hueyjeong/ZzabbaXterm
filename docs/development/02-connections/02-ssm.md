@@ -6,6 +6,8 @@
 
 **준비물:** 네이티브 Windows 11(한국어 두벌식)·Ubuntu 24.04 GNOME Wayland(IBus Hangul 두벌식), 두 PC의 AWS CLI v2와 공식 Session Manager 플러그인, IAM Identity Center 시험 프로필, UTF-8 대화형 셸이 있는 승인된 비운영 온라인 노드. 관리자에게 목록 조회·세션 시작·자기 세션 종료와 검증용 세션 상태 조회 범위를 확인한다. 빈 리전, 조회가 거부된 시험 프로필, 만료된 별도 시험 로그인, 오프라인 시험 노드를 준비한다. 설치·권한 변경·Agent 정지는 앱 밖에서 별도 승인받는다.
 
+Linux에서는 관리자가 [AWS CLI v2 공식 안내의 시스템 설치(`--system`)](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html#install-linux)와 [Session Manager 플러그인 공식 Linux 설치 안내](https://docs.aws.amazon.com/systems-manager/latest/userguide/install-plugin-linux-overview.html)에 따라 두 도구를 설치해야 한다. C02는 root가 소유하고 일반 사용자가 수정할 수 없는 시스템 설치만 지원한다. 사용자 홈 설치는 미지원이다.
+
 | Given (조건) | When (행동) | Then (관찰) |
 |---|---|---|
 | 선택한 프로필·리전에 온라인 노드가 있다 | 마법사에서 시험·저장 후 같은 노드를 두 번 연다 | 독립된 두 탭에서 `whoami`가 응답한다. 첫 탭을 닫은 뒤에도 둘째 탭은 입력을 받고 첫 AWS 세션만 끝난다. |

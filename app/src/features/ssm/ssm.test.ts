@@ -274,6 +274,14 @@ describe("SSM 검색 IPC", () => {
     }
   });
 
+  it("설치 또는 구성 오류에서 Linux 시스템 설치 요건을 표시한다", async () => {
+    window.__ZZABBA_SSM_DOCUMENT__ = "document";
+    invokeSsm.mockResolvedValueOnce("1").mockRejectedValueOnce({ code: "InvalidConfiguration" });
+    await render(createSsmDiscovery());
+    expect(error()).toContain("AWS CLI v2와 Session Manager 플러그인의 관리자 관리 시스템 설치가 필요합니다");
+    expect(reloginButton()).toBeUndefined();
+  });
+
   it("화면에서 만료된 조회 ID만 한 번 사용하고 성공 뒤 새 ID로 동일 범위를 조회한다", async () => {
     window.__ZZABBA_SSM_DOCUMENT__ = "document";
     invokeSsm.mockResolvedValueOnce("1").mockResolvedValueOnce(["alpha"])
