@@ -10,7 +10,7 @@ use crate::{
     terminal::{
         CENTRAL_UNAVAILABLE as UNAVAILABLE, CONTROL_CANCELLED as CANCELLED, CloseResult,
         ControlBinding, Event, LiveSsmIdentity, Sessions,
-        process::{Launch, Session, Stop},
+        process::{Session, Stop},
         remote::Target,
     },
 };
@@ -30,7 +30,7 @@ pub(crate) enum Output {
     CliExited(u32),
 }
 
-/// 독립 PTY의 수명을 중앙 세션에 결부한다. PTY는 세션 레지스트리나 IPC에 등록하지 않는다.
+/// 독립 PTY는 중앙 세션에 결부하며 앱 종료 시 전용 작업으로만 추적한다.
 #[must_use]
 pub(crate) struct ControlTransport {
     binding: Arc<ControlBinding>,
@@ -53,21 +53,19 @@ impl ControlTransport {
     ) -> Result<Self, String> {
         let binding = sessions.bind_ssm_control(owner, identity, cancel)?;
         let target = Target::new(&identity.profile, &identity.region, &identity.instance_id)?;
-        let session = Arc::new(Session::dedicated(&binding));
         // 미확인 PTY 출력 크레딧이 바이트 큐를 제한한다. 블로킹 전송은 종료를 막을 수 있다.
         let (tx, output) = mpsc::channel();
         let open_deadline = Instant::now() + OPEN_TIMEOUT;
+        let (session, opened) = sessions.launch_control(&binding, PtySize::default(), target,
+            move |event| tx.send(event).map_err(|_| CANCELLED.into()),
+        )?;
         let transport = Self {
             binding, session, output,
             open_deadline, connected: false, received: 0,
             #[cfg(windows)]
             cursor_query: 0,
         };
-        let result = transport.session.launch(
-            PtySize::default(), Launch::AiControl(target, Arc::clone(&transport.binding)),
-            move |event| tx.send(event).map_err(|_| CANCELLED.into()),
-            |_| {},
-        ).and_then(|()| transport.session.start_until(Some(open_deadline)));
+        let result = opened.and_then(|()| transport.session.start_until(Some(open_deadline)));
         let result = result.and_then(|()| transport.require_active());
         if let Err(error) = result {
             return Err(match transport.close().warning() {

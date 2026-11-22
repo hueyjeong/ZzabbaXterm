@@ -146,6 +146,7 @@ impl ControlBinding {
 #[derive(Default)]
 struct Registry {
     sessions: HashMap<String, Arc<Session>>,
+    controls: HashMap<u64, Arc<Session>>,
     close_results: HashMap<String, Retired>,
     destroyed: HashSet<String>,
     documents: HashMap<String, u64>,
@@ -153,6 +154,20 @@ struct Registry {
     closing: HashSet<String>,
     exiting: bool,
     shutdown: bool,
+}
+
+struct ControlJob {
+    id: u64,
+    registry: Arc<Mutex<Registry>>,
+}
+
+impl Drop for ControlJob {
+    fn drop(&mut self) {
+        let session = self.registry.lock().unwrap().controls.remove(&self.id);
+        if let Some(session) = session {
+            session.finish();
+        }
+    }
 }
 
 impl Registry {
@@ -213,6 +228,36 @@ impl Sessions {
         Ok(Arc::new(ControlBinding {
             registry: Arc::clone(&self.registry), central, owner: owner.into(), identity: identity.clone(), request: request.clone(), cancel,
         }))
+    }
+
+    pub(crate) fn launch_control(
+        &self,
+        binding: &Arc<ControlBinding>,
+        size: PtySize,
+        target: remote::Target,
+        send: impl Fn(Event) -> Result<(), String> + Send + 'static,
+    ) -> Result<(Arc<Session>, Result<(), String>), String> {
+        let session = Arc::new(Session::dedicated(binding));
+        let command = Launch::AiControl(target, Arc::clone(binding));
+        // 추적은 작업자가 원격 종료 확인을 마치거나 작업자 생성에 실패할 때 끝난다.
+        let job = self.track_control(binding, &session)?;
+        let opened = session.begin_launch(size, command, send, move |_| drop(job))?;
+        let result = opened.recv().map_err(|error| stage("open handshake", error)).and_then(|result| result);
+        Ok((session, result))
+    }
+
+    fn track_control(&self, binding: &ControlBinding, session: &Arc<Session>) -> Result<ControlJob, String> {
+        if !Arc::ptr_eq(&self.registry, &binding.registry) { return Err(CENTRAL_UNAVAILABLE.into()); }
+        let mut registry = self.registry.lock().unwrap();
+        binding.check_request()?;
+        registry.with_live_ssm_session(&binding.owner, &binding.identity, |_, _| {
+            binding.check_request()?;
+            if binding.cancel.is_cancelled() { return Err(CONTROL_CANCELLED.into()); }
+            Ok::<_, String>(())
+        }).ok_or(CENTRAL_UNAVAILABLE)??;
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        registry.controls.insert(id, Arc::clone(session));
+        Ok(ControlJob { id, registry: Arc::clone(&self.registry) })
     }
 
     pub(crate) fn with_probes<T>(&self, owner: &str, document: u64, use_probes: impl FnOnce(&mut Runs) -> Result<T, String>) -> Result<T, String> {
@@ -432,7 +477,7 @@ impl Sessions {
             let mut registry = self.registry.lock().unwrap();
             registry.shutdown = true;
             registry.close_results.clear();
-            (registry.sessions.values().cloned().collect::<Vec<_>>(), registry.probes.stop_all())
+            (registry.sessions.values().chain(registry.controls.values()).cloned().collect::<Vec<_>>(), registry.probes.stop_all())
         };
         for session in &sessions {
             session.stop(process::Stop::Closed);

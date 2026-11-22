@@ -189,3 +189,29 @@ fn request_cancel_reaches_the_control_child_without_cancelling_the_central_sessi
     });
     assert!(sessions.with_live_ssm_session(OWNER, &selected.identity, || ()).is_some());
 }
+
+#[test]
+fn shutdown_completes_control_cancel_before_start_and_rejects_late_launch() {
+    use std::thread;
+
+    const WAIT: Duration = Duration::from_secs(5);
+    let sessions = Sessions::default();
+    let central = sessions.insert_live_ssm_fixture(OWNER, sessions.document(OWNER), ACCOUNT, REGION, NODE);
+    let request = CancellationToken::new();
+    let binding = sessions.bind_ssm_control(OWNER, &central.identity, &request).unwrap();
+    let (control, opened) = sessions.launch_control(&binding, PtySize::default(), Target::new("fixture", REGION, NODE).unwrap(), |_| unreachable!()).unwrap();
+    opened.unwrap();
+
+    let (done, finished) = mpsc::channel();
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            sessions.shutdown();
+            done.send(()).unwrap();
+        });
+        finished.recv_timeout(WAIT).unwrap();
+    });
+    assert!(binding.cancel_token().is_cancelled());
+    assert!(control.start_until(None).is_err());
+    assert_eq!(control.close_result(), CloseResult::default());
+    assert!(matches!(sessions.launch_control(&binding, PtySize::default(), Target::new("fixture", REGION, NODE).unwrap(), |_| unreachable!()), Err(error) if error == UNAVAILABLE));
+}

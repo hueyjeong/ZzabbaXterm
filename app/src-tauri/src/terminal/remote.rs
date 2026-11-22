@@ -233,6 +233,9 @@ fn submitted_control_start_is_reaped_and_checks_exact_ssm_cleanup_after_revocati
     let mut remote = Remote::fixture(&program);
     let selected = sessions.get("main", &central.identity.id).unwrap();
     let permit = remote.authorize(cancel).unwrap();
+    let session = Arc::new(Session::dedicated(&binding));
+    let tracked = sessions.track_control(&binding, &session).unwrap();
+    assert!(sessions.get("main", &tracked.id.to_string()).is_err());
 
     let (pair, mut child) = thread::scope(|scope| {
         let (submit, submitted) = mpsc::channel();
@@ -257,11 +260,31 @@ fn submitted_control_start_is_reaped_and_checks_exact_ssm_cleanup_after_revocati
         child
     });
     assert!(cancel.is_cancelled());
-    let session = Session::dedicated(&binding);
-    session.terminate_fixture(child.as_mut(), pair.master.as_ref());
-    drop(pair);
-    assert_eq!(session.close_result().local, LocalClose::CliReaped);
-    assert_eq!(remote.close(), (RemoteClose::Unconfirmed, Some("i-01234567".into())));
+    let (cleanup, permit_cleanup) = mpsc::channel();
+    let (result, checked) = mpsc::channel();
+    let (exit, exited) = mpsc::channel();
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            sessions.shutdown();
+            exit.send(()).unwrap();
+        });
+        scope.spawn(move || {
+            permit_cleanup.recv_timeout(WAIT).unwrap();
+            session.terminate_fixture(child.as_mut(), pair.master.as_ref());
+            drop(pair);
+            result.send((session.close_result().local, remote.close())).unwrap();
+            drop(tracked);
+        });
+        let deadline = std::time::Instant::now() + WAIT;
+        while !sessions.registry.lock().unwrap().shutdown {
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        }
+        assert!(matches!(exited.recv_timeout(Duration::from_millis(100)), Err(mpsc::RecvTimeoutError::Timeout)));
+        cleanup.send(()).unwrap();
+        assert_eq!(checked.recv_timeout(WAIT).unwrap(), (LocalClose::CliReaped, (RemoteClose::Unconfirmed, Some("i-01234567".into()))));
+        exited.recv_timeout(WAIT).unwrap();
+    });
     assert!(root.path().join("History").is_file());
 }
 

@@ -152,7 +152,7 @@ impl Session {
         Some((Arc::clone(&sftp.plan), sftp.cancel.child_token(), worker))
     }
 
-    pub(crate) fn launch(
+    pub(super) fn launch(
         self: &Arc<Self>,
         size: PtySize,
         command: Launch,
@@ -171,18 +171,19 @@ impl Session {
         retired: impl FnOnce(&Arc<Session>) + Send + 'static,
     ) -> Result<mpsc::Receiver<Result<(), String>>, String> {
         if self.control != matches!(command, Launch::AiControl(..)) || self.control && self.document.is_some() {
-            self.finish();
+            if !self.control { self.finish(); }
             return Err(stage("open", "제어 세션에는 전용 PTY가 필요합니다"));
         }
         let this = Arc::clone(self);
         let (ready, opened) = mpsc::sync_channel(1);
         let ssm = command.is_ssm();
+        if self.control && self.flow.lock().unwrap().stop.is_some() { return Err(CLOSED.into()); }
         if let Err(error) = thread::Builder::new().name("terminal-pty".into()).spawn(move || {
             let mut retired = Some(retired);
             let mut complete = || {
                 if let Some(retired) = retired.take() {
                     retired(&this);
-                    this.finish();
+                    if !this.control { this.finish(); }
                 }
             };
             let result = this.run(size, command, send, &ready, &mut complete);
@@ -199,7 +200,7 @@ impl Session {
                 thread::sleep(Duration::from_millis(250));
             }
         }) {
-            self.finish();
+            if !self.control { self.finish(); }
             return Err(stage("PTY worker", error));
         }
         Ok(opened)
@@ -215,9 +216,10 @@ impl Session {
     ) -> Result<(), String> {
         let ssm = command.is_ssm();
         if ssm {
-            self.flow.lock().unwrap().start_deadline = Some(std::time::Instant::now() + START_TIMEOUT);
-            let _ = ready.send(Ok(()));
             let mut flow = self.flow.lock().unwrap();
+            if self.control && flow.stop.is_some() { return Err(CLOSED.into()); }
+            flow.start_deadline = Some(std::time::Instant::now() + START_TIMEOUT);
+            let _ = ready.send(Ok(()));
             while let Some(deadline) = flow.start_deadline {
                 flow.expire_start();
                 if flow.stop.is_some() { return Err(CLOSED.into()); }
@@ -840,7 +842,7 @@ impl Session {
         drop(self.control_submit.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
     }
 
-    fn finish(&self) {
+    pub(super) fn finish(&self) {
         self.flow.lock().unwrap().finished = true;
         self.wake.notify_all();
     }
