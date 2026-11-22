@@ -218,7 +218,7 @@ async fn open(
         return Outcome::Unattached;
     }
     let (offer, mut done) = state.offer(offer_id.clone(), document, parent, opened, request.clone(), slot_cancel.clone());
-    if app.emit_to(EventTarget::webview(MAIN), "editor-remote-nano-open", offer).is_err() {
+    if app.emit_to(EventTarget::webview(MAIN), "editor-remote-nano-open", &offer).is_err() {
         state.interrupted(&offer_id, false);
     }
     let deadline = tokio::time::sleep(OFFER_TIMEOUT);
@@ -242,6 +242,9 @@ async fn open(
             }
         }
     };
+    if outcome == Outcome::Failed && sessions.document(MAIN) == document {
+        let _ = app.emit_to(EventTarget::webview(MAIN), "editor-remote-nano-disconnected", &offer);
+    }
     if outcome != Outcome::Closed {
         sftp.discard_bridge_file(slot, &offer_id, &handle).await;
     }
