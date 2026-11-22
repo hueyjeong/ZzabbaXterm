@@ -5,24 +5,22 @@ import { connectLocalTerminal, type LocalTerminalIpc } from "./session";
 it("분할된 한글과 ANSI를 xterm 버퍼에 반영하고 파서 완료 위치만 ACK한다", async () => {
   const size = { cols: 80, rows: 24 };
   const terminal = new xterm.Terminal(size);
-  const parserEntered = Promise.withResolvers<void>();
+  let parserEntered = false;
   const resumeParser = Promise.withResolvers<boolean>();
   const handler = terminal.parser.registerCsiHandler({ final: "m" }, ([param]) => {
     if (param !== 31) return false;
-    parserEntered.resolve();
+    parserEntered = true;
     return resumeParser.promise;
   });
-  const running = Promise.withResolvers<void>();
+  const status = vi.fn();
   const open = vi.fn<LocalTerminalIpc["open"]>().mockResolvedValue("parser");
   const ack = vi.fn<LocalTerminalIpc["ack"]>().mockResolvedValue(undefined);
   const unused = async () => { };
   const ipc: LocalTerminalIpc = { open, ack, start: unused, input: unused, resize: unused, close: unused };
-  const session = connectLocalTerminal(size, (bytes, parsed) => terminal.write(bytes, parsed), (status) => {
-    if (status.kind === "running") running.resolve();
-  }, ipc);
+  const session = connectLocalTerminal(size, (bytes, parsed) => terminal.write(bytes, parsed), status, ipc);
 
   try {
-    await running.promise;
+    await vi.waitFor(() => expect(status).toHaveBeenLastCalledWith({ kind: "running" }, "parser"), 1_000);
     const [, receive] = open.mock.calls[0];
     for (const chunk of [
       [0xed, 0x95], // '한'의 UTF-8 앞 두 바이트
@@ -34,7 +32,7 @@ it("분할된 한글과 ANSI를 xterm 버퍼에 반영하고 파서 완료 위�
     }
 
     expect(ack).not.toHaveBeenCalled();
-    await parserEntered.promise;
+    await vi.waitFor(() => expect(parserEntered).toBe(true), 1_000);
     expect(terminal.buffer.active.getLine(0)?.translateToString(true)).toBe("한");
     expect(ack.mock.calls).toEqual([["parser", 2], ["parser", 6]]);
 
