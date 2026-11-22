@@ -15,7 +15,7 @@ import { StorageTab } from "../storage/StorageTab";
 import { TerminalView } from "../terminal/TerminalView";
 import type { TerminalStatus } from "../terminal/session";
 import { TunnelTab } from "../tunnels/TunnelTab";
-import { tunnelIpc } from "../tunnels/tunnelIpc";
+import { tunnelIpc, type DesktopTunnelSource } from "../tunnels/tunnelIpc";
 import { VncView } from "../vnc/VncView";
 import { LocalTree } from "./LocalTree";
 import { Splitter } from "./Splitter";
@@ -29,8 +29,8 @@ type Tab = { id: number; label: string } & (
   | { kind: "terminal"; targetId?: string; ssm?: SsmTarget; ssh?: SshTransport["kind"]; status: TerminalStatus; sessionId?: string; sftpSessionId?: string; closeStatus?: CloseStatus }
   | { kind: "editor"; file: ApprovedEditorFile; transport: EditorTransport; close: () => Promise<void>; source: EditorSource; attaching?: true }
   | { kind: "tunnel"; handle: string; targetId: string; name: string; method: "ssh" | "ssm"; closeStatus?: CloseStatus; closeError?: string }
-  | { kind: "rdp" }
-  | { kind: "vnc" }
+  | { kind: "rdp"; source?: DesktopTunnelSource }
+  | { kind: "vnc"; source?: DesktopTunnelSource }
 );
 type StorageTarget = { targetId: string; label: string; closeStatus?: CloseStatus };
 type ProfileLoad = { kind: "loading" | "ready"; profiles?: SavedConnections }
@@ -248,9 +248,9 @@ export function Workspace() {
     selectTab(id);
   }
 
-  function openDesktop(kind: DesktopKind) {
+  function openDesktop(kind: DesktopKind, source?: DesktopTunnelSource) {
     const id = nextTab.current++;
-    setTabs(current => [...current, { id, label: `${kind.toUpperCase()} ${id}`, kind }]);
+    setTabs(current => [...current, { id, label: `${kind.toUpperCase()} ${id}`, kind, source }]);
     selectTab(id);
   }
 
@@ -523,11 +523,12 @@ export function Workspace() {
                 <TunnelTab tab={tab.handle} targetId={tab.targetId} method={tab.method}
                   closeState={tab.closeStatus === "closing" ? { kind: "closing" } : tab.closeStatus === "unconfirmed"
                     ? { kind: "unconfirmed", error: tab.closeError ?? "종료 확인 불가" } : undefined}
-                  onShare={(targetId, tabHandle, tunnelId) => openTunnel(targetId, tab.name, tab.method, { tab: tabHandle, id: tunnelId })} />
+                  onShare={(targetId, tabHandle, tunnelId) => openTunnel(targetId, tab.name, tab.method, { tab: tabHandle, id: tunnelId })}
+                  onOpenDesktop={openDesktop} />
               ) : tab.kind === "rdp" ? (
-                <RdpTab active={id === active} label={label} />
+                <RdpTab active={id === active} label={label} source={tab.source} />
               ) : tab.kind === "vnc" ? (
-                <VncView active={id === active} />
+                <VncView active={id === active} source={tab.source} />
               ) : (
                 <EditorTab file={tab.file} active={id === active && !tab.attaching} transport={tab.transport}
                   confirmDiscard={(request) => confirmEditorDiscard(tab.source, request)}
@@ -624,7 +625,7 @@ export function Workspace() {
           !current.closeStatus && terminalStatus(current.status)].filter(Boolean).join(" · ")
           : current?.kind === "tunnel" ? current.label
             : current?.kind === "rdp" || current?.kind === "vnc"
-              ? `${current.label} · 직접 · ${current.kind === "rdp" ? "NLA" : "TLS"}`
+              ? `${current.label} · ${current.source ? (current.kind === "rdp" ? "SSH 터널 · NLA" : "SSH 터널") : (current.kind === "rdp" ? "직접 · NLA" : "직접 · TLS")}`
               : current ? (current.source === "local" ? "내 PC · 로컬 파일" : current.source === "sftp" ? "SFTP" : "S3") : "연결 없음"}</span>
         {windowError && <span role="alert">{windowError}</span>}
         {fileError && <span role="alert">{fileError}</span>}

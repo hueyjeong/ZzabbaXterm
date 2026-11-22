@@ -11,7 +11,8 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 let host: HTMLDivElement;
 let root: Root;
 const onShare = vi.fn();
-const props = { tab: "owned", targetId: "saved-target", method: "ssh", onShare } as const;
+const onOpenDesktop = vi.fn();
+const props = { tab: "owned", targetId: "saved-target", method: "ssh", onShare, onOpenDesktop } as const;
 const tunnel = { id: "7", route: "-D 127.0.0.1:1080 → SOCKS", endpoint: "fixture@127.0.0.1:2222", owners: ["시험 A", "시험 B"], error: null };
 
 beforeEach(() => {
@@ -19,6 +20,7 @@ beforeEach(() => {
   vi.spyOn(navigator, "userAgent", "get").mockReturnValue("Linux");
   invoke.mockReset();
   onShare.mockReset();
+  onOpenDesktop.mockReset();
   host = document.body.appendChild(document.createElement("div"));
   root = createRoot(host);
 });
@@ -48,6 +50,29 @@ it("distinguishes readiness, failure and disconnection for the owned tunnel", as
   expect([...host.querySelectorAll('[role="status"]')].map(status => status.textContent)).toEqual(["끊김", "시작 실패"]);
   expect([...host.querySelectorAll('[role="alert"]')].map(alert => alert.textContent)).toEqual(["SSH 자식 종료", "수신 포트 충돌"]);
   expect(invoke.mock.calls).toEqual(Array.from({ length: 3 }, () => ["tunnel_status", { tab: "owned" }]));
+});
+
+it.each(["rdp", "vnc"] as const)("offers only the Ready %s desktop action with the Rust destination", async protocol => {
+  const destination = { host: "private.example.invalid", port: 14444 };
+  const desktop = { protocol, targetId: "desktop-target", destination };
+  invoke.mockResolvedValue([
+    { ...tunnel, id: "tcp", state: "ready" },
+    { ...tunnel, id: "starting", state: "starting", desktop },
+    { ...tunnel, id: "failed", state: "failed", desktop },
+    { ...tunnel, id: "disconnected", state: "disconnected", desktop },
+    { ...tunnel, state: "ready", desktop },
+  ]);
+  await act(async () => root.render(<TunnelTab {...props} />));
+  const actions = () => [...host.querySelectorAll<HTMLButtonElement>("li button")]
+    .filter(button => button.textContent?.endsWith("로 열기"));
+  expect(actions().map(button => button.textContent)).toEqual([`${protocol.toUpperCase()}로 열기`]);
+  expect(actions()[0]?.closest("li")?.querySelector('[role="status"]')?.textContent).toBe("수신 준비됨");
+  await act(async () => actions()[0]?.click());
+  expect(onOpenDesktop.mock.calls).toEqual([[protocol, {
+    tabHandle: "owned", tunnelId: "7", targetId: "desktop-target", destination,
+  }]]);
+  await act(async () => root.render(<TunnelTab {...props} closeState={{ kind: "closing" }} />));
+  expect(actions()).toEqual([]);
 });
 
 it("reports Windows -R and official SSM limits before start", async () => {
