@@ -21,7 +21,7 @@ export interface EditorTabProps {
 }
 
 function statusText({ busy, dirty, status }: EditorState) {
-  if (busy === "save") return "저장 중 · 저장 응답 후 탭 닫기 가능";
+  if (busy === "save") return "저장 중";
   if (busy) return "읽는 중";
   switch (status.kind) {
     case "conflict": {
@@ -123,14 +123,12 @@ function EditorTabContent({ ref, file, active, focusRequested, transport, confir
       void connection.current?.save();
     }}>
       <header className="editor-toolbar">
-        <span className="editor-label">{file.label}{state.dirty ? " •" : ""}</span>
         <button type="button" disabled={!active || state.saving || Boolean(state.busy) || !state.dirty || state.needsReload} onClick={() => void connection.current?.save()}>저장</button>
         <button type="button" disabled={!active || Boolean(state.busy)} onClick={() => void connection.current?.compare()}>원본과 비교</button>
         <button type="button" disabled={!active || state.saving || Boolean(state.busy)} onClick={() => void connection.current?.reload(confirmDiscard)}>다시 읽기</button>
         {comparison !== undefined && <button type="button" onClick={() => connection.current?.dismissComparison()}>비교 닫기</button>}
         <output role="status">
-          {[statusText(state), !state.busy && state.needsReload && "다시 읽기 필요",
-            state.saving && state.busy !== "save" && "저장 응답 후 탭 닫기 가능"].filter(Boolean).join(" · ")}
+          {[statusText(state), !state.busy && state.needsReload && "다시 읽기 필요"].filter(Boolean).join(" · ")}
         </output>
       </header>
       <div className="editor-surface" ref={host} hidden={showingDiff} />

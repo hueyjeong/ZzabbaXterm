@@ -21,9 +21,9 @@
 }
 
 .editor-toolbar { flex-wrap: wrap; }
-.editor-toolbar button { padding: 4px 6px; }
+.editor-toolbar button { max-width: 100%; padding: 4px 6px; overflow-wrap: anywhere; }
 .editor-toolbar button:disabled { opacity: 0.5; }
-.editor-label { overflow-wrap: anywhere; font-weight: 600; }
-.editor-toolbar output { color: var(--accent, #9cd9bf); overflow-wrap: anywhere; }
+.editor-toolbar output { max-width: 100%; color: var(--accent, #9cd9bf); overflow-wrap: anywhere; }
+.editor-toolbar output:empty { position: absolute; }
 .editor-diff-labels span { flex: 1; }
 .editor-surface { flex: 1; min-height: 0; min-width: 0; overflow: hidden; }
