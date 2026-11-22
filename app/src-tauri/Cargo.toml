@@ -16,6 +16,11 @@ name = "zzabba"
 path = "src/bin/zzabba.rs"
 required-features = ["local-cli"]
 
+[[bin]]
+name = "zzabba-edit"
+path = "src/bin/zzabba-edit.rs"
+required-features = ["local-cli"]
+
 # Linux 노드에 별도로 배포한다.
 [[bin]]
 name = "zzabba-ai-control"

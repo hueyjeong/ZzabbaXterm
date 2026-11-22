@@ -2,7 +2,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use tokio::io::{AsyncWriteExt, duplex};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
 use super::*;
 
@@ -50,12 +50,15 @@ async fn restricted_methods_and_exact_fields() {
         br#"{"method":"propose","proposal":{"targetId":"dev-a","operation":"uptime","arguments":[]}}"#,
         br#"{"method":"propose","proposal":{"targetId":"dev-a","operation":"uptime; id"}}"#,
         br#"{"method":"propose","proposal":{"targetId":"dev a","operation":"uptime"}}"#,
+        br#"{"method":"edit","path":"relative"}"#,
+        br#"{"method":"edit","path":"relative","wait":true,"approved":true}"#,
+        br#"{"method":"edit","path":"relative","path":"other","wait":true}"#,
         br#"{"method":"list"}{"method":"list"}"#,
         b"{\"method\":\"\xff\"}",
     ] {
         let (mut client, mut server) = duplex(MAX_FRAME);
         write_frame(&mut client, bytes, MAX_FRAME).await.unwrap();
-        serve_connection(&mut server, requests.clone(), Arc::new(Semaphore::new(1))).await.unwrap();
+        assert!(serve_connection(&mut server, requests.clone(), Arc::new(Semaphore::new(1)), &Arc::new(Semaphore::new(MAX_EDITS))).await.unwrap().is_none());
         let reply = read_frame(&mut client, MAX_FRAME).await.unwrap();
         assert_eq!(decode::<Receipt>(&reply).unwrap(), Receipt::Failed { error: Error::InvalidRequest }, "{bytes:?}");
     }
@@ -165,7 +168,7 @@ async fn invalid_frame_length_and_stalled_client() {
     for size in [0, (MAX_FRAME + 1) as u32] {
         let (mut client, mut server) = duplex(128);
         client.write_u32(size).await.unwrap();
-        serve_connection(&mut server, requests.clone(), Arc::new(Semaphore::new(1))).await.unwrap();
+        serve_connection(&mut server, requests.clone(), Arc::new(Semaphore::new(1)), &Arc::new(Semaphore::new(MAX_EDITS))).await.unwrap();
         assert_eq!(
             decode::<Receipt>(&read_frame(&mut client, MAX_FRAME).await.unwrap()).unwrap(),
             Receipt::Failed {
@@ -177,9 +180,9 @@ async fn invalid_frame_length_and_stalled_client() {
     client.write_u32(32).await.unwrap();
     client.write_u8(b'{').await.unwrap();
     assert_eq!(
-        serve_connection(&mut server, requests, Arc::new(Semaphore::new(1)))
+        serve_connection(&mut server, requests, Arc::new(Semaphore::new(1)), &Arc::new(Semaphore::new(MAX_EDITS)))
             .await
-            .unwrap_err()
+            .err().unwrap()
             .kind(),
         io::ErrorKind::TimedOut
     );
@@ -221,9 +224,9 @@ async fn verified_local_transport_dispatches_only_requests() {
     ] {
         let (result, server) = tokio::join!(exchange(&endpoint, &call), async {
             let mut connection = listener.accept().await.unwrap();
-            serve_connection(&mut connection, requests.clone(), Arc::new(Semaphore::new(1))).await
+            serve_connection(&mut connection, requests.clone(), Arc::new(Semaphore::new(1)), &Arc::new(Semaphore::new(MAX_EDITS))).await
         });
-        server.unwrap();
+        assert!(server.unwrap().is_none());
         assert_eq!(result, expected);
     }
     assert_eq!(requests.reviews.load(Ordering::Relaxed), 1);
@@ -233,7 +236,7 @@ async fn verified_local_transport_dispatches_only_requests() {
 async fn a_partial_client_does_not_block_other_clients_and_busy_workers_reject() {
     let endpoint = Endpoint::for_service(&format!("parallel-test-{}", std::process::id())).unwrap();
     let listener = Listener::bind(&endpoint).unwrap();
-    let service = tokio::spawn(serve(listener, State::default()));
+    let service = tokio::spawn(serve(listener, State::default(), deny_edit));
     let mut stalled = endpoint.connect().await.unwrap();
     stalled.write_u32(12).await.unwrap();
     stalled.write_u8(b'{').await.unwrap();
@@ -243,7 +246,7 @@ async fn a_partial_client_does_not_block_other_clients_and_busy_workers_reject()
 
     let (mut client, mut server) = duplex(128);
     write_frame(&mut client, br#"{"method":"list"}"#, MAX_FRAME).await.unwrap();
-    serve_connection(&mut server, Arc::new(State::default()), Arc::new(Semaphore::new(0))).await.unwrap();
+    serve_connection(&mut server, Arc::new(State::default()), Arc::new(Semaphore::new(0)), &Arc::new(Semaphore::new(MAX_EDITS))).await.unwrap();
     assert_eq!(read_frame(&mut client, MAX_FRAME).await.unwrap(), br#"{"error":"rejected"}"#);
 }
 
@@ -263,7 +266,60 @@ async fn actual_json_overflow_rejects_before_connect_and_returns_a_wire_error() 
         fn request_review(&self, _: Proposal, _: Instant) -> Result<String, Rejected> { Err(Rejected) }
     }
     let listener = Listener::bind(&endpoint).unwrap();
-    let service = tokio::spawn(serve(listener, Oversized));
+    let service = tokio::spawn(serve(listener, Oversized, deny_edit));
     assert_eq!(exchange(&endpoint, &Outbound::List).await, Err(Error::Rejected));
+    service.abort();
+}
+
+async fn deny_edit(pending: edit::Pending) {
+    pending.decline();
+}
+
+async fn edit_response(stream: &mut (impl AsyncRead + Unpin)) -> edit::Response {
+    let bytes = timeout(DEADLINE, read_frame(stream, MAX_FRAME)).await.unwrap().unwrap();
+    decode::<edit::Receipt>(&bytes).unwrap().edit
+}
+
+#[tokio::test]
+async fn edit_waits_use_separate_slots_until_document_close() {
+    let endpoint = Endpoint::for_service(&format!("edits-test-{}", std::process::id())).unwrap();
+    let listener = Listener::bind(&endpoint).unwrap();
+    let (opened, mut documents) = tokio::sync::mpsc::unbounded_channel();
+    let service = tokio::spawn(serve(listener, State::default(), move |pending| {
+        let opened = opened.clone();
+        async move { opened.send(pending.opened().ok().unwrap()).ok().unwrap(); }
+    }));
+    let mut invalid = timeout(DEADLINE, endpoint.connect()).await.unwrap().unwrap();
+    write_frame(&mut invalid, br#"{"method":"edit","path":"relative","wait":true}"#, MAX_FRAME).await.unwrap();
+    assert_eq!(edit_response(&mut invalid).await, edit::Response::InvalidRequest);
+    assert!(documents.try_recv().is_err());
+
+    let request = serde_json::to_vec(&serde_json::json!({
+        "method": "edit", "path": std::env::temp_dir().join("한글.txt"), "wait": true,
+    })).unwrap();
+    let mut clients = Vec::new();
+    for _ in 0..32 {
+        let mut client = timeout(DEADLINE, endpoint.connect()).await.unwrap().unwrap();
+        write_frame(&mut client, &request, MAX_FRAME).await.unwrap();
+        assert_eq!(edit_response(&mut client).await, edit::Response::Accepted);
+        assert_eq!(edit_response(&mut client).await, edit::Response::Opened);
+        clients.push((client, documents.try_recv().unwrap()));
+    }
+    assert!(matches!(exchange(&endpoint, &Outbound::List).await, Ok(Receipt::Listed { .. })));
+
+    let mut overflow = timeout(DEADLINE, endpoint.connect()).await.unwrap().unwrap();
+    write_frame(&mut overflow, &request, MAX_FRAME).await.unwrap();
+    assert_eq!(edit_response(&mut overflow).await, edit::Response::OpenFailed);
+
+    let (mut client, document) = clients.pop().unwrap();
+    document.closed();
+    assert_eq!(edit_response(&mut client).await, edit::Response::Closed);
+    // 연결이 닫히기 전에 전용 슬롯이 반환된다.
+    assert!(timeout(DEADLINE, client.read_u8()).await.unwrap().is_err());
+
+    let mut next = timeout(DEADLINE, endpoint.connect()).await.unwrap().unwrap();
+    write_frame(&mut next, &request, MAX_FRAME).await.unwrap();
+    assert_eq!(edit_response(&mut next).await, edit::Response::Accepted);
+    assert_eq!(edit_response(&mut next).await, edit::Response::Opened);
     service.abort();
 }

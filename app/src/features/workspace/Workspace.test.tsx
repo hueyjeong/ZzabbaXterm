@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import type { EventCallback } from "@tauri-apps/api/event";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -9,6 +10,7 @@ import type { ConnectionRequest, ConnectionTestDraft, ConnectionTestRun } from "
 
 const native = vi.hoisted(() => ({
   invoke: vi.fn(),
+  listen: vi.fn(),
   fit: vi.fn(),
 }));
 vi.mock("@tauri-apps/api/core", () => ({
@@ -16,6 +18,8 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: native.invoke,
   Channel: class { constructor(readonly receive: (message: unknown) => void) { } },
 }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: native.listen }));
+vi.mock("@tauri-apps/api/webview", () => ({ getCurrentWebview: () => ({ label: "main" }) }));
 vi.mock("@xterm/addon-fit", () => ({ FitAddon: class { fit = native.fit; } }));
 vi.mock("@xterm/xterm", () => ({
   Terminal: class {
@@ -63,6 +67,8 @@ let runDiscovery: (args: unknown) => Promise<unknown>;
 let runStorage: (command: string, args: unknown) => Promise<unknown>;
 let runSftp: (command: string, args: unknown) => Promise<unknown>;
 let runTunnel: (command: string, args: unknown) => Promise<unknown>;
+let receiveCliOpen: EventCallback<{ requestId: string }> | undefined;
+let runCliEditor: (command: string, args: { attached?: boolean }) => Promise<unknown>;
 let openFile: () => Promise<unknown>;
 let saveFile: () => Promise<unknown>;
 
@@ -106,6 +112,12 @@ beforeEach(async () => {
   runStorage = async command => { throw new Error(`예상하지 않은 스토리지 명령: ${command}`); };
   runSftp = async command => { throw new Error(`예상하지 않은 SFTP 명령: ${command}`); };
   runTunnel = async command => { throw new Error(`예상하지 않은 터널 명령: ${command}`); };
+  receiveCliOpen = undefined;
+  native.listen.mockImplementation(async (event, receive) => {
+    if (event === "editor-local-cli-open") receiveCliOpen = receive;
+    return () => { receiveCliOpen = undefined; };
+  });
+  runCliEditor = async command => { throw new Error(`예상하지 않은 CLI 편집 명령: ${command}`); };
   openFile = async () => ({ status: "cancelled" });
   saveFile = async () => null;
   native.invoke.mockImplementation(async (command, args) => {
@@ -116,6 +128,7 @@ beforeEach(async () => {
     if (command.startsWith("storage_")) return runStorage(command, args);
     if (command.startsWith("editor_sftp_")) return runSftp(command, args);
     if (command.startsWith("tunnel_")) return runTunnel(command, args);
+    if (command.startsWith("editor_local_cli_")) return runCliEditor(command, args);
     if (command === "editor_local_open") return openFile();
     if (command === "editor_local_save") return saveFile();
     if (command === "terminal_start") return starts.get(args.id);
@@ -207,6 +220,84 @@ async function openSecond() {
   expect(document.activeElement).toBe(find('[role="treeitem"]:not([aria-expanded])'));
   await key(document.activeElement as HTMLElement, "Enter");
 }
+
+describe("CLI 로컬 파일 열기", () => {
+  const requestId = "1".repeat(32);
+  const handle = "a".repeat(32);
+  const file = { status: "opened", handle, name: "CLI 문서.txt", text: "CLI 원본" };
+  const preview = '.editor-tab[aria-label="CLI 문서.txt"]';
+
+  async function openFromCli(respond: () => Promise<void>) {
+    runCliEditor = async (command, args) => {
+      if (command === "editor_local_cli_claim") return file;
+      if (args.attached) await respond();
+    };
+    await act(async () => receiveCliOpen!({ event: "editor-local-cli-open", id: 1, payload: { requestId } }));
+  }
+
+  it("마운트한 편집 탭의 정확한 핸들을 부착하고 해당 탭을 닫을 때만 파일을 닫는다", async () => {
+    const attached = Promise.withResolvers<void>();
+    let textAtAttach: string | undefined;
+    await openSecond();
+    await press("로컬 1");
+    await openFromCli(() => {
+      textAtAttach = editor.getModels().find(item => item.uri.query === handle)?.getValue();
+      return attached.promise;
+    });
+
+    expect(textAtAttach).toBe(file.text);
+    expect(connectionCalls("editor_local_cli_respond")).toEqual([
+      ["editor_local_cli_respond", { requestId, handle, attached: true }],
+    ]);
+    expect(find(preview).hidden).toBe(true);
+    expect(button("로컬 1")?.getAttribute("aria-pressed")).toBe("true");
+    await press("로컬 2");
+    const input = find<HTMLTextAreaElement>('section[aria-label="로컬 2"] textarea');
+    expect(document.activeElement).toBe(input);
+    await type(input, "READY");
+    expect(calls("input")).toEqual([{ id: "pty-11", bytes: Array.from(new TextEncoder().encode("READY")) }]);
+
+    await act(async () => attached.resolve());
+    expect(button(file.name)?.getAttribute("aria-pressed")).toBe("true");
+    expect(find(preview).hidden).toBe(false);
+    await press("로컬 2");
+    expect(find('section[aria-label="로컬 2"] textarea')).toBe(input);
+    expect(input.value).toBe("READY");
+    await press("로컬 1 닫기");
+    expect(connectionCalls("editor_local_close")).toEqual([]);
+    await press(`${file.name} 닫기`);
+    expect(connectionCalls("editor_local_close")).toEqual([["editor_local_close", { handle }]]);
+    expect(button(file.name)).toBeUndefined();
+    expect(calls("close")).toEqual([{ id: "pty-10" }]);
+    expect(button("로컬 2")?.getAttribute("aria-pressed")).toBe("true");
+  });
+
+  it.each(["수신 종료", "부착 응답 실패"])("%s 시 임시 편집 탭만 사라진다", async (failure) => {
+    const attached = Promise.withResolvers<void>();
+    await openSecond();
+    const input = find<HTMLTextAreaElement>('section[aria-label="로컬 2"] textarea');
+    await openFromCli(() => attached.promise);
+    expect(button(file.name)?.disabled).toBe(true);
+
+    if (failure === "수신 종료") {
+      await act(async () => { window.dispatchEvent(new Event("pagehide")); });
+      expect(button(file.name)).toBeUndefined();
+      await act(async () => attached.resolve());
+    } else {
+      await act(async () => attached.reject(new Error("응답 연결 끊김")));
+    }
+
+    expect(button(file.name)).toBeUndefined();
+    expect(editor.getModels().some(item => item.uri.query === handle)).toBe(false);
+    expect(button("로컬 1")).toBeDefined();
+    expect(button("로컬 2")?.getAttribute("aria-pressed")).toBe("true");
+    expect(document.activeElement).toBe(input);
+    await type(input, "STILL_READY");
+    expect(calls("input")).toEqual([{ id: "pty-11", bytes: Array.from(new TextEncoder().encode("STILL_READY")) }]);
+    expect(calls("close")).toEqual([]);
+    expect(connectionCalls("editor_local_close")).toEqual([]);
+  });
+});
 
 describe("L02", () => {
   it("셸이 준비되기 전에는 입력을 받지 않고 준비되면 선택한 터미널로 포커스가 이동한다", async () => {

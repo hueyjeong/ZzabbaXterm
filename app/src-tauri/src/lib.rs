@@ -9,6 +9,10 @@ mod terminal;
 mod tunnels;
 mod workspace_window;
 
+pub mod editor_cli {
+    pub use crate::editor::cli::{CliError, run};
+}
+
 use editor::registry::LocalEditors;
 use editor::sftp_ipc::SftpIpc;
 use storage::ipc::{self as storage_ipc, StorageIpc};
@@ -112,6 +116,7 @@ pub fn run() {
             }
             tauri::RunEvent::Exit => {
                 app.state::<tunnels::ipc::TunnelTabs>().navigate(true);
+                app.state::<LocalEditors>().destroy("main");
                 app.state::<SftpIpc>().shutdown();
                 app.state::<StorageIpc>().shutdown();
                 app.state::<Sessions>().shutdown();

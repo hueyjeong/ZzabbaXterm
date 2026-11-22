@@ -603,3 +603,67 @@ fn ipc_conflict_preserves_disk_and_buffer_until_explicit_reload() {
     assert_eq!(fs::read_to_string(&path).unwrap(), buffer);
     dir.cleanup_checked(1);
 }
+
+#[test]
+fn cli_wait_belongs_to_the_claimed_tab_in_the_approving_document() {
+    use cli::{Opening, Pending, Request, Response};
+    use registry::{EditorError, LocalEditors, Selected};
+    use tokio::{sync::oneshot, time::Instant};
+
+    let dir = Sandbox::new();
+    let path = dir.path("한글.txt");
+    fs::write(&path, "원본").unwrap();
+    let editors = LocalEditors::default();
+    editors.navigate("main");
+    editors.navigate("other");
+    let document = editors.document("main").unwrap();
+    let other = editors.document("other").unwrap();
+
+    let offer = || {
+        let request: Request = serde_json::from_value(serde_json::json!({ "path": &path, "wait": true })).unwrap();
+        let (reply, response) = oneshot::channel();
+        let (opened, mounted) = oneshot::channel();
+        let opening = Opening::new(Instant::now() + cli::OPEN_TIMEOUT);
+        let pending = Pending::new(request, reply, opened, opening.clone());
+        let (file, text) = LocalFile::open(&path).unwrap();
+        let (id, _) = editors.offer("main", document, pending, file, text).unwrap();
+        (id, response, mounted, opening)
+    };
+    let (id, mut response, mut mounted, _) = offer();
+    let (other_id, mut other_response, mut other_mounted, _) = offer();
+    assert!(matches!(editors.claim("other", other, &id), Err(EditorError::InvalidHandle)));
+    let Selected::Opened { handle, text, .. } = editors.claim("main", document, &id).unwrap() else { panic!("CLI 탭 누락"); };
+    let Selected::Opened { handle: other_handle, .. } = editors.claim("main", document, &other_id).unwrap() else { panic!("CLI 탭 누락"); };
+    assert_eq!(text, "원본");
+    assert_ne!(handle, other_handle);
+    assert!(matches!(editors.claim("main", document, &id), Err(EditorError::InvalidHandle)));
+    assert!(editors.close("main", document, &handle).is_err());
+    assert!(editors.respond_to_offer("main", document, &id, &other_handle, true).is_err());
+    assert_eq!(mounted.try_recv(), Err(oneshot::error::TryRecvError::Empty));
+
+    editors.respond_to_offer("main", document, &id, &handle, true).unwrap();
+    editors.respond_to_offer("main", document, &other_id, &other_handle, true).unwrap();
+    assert_eq!(mounted.try_recv(), Ok(()));
+    assert_eq!(other_mounted.try_recv(), Ok(()));
+    editors.close("main", document, &handle).unwrap();
+    assert_eq!(response.try_recv(), Ok(Response::Closed));
+    assert_eq!(other_response.try_recv(), Err(oneshot::error::TryRecvError::Empty));
+
+    let (cancelled_id, mut cancelled_response, mut cancelled_mounted, opening) = offer();
+    let Selected::Opened { handle: cancelled_handle, .. } = editors.claim("main", document, &cancelled_id).unwrap()
+        else { panic!("CLI 탭 누락"); };
+    assert!(opening.cancel_pending());
+    assert!(editors.respond_to_offer("main", document, &cancelled_id, &cancelled_handle, true).is_err());
+    editors.discard_offer(document, &cancelled_id, false);
+    assert_eq!(cancelled_response.try_recv(), Err(oneshot::error::TryRecvError::Closed));
+    assert_eq!(cancelled_mounted.try_recv(), Err(oneshot::error::TryRecvError::Closed));
+
+    let (pending_id, mut pending_response, mut pending_mounted, _) = offer();
+    editors.navigate("main");
+    assert_eq!(other_response.try_recv(), Err(oneshot::error::TryRecvError::Closed));
+    assert_eq!(pending_response.try_recv(), Err(oneshot::error::TryRecvError::Closed));
+    assert_eq!(pending_mounted.try_recv(), Err(oneshot::error::TryRecvError::Closed));
+    let next = editors.document("main").unwrap();
+    assert!(matches!(editors.claim("main", next, &pending_id), Err(EditorError::InvalidHandle)));
+    assert!(matches!(editors.close("main", next, &other_handle), Err(EditorError::InvalidHandle)));
+}

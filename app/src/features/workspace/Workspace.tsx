@@ -3,6 +3,7 @@ import { LocalAiPanel } from "../ai/LocalAiPanel";
 import { createLocalConnectionIpc, type SavedConnections } from "../connections/connectionIpc";
 import { LocalConnectionWizard } from "../connections/LocalConnectionWizard";
 import type { ConnectionClose, InitialWizardDraft, SshTransport } from "../connections/profiles";
+import { subscribeLocalCliOpen } from "../editor/cliOpen";
 import { EditorTab, type EditorTabActions } from "../editor/EditorTab";
 import type { ApprovedEditorFile, ConfirmEditorDiscard, EditorTransport } from "../editor/contract";
 import { closeLocalFile, localEditorError, localEditorTransport, openLocalFile } from "../editor/localEditorIpc";
@@ -23,7 +24,7 @@ type CloseStatus = "closing" | "unconfirmed";
 type Split = { left: number; right: number };
 type Tab = { id: number; label: string } & (
   | { kind: "terminal"; targetId?: string; ssm?: SsmTarget; ssh?: SshTransport["kind"]; status: TerminalStatus; sessionId?: string; sftpSessionId?: string; closeStatus?: CloseStatus }
-  | { kind: "editor"; file: ApprovedEditorFile; transport: EditorTransport; close: () => Promise<void>; source: EditorSource }
+  | { kind: "editor"; file: ApprovedEditorFile; transport: EditorTransport; close: () => Promise<void>; source: EditorSource; attaching?: true }
   | { kind: "tunnel"; handle: string; targetId: string; name: string; method: "ssh" | "ssm"; closeStatus?: CloseStatus; closeError?: string }
 );
 type StorageTarget = { targetId: string; label: string; closeStatus?: CloseStatus };
@@ -65,6 +66,7 @@ export function Workspace() {
   const closingStorage = useRef(new Set<string>());
   const sftpPanels = useRef(new Map<string, SftpPanelActions>());
   const editorActions = useRef(new Map<number, EditorTabActions>());
+  const cliMounts = useRef(new Map<number, (mounted: boolean) => void>());
   const openingFile = useRef(false);
   const [filePickerBusy, setFilePickerBusy] = useState(false);
   const [fileError, setFileError] = useState("");
@@ -72,7 +74,12 @@ export function Workspace() {
   const liveTabs = useRef(tabs);
   const closingTabs = useRef(new Set<number>());
   const sessionClosers = useRef(new Map<number, { confirmClose(): Promise<void> }>());
-  useLayoutEffect(() => { liveTabs.current = tabs; }, [tabs]);
+  useLayoutEffect(() => {
+    liveTabs.current = tabs;
+    for (const tab of tabs) {
+      if (tab.kind === "editor" && tab.attaching) cliMounts.current.get(tab.id)?.(editorActions.current.has(tab.id));
+    }
+  }, [tabs]);
   const [focused, setFocused] = useState(false);
   const [windowError, setWindowError] = useState("");
   const [loadVersion, setLoadVersion] = useState(0);
@@ -87,6 +94,50 @@ export function Workspace() {
   const sideLimit = Math.min(640, Math.floor(bodyWidth * 0.32));
   const left = Math.min(treeWidth, sideLimit);
   const right = Math.min(aiWidth, sideLimit);
+
+  useEffect(() => {
+    const attachingHandles = new Set<ApprovedEditorFile["handle"]>();
+    const report = (error: unknown) => setFileError(`CLI 파일 열기 실패: ${localEditorError(error).message}`);
+    const unsubscribe = subscribeLocalCliOpen(async (file, respond, signal) => {
+      if (signal.aborted || attachingHandles.has(file.handle) || liveTabs.current.some(tab =>
+        tab.kind === "editor" && tab.source === "local" && tab.file.handle === file.handle)) return;
+      attachingHandles.add(file.handle);
+      const id = nextTab.current++;
+      const removePreview = () => setTabs(current => current.filter(tab => tab.id !== id));
+      const { promise: mounted, resolve } = Promise.withResolvers<boolean>();
+      cliMounts.current.set(id, resolve);
+      const abort = () => {
+        resolve(false);
+        removePreview();
+      };
+      signal.addEventListener("abort", abort, { once: true });
+      setTabs(current => [...current, { id, label: file.label, kind: "editor", file,
+        source: "local", transport: localEditorTransport, close: () => closeLocalFile(file.handle), attaching: true }]);
+      try {
+        const committed = await mounted;
+        if (signal.aborted) return;
+        if (!committed) throw new Error("편집기 탭을 부착할 수 없습니다");
+        await respond({ attached: true });
+        if (signal.aborted) return;
+        setTabs(current => current.map(tab => tab.id === id && tab.kind === "editor"
+          ? { ...tab, attaching: undefined } : tab));
+        selectTab(id);
+      } catch (error) {
+        removePreview();
+        if (!signal.aborted) report(error);
+        throw error;
+      } finally {
+        cliMounts.current.delete(id);
+        attachingHandles.delete(file.handle);
+        signal.removeEventListener("abort", abort);
+      }
+    }, report);
+    window.addEventListener("pagehide", unsubscribe);
+    return () => {
+      window.removeEventListener("pagehide", unsubscribe);
+      unsubscribe();
+    };
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -370,9 +421,10 @@ export function Workspace() {
           const { id, label, kind } = tab;
           const closeStatus = kind === "editor" ? undefined : tab.closeStatus;
           return <div className="workspace-tab" key={id}>
-            <button ref={id === active ? activeButton : undefined} aria-pressed={id === active} onClick={() => selectTab(id)}>{label}</button>
+            <button ref={id === active ? activeButton : undefined} aria-pressed={id === active}
+              disabled={kind === "editor" && tab.attaching} onClick={() => selectTab(id)}>{label}</button>
             <button aria-label={`${label} ${closeStatus === "unconfirmed" ? "종료 다시 확인" : "닫기"}`}
-              disabled={closeStatus === "closing"} onClick={() => {
+              disabled={closeStatus === "closing" || (kind === "editor" && tab.attaching)} onClick={() => {
                 if (kind === "editor") void editorActions.current.get(id)?.requestClose();
                 else void closeTab(id);
               }}>×</button>
@@ -440,7 +492,7 @@ export function Workspace() {
                     ? { kind: "unconfirmed", error: tab.closeError ?? "종료 확인 불가" } : undefined}
                   onShare={(targetId, tabHandle, tunnelId) => openTunnel(targetId, tab.name, tab.method, { tab: tabHandle, id: tunnelId })} />
               ) : (
-                <EditorTab file={tab.file} active={id === active} transport={tab.transport}
+                <EditorTab file={tab.file} active={id === active && !tab.attaching} transport={tab.transport}
                   confirmDiscard={(request) => confirmEditorDiscard(tab.source, request)}
                   focusRequested={id === focusTab}
                   ref={(actions) => {
@@ -448,7 +500,7 @@ export function Workspace() {
                     else editorActions.current.delete(id);
                   }}
                   onClose={(handle) => {
-                    if (handle !== tab.file.handle) return;
+                    if (tab.attaching || handle !== tab.file.handle) return;
                     void closeTab(id);
                     void tab.close().catch((error: unknown) => {
                       const message = tab.source === "local" ? localEditorError(error).message : tab.source === "sftp" ? sftpError(error).message

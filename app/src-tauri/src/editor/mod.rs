@@ -3,6 +3,9 @@
 #[cfg_attr(unix, path = "unix.rs")]
 #[cfg_attr(windows, path = "windows.rs")]
 mod os;
+pub(crate) mod cli;
+mod cli_open;
+pub(crate) use cli_open::prepare_cli;
 pub(crate) mod ipc;
 pub(crate) mod registry;
 pub(crate) mod sftp;
