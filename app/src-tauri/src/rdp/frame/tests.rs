@@ -293,7 +293,7 @@ fn xrdp_compressed_bitmap_crops_source_stride_without_shear() {
 
 #[test]
 fn oversized_declared_bitmap_is_rejected_before_decoding() {
-    let data = encoded_bitmap(InclusiveRectangle { left: 0, top: 0, right: 10, bottom: 9 }, 65535, 700, 32, Compression::empty(), &[]);
+    let data = encoded_bitmap(InclusiveRectangle { left: 0, top: 0, right: 10, bottom: 9 }, 65535, 10, 32, Compression::empty(), &[]);
     let pdu = fastpath_frame(&[(Fragmentation::Single, UpdateCode::Bitmap, &data)]);
     assert!(matches!(Normalizer::default().normalize(Action::FastPath, &pdu, &test_image()), Err(Error::Bounds)));
 }
@@ -309,6 +309,13 @@ fn large_cropped_bitmap_is_split_into_bounded_pdus_with_correct_pixels() {
     assert!(pdus.len() > 1);
     assert!(pdus.iter().all(|(_, pdu)| pdu.len() <= 32_767));
     let bitmaps = output_bitmaps(normalized);
+    let mut bands = bitmaps.iter().map(|bitmap| bitmap.rectangles[0].rectangle.clone()).collect::<Vec<_>>();
+    bands.sort_by_key(|rect| rect.top);
+    assert_eq!(bands.first().map(|rect| rect.top), Some(0));
+    assert_eq!(bands.last().map(|rect| rect.bottom), Some(29));
+    for pair in bands.windows(2) {
+        assert_eq!(pair[1].top, pair[0].bottom + 1);
+    }
     let rows: u32 = bitmaps.iter().map(|bitmap| u32::from(bitmap.rectangles[0].height)).sum();
     assert_eq!(rows, 30);
     for bitmap in &bitmaps {
@@ -362,4 +369,70 @@ fn pointer_update_sharing_a_pdu_with_a_bitmap_is_kept() {
     }
     assert!(codes.contains(&UpdateCode::PositionPointer));
     assert!(codes.contains(&UpdateCode::Bitmap));
+}
+
+#[test]
+fn fragmented_non_bitmap_update_keeps_its_fragmentation() {
+    let (encoded, _) = rdp6(8, 3);
+    let data = encoded_bitmap(InclusiveRectangle { left: 0, top: 0, right: 6, bottom: 2 }, 8, 3, 32,
+        Compression::BITMAP_COMPRESSION | Compression::NO_BITMAP_COMPRESSION_HDR, &encoded);
+    let pdu = fastpath_frame(&[
+        (Fragmentation::First, UpdateCode::SurfaceCommands, &[0u8; 4]),
+        (Fragmentation::Single, UpdateCode::Bitmap, &data),
+    ]);
+    let Normalized::Replace(pdus) = Normalizer::default().normalize(Action::FastPath, &pdu, &test_image()).unwrap()
+        else { panic!("expected replacement") };
+    let mut seen = Vec::new();
+    for (_, pdu) in pdus {
+        let mut input = ReadCursor::new(&pdu);
+        let _: FastPathHeader = decode_cursor(&mut input).unwrap();
+        while !input.is_empty() {
+            let update: FastPathUpdatePdu<'_> = decode_cursor(&mut input).unwrap();
+            seen.push((update.update_code, update.fragmentation));
+        }
+    }
+    assert!(seen.contains(&(UpdateCode::SurfaceCommands, Fragmentation::First)));
+}
+
+#[test]
+fn fragment_buffer_cap_is_bounds() {
+    let mut buffer = vec![0u8; 5];
+    assert!(matches!(super::extend_fragment(&mut buffer, &[0u8; 6], 10), Err(Error::Bounds)));
+}
+
+#[test]
+fn invalid_bits_per_pixel_is_bounds_without_panic() {
+    for bits in [0u16, 7] {
+        let data = encoded_bitmap(InclusiveRectangle { left: 0, top: 0, right: 1, bottom: 1 }, 2, 2, bits, Compression::empty(), &[0; 32]);
+        let pdu = fastpath_frame(&[(Fragmentation::Single, UpdateCode::Bitmap, &data)]);
+        assert!(matches!(Normalizer::default().normalize(Action::FastPath, &pdu, &test_image()), Err(Error::Bounds)));
+    }
+}
+
+#[test]
+fn a_single_bitmap_drops_an_older_fragment() {
+    let (encoded, _) = rdp6(8, 3);
+    let data = encoded_bitmap(InclusiveRectangle { left: 0, top: 0, right: 6, bottom: 2 }, 8, 3, 32,
+        Compression::BITMAP_COMPRESSION | Compression::NO_BITMAP_COMPRESSION_HDR, &encoded);
+    let first = fastpath_frame(&[(Fragmentation::First, UpdateCode::Bitmap, &data[..4])]);
+    let mut normalizer = Normalizer::default();
+    assert!(matches!(normalizer.normalize(Action::FastPath, &first, &test_image()).unwrap(), Normalized::Drop));
+    let single = fastpath_frame(&[(Fragmentation::Single, UpdateCode::Bitmap, &data)]);
+    assert!(matches!(normalizer.normalize(Action::FastPath, &single, &test_image()).unwrap(), Normalized::Replace(_)));
+    let orphan = fastpath_frame(&[(Fragmentation::Last, UpdateCode::Bitmap, &[])]);
+    assert!(matches!(normalizer.normalize(Action::FastPath, &orphan, &test_image()), Err(Error::Protocol)));
+}
+
+#[test]
+fn a_pointer_next_to_a_bitmap_fragment_is_not_dropped() {
+    let pdu = fastpath_frame(&[
+        (Fragmentation::First, UpdateCode::Bitmap, &[0u8; 4]),
+        (Fragmentation::Single, UpdateCode::PositionPointer, &[1, 0, 2, 0]),
+    ]);
+    let Normalized::Replace(pdus) = Normalizer::default().normalize(Action::FastPath, &pdu, &test_image()).unwrap()
+        else { panic!("expected replacement") };
+    let mut input = ReadCursor::new(&pdus[0].1);
+    let _: FastPathHeader = decode_cursor(&mut input).unwrap();
+    let update: FastPathUpdatePdu<'_> = decode_cursor(&mut input).unwrap();
+    assert_eq!((update.update_code, update.data), (UpdateCode::PositionPointer, &[1u8, 0, 2, 0][..]));
 }

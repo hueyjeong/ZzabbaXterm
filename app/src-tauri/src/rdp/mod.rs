@@ -281,6 +281,7 @@ impl Session {
                                                 .await.map_err(|_| Error::Timeout)??;
                                             display_generation += 1;
                                             inbound.reset_graphics();
+                                            normalizer = frame::Normalizer::default();
                                             dirty = None;
                                         }
                                         ActiveStageOutput::Terminate(_) => return Ok(()),
@@ -288,7 +289,11 @@ impl Session {
                                     }
                                 }
                                 if let Some(dirty) = dirty {
-                                    if let Some(frame) = graphics.update(id, &dirty)? { pending.push_back(Event::Frame(frame)); }
+                                    if let Some(frame) = graphics.update(id, &dirty)? {
+                                        pending.push_back(Event::Frame(frame));
+                                        // 같은 PDU에서 나뉜 나머지 밴드는 전체 프레임이 아니라 패치로 보낸다.
+                                        graphics.ready = true;
+                                    }
                                 }
                             }
                             let next_channels = channel_state(&mut active, inbound.clipboard_id, &area);
