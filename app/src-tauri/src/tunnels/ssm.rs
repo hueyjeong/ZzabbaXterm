@@ -10,7 +10,7 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    connections::SavedSsm,
+    connections::profile::Ssm,
     ssm::{AwsCli, CliError, ForwardGuard, ForwardPermit, Scope, SessionDocument, SessionLookup, StartRequest, valid_session_id},
     terminal::remote::start_error,
 };
@@ -38,6 +38,8 @@ const LISTEN_TIMEOUT: Duration = Duration::from_secs(3);
 // 트리를 정리한 뒤 출력 읽기 작업이 끝나기를 기다리는 한도다. 터널 문서 잠금 안에서 호출된다.
 const READER_TIMEOUT: Duration = Duration::from_secs(1);
 const LINE_LIMIT: usize = 512;
+// 빈 포트를 고른 뒤 플러그인이 bind하기 전에 다른 프로그램이 가져간 경우의 재시도 한도다.
+const BIND_ATTEMPTS: usize = 3;
 const STDERR_LIMIT: usize = 8 * 1024;
 
 const FORMAT: &str = "SSM 플러그인 출력 형식을 확인할 수 없습니다";
@@ -57,9 +59,8 @@ pub(crate) struct ForwardPlan {
 
 impl ForwardPlan {
     /// 수신 주소·노드 형식·원격 호스트를 검사하고, 경로의 노드가 저장 대상의 노드와 같을 때만 계획을 만든다.
-    /// 프로필·리전은 `saved`에서만 가져오므로 따로 대조할 승인 값이 없다.
-    pub(crate) fn new(route: &Route, saved: &SavedSsm) -> Result<Self, String> {
-        let target = &saved.target;
+    /// 프로필·리전은 저장 대상에서만 가져오므로 따로 대조할 승인 값이 없다.
+    pub(crate) fn new(route: &Route, target: &Ssm) -> Result<Self, String> {
         let scope = SsmScope { profile: &target.profile, region: &target.region };
         let plan = SsmPlan::new(route, scope, route, scope).map_err(|error| format!("SSM 전달 승인: {error:?}"))?;
         let Route::Ssm { node, .. } = route else { unreachable!("SSM 전달 계획 필요") };
@@ -147,6 +148,46 @@ impl RemoteSession {
     }
 }
 
+/// SSH-over-SSM의 노드 SSH 포트 전달을 열고 수신 소유권까지 확인한다. 루프백 빈 포트를 쓰고 bind 충돌이면 새 포트로 다시 시도한다.
+pub(crate) fn open_ssh_forward(target: &Ssm, port: u16, cancel: &CancellationToken) -> Result<(u16, SsmChild), String> {
+    let pick = || std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).and_then(|listener| listener.local_addr());
+    ready_on_free_port(cancel, pick, |listen| {
+        let route = Route::Ssm { listen, node: target.instance_id.clone(), port, host: None };
+        let plan = ForwardPlan::new(&route, target)?;
+        tauri::async_runtime::block_on(prepare(plan, cancel))?.spawn()
+    })
+}
+
+fn ready_on_free_port(
+    cancel: &CancellationToken,
+    mut pick: impl FnMut() -> io::Result<SocketAddr>,
+    mut start: impl FnMut(SocketAddr) -> Result<SsmChild, String>,
+) -> Result<(u16, SsmChild), String> {
+    let mut conflict = None;
+    for _ in 0..BIND_ATTEMPTS {
+        let listen = pick().map_err(|error| format!("SSM 수신 포트 선택: {error}"))?;
+        // 재시도는 실패 사유 문자열이 아니라 bind 충돌 여부로 정한다.
+        let ready = match start(listen) {
+            // 자식을 띄우기 전 실패는 그 포트를 다른 프로그램이 잡았을 때만 충돌로 본다.
+            Err(error) => Err((error, super::ssh::local_conflict(Listener::Local(listen)))),
+            Ok(mut child) => loop {
+                if cancel.is_cancelled() { break Err(("SSM 포트 전달이 취소되었습니다".into(), false)); }
+                match child.observe() {
+                    Observation::Listening => break Ok(child),
+                    Observation::Pending => thread::sleep(Duration::from_millis(50)),
+                    Observation::Ended(reason) => break Err((reason, child.bind_conflicted())),
+                }
+            },
+        };
+        match ready {
+            Ok(child) => return Ok((listen.port(), child)),
+            Err((error, true)) => conflict = Some(error),
+            Err((error, false)) => return Err(error),
+        }
+    }
+    Err(conflict.unwrap_or_default())
+}
+
 type Verify = Box<dyn FnOnce(&str, &CancellationToken) -> Result<String, String> + Send>;
 type Terminate = Box<dyn FnOnce() + Send>;
 
@@ -155,6 +196,8 @@ struct Progress {
     bound: Option<(u16, String)>,
     verified: Option<String>,
     failure: Option<String>,
+    // `failure`가 수신 주소 bind 충돌이다.
+    bind_conflict: bool,
     stdout_closed: bool,
     stderr_closed: bool,
     stderr: Vec<u8>,
@@ -276,8 +319,13 @@ impl SsmChild {
         }
     }
 
+    /// 기록된 실패가 수신 주소 bind 충돌이면 참이다.
+    fn bind_conflicted(&self) -> bool {
+        self.progress.lock().unwrap().bind_conflict
+    }
+
     fn start_failure(&self, status: &str) -> String {
-        let progress = self.progress.lock().unwrap();
+        let mut progress = self.progress.lock().unwrap();
         if let Some(failure) = &progress.failure {
             return failure.clone();
         }
@@ -285,7 +333,8 @@ impl SsmChild {
             return reason;
         }
         if bind_conflict(&String::from_utf8_lossy(&progress.stderr)) || super::ssh::local_conflict(Listener::Local(self.listen)) {
-            return ended(observe_ssm(self.listen, Event::Ended(Failure::BindConflict), None));
+            progress.bind_conflict = true;
+            return OutputFault::BindConflict.message(self.listen);
         }
         format!("SSM 포트 전달 시작 실패: {status}")
     }
@@ -401,6 +450,9 @@ fn read_stdout(stdout: impl Read, listen: SocketAddr, progress: &Arc<Mutex<Progr
                 }
             }
             Err(fault) => {
+                if state.failure.is_none() {
+                    state.bind_conflict = fault == OutputFault::BindConflict;
+                }
                 state.failure.get_or_insert(fault.message(listen));
                 // 실패를 기록한 뒤에도 자식이 쓰기에서 막히지 않도록 끝까지 비운다.
                 drop(state);
@@ -538,19 +590,41 @@ pub(super) fn start_rejection(stderr: &[u8]) -> Option<String> {
 #[cfg(test)]
 pub(super) fn fixture_child(mode: &str, listen: SocketAddr, printed: Option<u16>, verified: Result<&str, &str>,
                             terminated: Option<Arc<std::sync::atomic::AtomicBool>>) -> Result<SsmChild, String> {
+    let verified = verified.map(str::to_owned).map_err(str::to_owned);
+    fixture_verified(mode, listen, printed, Box::new(move |expected: &str, _: &CancellationToken| {
+        assert_eq!(expected, tests::SESSION);
+        verified
+    }), terminated)
+}
+
+#[cfg(test)]
+fn fixture_verified(mode: &str, listen: SocketAddr, printed: Option<u16>, verify: Verify,
+                    terminated: Option<Arc<std::sync::atomic::AtomicBool>>) -> Result<SsmChild, String> {
     let program = tests::fixture_program();
     let (port, printed) = (listen.port().to_string(), printed.unwrap_or(listen.port()).to_string());
     let permit = ForwardPermit::fixture(program, &[mode, &port, tests::SESSION, &printed]);
-    let verified = verified.map(str::to_owned).map_err(str::to_owned);
     SsmChild::start(
         listen,
         |configure| permit.spawn_fixture(configure).map(|(child, guard)| (child, Some(guard))),
-        Box::new(move |expected: &str, _: &CancellationToken| {
-            assert_eq!(expected, tests::SESSION);
-            verified
-        }),
+        verify,
         terminated.map(|flag| Box::new(move || flag.store(true, std::sync::atomic::Ordering::SeqCst)) as Terminate),
     )
+}
+
+/// `open_ssh_forward`와 같은 대기·취소 경로를 가짜 CLI 트리로 실행한다. 플러그인은 bind 없이 준비 문장을 출력하고,
+/// 세션 확인은 `held`로 알린 뒤 전달이 닫힐 때까지 붙잡아 준비 중으로 둔다.
+#[cfg(test)]
+pub(crate) fn fixture_held_ssh_forward(cancel: &CancellationToken, held: std::sync::mpsc::Sender<()>,
+                                       terminated: Arc<std::sync::atomic::AtomicBool>) -> Result<(u16, SsmChild), String> {
+    ready_on_free_port(cancel, || tests::bind_loopback().local_addr(), |listen| {
+        let held = held.clone();
+        fixture_verified("impostor", listen, None, Box::new(move |expected: &str, closed: &CancellationToken| {
+            assert_eq!(expected, tests::SESSION);
+            let _ = held.send(());
+            tauri::async_runtime::block_on(closed.cancelled());
+            Err("SSM 세션 연결 확인 불가".into())
+        }), Some(terminated.clone()))
+    })
 }
 
 fn ended(observation: Observation) -> String {

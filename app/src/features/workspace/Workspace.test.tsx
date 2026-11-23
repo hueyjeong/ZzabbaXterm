@@ -1742,7 +1742,7 @@ describe("F01 직접 SSH", () => {
     await changeInput("표시명", "개발 서버");
     await press("다음");
     await chooseMethod("ssh");
-    expect(find<HTMLOptionElement>('option[value="ssm"][disabled]').textContent).toContain("SSH-over-SSM");
+    expect(find<HTMLOptionElement>('option[value="ssm"]:not([disabled])').textContent).toBe("SSH-over-SSM");
     await changeInput("서버 호스트", "dev.example.invalid");
     await changeInput("SSH 포트", "2222");
     await changeInput("SSH 계정", "deploy");
@@ -2560,5 +2560,104 @@ describe("현재 SSH 세션의 SFTP", () => {
     expect(connectionCalls("editor_sftp_close")).toEqual([["editor_sftp_close", { sessionId: ssh.id, handle: "remote-file" }]]);
     expect(connectionCalls("editor_local_close")).toEqual([]);
     expect(button("원격.txt")).toBeUndefined();
+  });
+});
+
+describe("SSO 만료로 열지 못한 원격 화면", () => {
+  it("SSO 로그인 뒤 같은 RDP 프로필의 SSM 경로를 다시 열고 로그인 실패를 표시한다", async () => {
+    loadProfiles = async () => ({
+      version: 1,
+      groups: [{ revision: 1, profile: { id: "work", displayName: "작업" } }],
+      targets: [{
+        revision: 1,
+        profile: {
+          id: "rdp-ssm", groupId: "work", displayName: "윈도 서버", defaultMethod: "rdp",
+          rdp: {
+            host: "win.example.invalid", port: 3389, tlsOnly: false,
+            route: { kind: "ssm", profile: "dev", region: "ap-northeast-2", instanceId: "i-0123456789abcdef0" },
+          },
+        },
+      }],
+    });
+    let ready = false;
+    runTunnel = async command => {
+      if (command === "tunnel_tab_open") return "route";
+      if (command === "tunnel_start") return "forward";
+      if (command === "tunnel_tab_close") return null;
+      if (command === "tunnel_status") return [{
+        id: "forward", endpoint: "dev · ap-northeast-2", route: "SSM", owners: [], state: ready ? "ready" : "failed",
+        error: ready ? null : "SSM: SSO 재로그인 필요",
+        desktop: { protocol: "rdp", targetId: "rdp-ssm", destination: { host: "win.example.invalid", port: 3389 } },
+      }];
+      throw new Error(command);
+    };
+    const login = vi.fn().mockRejectedValueOnce("SSM: 권한 거부").mockImplementation(async () => {
+      ready = true;
+      return "loggedIn";
+    });
+    const base = native.invoke.getMockImplementation()!;
+    native.invoke.mockImplementation(async (command, args) => command === "ssm_target_relogin" ? login(args) : base(command, args));
+    await restartWorkspace();
+    await key(treeTarget("윈도 서버"), "Enter");
+    await vi.waitFor(() => expect(status()).toContain("윈도 서버 열기 실패: SSM: SSO 재로그인 필요"));
+    expect(connectionCalls("tunnel_tab_open")).toHaveLength(1);
+
+    await press("SSO 로그인");
+    await vi.waitFor(() => expect(status()).toContain("SSO 로그인 실패: SSM: 권한 거부"));
+    expect(login).toHaveBeenCalledWith({ targetId: "rdp-ssm", requestId: expect.any(String) });
+    expect(connectionCalls("tunnel_tab_open")).toHaveLength(1);
+
+    await press("SSO 로그인");
+    await vi.waitFor(() => expect(connectionCalls("tunnel_tab_open")).toHaveLength(2));
+    await vi.waitFor(() => expect(button("윈도 서버")).toBeDefined());
+    expect(status()).not.toContain("열기 실패");
+    expect(button("SSO 로그인")).toBeUndefined();
+  });
+
+  it("다른 열기 시도가 시작되면 진행 중인 SSO 로그인을 취소하고 그 로그인으로 다시 열지 않는다", async () => {
+    loadProfiles = async () => ({
+      version: 1,
+      groups: [{ revision: 1, profile: { id: "work", displayName: "작업" } }],
+      targets: [{
+        revision: 1,
+        profile: {
+          id: "rdp-ssm", groupId: "work", displayName: "윈도 서버", defaultMethod: "rdp",
+          rdp: {
+            host: "win.example.invalid", port: 3389, tlsOnly: false,
+            route: { kind: "ssm", profile: "dev", region: "ap-northeast-2", instanceId: "i-0123456789abcdef0" },
+          },
+        },
+      }],
+    });
+    runTunnel = async command => {
+      if (command === "tunnel_tab_open") return "route";
+      if (command === "tunnel_start") return "forward";
+      if (command === "tunnel_tab_close") return null;
+      if (command === "tunnel_status") return [{
+        id: "forward", endpoint: "dev · ap-northeast-2", route: "SSM", owners: [], state: "failed",
+        error: "SSM: SSO 재로그인 필요",
+        desktop: { protocol: "rdp", targetId: "rdp-ssm", destination: { host: "win.example.invalid", port: 3389 } },
+      }];
+      throw new Error(command);
+    };
+    let finish!: (value: string) => void;
+    const login = vi.fn(() => new Promise<string>(resolve => { finish = resolve; }));
+    const cancel = vi.fn<(args: unknown) => Promise<null>>(async () => null);
+    const base = native.invoke.getMockImplementation()!;
+    native.invoke.mockImplementation(async (command, args) => command === "ssm_target_relogin" ? login()
+      : command === "ssm_target_relogin_cancel" ? cancel(args) : base(command, args));
+    await restartWorkspace();
+    await key(treeTarget("윈도 서버"), "Enter");
+    await vi.waitFor(() => expect(status()).toContain("윈도 서버 열기 실패: SSM: SSO 재로그인 필요"));
+    await press("SSO 로그인");
+    expect(login).toHaveBeenCalledTimes(1);
+    const requestId = (native.invoke.mock.calls.find(([command]) => command === "ssm_target_relogin")![1] as { requestId: string }).requestId;
+
+    await key(treeTarget("윈도 서버"), "Enter");
+    await vi.waitFor(() => expect(cancel).toHaveBeenCalledWith({ requestId }));
+    await vi.waitFor(() => expect(connectionCalls("tunnel_tab_open")).toHaveLength(2));
+    await act(async () => { finish("loggedIn"); });
+    await act(async () => { await Promise.resolve(); });
+    expect(connectionCalls("tunnel_tab_open")).toHaveLength(2);
   });
 });

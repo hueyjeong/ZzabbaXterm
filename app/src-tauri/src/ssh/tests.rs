@@ -18,6 +18,42 @@ fn approve<'a>(endpoint: &'a Endpoint, sha: &str) -> ApprovedHost<'a> {
     ApprovedHost::confirm(endpoint, endpoint, sha).unwrap()
 }
 
+/// 시험용 SSM 전달이다. `ended`를 켜면 종료를 관찰시키고, 계획과 함께 버려지면 `dropped`를 켠다.
+pub(crate) struct FakeForward {
+    ended: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl FakeForward {
+    pub(crate) fn transport(port: u16) -> (Transport, std::sync::Arc<std::sync::atomic::AtomicBool>, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let forward = Self { ended: Default::default(), dropped: Default::default() };
+        let (ended, dropped) = (forward.ended.clone(), forward.dropped.clone());
+        (Transport::Ssm { port, forward: Box::new(forward) }, ended, dropped)
+    }
+}
+
+impl crate::tunnels::Transport for FakeForward {
+    fn observe(&mut self) -> crate::tunnels::Observation {
+        if self.ended.load(std::sync::atomic::Ordering::SeqCst) {
+            crate::tunnels::Observation::Ended("시험 전달 종료".into())
+        } else {
+            crate::tunnels::Observation::Listening
+        }
+    }
+
+    fn close(&mut self) -> io::Result<()> { Ok(()) }
+}
+
+impl Drop for FakeForward {
+    fn drop(&mut self) {
+        self.dropped.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn ssm(port: u16) -> Transport {
+    FakeForward::transport(port).0
+}
+
 #[test]
 fn f01_only_matching_sha_creates_a_pin_and_registration_never_replaces_it() {
     let (root, store, endpoint) = setup();
@@ -53,7 +89,7 @@ fn f01_both_transports_require_the_exact_host_and_port_before_planning() {
         let other = Endpoint::new(host, port).unwrap();
         assert!(matches!(ApprovedHost::confirm(&other, &endpoint, SHA), Err(Error::ApprovedEndpointMismatch)));
         let other = approve(&other, SHA);
-        for transport in [Transport::Direct, Transport::Ssm] {
+        for transport in [Transport::Direct, ssm(40022)] {
             assert!(matches!(
                 ConnectionPlan::prepare(&store, &other, "dev", transport, Authentication::ManualPassword),
                 Err(Error::UnregisteredHost),
@@ -61,13 +97,70 @@ fn f01_both_transports_require_the_exact_host_and_port_before_planning() {
         }
     }
     assert!(matches!(
-        ConnectionPlan::prepare(&store, &approved, "dev", Transport::Ssm, Authentication::Agent { public_key: KEY }),
-        Err(Error::SsmProxyUnavailable),
+        ConnectionPlan::prepare(&store, &approved, "dev", ssm(0), Authentication::Agent { public_key: KEY }),
+        Err(Error::InvalidEndpoint),
     ));
-    assert!(matches!(
-        ConnectionPlan::prepare(&store, &approved, "dev", Transport::Ssm, Authentication::StoredPassword { item: ITEM }),
-        Err(Error::SsmProxyUnavailable),
-    ));
+}
+
+#[test]
+fn f01_ssm_transport_connects_to_the_forward_port_under_the_original_host_key_alias() {
+    use std::sync::atomic::Ordering;
+
+    let (_root, store, endpoint) = setup();
+    let approved = approve(&endpoint, SHA);
+    store.register(&approved, KEY).unwrap();
+    let config = |plan: &ConnectionPlan| fs::read_to_string(&plan.config).unwrap();
+    let shared = [
+        "User dev", "HostKeyAlias [dev.example.invalid]:2222", "StrictHostKeyChecking yes", "GlobalKnownHostsFile none",
+        "KnownHostsCommand none", "CheckHostIP no", "UpdateHostKeys no", "HostKeyAlgorithms ssh-ed25519",
+        "ProxyCommand none", "ProxyJump none", "ControlMaster no", "ClearAllForwardings yes", "ForwardAgent no",
+        "PreferredAuthentications publickey", "BatchMode yes",
+    ];
+
+    let direct = ConnectionPlan::prepare(&store, &approved, "dev", Transport::Direct, Authentication::Agent { public_key: KEY }).unwrap();
+    let direct_config = config(&direct);
+    for option in shared.iter().chain(&["HostName dev.example.invalid", "Port 2222"]) {
+        assert!(direct_config.lines().any(|line| line == *option), "{option}");
+    }
+    assert!(!direct_config.contains("127.0.0.1"));
+    assert_eq!(direct.forward_ended(), None);
+
+    let (transport, ended, dropped) = FakeForward::transport(40022);
+    let plan = ConnectionPlan::prepare(&store, &approved, "dev", transport, Authentication::Agent { public_key: KEY }).unwrap();
+    let forwarded = config(&plan);
+    for option in shared.iter().chain(&["HostName 127.0.0.1", "Port 40022"]) {
+        assert!(forwarded.lines().any(|line| line == *option), "{option}");
+    }
+    assert!(!forwarded.lines().any(|line| line == "HostName dev.example.invalid" || line == "Port 2222"));
+    // SSM 유휴 제한을 넘기도록 SSM 전송에만 keepalive를 둔다.
+    for option in ["ServerAliveInterval 60", "ServerAliveCountMax 3"] {
+        assert!(forwarded.lines().any(|line| line == option), "{option}");
+    }
+    assert!(!direct_config.contains("ServerAlive"));
+    // 접속 주소와 keepalive만 바뀌고 나머지 설정과 PIN 기록은 직접 전송과 같다.
+    let normalize = |text: &str| text.lines().filter(|line| !line.starts_with("HostName ") && !line.starts_with("Port ")
+        && !line.starts_with("UserKnownHostsFile ") && !line.starts_with("IdentityFile ") && !line.starts_with("CertificateFile ")
+        && !line.starts_with("ServerAlive"))
+        .collect::<Vec<_>>().join("\n");
+    assert_eq!(normalize(&forwarded), normalize(&direct_config));
+    let pin = forwarded.lines().find_map(|line| line.strip_prefix("UserKnownHostsFile ")).unwrap();
+    assert_eq!(fs::read_to_string(Path::new(pin.trim_matches('"'))).unwrap(), format!("[dev.example.invalid]:2222 {KEY}\n"));
+
+    assert_eq!(plan.forward_ended(), None);
+    ended.store(true, Ordering::SeqCst);
+    assert_eq!(plan.forward_ended().as_deref(), Some("SSM 전달 종료: 시험 전달 종료"));
+    assert!(!dropped.load(Ordering::SeqCst));
+    drop(plan);
+    assert!(dropped.load(Ordering::SeqCst));
+
+    #[cfg(any(windows, target_os = "linux"))]
+    {
+        let stored = ConnectionPlan::prepare(&store, &approved, "dev", ssm(40023), Authentication::StoredPassword { item: ITEM }).unwrap();
+        assert_eq!(stored.stored().unwrap().target, "[dev.example.invalid]:2222");
+        let invocation = stored.stored_ssh_invocation().unwrap();
+        let text = fs::read_to_string(Path::new(invocation.args[1])).unwrap();
+        assert!(text.lines().any(|line| line == "HostName 127.0.0.1") && text.lines().any(|line| line == "Port 40023"));
+    }
 }
 
 #[cfg(any(windows, target_os = "linux"))]
@@ -144,7 +237,7 @@ fn f01_corrupt_pin_never_produces_an_invocation_or_gets_replaced() {
     assert_eq!(fs::read_to_string(&path).unwrap(), corrupt);
     let changed = format!("{} {OTHER_KEY}\n", endpoint.alias());
     fs::write(&path, &changed).unwrap();
-    for transport in [Transport::Direct, Transport::Ssm] {
+    for transport in [Transport::Direct, ssm(40022)] {
         assert!(matches!(
             ConnectionPlan::prepare(&store, &approved, "dev", transport, Authentication::ManualPassword),
             Err(Error::FingerprintMismatch),

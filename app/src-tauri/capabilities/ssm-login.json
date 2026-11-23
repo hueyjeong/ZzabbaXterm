@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "local-ssm-login",
+  "description": "SSO login for saved SSM targets in the bundled main webview",
+  "local": true,
+  "webviews": ["main"],
+  "permissions": [
+    "allow-ssm-target-relogin",
+    "allow-ssm-target-relogin-cancel"
+  ]
+}

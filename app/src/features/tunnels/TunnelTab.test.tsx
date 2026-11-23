@@ -2,6 +2,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import type { SsoLoginIpc } from "../ssm/ssoLogin";
 import { TunnelTab } from "./TunnelTab";
 import { tunnelIpc } from "./tunnelIpc";
 
@@ -139,4 +140,139 @@ it("starts a local route on the owned handle without sending saved connection se
   expect(invoke).toHaveBeenNthCalledWith(2, "tunnel_start", {
     tab: "owned", request: { direction: "local", listen: 13389, host: "127.0.0.1", port: 3389, protocol: "rdp" },
   });
+});
+
+it("SSO 만료로 실패한 SSM 터널은 로그인 뒤 같은 요청으로 다시 시작하고 로그인 실패를 표시한다", async () => {
+  vi.useFakeTimers();
+  const request = { direction: "ssm", listen: 15901, port: 5901, protocol: "vnc" };
+  let snapshot: unknown[] = [];
+  let starts = 0;
+  invoke.mockImplementation(async (command: string) => {
+    if (command === "tunnel_status") return snapshot;
+    if (command === "tunnel_start") return String(++starts);
+    throw new Error(command);
+  });
+  const sso: SsoLoginIpc = {
+    login: vi.fn().mockRejectedValueOnce("SSM: 권한 거부").mockResolvedValue("loggedIn"),
+    cancel: vi.fn().mockResolvedValue(null),
+  };
+  await act(async () => root.render(<TunnelTab {...props} targetId="vnc-ssm" method="ssm" ssoIpc={sso} />));
+  const field = (name: string) => host.querySelector<HTMLInputElement | HTMLSelectElement>(`[name="${name}"]`)!;
+  field("listen").value = "15901";
+  field("port").value = "5901";
+  field("protocol").value = "vnc";
+  await act(async () => host.querySelector<HTMLButtonElement>('button[type="submit"]')?.click());
+  const login = () => host.querySelector<HTMLButtonElement>('li button[aria-label="SSO 로그인"]');
+  snapshot = [{ ...tunnel, id: "1", state: "failed", error: "SSM: SSO 재로그인 필요" }, { ...tunnel, id: "other", state: "failed", error: "SSM: SSO 재로그인 필요" }];
+  await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+  // 이 탭에서 시작한 요청만 다시 시작할 수 있다.
+  expect(host.querySelectorAll('li button[aria-label="SSO 로그인"]')).toHaveLength(1);
+
+  await act(async () => login()?.click());
+  expect(sso.login).toHaveBeenLastCalledWith("vnc-ssm", expect.any(String));
+  expect([...host.querySelectorAll('[role="alert"]')].map(alert => alert.textContent)).toContain("SSO 로그인 실패: SSM: 권한 거부");
+  expect(invoke.mock.calls.filter(([command]) => command === "tunnel_start")).toHaveLength(1);
+
+  await act(async () => login()?.click());
+  expect(sso.login).toHaveBeenCalledTimes(2);
+  expect(invoke.mock.calls.filter(([command]) => command === "tunnel_start")).toEqual([
+    ["tunnel_start", { tab: "owned", request }], ["tunnel_start", { tab: "owned", request }],
+  ]);
+  expect(host.textContent).not.toContain("SSO 로그인 실패");
+});
+
+it("상태에서 사라진 터널의 요청은 지우고 다시 시작할 수 없다", async () => {
+  vi.useFakeTimers();
+  let snapshot: unknown[] = [];
+  invoke.mockImplementation(async (command: string) => {
+    if (command === "tunnel_status") return snapshot;
+    if (command === "tunnel_start") return "1";
+    throw new Error(command);
+  });
+  const sso: SsoLoginIpc = { login: vi.fn(), cancel: vi.fn().mockResolvedValue(null) };
+  await act(async () => root.render(<TunnelTab {...props} targetId="vnc-ssm" method="ssm" ssoIpc={sso} />));
+  const field = (name: string) => host.querySelector<HTMLInputElement>(`[name="${name}"]`)!;
+  field("listen").value = "15901";
+  field("port").value = "5901";
+  await act(async () => host.querySelector<HTMLButtonElement>('button[type="submit"]')?.click());
+  const failed = [{ ...tunnel, id: "1", state: "failed", error: "SSM: SSO 재로그인 필요" }];
+  const logins = () => host.querySelectorAll('li button[aria-label="SSO 로그인"]');
+  snapshot = failed;
+  await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+  expect(logins()).toHaveLength(1);
+  snapshot = [];
+  await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+  // 같은 ID가 다시 보여도 이 탭의 요청으로 다시 시작하지 않는다.
+  snapshot = failed;
+  await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+  expect(logins()).toHaveLength(0);
+});
+
+it("다른 작업 중에 로그인이 끝나면 그 작업 뒤에 같은 요청으로 다시 시작한다", async () => {
+  vi.useFakeTimers();
+  const request = { direction: "ssm", listen: 15901, port: 5901 };
+  let snapshot: unknown[] = [];
+  invoke.mockImplementation(async (command: string) => {
+    if (command === "tunnel_status") return snapshot;
+    if (command === "tunnel_start") return "1";
+    throw new Error(command);
+  });
+  let loggedIn!: (value: "loggedIn") => void;
+  const sso: SsoLoginIpc = {
+    login: vi.fn(() => new Promise<"loggedIn">(resolve => { loggedIn = resolve; })), cancel: vi.fn().mockResolvedValue(null),
+  };
+  let shared!: () => void;
+  onShare.mockImplementation(() => new Promise<void>(resolve => { shared = resolve; }));
+  await act(async () => root.render(<TunnelTab {...props} targetId="vnc-ssm" method="ssm" ssoIpc={sso} />));
+  const field = (name: string) => host.querySelector<HTMLInputElement>(`[name="${name}"]`)!;
+  field("listen").value = "15901";
+  field("port").value = "5901";
+  await act(async () => host.querySelector<HTMLButtonElement>('button[type="submit"]')?.click());
+  snapshot = [{ ...tunnel, id: "1", state: "failed", error: "SSM: SSO 재로그인 필요" }, { ...tunnel, id: "ready", state: "ready" }];
+  await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+  await act(async () => host.querySelector<HTMLButtonElement>('li button[aria-label="SSO 로그인"]')?.click());
+  await act(async () => [...host.querySelectorAll<HTMLButtonElement>("li button")].find(item => item.textContent === "새 탭에 공유")?.click());
+  expect(onShare).toHaveBeenCalledTimes(1);
+  const starts = () => invoke.mock.calls.filter(([command]) => command === "tunnel_start");
+  await act(async () => { loggedIn("loggedIn"); });
+  expect(starts()).toHaveLength(1);
+  await act(async () => { shared(); });
+  expect(starts()).toEqual([["tunnel_start", { tab: "owned", request }], ["tunnel_start", { tab: "owned", request }]]);
+});
+
+it.each(["로그인 뒤", "로그인 중"] as const)("%s 탭이 닫히면 같은 요청으로 다시 시작하지 않고 로그인을 취소한다", async when => {
+  vi.useFakeTimers();
+  let snapshot: unknown[] = [];
+  invoke.mockImplementation(async (command: string) => {
+    if (command === "tunnel_status") return snapshot;
+    if (command === "tunnel_start") return "1";
+    throw new Error(command);
+  });
+  let loggedIn!: (value: "loggedIn") => void;
+  const sso: SsoLoginIpc = {
+    login: vi.fn(() => new Promise<"loggedIn">(resolve => { loggedIn = resolve; })), cancel: vi.fn().mockResolvedValue(null),
+  };
+  let shared!: () => void;
+  onShare.mockImplementation(() => new Promise<void>(resolve => { shared = resolve; }));
+  const tab = (closeState?: { kind: "closing" }) => <TunnelTab {...props} targetId="vnc-ssm" method="ssm" ssoIpc={sso} closeState={closeState} />;
+  await act(async () => root.render(tab()));
+  const field = (name: string) => host.querySelector<HTMLInputElement>(`[name="${name}"]`)!;
+  field("listen").value = "15901";
+  field("port").value = "5901";
+  await act(async () => host.querySelector<HTMLButtonElement>('button[type="submit"]')?.click());
+  snapshot = [{ ...tunnel, id: "1", state: "failed", error: "SSM: SSO 재로그인 필요" }, { ...tunnel, id: "ready", state: "ready" }];
+  await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+  await act(async () => host.querySelector<HTMLButtonElement>('li button[aria-label="SSO 로그인"]')?.click());
+  await act(async () => [...host.querySelectorAll<HTMLButtonElement>("li button")].find(item => item.textContent === "새 탭에 공유")?.click());
+  const requestId = vi.mocked(sso.login).mock.calls[0]?.[1];
+  // 로그인 뒤에 닫히면 대기열에 든 재시작을 버린다.
+  if (when === "로그인 뒤") await act(async () => { loggedIn("loggedIn"); });
+  await act(async () => root.render(tab({ kind: "closing" })));
+  expect(sso.cancel).toHaveBeenCalledTimes(when === "로그인 중" ? 1 : 0);
+  if (when === "로그인 중") {
+    expect(sso.cancel).toHaveBeenCalledWith(requestId);
+    await act(async () => { loggedIn("loggedIn"); });
+  }
+  await act(async () => { shared(); });
+  expect(invoke.mock.calls.filter(([command]) => command === "tunnel_start")).toHaveLength(1);
 });

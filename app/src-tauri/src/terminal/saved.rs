@@ -2,15 +2,16 @@ use std::path::Path;
 
 use portable_pty::CommandBuilder;
 
-use crate::{connections::{profile::{MethodRef, Shell}, with_saved_method, with_saved_ssh}, ssh::terminal::{DirectLaunch, prepare_remote_editor}};
+use crate::{connections::{profile::{MethodRef, Shell}, with_saved_method, with_saved_ssh}, ssh::terminal::{SavedLaunch, prepare_remote_editor}};
 
 use super::{process::Launch, remote};
+use crate::ssm::CancellationToken;
 
 pub(super) fn launch(config: &Path, id: &str) -> Result<Launch, String> {
     with_saved_method(config, id, |method, _| match method {
         MethodRef::Local { shell, start_directory } => local(shell, start_directory).map(Launch::Local),
         MethodRef::Ssm { profile, region, instance_id } => remote::Target::new(profile, region, instance_id).map(Launch::Ssm),
-        MethodRef::Ssh { ssh } => crate::ssh::terminal::saved(config, ssh).map(Launch::Ssh),
+        MethodRef::Ssh { ssh } => crate::ssh::terminal::saved(config, ssh, &CancellationToken::new()).map(Launch::Ssh),
         MethodRef::S3 { .. } => Err("S3 연결은 스토리지 탭에서 열 수 있습니다".into()),
         MethodRef::Desktop { .. } => Err("원격 화면 연결은 RDP·VNC 탭에서 열 수 있습니다".into()),
     })
@@ -27,7 +28,7 @@ pub(super) fn launch_interactive(
     with_saved_method(config, id, |method, _| match method {
         MethodRef::Local { shell, start_directory } => local(shell, start_directory).map(Launch::Local),
         MethodRef::Ssm { profile, region, instance_id } => remote::Target::new(profile, region, instance_id).map(Launch::Ssm),
-        MethodRef::Ssh { ssh } => crate::ssh::terminal::saved_interactive(config, ssh, owner, document, confirm).map(Launch::Ssh),
+        MethodRef::Ssh { ssh } => crate::ssh::terminal::saved_interactive(config, ssh, owner, document, confirm).map(Launch::from),
         MethodRef::S3 { .. } => Err("S3 연결은 스토리지 탭에서 열 수 있습니다".into()),
         MethodRef::Desktop { .. } => Err("원격 화면 연결은 RDP·VNC 탭에서 열 수 있습니다".into()),
     })
@@ -35,7 +36,7 @@ pub(super) fn launch_interactive(
 
 pub(super) fn approve_remote_editor<T>(config: &Path, id: &str,
     confirm: impl FnOnce(String) -> Result<bool, String>,
-    register: impl FnOnce(DirectLaunch) -> Result<T, String>,
+    register: impl FnOnce(SavedLaunch) -> Result<T, String>,
 ) -> Result<T, String> {
     let saved = with_saved_ssh(config, id, |saved| saved)?.ok_or("저장된 SSH 연결을 찾을 수 없습니다")?;
     let (launch, message) = prepare_remote_editor(config, id, saved.0, &saved.1)?;
@@ -131,7 +132,7 @@ fn nano_approval_admits_only_the_confirmed_saved_ssh_and_document() {
             fs::write(&file, serde_json::to_vec(&current).unwrap()).unwrap();
             Ok(true)
         }, |launch| {
-            let command = Launch::Ssh(launch);
+            let command = Launch::from(launch);
             let (id, session) = sessions.register_document("main", document, &command, true)?;
             let registered = sessions.registry.lock().unwrap().sessions.remove(&id).unwrap();
             assert!(std::sync::Arc::ptr_eq(&registered, &session));
@@ -167,7 +168,7 @@ fn rejects_saved_s3_without_launching_a_pty() {
 pub(super) fn command(config: &Path, id: &str) -> Result<CommandBuilder, String> {
     match launch(config, id)? {
         Launch::Local(command) => Ok(command),
-        Launch::Ssm(_) | Launch::Ssh(_) | Launch::AiControl(..) => Err("로컬 연결이 아닙니다".into()),
+        Launch::Ssm(_) | Launch::Ssh(_) | Launch::Forward(_) | Launch::AiControl(..) => Err("로컬 연결이 아닙니다".into()),
         #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
         Launch::Elevated(_) | Launch::RemoteElevated(_) => Err("로컬 연결이 아닙니다".into()),
     }

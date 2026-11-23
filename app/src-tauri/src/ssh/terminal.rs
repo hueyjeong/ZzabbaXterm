@@ -4,6 +4,7 @@ use std::sync::Arc;
 #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
 use std::time::{Duration, Instant};
 use crate::connections::profile::{Ssh, SshAuth, SshTransport};
+use tokio_util::sync::CancellationToken;
 
 use super::{ApprovedHost, Authentication, Client, ConnectionPlan, Error, Invocation, Transport, TrustStore};
 
@@ -43,6 +44,7 @@ impl DirectLaunch {
         account: &str,
         approved_account: &str,
         auth: Authentication<'_>,
+        transport: Transport,
     ) -> Result<Self, Error> {
         if account != approved_account {
             return Err(Error::ApprovedAccountMismatch);
@@ -50,7 +52,7 @@ impl DirectLaunch {
         if matches!(auth, Authentication::StoredPassword { .. }) {
             return Err(Error::StoredAuthenticationUnavailable);
         }
-        let plan = Arc::new(ConnectionPlan::prepare(store, approved_host, account, Transport::Direct, auth)?);
+        let plan = Arc::new(ConnectionPlan::prepare(store, approved_host, account, transport, auth)?);
         let command = command(plan.invocation(Client::Ssh)?);
         Ok(Self {
             command,
@@ -91,9 +93,8 @@ impl DirectLaunch {
     }
 
     pub(crate) fn enable_editor(&mut self, app: tauri::AppHandle, owner: String, document: u64) -> tokio::sync::oneshot::Sender<String> {
-        let (id, parent) = tokio::sync::oneshot::channel();
-        let (started, ready) = tokio::sync::oneshot::channel();
-        self.editor = Some((super::nano::Binding { app, owner, document, parent, started: ready }, started));
+        let (editor, id) = editor_binding(app, owner, document);
+        self.editor = Some(editor);
         id
     }
 
@@ -122,10 +123,76 @@ impl DirectLaunch {
     }
 
     #[cfg(test)]
+    pub(crate) fn replace_command(&mut self, command: CommandBuilder) {
+        self.command = command;
+    }
+
+    #[cfg(test)]
     pub(crate) fn fixture(&mut self, executable: &Path) -> std::path::PathBuf {
         self.command.get_argv_mut()[0] = executable.as_os_str().to_owned();
         self.command.env("ZZABBA_F01_FIXTURE_WAIT", "1");
         self.plan.config.clone()
+    }
+}
+
+type Editor = (super::nano::Binding, tokio::sync::oneshot::Sender<()>);
+
+fn editor_binding(app: tauri::AppHandle, owner: String, document: u64) -> (Editor, tokio::sync::oneshot::Sender<String>) {
+    let (id, parent) = tokio::sync::oneshot::channel();
+    let (started, ready) = tokio::sync::oneshot::channel();
+    ((super::nano::Binding { app, owner, document, parent, started: ready }, started), id)
+}
+
+type PrepareForward = Box<dyn FnOnce(&CancellationToken) -> Result<DirectLaunch, String> + Send>;
+
+/// SSH-over-SSM 탭은 먼저 열고, PTY 작업자가 탭의 취소 토큰으로 전달과 접속 계획을 준비한다.
+pub(crate) struct ForwardLaunch {
+    prepare: PrepareForward,
+    editor: Option<Editor>,
+}
+
+impl ForwardLaunch {
+    /// 저장 암호가 아닌 SSH-over-SSM 대상은 PIN만 먼저 확인하고 전달 준비를 미룬다.
+    fn saved(config: &Path, ssh: &Ssh) -> Result<Option<Self>, String> {
+        if !matches!(ssh.transport, SshTransport::Ssm(_)) || matches!(ssh.auth, SshAuth::StoredPassword { .. }) {
+            return Ok(None);
+        }
+        let endpoint = super::Endpoint::new(&ssh.host, ssh.port).map_err(pin_error)?;
+        let approved = ApprovedHost::confirm(&endpoint, &endpoint, &ssh.host_key_fingerprint).map_err(pin_error)?;
+        trust_store(config)?.pin(&approved).map_err(pin_error)?;
+        let (config, ssh) = (config.to_owned(), ssh.clone());
+        Ok(Some(Self { prepare: Box::new(move |cancel| saved(&config, &ssh, cancel)), editor: None }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture(prepare: impl FnOnce(&CancellationToken) -> Result<DirectLaunch, String> + Send + 'static) -> Self {
+        Self { prepare: Box::new(prepare), editor: None }
+    }
+
+    /// 취소되면 이미 시작한 SSM 자식과 원격 세션은 전달을 버리는 경로로 정리된다.
+    pub(crate) fn prepare(self, cancel: &CancellationToken) -> Result<DirectLaunch, String> {
+        let mut launch = (self.prepare)(cancel)?;
+        launch.editor = self.editor;
+        Ok(launch)
+    }
+}
+
+/// 터미널 탭이 여는 저장 SSH 실행이다.
+pub(crate) enum SavedLaunch {
+    Ready(DirectLaunch),
+    Forward(ForwardLaunch),
+}
+
+impl SavedLaunch {
+    pub(crate) fn enable_editor(&mut self, app: tauri::AppHandle, owner: String, document: u64) -> tokio::sync::oneshot::Sender<String> {
+        match self {
+            Self::Ready(launch) => launch.enable_editor(app, owner, document),
+            Self::Forward(launch) => {
+                let (editor, id) = editor_binding(app, owner, document);
+                launch.editor = Some(editor);
+                id
+            }
+        }
     }
 }
 
@@ -143,7 +210,7 @@ pub(crate) fn remote_plan(config: &Path, ssh: &Ssh) -> Result<Arc<ConnectionPlan
     if !matches!(ssh.auth, SshAuth::Agent { .. } | SshAuth::KeyFile { .. }) {
         return Err("원격 sudo 승격은 SSH Agent 또는 키 파일 연결에서만 사용할 수 있습니다. 터미널에서 직접 입력하세요".into());
     }
-    let launch = saved(config, ssh)?;
+    let launch = saved(config, ssh, &CancellationToken::new())?;
     let (_, plan) = launch.into_parts();
     Ok(plan)
 }
@@ -201,32 +268,31 @@ pub(crate) fn remote_channel(plan: &Arc<ConnectionPlan>, remote: &[String]) -> R
     Ok(RemoteChannel { terminal, piped })
 }
 
-pub(crate) fn saved(config: &Path, ssh: &Ssh) -> Result<DirectLaunch, String> {
-    if !matches!(ssh.transport, SshTransport::Direct {}) {
-        return Err("SSH-over-SSM을 사용할 수 없습니다".into());
-    }
+/// SSH-over-SSM 대상은 SSM 포트 전달이 수신을 확인할 때까지 기다린다. `cancel`은 그 대기를 끊는다.
+pub(crate) fn saved(config: &Path, ssh: &Ssh, cancel: &CancellationToken) -> Result<DirectLaunch, String> {
     let endpoint = super::Endpoint::new(&ssh.host, ssh.port).map_err(pin_error)?;
-    prepare_saved(config, ssh, &endpoint)
+    prepare_saved(config, ssh, &endpoint, cancel)
 }
 
 /// 터미널 탭에서만 쓴다. 저장 암호 대상은 로컬 확인 창을 거친 한 번의 승인으로 실행한다.
+/// SSH-over-SSM 대상은 탭을 먼저 열 수 있도록 전달 준비를 미룬다.
 pub(crate) fn saved_interactive(
     config: &Path,
     ssh: &Ssh,
     owner: &str,
     document: u64,
     confirm: impl FnOnce(String) -> Result<bool, String>,
-) -> Result<DirectLaunch, String> {
+) -> Result<SavedLaunch, String> {
+    if let Some(forward) = ForwardLaunch::saved(config, ssh)? {
+        return Ok(SavedLaunch::Forward(forward));
+    }
     #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
     if let SshAuth::StoredPassword { item_id } = &ssh.auth {
-        if !matches!(ssh.transport, SshTransport::Direct {}) {
-            return Err("SSH-over-SSM을 사용할 수 없습니다".into());
-        }
         let endpoint = super::Endpoint::new(&ssh.host, ssh.port).map_err(pin_error)?;
         return prepare_stored(config, ssh, &endpoint, item_id, owner, document, confirm);
     }
     let _ = (owner, document, confirm);
-    saved(config, ssh)
+    saved(config, ssh, &CancellationToken::new()).map(SavedLaunch::Ready)
 }
 
 #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
@@ -238,7 +304,7 @@ fn prepare_stored(
     owner: &str,
     document: u64,
     confirm: impl FnOnce(String) -> Result<bool, String>,
-) -> Result<DirectLaunch, String> {
+) -> Result<SavedLaunch, String> {
     let vault = crate::local_auth::Bitwarden::discover();
     prepare_stored_with(config, ssh, endpoint, item, owner, document, vault, confirm)
 }
@@ -253,9 +319,13 @@ fn prepare_stored_with(
     document: u64,
     vault: Result<crate::local_auth::Bitwarden, crate::local_auth::Error>,
     confirm: impl FnOnce(String) -> Result<bool, String>,
-) -> Result<DirectLaunch, String> {
-    prepare_stored_bounded(config, ssh, endpoint, item, owner, document, APPROVAL_TTL, vault, confirm)
+) -> Result<SavedLaunch, String> {
+    prepare_stored_bounded(config, ssh, endpoint, item, owner, document, APPROVAL_TTL, transport, vault, confirm)
 }
+
+/// 시험은 실제 SSM 전달 대신 가짜 전달을 넣는다.
+#[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+type OpenTransport = fn(&TrustStore, &ApprovedHost<'_>, &Ssh, &CancellationToken) -> Result<Transport, String>;
 
 #[allow(clippy::too_many_arguments)]
 #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
@@ -267,9 +337,10 @@ fn prepare_stored_bounded(
     owner: &str,
     document: u64,
     budget: Duration,
+    open: OpenTransport,
     vault: Result<crate::local_auth::Bitwarden, crate::local_auth::Error>,
     confirm: impl FnOnce(String) -> Result<bool, String>,
-) -> Result<DirectLaunch, String> {
+) -> Result<SavedLaunch, String> {
     let vault = match vault {
         Ok(vault) => vault,
         Err(error) => return manual(config, ssh, endpoint, fallback_reason(&error)),
@@ -281,21 +352,58 @@ fn prepare_stored_bounded(
         return manual(config, ssh, endpoint, fallback_reason(&error));
     }
     let approved = ApprovedHost::confirm(endpoint, endpoint, &ssh.host_key_fingerprint).map_err(pin_error)?;
-    let plan = Arc::new(
-        ConnectionPlan::prepare(
-            &trust_store(config)?,
-            &approved,
-            &ssh.account,
-            Transport::Direct,
-            Authentication::StoredPassword { item },
-        )
-        .map_err(pin_error)?,
-    );
+    let store = trust_store(config)?;
+    if matches!(ssh.transport, SshTransport::Ssm(_)) {
+        // 승인을 먼저 받고, 전달과 승인 계획은 탭을 등록한 뒤 탭의 취소 토큰 아래에서 만든다.
+        store.pin(&approved).map_err(pin_error)?;
+        let shown = [endpoint.alias(), ssh.account.clone(), approved.fingerprint(), item.to_owned()];
+        confirm_stored(stored_message(&shown, ssh), budget, confirm)?;
+        let approved_at = Instant::now();
+        let (config, ssh, owner, item) = (config.to_owned(), ssh.clone(), owner.to_owned(), item.to_owned());
+        // 승인 창의 값은 같은 `ssh` 복제본에서 나온다. 전달 뒤에는 `stored_plan`이 PIN을 다시 확인하고,
+        // 계획의 `Stored` 스냅샷이 그 PIN을 계획 수명 동안 고정한다.
+        let prepare = move |cancel: &CancellationToken| {
+            let endpoint = super::Endpoint::new(&ssh.host, ssh.port).map_err(pin_error)?;
+            let approved = ApprovedHost::confirm(&endpoint, &endpoint, &ssh.host_key_fingerprint).map_err(pin_error)?;
+            let store = trust_store(&config)?;
+            let transport = open(&store, &approved, &ssh, cancel)?;
+            let plan = stored_plan(&store, &approved, &ssh, &item, transport)?;
+            // 전달 준비가 길어져 승인 뒤 시효를 넘기면 금고를 쓰지 않는다.
+            if approved_at.elapsed() > budget {
+                return Err(stored_error(&crate::local_auth::Error::Expired));
+            }
+            approve_stored(plan, &owner, document, vault)
+        };
+        return Ok(SavedLaunch::Forward(ForwardLaunch { prepare: Box::new(prepare), editor: None }));
+    }
+    let plan = stored_plan(&store, &approved, ssh, item, Transport::Direct)?;
     let details = plan.stored().ok_or("저장된 SSH 암호 계획이 없습니다")?;
-    let message = format!(
-        "서버: {}\n계정: {}\n호스트 키 SHA256 지문: {}\n금고 항목 ID: {}\n\n저장된 SSH 암호로 로그인하시겠습니까?",
-        details.target, details.user, details.fingerprint, details.item,
-    );
+    let shown = [details.target.clone(), details.user.clone(), details.fingerprint.clone(), details.item.clone()];
+    confirm_stored(stored_message(&shown, ssh), budget, confirm)?;
+    approve_stored(plan, owner, document, vault).map(SavedLaunch::Ready)
+}
+
+#[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+fn stored_plan(store: &TrustStore, approved: &ApprovedHost<'_>, ssh: &Ssh, item: &str, transport: Transport)
+    -> Result<Arc<ConnectionPlan>, String>
+{
+    ConnectionPlan::prepare(store, approved, &ssh.account, transport, Authentication::StoredPassword { item })
+        .map(Arc::new)
+        .map_err(pin_error)
+}
+
+/// `shown`은 서버, 계정, 지문, 금고 항목 순서다.
+#[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+fn stored_message(shown: &[String; 4], ssh: &Ssh) -> String {
+    let [target, user, fingerprint, item] = shown;
+    format!(
+        "서버: {target}\n계정: {user}\n호스트 키 SHA256 지문: {fingerprint}\n금고 항목 ID: {item}\n{}\n저장된 SSH 암호로 로그인하시겠습니까?",
+        transport_line(ssh),
+    )
+}
+
+#[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+fn confirm_stored(message: String, budget: Duration, confirm: impl FnOnce(String) -> Result<bool, String>) -> Result<(), String> {
     let shown = Instant::now();
     if !confirm(message)? {
         return Err("저장된 SSH 암호 승인이 취소되었습니다".into());
@@ -303,7 +411,14 @@ fn prepare_stored_bounded(
     if shown.elapsed() > budget {
         return Err("저장된 SSH 암호 승인이 만료되었습니다".into());
     }
-    // 승인 기산점은 창을 닫은 뒤다. 승인 소비 규칙과 askpass 교환 기한은 그대로 둔다.
+    Ok(())
+}
+
+/// 승인 기산점은 창을 닫은 뒤다. 승인 소비 규칙과 askpass 교환 기한은 그대로 둔다.
+#[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+fn approve_stored(plan: Arc<ConnectionPlan>, owner: &str, document: u64, vault: crate::local_auth::Bitwarden)
+    -> Result<DirectLaunch, String>
+{
     let current = crate::local_auth::Document {
         owner: owner.into(),
         document,
@@ -323,19 +438,22 @@ fn prepare_stored_bounded(
 }
 
 /// 금고를 쓸 수 없으면 같은 대상·계정·지문의 직접 입력으로 돌린다. 다른 자격 증명으로 재시도하지 않는다.
+/// SSH-over-SSM이면 전달 준비를 탭으로 미룬다.
 #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
-fn manual(config: &Path, ssh: &Ssh, endpoint: &super::Endpoint, reason: &str) -> Result<DirectLaunch, String> {
-    let approved = ApprovedHost::confirm(endpoint, endpoint, &ssh.host_key_fingerprint).map_err(pin_error)?;
-    let mut launch = DirectLaunch::prepare(
-        &trust_store(config)?,
-        &approved,
-        &ssh.account,
-        &ssh.account,
-        Authentication::ManualPassword,
-    )
-    .map_err(pin_error)?;
-    launch.notice = Some(format!("저장된 인증을 사용할 수 없어 직접 입력으로 전환했습니다: {reason}"));
-    Ok(launch)
+fn manual(config: &Path, ssh: &Ssh, endpoint: &super::Endpoint, reason: &str) -> Result<SavedLaunch, String> {
+    let notice = format!("저장된 인증을 사용할 수 없어 직접 입력으로 전환했습니다: {reason}");
+    let ssh = Ssh { auth: SshAuth::ManualPassword {}, ..ssh.clone() };
+    if let Some(ForwardLaunch { prepare, editor }) = ForwardLaunch::saved(config, &ssh)? {
+        let prepare = move |cancel: &CancellationToken| {
+            let mut launch = prepare(cancel)?;
+            launch.notice = Some(notice);
+            Ok(launch)
+        };
+        return Ok(SavedLaunch::Forward(ForwardLaunch { prepare: Box::new(prepare), editor }));
+    }
+    let mut launch = prepare_saved(config, &ssh, endpoint, &CancellationToken::new())?;
+    launch.notice = Some(notice);
+    Ok(SavedLaunch::Ready(launch))
 }
 
 #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
@@ -378,24 +496,24 @@ pub(crate) fn stored_failure(error: &crate::local_auth::Error) -> Option<String>
 }
 
 pub(crate) fn prepare_remote_editor(config: &Path, id: &str, revision: std::num::NonZeroU64, ssh: &Ssh)
-    -> Result<(DirectLaunch, String), String>
+    -> Result<(SavedLaunch, String), String>
 {
-    if !matches!(ssh.transport, SshTransport::Direct {}) {
-        return Err("nano 연동은 직접 SSH 연결에서만 사용할 수 있습니다".into());
-    }
     if !matches!(ssh.auth, SshAuth::Agent { .. } | SshAuth::KeyFile { .. }) {
         return Err("nano 연동에는 SSH Agent 또는 키 파일이 필요합니다".into());
     }
     let endpoint = super::Endpoint::new(&ssh.host, ssh.port).map_err(pin_error)?;
-    let launch = prepare_saved(config, ssh, &endpoint)?;
+    let launch = match ForwardLaunch::saved(config, ssh)? {
+        Some(forward) => SavedLaunch::Forward(forward),
+        None => SavedLaunch::Ready(prepare_saved(config, ssh, &endpoint, &CancellationToken::new())?),
+    };
     let message = format!(
-        "프로필: {id}\n리비전: {revision}\n서버: {}\n포트: {}\n계정: {}\n호스트 키 지문: {}\n\n관리자가 SSH 셸과 SFTP에서 같은 경로가 같은 파일을 가리킨다고 확인했습니까?",
-        endpoint.host, endpoint.port, ssh.account, ssh.host_key_fingerprint,
+        "프로필: {id}\n리비전: {revision}\n서버: {}\n포트: {}\n계정: {}\n호스트 키 지문: {}\n{}\n관리자가 SSH 셸과 SFTP에서 같은 경로가 같은 파일을 가리킨다고 확인했습니까?",
+        endpoint.host, endpoint.port, ssh.account, ssh.host_key_fingerprint, transport_line(ssh),
     );
     Ok((launch, message))
 }
 
-fn prepare_saved(config: &Path, ssh: &Ssh, endpoint: &super::Endpoint) -> Result<DirectLaunch, String> {
+fn prepare_saved(config: &Path, ssh: &Ssh, endpoint: &super::Endpoint, cancel: &CancellationToken) -> Result<DirectLaunch, String> {
     let auth = match &ssh.auth {
         SshAuth::Agent { public_key_path } => Authentication::AgentFile { public_key_path },
         SshAuth::KeyFile { private_key_path } => Authentication::KeyFile { private_key: private_key_path },
@@ -403,7 +521,25 @@ fn prepare_saved(config: &Path, ssh: &Ssh, endpoint: &super::Endpoint) -> Result
         SshAuth::StoredPassword { .. } => return Err("저장된 SSH 암호를 사용할 수 없습니다".into()),
     };
     let approved = ApprovedHost::confirm(endpoint, endpoint, &ssh.host_key_fingerprint).map_err(pin_error)?;
-    DirectLaunch::prepare(&trust_store(config)?, &approved, &ssh.account, &ssh.account, auth).map_err(pin_error)
+    let store = trust_store(config)?;
+    let transport = transport(&store, &approved, ssh, cancel)?;
+    DirectLaunch::prepare(&store, &approved, &ssh.account, &ssh.account, auth, transport).map_err(pin_error)
+}
+
+/// 승인 창의 전송 줄이다. SSM 전송이면 줄 끝 개행까지 돌려준다.
+fn transport_line(ssh: &Ssh) -> String {
+    match &ssh.transport {
+        SshTransport::Ssm(target) => format!("전송: SSM · {} · {} · {}\n", target.profile, target.region, target.instance_id),
+        SshTransport::Direct {} => String::new(),
+    }
+}
+
+/// SSH-over-SSM은 등록된 PIN을 먼저 확인한 뒤 앱이 소유한 SSM 포트 전달을 열고 그 루프백 포트로 접속한다.
+fn transport(store: &TrustStore, approved: &ApprovedHost<'_>, ssh: &Ssh, cancel: &CancellationToken) -> Result<Transport, String> {
+    let SshTransport::Ssm(target) = &ssh.transport else { return Ok(Transport::Direct) };
+    store.pin(approved).map_err(pin_error)?;
+    let (port, forward) = crate::tunnels::ssm::open_ssh_forward(target, ssh.port, cancel)?;
+    Ok(Transport::Ssm { port, forward: Box::new(forward) })
 }
 
 fn trust_store(config: &Path) -> Result<TrustStore, String> {

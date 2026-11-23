@@ -226,6 +226,254 @@ fn f01_two_saved_ssh_launches_reap_only_the_owned_plan_and_child() {
     });
 }
 
+#[test]
+fn f01_ssm_forward_end_disconnects_the_ssh_tab_and_releases_the_forward() {
+    use crate::ssh::{ApprovedHost, Authentication, Endpoint, TRUST_DIRECTORY, TrustStore, terminal::DirectLaunch, tests::FakeForward};
+    use std::sync::atomic::Ordering;
+
+    bounded(|| {
+        let config = tempfile::tempdir().unwrap();
+        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti";
+        let sha = "SHA256:UCUiLr7Pjs9wFFJMDByLgc3NrtdU344OgUM45wZPcIQ";
+        let store = TrustStore::create(&config.path().join(TRUST_DIRECTORY)).unwrap();
+        let endpoint = Endpoint::new("dev.example.invalid", 2222).unwrap();
+        let approved = ApprovedHost::confirm(&endpoint, &endpoint, sha).unwrap();
+        store.register(&approved, key).unwrap();
+        let (transport, ended, dropped) = FakeForward::transport(40022);
+        let mut launch = DirectLaunch::prepare(&store, &approved, "approved-user", "approved-user",
+            Authentication::Agent { public_key: key }, transport).unwrap();
+        // 실제 ssh 대신 종료하지 않는 셸을 같은 계획의 SSH 자식 자리에서 실행한다.
+        let mut command = shell();
+        #[cfg(windows)]
+        command.args(["-Command", "[Console]::WriteLine('SSM-' + 'FIXTURE-READY'); Start-Sleep 60"]);
+        #[cfg(unix)]
+        command.args(["-c", "printf 'SSM-%s\n' FIXTURE-READY; sleep 60"]);
+        launch.replace_command(command);
+        let sessions = Sessions::default();
+        let mut pty = Pty::open_launch(&sessions, super::Launch::Ssh(launch));
+        pty.until_bytes(b"SSM-FIXTURE-READY", 0, true);
+        assert!(!dropped.load(Ordering::SeqCst));
+
+        ended.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            match pty.next(deadline) {
+                Event::Bytes(_) => pty.ack(pty.output.len()),
+                Event::Disconnected(reason) => {
+                    assert_eq!(reason, "SSM 전달 종료: 시험 전달 종료");
+                    break;
+                }
+                other => panic!("SSM 전달 종료 대신 다른 이벤트: {other:?}"),
+            }
+        }
+        while !dropped.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "SSH 자식을 회수한 뒤에도 SSM 전달이 남아 있습니다");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(sessions.input("main", &pty.id, b"closed").is_err());
+    });
+}
+
+/// SSH-over-SSM 탭 시험용 실행이다. `open`은 탭의 취소 토큰으로 전달을 열고, ssh 자리에는 표식을 남기는 셸을 둔다.
+fn forward_launch(
+    config: &std::path::Path,
+    marker: &std::path::Path,
+    open: impl FnOnce(&crate::ssm::CancellationToken) -> Result<crate::ssh::Transport, String> + Send + 'static,
+) -> super::Launch {
+    use crate::ssh::{ApprovedHost, Authentication, Endpoint, TRUST_DIRECTORY, TrustStore, terminal::{DirectLaunch, ForwardLaunch}};
+
+    const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti";
+    const SHA: &str = "SHA256:UCUiLr7Pjs9wFFJMDByLgc3NrtdU344OgUM45wZPcIQ";
+    let trust = config.join(TRUST_DIRECTORY);
+    let endpoint = Endpoint::new("dev.example.invalid", 2222).unwrap();
+    TrustStore::create(&trust).unwrap().register(&ApprovedHost::confirm(&endpoint, &endpoint, SHA).unwrap(), KEY).unwrap();
+    let mut command = shell();
+    #[cfg(windows)]
+    command.args(["-Command", &format!("Set-Content -LiteralPath '{}' started; [Console]::WriteLine('SSM-' + 'FIXTURE-READY'); Start-Sleep 60", marker.display())]);
+    #[cfg(unix)]
+    command.args(["-c", &format!("touch '{}'; printf 'SSM-%s\\n' FIXTURE-READY; sleep 60", marker.display())]);
+    super::Launch::Forward(ForwardLaunch::fixture(move |cancel| {
+        let transport = open(cancel)?;
+        let store = TrustStore::open(&trust).unwrap();
+        let approved = ApprovedHost::confirm(&endpoint, &endpoint, SHA).unwrap();
+        let mut launch = DirectLaunch::prepare(&store, &approved, "approved-user", "approved-user",
+            Authentication::Agent { public_key: KEY }, transport).unwrap();
+        launch.replace_command(command);
+        Ok(launch)
+    }))
+}
+
+fn open_forward<'a>(sessions: &'a Sessions, launch: super::Launch) -> Pty<'a> {
+    let (tx, events) = mpsc::channel();
+    let started = Instant::now();
+    let id = sessions.open_document("main", sessions.document("main"), size(24, 120), launch, move |event| {
+        tx.send(event).map_err(|error| error.to_string())
+    }).expect("SSH-over-SSM 탭 열기");
+    // 전달 준비를 기다리지 않고 탭 ID를 돌려준다.
+    assert!(started.elapsed() < TIMEOUT / 4);
+    Pty { sessions, id, events, output: Vec::new() }
+}
+
+#[test]
+fn f01_ssm_ssh_tab_opens_before_the_forward_is_ready_and_then_starts_ssh() {
+    use crate::ssh::tests::FakeForward;
+    use std::sync::atomic::Ordering;
+
+    bounded(|| {
+        let config = tempfile::tempdir().unwrap();
+        let marker = config.path().join("ssh started");
+        let (release, gate) = mpsc::channel::<()>();
+        let (transport, _, dropped) = FakeForward::transport(40022);
+        let launch = forward_launch(config.path(), &marker, move |_| {
+            gate.recv().unwrap();
+            Ok(transport)
+        });
+        let sessions = Sessions::default();
+        let mut pty = open_forward(&sessions, launch);
+        thread::scope(|scope| {
+            let (sessions, id) = (&sessions, pty.id.clone());
+            let start = scope.spawn(move || sessions.start("main", &id));
+            assert!(matches!(pty.next(Instant::now() + TIMEOUT), Event::Connecting));
+            // 준비가 끝나기 전에는 ssh를 시작하지 않는다.
+            pty.assert_stalled();
+            assert!(!start.is_finished() && !marker.exists());
+            release.send(()).unwrap();
+            start.join().unwrap().unwrap();
+        });
+        #[cfg(windows)]
+        {
+            pty.until_bytes(b"\x1b[6n", 0, false);
+            pty.input(b"\x1b[1;1R");
+        }
+        pty.until_bytes(b"SSM-FIXTURE-READY", 0, true);
+        assert!(marker.exists() && !dropped.load(Ordering::SeqCst));
+        assert!(sessions.close("main", &pty.id).unwrap().warning().is_none());
+        assert!(dropped.load(Ordering::SeqCst));
+    });
+}
+
+#[test]
+fn f01_ssm_ssh_tab_close_or_navigation_cancels_the_started_forward_without_ssh() {
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+
+    for navigate in [false, true] {
+        bounded(move || {
+            let config = tempfile::tempdir().unwrap();
+            let marker = config.path().join("ssh started");
+            let terminated = Arc::new(AtomicBool::new(false));
+            let (held, holding) = mpsc::channel();
+            let launch = forward_launch(config.path(), &marker, {
+                let terminated = terminated.clone();
+                move |cancel| {
+                    let (port, forward) = crate::tunnels::ssm::fixture_held_ssh_forward(cancel, held, terminated)?;
+                    Ok(crate::ssh::Transport::Ssm { port, forward: Box::new(forward) })
+                }
+            });
+            let sessions = Sessions::default();
+            let mut pty = open_forward(&sessions, launch);
+            thread::scope(|scope| {
+                let (sessions, id) = (&sessions, pty.id.clone());
+                let start = scope.spawn(move || sessions.start("main", &id));
+                assert!(matches!(pty.next(Instant::now() + TIMEOUT), Event::Connecting));
+                // 가짜 CLI·플러그인 트리가 시작되어 원격 세션 확인을 기다리는 중이다.
+                if holding.recv_timeout(TIMEOUT).is_err() {
+                    panic!("가짜 전달이 세션 확인 전에 끝났습니다: {:?}", start.join().unwrap());
+                }
+                if navigate {
+                    sessions.navigate("main");
+                } else {
+                    assert!(sessions.close("main", &pty.id).unwrap().warning().is_none());
+                }
+                assert!(start.join().unwrap().is_err());
+            });
+            let deadline = Instant::now() + TIMEOUT;
+            while !terminated.load(Ordering::SeqCst) {
+                assert!(Instant::now() < deadline, "취소한 전달의 원격 세션 종료 작업이 실행되지 않았습니다");
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(!marker.exists(), "취소한 탭에서 ssh를 시작했습니다");
+            assert!(matches!(pty.events.recv_timeout(QUIET), Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected)));
+        });
+    }
+}
+
+#[test]
+fn f01_ssm_ssh_forward_finished_after_close_never_starts_ssh() {
+    use crate::ssh::tests::FakeForward;
+    use std::sync::atomic::Ordering;
+
+    bounded(|| {
+        let config = tempfile::tempdir().unwrap();
+        let marker = config.path().join("ssh started");
+        let (transport, _, dropped) = FakeForward::transport(40022);
+        // 취소를 관찰한 뒤에도 준비를 성공으로 끝내는 늦은 완료를 흉내 낸다.
+        let launch = forward_launch(config.path(), &marker, move |cancel| {
+            tauri::async_runtime::block_on(cancel.cancelled());
+            Ok(transport)
+        });
+        let sessions = Sessions::default();
+        let mut pty = open_forward(&sessions, launch);
+        thread::scope(|scope| {
+            let (sessions, id) = (&sessions, pty.id.clone());
+            let start = scope.spawn(move || sessions.start("main", &id));
+            assert!(matches!(pty.next(Instant::now() + TIMEOUT), Event::Connecting));
+            assert!(sessions.close("main", &pty.id).unwrap().warning().is_none());
+            assert!(start.join().unwrap().is_err());
+        });
+        assert!(dropped.load(Ordering::SeqCst), "늦게 끝난 전달을 버리지 않았습니다");
+        assert!(!marker.exists(), "취소한 탭에서 ssh를 시작했습니다");
+    });
+}
+
+#[test]
+fn f01_ssm_ssh_forward_failure_reaches_the_tab() {
+    bounded(|| {
+        let config = tempfile::tempdir().unwrap();
+        let marker = config.path().join("ssh started");
+        let expected = super::remote::start_error(crate::ssm::CliError::SsoLoginRequired);
+        assert_eq!(expected, "SSM: SSO 재로그인 필요");
+        let failure = expected.clone();
+        let launch = forward_launch(config.path(), &marker, move |_| Err(failure));
+        let sessions = Sessions::default();
+        let mut pty = open_forward(&sessions, launch);
+        assert_eq!(sessions.start("main", &pty.id), Err(expected));
+        assert!(matches!(pty.next(Instant::now() + TIMEOUT), Event::Connecting));
+        assert!(!marker.exists());
+        assert!(sessions.close("main", &pty.id).unwrap().warning().is_none());
+    });
+}
+
+#[test]
+fn f01_ssm_ssh_editor_start_requested_first_is_sent_after_the_tab_attaches() {
+    use crate::ssh::tests::FakeForward;
+
+    bounded(|| {
+        let config = tempfile::tempdir().unwrap();
+        let marker = config.path().join("ssh started");
+        let (transport, _, _dropped) = FakeForward::transport(40022);
+        let (session_tx, session_rx) = mpsc::channel::<std::sync::Arc<super::process::Session>>();
+        let (started_tx, mut started_rx) = tokio::sync::oneshot::channel();
+        // 시작 요청이 먼저 오고, 전달 준비 뒤에 편집기 시작 신호 자리가 생긴다.
+        let launch = forward_launch(config.path(), &marker, move |_| {
+            session_rx.recv().unwrap().arm_editor_start(started_tx);
+            Ok(transport)
+        });
+        let sessions = Sessions::default();
+        let mut pty = open_forward(&sessions, launch);
+        session_tx.send(sessions.get("main", &pty.id).unwrap()).unwrap();
+        sessions.start("main", &pty.id).unwrap();
+        assert!(matches!(pty.next(Instant::now() + TIMEOUT), Event::Connecting));
+        assert_eq!(started_rx.try_recv(), Ok(()), "연결 뒤 편집기 시작 신호를 보내지 않았습니다");
+        #[cfg(windows)]
+        {
+            pty.until_bytes(b"\x1b[6n", 0, false);
+            pty.input(b"\x1b[1;1R");
+        }
+        pty.until_bytes(b"SSM-FIXTURE-READY", 0, true);
+        assert!(sessions.close("main", &pty.id).unwrap().warning().is_none());
+    });
+}
+
 fn load(sessions: &Sessions) -> Pty<'_> {
     Pty::open(sessions, Some(&LOAD.replace("@COUNT@", &RECORDS.to_string()).replace("@PAYLOAD@", PAYLOAD)))
 }

@@ -108,6 +108,11 @@ export function connectLocalTerminal(
       if (!(message instanceof ArrayBuffer) && message.kind === "notice") earlyOutput.push(message);
       return;
     }
+    if (!remote && !ready && !(message instanceof ArrayBuffer) && message.kind === "connecting") {
+      // SSH-over-SSM 탭은 시작 응답 전에 전달 준비 단계를 받는다.
+      status({ kind: "connecting", notice }, id);
+      return;
+    }
     if (!receiving) {
       earlyOutput.push(message);
       return;

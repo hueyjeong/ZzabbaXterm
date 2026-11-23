@@ -81,7 +81,7 @@ pub(super) struct Local {
     pub(super) start_directory: PathBuf,
 }
 
-#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Ssm {
     pub(crate) profile: String,
@@ -203,7 +203,7 @@ fn validate_desktop(protocol: DesktopProtocol, host: &str, port: u16, route: &De
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Ssh {
     pub(crate) host: String,
@@ -214,14 +214,14 @@ pub(crate) struct Ssh {
     pub(crate) auth: SshAuth,
 }
 
-#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) enum SshTransport {
     Direct {},
     Ssm(Ssm),
 }
 
-#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase", deny_unknown_fields)]
 pub(crate) enum SshAuth {
     Agent { public_key_path: PathBuf },

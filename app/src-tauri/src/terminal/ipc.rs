@@ -65,7 +65,7 @@ pub(crate) fn terminal_open(invoke: Invoke) {
                 crate::ssh::registration::confirm_remote_editor(&window, message)
             }, |mut launch| {
                 let parent = launch.enable_editor(webview.app_handle().clone(), owner.into(), document);
-                let command = Launch::Ssh(launch);
+                let command = Launch::from(launch);
                 let registration = sessions.register_document(owner, document, &command, true)?;
                 Ok((registration, command, parent))
             })?;

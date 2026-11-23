@@ -65,7 +65,7 @@ impl<T: Transport> Tunnels<T> {
             if !matches!(ssh.auth, SshAuth::Agent { .. } | SshAuth::KeyFile { .. }) {
                 return Err("SSH 전달에는 Agent 또는 비대화형 키 인증이 필요합니다".into());
             }
-            let (_, connection) = terminal::saved(directory, &ssh)?.into_parts();
+            let (_, connection) = terminal::saved(directory, &ssh, &tokio_util::sync::CancellationToken::new())?.into_parts();
             Ok(connection)
         })??;
         let id = self.begin(owner, route).ok_or("터널 탭이 닫혔습니다")?;

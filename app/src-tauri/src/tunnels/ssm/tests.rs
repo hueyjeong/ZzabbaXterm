@@ -167,11 +167,11 @@ fn saved(desktop: bool) -> SavedSsm {
 fn forward_plan_binds_saved_scope_and_fixed_document_arguments() {
     let listen = SocketAddr::from((Ipv4Addr::LOCALHOST, 50022));
     let node_route = Route::Ssm { listen, node: NODE.into(), port: 22, host: None };
-    let plan = ForwardPlan::new(&node_route, &saved(false)).unwrap();
+    let plan = ForwardPlan::new(&node_route, &saved(false).target).unwrap();
     assert_eq!((plan.document(), plan.parameters()), ("AWS-StartPortForwardingSession", "portNumber=22,localPortNumber=50022"));
     assert_eq!((plan.scope.profile(), plan.scope.region(), plan.node.as_str()), ("company-sso", "ap-northeast-2", NODE));
     let remote = Route::Ssm { listen, node: NODE.into(), port: 3389, host: Some("rdp.example.test".into()) };
-    let plan = ForwardPlan::new(&remote, &saved(true)).unwrap();
+    let plan = ForwardPlan::new(&remote, &saved(true).target).unwrap();
     assert_eq!((plan.document(), plan.parameters()),
         ("AWS-StartPortForwardingSessionToRemoteHost", "host=rdp.example.test,portNumber=3389,localPortNumber=50022"));
     // 승인 경로와 범위의 불일치는 transport 시험이 SsmPlan에서 확인한다. 여기서는 저장 대상과 다른 노드와 형식 오류를 거부한다.
@@ -180,7 +180,7 @@ fn forward_plan_binds_saved_scope_and_fixed_document_arguments() {
         Route::Ssm { listen: SocketAddr::from(([0, 0, 0, 0], 50022)), node: NODE.into(), port: 22, host: None },
         Route::Ssm { listen, node: NODE.into(), port: 22, host: Some("a,b".into()) },
     ] {
-        assert!(ForwardPlan::new(&route, &saved(false)).err().is_some_and(|error| error.starts_with("SSM 전달 승인")));
+        assert!(ForwardPlan::new(&route, &saved(false).target).err().is_some_and(|error| error.starts_with("SSM 전달 승인")));
     }
 }
 
@@ -268,6 +268,48 @@ fn fake_cli_failures_are_reported_by_stage_and_cleaned() {
 }
 
 #[test]
+fn ssh_forward_retries_a_new_free_port_only_after_a_bind_conflict() {
+    // 첫 시도는 플러그인 bind 충돌, 둘째 시도는 정상 준비다. 충돌한 포트는 다시 쓰지 않는다.
+    let mut attempts = Vec::new();
+    let cancel = CancellationToken::new();
+    let (port, mut child) = ready_on_free_port(&cancel, || Ok(free_port()), |listen| {
+        attempts.push(listen);
+        fixture_child(if attempts.len() == 1 { "bind" } else { "cli" }, listen, None, Ok(SESSION), None)
+    }).unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert_ne!(attempts[0], attempts[1]);
+    assert_eq!(SocketAddr::from((Ipv4Addr::LOCALHOST, port)), attempts[1]);
+    assert!(attempts.iter().all(|listen| listen.ip() == Ipv4Addr::LOCALHOST && listen.port() != 0));
+    assert!(matches!(child.observe(), Observation::Listening));
+    child.close().unwrap();
+
+    // bind 충돌이 아닌 시작 실패는 다시 시도하지 않고 그대로 돌려준다.
+    let mut attempts = 0;
+    let error = ready_on_free_port(&cancel, || Ok(free_port()), |listen| {
+        attempts += 1;
+        fixture_child("reject", listen, None, Ok(SESSION), None)
+    }).err().unwrap();
+    assert_eq!((attempts, error.as_str()), (1, "SSM: 포트 전달 문서 실행 권한 거부"));
+
+    let mut attempts = 0;
+    let error = ready_on_free_port(&cancel, || Ok(free_port()), |listen| {
+        attempts += 1;
+        fixture_child("bind", listen, None, Ok(SESSION), None)
+    }).err().unwrap();
+    assert_eq!(attempts, BIND_ATTEMPTS);
+    assert!(error.starts_with("로컬 수신 주소 사용 중: 127.0.0.1:"), "{error}");
+
+    // 재시도는 자식이 기록한 bind 충돌로만 정한다. 다른 실패가 같은 문구여도 다시 시도하지 않는다.
+    let mut attempts = 0;
+    let error = ready_on_free_port(&cancel, || Ok(free_port()), |listen| {
+        attempts += 1;
+        fixture_child("cli", listen, None, Err(&OutputFault::BindConflict.message(listen)), None)
+    }).err().unwrap();
+    assert_eq!(attempts, 1);
+    assert!(error.starts_with("로컬 수신 주소 사용 중: 127.0.0.1:"), "{error}");
+}
+
+#[test]
 fn listener_outside_the_tree_is_not_ready_and_streams_are_refused() {
     // 플러그인 역할 프로세스는 bind하지 않고, 시험 프로세스가 같은 승인 주소를 열고 받아들인다.
     // 이 시험 PC는 방금 놓은 포트의 재bind가 실패할 때가 있어 시험 준비만 새 포트로 다시 시도한다.
@@ -316,7 +358,7 @@ fn real_cli_forward() {
         desktop: None,
     };
     let route = Route::Ssm { listen, node: saved.target.instance_id.clone(), port, host };
-    let plan = ForwardPlan::new(&route, &saved).unwrap();
+    let plan = ForwardPlan::new(&route, &saved.target).unwrap();
     println!("문서: {} · 매개변수: {}", plan.document(), plan.parameters());
     let prepared = match tauri::async_runtime::block_on(prepare(plan, &CancellationToken::new())) {
         Ok(prepared) => prepared,

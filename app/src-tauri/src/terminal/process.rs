@@ -1,6 +1,6 @@
 use super::remote;
 use crate::ssm::CancellationToken;
-use crate::ssh::{ConnectionPlan, nano::Startup, terminal::DirectLaunch};
+use crate::ssh::{ConnectionPlan, nano::Startup, terminal::{DirectLaunch, ForwardLaunch, SavedLaunch}};
 use super::{CHUNK, CLOSED, CloseResult, ControlBinding, Event, LocalClose, WINDOW, stage};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::{
@@ -87,6 +87,8 @@ pub(crate) enum Launch {
     Ssm(remote::Target),
     AiControl(remote::Target, Arc<ControlBinding>),
     Ssh(DirectLaunch),
+    /// SSH-over-SSM은 탭을 연 뒤 작업자가 전달을 준비한다.
+    Forward(ForwardLaunch),
     #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
     Elevated(crate::elevation::Launch),
     #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
@@ -97,6 +99,20 @@ impl Launch {
     pub(super) fn is_ssm(&self) -> bool {
         matches!(self, Self::Ssm(_) | Self::AiControl(..))
     }
+
+    /// 열기 응답을 먼저 보내고 시작 요청 뒤에 취소 토큰으로 원격 준비를 진행한다.
+    pub(super) fn defers_start(&self) -> bool {
+        self.is_ssm() || matches!(self, Self::Forward(_))
+    }
+}
+
+impl From<SavedLaunch> for Launch {
+    fn from(launch: SavedLaunch) -> Self {
+        match launch {
+            SavedLaunch::Ready(launch) => Self::Ssh(launch),
+            SavedLaunch::Forward(launch) => Self::Forward(launch),
+        }
+    }
 }
 
 pub(crate) struct Session {
@@ -105,7 +121,10 @@ pub(crate) struct Session {
     control: bool,
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     pub(super) control_submit: Mutex<()>,
+    // 열기 응답 뒤 원격 준비를 진행하는 탭(SSM 셸, SSH-over-SSM)만 취소 토큰을 갖는다.
     cancel: Option<CancellationToken>,
+    // SSM 셸(제어 세션 포함)이다. SSH-over-SSM은 SSH 세션으로 본다.
+    ssm: bool,
     close_result: Mutex<CloseResult>,
     unconfirmed: Mutex<Option<remote::Remote>>,
     ssh_pending: Mutex<Option<OwnedSsh>>,
@@ -121,19 +140,25 @@ struct OwnedSsh {
 
 impl Session {
     pub(super) fn new(owner: &str, ssm: bool) -> Self {
-        Self::with_cancel(owner, ssm.then(CancellationToken::new), false)
+        Self::with_cancel(owner, ssm.then(CancellationToken::new), ssm, false)
+    }
+
+    /// 탭 실행의 종류에 맞춰 취소 토큰과 SSM 셸 여부를 따로 정한다.
+    pub(super) fn for_launch(owner: &str, command: &Launch) -> Self {
+        Self::with_cancel(owner, command.defers_start().then(CancellationToken::new), command.is_ssm(), false)
     }
 
     pub(crate) fn dedicated(binding: &ControlBinding) -> Self {
-        Self::with_cancel("", Some(binding.cancel_token().clone()), true)
+        Self::with_cancel("", Some(binding.cancel_token().clone()), true, true)
     }
 
-    fn with_cancel(owner: &str, cancel: Option<CancellationToken>, control: bool) -> Self {
+    fn with_cancel(owner: &str, cancel: Option<CancellationToken>, ssm: bool, control: bool) -> Self {
         Self {
             owner: owner.into(),
             document: None,
             control,
             cancel,
+            ssm,
             control_submit: Mutex::new(()),
             close_result: Mutex::new(CloseResult::default()),
             unconfirmed: Mutex::new(None),
@@ -146,6 +171,11 @@ impl Session {
     }
 
     pub(super) fn is_ssm(&self) -> bool {
+        self.ssm
+    }
+
+    /// 열기 응답 뒤 원격 준비를 진행하는 탭이다. 닫을 때 결과를 보존한다.
+    pub(super) fn defers_start(&self) -> bool {
         self.cancel.is_some()
     }
 
@@ -189,7 +219,7 @@ impl Session {
         }
         let this = Arc::clone(self);
         let (ready, opened) = mpsc::sync_channel(1);
-        let ssm = command.is_ssm();
+        let deferred = command.defers_start();
         if self.control && self.flow.lock().unwrap().stop.is_some() { return Err(CLOSED.into()); }
         if let Err(error) = thread::Builder::new().name("terminal-pty".into()).spawn(move || {
             let mut retired = Some(retired);
@@ -201,7 +231,7 @@ impl Session {
             };
             let result = this.run(size, command, send, &ready, &mut complete);
             if let Err(error) = result {
-                if ssm {
+                if deferred {
                     this.flow.lock().unwrap().attach_error = Some(error);
                 } else {
                     let _ = ready.send(Err(error));
@@ -228,7 +258,8 @@ impl Session {
         complete: &mut impl FnMut(),
     ) -> Result<(), String> {
         let ssm = command.is_ssm();
-        if ssm {
+        let deferred = command.defers_start();
+        if deferred {
             let mut flow = self.flow.lock().unwrap();
             if self.control && flow.stop.is_some() { return Err(CLOSED.into()); }
             flow.start_deadline = Some(std::time::Instant::now() + START_TIMEOUT);
@@ -240,6 +271,14 @@ impl Session {
             }
             if flow.stop.is_some() { return Err(CLOSED.into()); }
         }
+        let command = match command {
+            Launch::Forward(forward) => {
+                send(Event::Connecting)?;
+                // 탭 닫기·문서 전환·창과 앱 종료가 이 토큰을 취소해 전달 준비를 멈춘다.
+                Launch::Ssh(forward.prepare(self.cancel.as_ref().unwrap())?)
+            }
+            command => command,
+        };
         let control = match &command {
             Launch::AiControl(_, binding) => Some(binding.as_ref()),
             _ => None,
@@ -253,12 +292,13 @@ impl Session {
         let mut remote = match &command {
             Launch::Ssm(target) => Some(tauri::async_runtime::block_on(target.prepare(None, self.cancel.as_ref().unwrap()))?),
             Launch::AiControl(target, binding) => Some(tauri::async_runtime::block_on(target.prepare_control(binding))?),
-            Launch::Local(_) | Launch::Ssh(_) => None,
+            Launch::Local(_) | Launch::Ssh(_) | Launch::Forward(_) => None,
             #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
             Launch::Elevated(_) => None,
             #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
             Launch::RemoteElevated(_) => None,
         };
+        // 취소된 준비가 늦게 끝나도 여기서 계획을 버려 PTY와 ssh를 시작하지 않는다.
         if self.flow.lock().unwrap().stop.is_some() {
             return Err(stage("open", CLOSED));
         }
@@ -303,7 +343,7 @@ impl Session {
             let (event_tx, event_rx) = mpsc::sync_channel(1);
             let (diagnostic_tx, diagnostic_rx) = mpsc::sync_channel(1);
             let drain = thread::Builder::new().name("terminal-output".into()).spawn_scoped(scope, move || {
-                if ssm {
+                if deferred {
                     drop(self.wake.wait_while(self.flow.lock().unwrap(), |flow| {
                         !flow.attached && flow.stop.is_none()
                     }).unwrap());
@@ -370,6 +410,7 @@ impl Session {
             let mut editor = None;
             let prepared = match command {
                 Launch::Ssm(_) | Launch::AiControl(..) => Prepared::Remote,
+                Launch::Forward(_) => unreachable!("전달 준비 뒤에는 SSH 실행으로 바뀐다"),
                 Launch::Local(command) => Prepared::Command(command),
                 Launch::Ssh(mut launch) => {
                     if launch.editor_requested() {
@@ -485,6 +526,8 @@ impl Session {
             {
                 let mut flow = self.flow.lock().unwrap();
                 flow.attached = true;
+                // 시작 요청을 먼저 받은 탭은 연결된 뒤 편집기 시작을 알린다.
+                if flow.started && let Some(editor) = flow.editor_start.take() { let _ = editor.send(()); }
                 if flow.stop.is_none() {
                     flow.sftp = ssh_plan.as_ref().map(|plan| SftpOwner {
                         plan: Arc::clone(plan),
@@ -513,7 +556,7 @@ impl Session {
                         flow.remote_elevation = Some(state);
                     }
                 }
-                if !ssm { flow.start_deadline = Some(std::time::Instant::now() + START_TIMEOUT); }
+                if !deferred { flow.start_deadline = Some(std::time::Instant::now() + START_TIMEOUT); }
                 self.wake.notify_all();
             }
             #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
@@ -525,7 +568,7 @@ impl Session {
                     });
                 });
             }
-            if !ssm { let _ = ready.send(Ok(())); }
+            if !deferred { let _ = ready.send(Ok(())); }
             if let Some(notice) = notice
                 && let Err(error) = send_event(Event::Notice(notice))
             {
@@ -557,7 +600,7 @@ impl Session {
                         }
                     });
                 }
-                let event = self.reap(child.as_mut(), ssh_plan.is_some());
+                let event = self.reap(child.as_mut(), ssh_plan.as_deref());
                 if let Some(cancel) = &self.cancel { cancel.cancel(); }
                 // 레지스트리에서 세션을 빼기 전에 승인된 로컬 생성 호출을 회수한다.
                 if self.document.is_some() && ssm { self.wait_control_submit(); }
@@ -691,9 +734,14 @@ impl Session {
         let _ = drain.join();
     }
 
-    fn reap(&self, child: &mut dyn Child, ssh: bool) -> Option<Event> {
+    fn reap(&self, child: &mut dyn Child, plan: Option<&ConnectionPlan>) -> Option<Event> {
+        let ssh = plan.is_some();
         loop {
             let mut flow = self.flow.lock().unwrap();
+            // SSH-over-SSM 전달이 먼저 끝나면 SSH 자식을 정리하고 종료 사유를 탭에 표시한다.
+            if flow.stop.is_none() && let Some(reason) = plan.and_then(ConnectionPlan::forward_ended) {
+                flow.stop = Some(Stop::Disconnected(reason));
+            }
             flow.expire_start();
             flow.expire_ack();
             if self.control {
@@ -1045,6 +1093,12 @@ impl Session {
         self.wake.notify_all();
     }
 
+    /// 시험에서 편집기 준비가 시작 신호 자리를 만든 상태를 흉내 낸다.
+    #[cfg(test)]
+    pub(super) fn arm_editor_start(&self, started: tokio::sync::oneshot::Sender<()>) {
+        self.flow.lock().unwrap().editor_start = Some(started);
+    }
+
     pub(super) fn wait_control_submit(&self) {
         debug_assert!(self.is_ssm());
         drop(self.control_submit.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
@@ -1333,6 +1387,18 @@ fn closing_tab_cancels_stored_auth() {
     session.stop(Stop::Closed);
     assert!(cancel.is_cancelled());
     assert!(session.flow.lock().unwrap().stored.is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn ssh_over_ssm_tab_keeps_a_cancel_token_without_becoming_an_ssm_shell() {
+    let forward = Session::for_launch("main", &Launch::Forward(ForwardLaunch::fixture(|_| Err("시험".into()))));
+    assert!(forward.defers_start() && !forward.is_ssm());
+    let target = remote::Target::new("fixture", "ap-northeast-2", "i-0123456789abcdef0").unwrap();
+    let ssm = Session::for_launch("main", &Launch::Ssm(target));
+    assert!(ssm.defers_start() && ssm.is_ssm());
+    let local = Session::for_launch("main", &Launch::Local(CommandBuilder::new("local")));
+    assert!(!local.defers_start() && !local.is_ssm());
 }
 
 #[cfg(all(test, feature = "stored-auth", any(windows, target_os = "linux")))]
