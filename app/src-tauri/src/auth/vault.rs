@@ -76,7 +76,7 @@ impl Bitwarden {
         }
     }
 
-    pub(super) async fn password(&self, item: &str) -> Result<Zeroizing<Vec<u8>>, Error> {
+    pub(crate) async fn password(&self, item: &str) -> Result<Zeroizing<Vec<u8>>, Error> {
         self.status().await?;
         let (ok, password, error) = self.run(&["get", "password", item], MAX_PASSWORD).await?;
         if !ok {
@@ -140,7 +140,7 @@ impl Bitwarden {
     }
 
     #[cfg(test)]
-    pub(super) fn fixture(program: TrustedFile, session: Zeroizing<String>) -> Self {
+    pub(crate) fn fixture(program: TrustedFile, session: Zeroizing<String>) -> Self {
         Self {
             program,
             session: Some(session),
@@ -193,7 +193,7 @@ async fn capture(mut pipe: impl AsyncRead + Unpin, limit: usize) -> Result<Secre
     Err(Error::VaultFailed)
 }
 
-pub(super) fn valid_item(item: &str) -> bool {
+pub(crate) fn valid_item(item: &str) -> bool {
     item.len() == 36
         && item.bytes().enumerate().all(|(i, b)| {
             if matches!(i, 8 | 13 | 18 | 23) {

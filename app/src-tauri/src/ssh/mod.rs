@@ -257,6 +257,11 @@ impl ConnectionPlan {
     #[cfg(any(windows, target_os = "linux"))]
     pub(crate) fn stored(&self) -> Option<&Stored> { self.stored.as_ref() }
 
+    #[cfg(test)]
+    pub(crate) fn config_path_for_test(&self) -> &std::path::Path {
+        &self.config
+    }
+
     /// 승인된 askpass 교환에서만 사용한다. 이 호출 자체는 askpass를 활성화하지 않는다.
     #[cfg(any(windows, target_os = "linux"))]
     pub(crate) fn stored_ssh_invocation(&self) -> Result<Invocation<'_>, Error> {

@@ -18,7 +18,7 @@ pub(in crate::local_auth) use os::Handle as PeerHandle;
 pub(super) use os::stdout_proof;
 pub(super) struct Output(os::Output);
 
-pub(super) fn installed_helper() -> Result<TrustedFile, Error> {
+pub(crate) fn installed_helper() -> Result<TrustedFile, Error> {
     let app = std::env::current_exe().map_err(|_| Error::UntrustedExecutable)?;
     let _app = TrustedFile::check(
         &app,
@@ -32,13 +32,13 @@ pub(super) fn installed_helper() -> Result<TrustedFile, Error> {
 }
 pub(super) const SSH: &str = if cfg!(windows) { "ssh.exe" } else { "ssh" };
 
-pub(super) struct TrustedFile {
+pub(crate) struct TrustedFile {
     path: PathBuf,
     guard: File,
 }
 
 impl TrustedFile {
-    pub(super) fn check(path: &Path, name: &str) -> Result<Self, Error> {
+    pub(crate) fn check(path: &Path, name: &str) -> Result<Self, Error> {
         if !path.is_absolute()
             || path
                 .file_name()
@@ -50,7 +50,7 @@ impl TrustedFile {
         Self::open(path).map_err(|_| Error::UntrustedExecutable)
     }
 
-    pub(super) fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 
@@ -70,26 +70,26 @@ impl TrustedFile {
     }
 
     #[cfg(test)]
-    pub(super) fn fixture(path: &Path) -> Self {
+    pub(crate) fn fixture(path: &Path) -> Self {
         Self::open(path).unwrap()
     }
 }
 
-pub(super) struct Process {
+pub(crate) struct Process {
     pid: u32,
     handle: os::Handle,
 }
 
 impl Process {
     #[cfg(windows)]
-    pub(super) fn open(pid: u32) -> io::Result<Self> {
+    pub(crate) fn open(pid: u32) -> io::Result<Self> {
         Ok(Self {
             pid,
             handle: os::Handle::open(pid)?,
         })
     }
 
-    pub(super) fn from_child(child: &dyn portable_pty::Child) -> io::Result<Self> {
+    pub(crate) fn from_child(child: &dyn portable_pty::Child) -> io::Result<Self> {
         let pid = child.process_id().ok_or(io::ErrorKind::NotFound)?;
         #[cfg(windows)]
         let handle = os::Handle::from_child(child, pid)?;
@@ -98,10 +98,14 @@ impl Process {
         Ok(Self { pid, handle })
     }
 
-    pub(super) async fn exited(&self) {
+    pub(crate) async fn exited(&self) {
         while self.handle.alive() {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
+    }
+
+    pub(crate) fn alive(&self) -> bool {
+        self.handle.alive()
     }
 
     #[cfg(target_os = "linux")]
@@ -134,6 +138,19 @@ impl Process {
                 .parent_is(self.pid, root.pid, &root.handle)
                 .unwrap_or(false)
             && root.matches(program)
+            && self.handle.alive()
+    }
+
+    /// `sudo -A`의 askpass는 setuid `sudo`의 자식이지만 실행 신원은 호출 사용자다.
+    /// 루트의 실행 파일·출력 파이프는 setuid 프로세스라 읽을 수 없으므로 자식 계보와 helper 신원만 확인한다.
+    pub(crate) fn is_askpass_of(&self, root: &Self, helper: &TrustedFile) -> bool {
+        self.pid != root.pid
+            && self.matches(helper)
+            && self
+                .handle
+                .parent_is(self.pid, root.pid, &root.handle)
+                .unwrap_or(false)
+            && root.handle.alive()
             && self.handle.alive()
     }
 }

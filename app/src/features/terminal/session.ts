@@ -1,5 +1,6 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import type { ConnectionTestRun } from "../connections/profiles";
+import type { ElevationRequest } from "../elevation/elevation";
 
 export type TerminalStatus =
   | { kind: "opening" | "connecting" | "running"; notice?: string }
@@ -11,7 +12,7 @@ export type Dimensions = { rows: number; cols: number };
 type Message = ArrayBuffer | End | { kind: "connecting" | "ready" } | { kind: "notice"; value: string };
 
 export interface LocalTerminalIpc {
-  open(size: Dimensions, receive: (message: Message) => void, targetId?: string, remoteEditor?: true): Promise<string>;
+  open(size: Dimensions, receive: (message: Message) => void, targetId?: string, remoteEditor?: true, elevation?: ElevationRequest): Promise<string>;
   start(id: string): Promise<void>;
   input(id: string, bytes: Uint8Array): Promise<void>;
   resize(id: string, size: Dimensions): Promise<void>;
@@ -20,10 +21,19 @@ export interface LocalTerminalIpc {
 }
 
 const tauriIpc: LocalTerminalIpc = {
-  open: (size, receive, targetId, remoteEditor) => invoke("terminal_open", {
-    ...size, output: new Channel(receive), ...(targetId === undefined ? {} : { targetId }),
-    ...(remoteEditor === true ? { remoteEditor } : {}),
-  }),
+  open: (size, receive, targetId, remoteEditor, elevation) => elevation === undefined
+    ? invoke("terminal_open", {
+      ...size, output: new Channel(receive), ...(targetId === undefined ? {} : { targetId }),
+      ...(remoteEditor === true ? { remoteEditor } : {}),
+    })
+    : elevation.targetId === undefined
+      ? invoke("elevation_open", {
+        ...size, output: new Channel(receive), program: elevation.program, args: [...elevation.args], item: elevation.item,
+      })
+      : invoke("elevation_open_remote", {
+        ...size, output: new Channel(receive), targetId: elevation.targetId,
+        program: elevation.program, args: [...elevation.args], item: elevation.item,
+      }),
   start: (id) => invoke("terminal_start", { id }),
   input: (id, bytes) => invoke("terminal_input", { id, bytes: Array.from(bytes) }),
   resize: (id, size) => invoke("terminal_resize", { id, ...size }),
@@ -55,6 +65,7 @@ export function connectLocalTerminal(
   remote = false,
   confirmExit = remote,
   remoteEditor?: true,
+  elevation?: ElevationRequest,
 ): LocalTerminal {
   let id: string | undefined;
   let stopped = false;
@@ -144,7 +155,7 @@ export function connectLocalTerminal(
   // React StrictMode에서 첫 마운트가 해제되면 네이티브 세션을 열지 않는다.
   const opened = Promise.resolve().then(async () => {
     if (stopped) return;
-    id = await (remoteEditor === true ? ipc.open(initialSize, receive, targetId, remoteEditor) : ipc.open(initialSize, receive, targetId));
+    id = await ipc.open(initialSize, receive, targetId, remoteEditor, elevation);
     return id;
   });
   void (async () => {
