@@ -120,6 +120,23 @@ fn direct_ssh_fixture_receives_exact_plan_and_pty_input() {
     }
 }
 
+#[test]
+fn remote_editor_approval_shows_the_ssm_transport() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = TrustStore::create(&directory.path().join(crate::ssh::TRUST_DIRECTORY)).unwrap();
+    let endpoint = Endpoint::new("dev.example.invalid", 2222).unwrap();
+    store.register(&ApprovedHost::confirm(&endpoint, &endpoint, SHA).unwrap(), KEY).unwrap();
+    let ssh = serde_json::from_value::<Ssh>(serde_json::json!({
+        "host": "dev.example.invalid", "port": 2222, "account": "deploy", "hostKeyFingerprint": SHA,
+        "transport": {"kind": "ssm", "profile": "dev-sso", "region": "ap-northeast-2", "instanceId": "i-0123456789abcdef0"},
+        "auth": {"kind": "agent", "publicKeyPath": directory.path().join("agent.pub")},
+    })).unwrap();
+    // SSM 대상은 승인 창을 띄우기 전에 전달을 열지 않는다.
+    let (launch, message) = prepare_remote_editor(directory.path(), "profile-1", std::num::NonZeroU64::MIN, &ssh).unwrap();
+    assert!(matches!(launch, SavedLaunch::Forward(_)));
+    assert!(message.contains("\n전송: SSM · dev-sso · ap-northeast-2 · i-0123456789abcdef0\n"), "{message}");
+}
+
 #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
 mod stored {
     use std::{
@@ -133,10 +150,10 @@ mod stored {
     use crate::{
         connections::profile::Ssh,
         local_auth::{Bitwarden, Error},
-        ssh::{ApprovedHost, Endpoint, TRUST_DIRECTORY, TrustStore},
+        ssh::{ApprovedHost, Endpoint, TRUST_DIRECTORY, TrustStore, tests::FakeForward},
     };
 
-    use super::super::{APPROVAL_TTL, DirectLaunch, SavedLaunch, prepare_stored_bounded, prepare_stored_with, saved};
+    use super::super::{APPROVAL_TTL, DirectLaunch, SavedLaunch, prepare_stored_bounded, prepare_stored_with, saved, transport};
     use tokio_util::sync::CancellationToken;
 
     const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti";
@@ -223,6 +240,37 @@ mod stored {
         }
     }
 
+    fn approved_over_ssm(budget: Duration, open: super::super::OpenTransport) -> (tempfile::TempDir, Result<DirectLaunch, String>) {
+        let (directory, mut ssh, endpoint) = target();
+        ssh.transport = serde_json::from_value(json!({
+            "kind": "ssm", "profile": "dev-sso", "region": "ap-northeast-2", "instanceId": "i-0123456789abcdef0",
+        })).unwrap();
+        let vault = vault(directory.path());
+        let launch = prepare_stored_bounded(directory.path(), &ssh, &endpoint, ITEM, "main", 1, budget, open, Ok(vault), |_| Ok(true));
+        let Ok(SavedLaunch::Forward(forward)) = launch else { panic!("SSM 저장 암호는 탭에서 전달을 준비합니다") };
+        let launch = forward.prepare(&CancellationToken::new());
+        (directory, launch)
+    }
+
+    #[test]
+    fn stored_password_over_ssm_approves_after_the_forward() {
+        let (_directory, launch) = approved_over_ssm(APPROVAL_TTL, |_, _, _, _| Ok(FakeForward::transport(40022).0));
+        let mut launch = launch.ok().unwrap();
+        let stored = launch.plan.stored().unwrap();
+        assert_eq!([stored.target.as_str(), stored.user.as_str(), stored.item.as_str()], ["[dev.example.invalid]:2222", "deploy", ITEM]);
+        // Pending::request와 approve가 성공해야 승인이 실행에 묶인다.
+        assert!(launch.stored.take().is_some());
+    }
+
+    #[test]
+    fn stored_password_over_ssm_expires_when_the_forward_outlasts_the_approval() {
+        let (_directory, result) = approved_over_ssm(Duration::from_millis(50), |_, _, _, _| {
+            std::thread::sleep(Duration::from_millis(120));
+            Ok(FakeForward::transport(40022).0)
+        });
+        assert_eq!(result.err().unwrap(), "저장된 SSH 암호 승인이 만료되었습니다");
+    }
+
     #[test]
     fn manual_fallback_over_ssm_defers_the_forward() {
         let (directory, mut ssh, endpoint) = target();
@@ -285,7 +333,7 @@ mod stored {
         let vault = vault(directory.path());
         // 창을 읽는 시간은 승인 기한에서 따로 재고, 승인 뒤 교환 예산은 spawn에서 새로 잰다.
         let launch = prepare_stored_bounded(
-            directory.path(), &ssh, &endpoint, ITEM, "main", 1, Duration::from_secs(5), Ok(vault),
+            directory.path(), &ssh, &endpoint, ITEM, "main", 1, Duration::from_secs(5), transport, Ok(vault),
             |_| {
                 std::thread::sleep(Duration::from_millis(60));
                 Ok(true)
@@ -300,7 +348,7 @@ mod stored {
         let (directory, ssh, endpoint) = target();
         let vault = vault(directory.path());
         let result = prepare_stored_bounded(
-            directory.path(), &ssh, &endpoint, ITEM, "main", 1, Duration::from_millis(10), Ok(vault),
+            directory.path(), &ssh, &endpoint, ITEM, "main", 1, Duration::from_millis(10), transport, Ok(vault),
             |_| {
                 std::thread::sleep(Duration::from_millis(30));
                 Ok(true)

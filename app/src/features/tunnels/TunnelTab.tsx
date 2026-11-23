@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "react";
 import { SsoLoginButton, SsoLoginStatus, ssoExpired, useSsoLogin, type SsoLoginIpc } from "../ssm/ssoLogin";
 import { tunnelIpc, type DesktopTunnelSource, type TunnelRequest, type TunnelStatus } from "./tunnelIpc";
 import "./tunnel.css";
@@ -27,6 +27,9 @@ export function TunnelTab({ tab, targetId, method, closeState, onShare, onOpenDe
   const [error, setError] = useState("");
   const [statusError, setStatusError] = useState("");
   const closing = closeState !== undefined;
+  // 이전 렌더의 run이 대기열을 실행할 때도 현재 닫힘 상태를 읽는다.
+  const closingNow = useRef(closing);
+  useLayoutEffect(() => { closingNow.current = closing; }, [closing]);
   // 이 탭에서 시작한 요청이다. SSO 로그인 뒤 같은 요청으로 다시 시작한다.
   const requests = useRef(new Map<string, TunnelRequest>());
   const retry = useRef<TunnelRequest | undefined>(undefined);
@@ -39,6 +42,13 @@ export function TunnelTab({ tab, targetId, method, closeState, onShare, onOpenDe
     if (busy.current) queued.current = request;
     else void run(() => begin(request));
   }, ssoIpc);
+  const cancelLogin = login.cancel;
+  // 닫히는 탭은 대기 중인 재시작을 버리고 진행 중인 로그인을 취소한다.
+  useLayoutEffect(() => {
+    if (!closing) return;
+    queued.current = undefined;
+    cancelLogin();
+  }, [closing, cancelLogin]);
 
   useEffect(() => {
     if (closing) return;
@@ -65,7 +75,7 @@ export function TunnelTab({ tab, targetId, method, closeState, onShare, onOpenDe
   }, [tab, closing]);
 
   async function run(action: () => Promise<unknown>) {
-    if (closing || busy.current) return;
+    if (closingNow.current || busy.current) return;
     busy.current = true;
     setPending(true);
     setError("");

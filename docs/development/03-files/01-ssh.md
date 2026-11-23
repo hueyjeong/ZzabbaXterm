@@ -46,11 +46,11 @@ Agent 공개 키는 열린 파일의 핸들로 링크 여부, 정규 파일 여�
 3. 빈 포트는 루프백에서 bind한 뒤 놓아 고른다. 플러그인이 bind 충돌로 끝나면 새 포트로 최대 3회까지 다시 연다. 그 밖의 시작 실패는 다시 시도하지 않는다.
 4. 수신이 확인되면 접속 계획의 `ssh_config`에 `HostName 127.0.0.1`, `Port <전달 포트>`를 쓰고 `HostKeyAlias`는 원래 대상의 `[host]:port`로 둔다. 그래서 저장된 PIN과 `StrictHostKeyChecking yes`, `ProxyCommand none` 등 나머지 설정이 직접 경로와 같게 적용된다. SSM 전송에만 `ServerAliveInterval 60`, `ServerAliveCountMax 3`을 더해 입력 없이 열어 둔 셸이 SSM 세션 유휴 제한(기본 20분)으로 끊기지 않게 한다.
 
-SSM 전달(`SsmChild`)은 접속 계획(`ConnectionPlan`)이 소유한다. 터미널 탭, 같은 탭의 SFTP 파일 목록, 원격 nano 편집기가 같은 계획을 공유하므로 모두 같은 전달로 접속한다. 이때 SSH·SFTP·nano는 한 포트 전달에 각각 TCP 연결로 붙으므로 노드의 SSM Agent가 포트 전달 다중 연결(TCP multiplexing)을 지원해야 한다. 이 기능은 SSM Agent 3.0.222.0에서 추가되었다([SSM Agent 릴리스 노트](https://github.com/aws/amazon-ssm-agent/blob/mainline/RELEASENOTES.md)). 탭을 닫거나 `ssh`가 끝나 계획이 해제되면 로컬 CLI·플러그인 트리를 정리하고 같은 요청의 원격 세션을 `terminate-session`으로 닫는다. 전달이 먼저 끝나면 터미널 감독자가 `ssh` 자식을 정리하고 탭에 `SSM 전달 종료: <사유>`를 표시한다.
+SSM 전달(`SsmChild`)은 접속 계획(`ConnectionPlan`)이 소유한다. 터미널 탭, 같은 탭의 SFTP 파일 목록, 원격 nano 편집기가 같은 계획을 공유하므로 모두 같은 전달로 접속한다. 이때 SSH·SFTP·nano는 한 포트 전달에 각각 TCP 연결로 붙으므로 노드의 SSM Agent가 포트 전달 다중 연결(TCP multiplexing)을 지원해야 한다. 이 기능은 SSM Agent 3.0.222.0에서 추가되었고, 클라이언트 Session Manager plugin은 1.2 이상이어야 한다([SSM Agent 릴리스 노트](https://github.com/aws/amazon-ssm-agent/blob/mainline/RELEASENOTES.md), [AWS 발표](https://aws.amazon.com/about-aws/whats-new/2020/10/port-forwarding-sessions-created-sessions-manager-support-multiple-simultaneous-connections)). 탭을 닫거나 `ssh`가 끝나 계획이 해제되면 로컬 CLI·플러그인 트리를 정리하고 같은 요청의 원격 세션을 `terminate-session`으로 닫는다. 전달이 먼저 끝나면 터미널 감독자가 `ssh` 자식을 정리하고 탭에 `SSM 전달 종료: <사유>`를 표시한다.
 
 터미널 탭과 원격 nano 탭은 PIN만 확인하고 바로 열려 `연결 중`을 표시하며, 전달 준비는 PTY 작업자가 탭의 취소 토큰으로 진행한다. 준비 중 탭 닫기·문서 전환·창 닫기·앱 종료는 준비를 즉시 멈추고 이미 시작한 SSM 자식과 원격 세션을 같은 정리 경로로 닫으며, 준비가 늦게 끝나도 `ssh`를 시작하지 않는다. 준비 실패는 `열기 실패: <오류>`로 표시한다.
 
-저장 전 연결 시험도 같은 경로를 쓴다. 시험을 취소하거나 시간이 초과되면 전달 준비를 중단한다. 호스트 키 등록은 관리자가 제공한 공개 키 파일만 읽으므로 네트워크 접속이 없고 SSM 대상도 원래 `[host]:port` 별칭으로 등록한다. 저장 암호 대상도 같은 전달 위에서 승인 경로로 연다. 승인 창(`전송: SSM · <profile> · <region> · <instanceId>` 줄 포함)을 먼저 띄우고, 승인 뒤 탭을 등록한 다음 탭의 취소 토큰 아래에서 전달을 연다. 전달 뒤 만든 계획의 대상·계정·지문·항목이 승인 창과 다르면 열지 않는다.
+저장 전 연결 시험도 같은 경로를 쓴다. 시험을 취소하거나 시간이 초과되면 전달 준비를 중단한다. 호스트 키 등록은 관리자가 제공한 공개 키 파일만 읽으므로 네트워크 접속이 없고 SSM 대상도 원래 `[host]:port` 별칭으로 등록한다. 저장 암호 대상도 같은 전달 위에서 승인 경로로 연다. 승인 창(`전송: SSM · <profile> · <region> · <instanceId>` 줄 포함)을 먼저 띄우고, 승인 뒤 탭을 등록한 다음 탭의 취소 토큰 아래에서 전달을 연다. 전달 뒤 계획을 만들 때 등록된 PIN을 다시 확인하고, 계획의 스냅샷이 그 PIN을 계획 수명 동안 고정한다. 승인 직후부터 금고 승인을 묶기 직전까지 승인 기한(120초)을 넘기면 만료로 끝내고 금고를 쓰지 않는다.
 
 다음은 SSH-over-SSM 대상에서 명시적 오류로 남는다: SSH 포트 전달 탭, 원격 sudo 승격, AI CLI 등록, 원격 화면의 SSH 경로.
 

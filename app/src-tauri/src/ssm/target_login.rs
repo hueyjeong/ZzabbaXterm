@@ -25,9 +25,10 @@ pub(crate) enum Relogin {
 }
 
 /// 요청 ID별 진행 중인 로그인이다. 값은 잠금 키와 취소 토큰이다.
+/// 요청 ID로 먼저 자리를 잡고, 잠금 키는 설정을 읽은 뒤 채운다.
 /// 같은 AWS 프로필이나 같은 SSO 세션을 쓰는 대상은 한 번에 하나만 로그인한다.
 #[derive(Default)]
-pub(crate) struct TargetLogins(Mutex<HashMap<String, ([String; 2], CancellationToken)>>);
+pub(crate) struct TargetLogins(Mutex<HashMap<String, (Option<[String; 2]>, CancellationToken)>>);
 
 /// 잠금 키는 AWS 프로필과 SSO 세션(없으면 시작 URL)이다.
 fn login_keys(scope: &Scope, config: &DirectSsoConfig) -> [String; 2] {
@@ -36,13 +37,36 @@ fn login_keys(scope: &Scope, config: &DirectSsoConfig) -> [String; 2] {
 }
 
 impl TargetLogins {
-    fn begin(&self, keys: [String; 2], request_id: &str) -> Result<CancellationToken, String> {
+    /// 설정을 읽는 동안 도착한 취소도 이 자리에 반영된다.
+    fn reserve(&self, request_id: &str, cancel: CancellationToken) -> Result<(), String> {
         let mut logins = self.0.lock().unwrap();
-        if logins.contains_key(request_id) || logins.values().any(|(held, _)| held.iter().any(|key| keys.contains(key))) {
+        if logins.contains_key(request_id) {
             return Err(IN_PROGRESS.into());
         }
+        logins.insert(request_id.to_owned(), (None, cancel));
+        Ok(())
+    }
+
+    /// 자리가 취소로 사라졌으면 로그인하지 않는다.
+    fn claim(&self, request_id: &str, keys: [String; 2]) -> Result<(), String> {
+        let mut logins = self.0.lock().unwrap();
+        if !logins.contains_key(request_id) {
+            return Err(CANCELLED.into());
+        }
+        if logins.iter().any(|(id, (held, _))| id != request_id && held.iter().flatten().any(|key| keys.contains(key))) {
+            return Err(IN_PROGRESS.into());
+        }
+        if let Some((held, _)) = logins.get_mut(request_id) {
+            *held = Some(keys);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn begin(&self, keys: [String; 2], request_id: &str) -> Result<CancellationToken, String> {
         let cancel = CancellationToken::new();
-        logins.insert(request_id.to_owned(), (keys, cancel.clone()));
+        self.reserve(request_id, cancel.clone())?;
+        self.claim(request_id, keys).inspect_err(|_| self.finish(request_id))?;
         Ok(cancel)
     }
 
@@ -155,17 +179,30 @@ pub(crate) async fn ssm_target_relogin(webview: Webview, target_id: String, requ
         return Err("잘못된 요청 ID".into());
     }
     let directory = webview.path().app_config_dir().map_err(|error| format!("앱 설정 디렉터리: {error}"))?;
-    let logins = webview.state::<TargetLogins>();
-    // 설정 읽기는 취소 토큰을 쓰지 않는다.
-    let (scope, config) = resolve(&directory, &target_id, &Cli(&CancellationToken::new()))?;
-    let cancel = logins.begin(login_keys(&scope, &config), &request_id)?;
-    let cli = Cli(&cancel);
-    let result = tokio::select! {
-        biased;
-        () = cancel.cancelled() => Err(CANCELLED.into()),
-        result = relogin(&scope, &config, &cli) => result,
-    };
-    logins.finish(&request_id);
+    let cancel = CancellationToken::new();
+    relogin_request(&webview.state::<TargetLogins>(), &directory, &target_id, &request_id, &cancel, &Cli(&cancel)).await
+}
+
+/// 요청 ID로 자리를 잡은 뒤 설정을 읽으므로 읽는 중에 온 취소도 로그인을 막는다.
+async fn relogin_request(
+    logins: &TargetLogins,
+    directory: &Path,
+    target_id: &str,
+    request_id: &str,
+    cancel: &CancellationToken,
+    sso: &impl Sso,
+) -> Result<Relogin, String> {
+    logins.reserve(request_id, cancel.clone())?;
+    let result = async {
+        let (scope, config) = resolve(directory, target_id, sso)?;
+        logins.claim(request_id, login_keys(&scope, &config))?;
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => Err(CANCELLED.into()),
+            result = relogin(&scope, &config, sso) => result,
+        }
+    }.await;
+    logins.finish(request_id);
     result
 }
 
@@ -334,6 +371,39 @@ mod tests {
         assert!(again.is_cancelled() && other.is_cancelled());
         assert!(logins.begin(shared, "f").is_ok());
         assert!(valid_request_id("0b7c-41") && !valid_request_id("") && !valid_request_id("a b") && !valid_request_id(&"a".repeat(65)));
+    }
+
+    /// 설정을 읽는 동안 같은 요청 ID의 취소가 도착한다.
+    struct CancelDuringConfig<'a>(&'a TargetLogins, &'a Fake);
+
+    impl Sso for CancelDuringConfig<'_> {
+        fn config(&self, scope: &Scope) -> Result<DirectSsoConfig, CliError> {
+            self.0.cancel("late");
+            self.1.config(scope)
+        }
+
+        async fn check(&self, scope: &Scope, current: &DirectSsoConfig) -> Result<(), CliError> {
+            self.1.check(scope, current).await
+        }
+
+        async fn login(&self, scope: &Scope, current: &DirectSsoConfig) -> Result<(), CliError> {
+            self.1.login(scope, current).await
+        }
+    }
+
+    #[test]
+    fn cancel_while_resolving_stops_the_login() {
+        let dir = saved_targets();
+        let logins = TargetLogins::default();
+        let fake = Fake::new(Err(CliError::SsoLoginRequired), Ok(()));
+        let cancel = CancellationToken::new();
+        let sso = CancelDuringConfig(&logins, &fake);
+        let result = tauri::async_runtime::block_on(relogin_request(&logins, dir.path(), "ssm-node", "late", &cancel, &sso));
+        assert_eq!(result, Err(CANCELLED.into()));
+        assert!(cancel.is_cancelled());
+        assert_eq!(fake.calls(), ["config company-sso ap-northeast-2"]);
+        // 취소된 요청은 잠금 키를 남기지 않는다.
+        assert!(logins.0.lock().unwrap().is_empty());
     }
 
     #[test]

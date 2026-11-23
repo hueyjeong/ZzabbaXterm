@@ -320,8 +320,12 @@ fn prepare_stored_with(
     vault: Result<crate::local_auth::Bitwarden, crate::local_auth::Error>,
     confirm: impl FnOnce(String) -> Result<bool, String>,
 ) -> Result<SavedLaunch, String> {
-    prepare_stored_bounded(config, ssh, endpoint, item, owner, document, APPROVAL_TTL, vault, confirm)
+    prepare_stored_bounded(config, ssh, endpoint, item, owner, document, APPROVAL_TTL, transport, vault, confirm)
 }
+
+/// 시험은 실제 SSM 전달 대신 가짜 전달을 넣는다.
+#[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+type OpenTransport = fn(&TrustStore, &ApprovedHost<'_>, &Ssh, &CancellationToken) -> Result<Transport, String>;
 
 #[allow(clippy::too_many_arguments)]
 #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
@@ -333,6 +337,7 @@ fn prepare_stored_bounded(
     owner: &str,
     document: u64,
     budget: Duration,
+    open: OpenTransport,
     vault: Result<crate::local_auth::Bitwarden, crate::local_auth::Error>,
     confirm: impl FnOnce(String) -> Result<bool, String>,
 ) -> Result<SavedLaunch, String> {
@@ -353,17 +358,19 @@ fn prepare_stored_bounded(
         store.pin(&approved).map_err(pin_error)?;
         let shown = [endpoint.alias(), ssh.account.clone(), approved.fingerprint(), item.to_owned()];
         confirm_stored(stored_message(&shown, ssh), budget, confirm)?;
-        let (config, ssh, owner) = (config.to_owned(), ssh.clone(), owner.to_owned());
+        let approved_at = Instant::now();
+        let (config, ssh, owner, item) = (config.to_owned(), ssh.clone(), owner.to_owned(), item.to_owned());
+        // 승인 창의 값은 같은 `ssh` 복제본에서 나온다. 전달 뒤에는 `stored_plan`이 PIN을 다시 확인하고,
+        // 계획의 `Stored` 스냅샷이 그 PIN을 계획 수명 동안 고정한다.
         let prepare = move |cancel: &CancellationToken| {
             let endpoint = super::Endpoint::new(&ssh.host, ssh.port).map_err(pin_error)?;
             let approved = ApprovedHost::confirm(&endpoint, &endpoint, &ssh.host_key_fingerprint).map_err(pin_error)?;
             let store = trust_store(&config)?;
-            let transport = transport(&store, &approved, &ssh, cancel)?;
-            let plan = stored_plan(&store, &approved, &ssh, &shown[3], transport)?;
-            // 승인 창에 보인 대상과 전달 뒤 만든 계획이 같을 때만 승인을 묶는다.
-            let details = plan.stored().ok_or("저장된 SSH 암호 계획이 없습니다")?;
-            if [&details.target, &details.user, &details.fingerprint, &details.item] != shown.each_ref() {
-                return Err(stored_error(&crate::local_auth::Error::InvalidApproval));
+            let transport = open(&store, &approved, &ssh, cancel)?;
+            let plan = stored_plan(&store, &approved, &ssh, &item, transport)?;
+            // 전달 준비가 길어져 승인 뒤 시효를 넘기면 금고를 쓰지 않는다.
+            if approved_at.elapsed() > budget {
+                return Err(stored_error(&crate::local_auth::Error::Expired));
             }
             approve_stored(plan, &owner, document, vault)
         };
