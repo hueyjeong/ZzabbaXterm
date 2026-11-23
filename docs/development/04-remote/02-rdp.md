@@ -22,3 +22,9 @@
 4. **Green — 주변 기능.** 협상한 CLIPRDR에서만 사용자가 복사한 시험 텍스트의 형식과 본문을 양방향 교환한다. Display Control 채널로 크기 변경을 요청하고 서버가 보낸 새 화면 크기로 canvas를 갱신한다. CSS 확대는 해상도 변경이 아니다. 단절 시 입력을 잠그고 재접속에서 경로와 인증서를 다시 검증해 새 ID의 프레임만 그린다.
 5. **자동 검증.** `cargo test --manifest-path src-tauri/Cargo.toml rdp`와 `npx vitest run src/features/rdp`에서 신원·프레임·입력 경계를 검증한다. 조작한 인증서로도 첫 인증 단계에 진입하면 수정 후 재시험한다.
 6. **실기기 시연(T5 RDP).** 각 클라이언트에서 `Windows RDP 직접`, `Linux xrdp 직접`, `Linux xrdp / SSM`을 별도 행으로 기록한다. 첫 프레임 → 키·클릭 → 서로 다른 무해한 문자열의 양방향 복사 → 서버 해상도 변경 전후 → 끊기·재접속 후 새 문자열 입력을 촬영한다. SSM을 끊는 동안 별도 탭의 입력도 기록한다. OS·서버·IronRDP 버전과 협상 채널을 붙인다. 서버 정책/협상과 기준 클라이언트에서 모두 막힌 기능만 해당 행의 `서버 미지원(근거)`이다. 앱에서만 실패하면 `실패(단계)`, 시험 환경이 없으면 `미실행(사유)`이다. 계정 비밀과 클립보드 원문은 로그에 넣지 않는다.
+
+## 실측 기록
+
+- xrdp 0.9.24(Ubuntu 24.04 패키지, `security_layer=negotiate`)는 RDP 협상 요청에 항상 `RDP_NEG_RSP selectedProtocol = 0x1`(SSL/TLS 전용)로 답한다. `HYBRID`·`HYBRID_EX`만 요청해도 같은 값이 온다. 따라서 이 패키지로는 NLA 로그인을 협상할 수 없고, 앱은 `RDP 서버와 NLA를 협상할 수 없습니다`로 중단한다. 이는 제품의 TLS+NLA 전용 정책과 xrdp 배포판 기본 빌드의 차이며, 시험에는 NLA를 지원하는 RDP 서버가 필요하다.
+- 확인 방법: 컨테이너의 `127.0.0.1:3389`에 X.224 `Connection Request` + `RDP_NEG_REQ`(`requestedProtocols`를 0x0b, 0x08, 0x02, 0x01로 각각)를 보내고 응답의 `selectedProtocol`을 읽는다. 네 경우 모두 `0x1`이었다.
+- 이 실측은 실제 원격 화면·입력 인수를 대신하지 않는다. T5는 승인된 Windows RDP 및 NLA 지원 xrdp 서버에서 따로 기록한다.
