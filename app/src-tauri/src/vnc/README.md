@@ -1,15 +1,16 @@
 # R03 Rust 엔진 계약
 
-워크스페이스에서 **VNC** 탭을 열고 호스트, TLS 포트, 서비스 인증을 입력한 뒤 네이티브 대화 상자에서 대상과 인증을 승인한다. 다시 연결할 때도 같은 승인 절차를 거치며, 이전 입력 큐와 워커는 새 접속 전에 폐기된다.
+워크스페이스에서 **VNC** 탭을 직접 열면 TLS 호스트·포트와 서비스 인증을 선택한다. 준비된 SSH 터널에서 연 **VNC** 탭은 지정된 원격 목적지만 사용한다. 두 경로 모두 다시 연결할 때 네이티브 승인을 받는다. 이전 입력 큐와 워커는 새 접속 전에 폐기된다.
 
 격리 검증은 저장소 루트에서 `cargo test --locked --manifest-path app/src-tauri/Cargo.toml --lib vnc`과 `npm --prefix app test -- src/features/vnc src/features/remoteDesktop`로 실행한다. 시험은 루프백 TLS, 격리 CA와 합성 비밀번호 공급원만 사용한다. Windows 비밀번호 대화 상자는 `User32`의 `DialogBoxIndirectParamW`와 기본 Edit·Static·Button 컨트롤을 사용한다. Windows MSVC 앱과 라이브러리 시험은 기존 `app/src-tauri/build.rs`의 Common Controls v6 매니페스트를 공유한다.
 
 ## 전송과 비밀
 
 1. 웹뷰 입력은 접속 초안이다. Rust가 호스트와 포트를 검증하고 실제 `Target`을 만들며, 네이티브 승인 후에만 `Approved`를 발급한다. 앱의 직접 경로는 첫 바이트부터 TLS 1.2 이상이며 TCP 호스트와 인증서 검증 이름이 같다. 앱은 OS 신뢰 저장소를 사용하고 격리 시험만 전용 CA를 공급한다. 평문과 VeNCrypt 재시도 경로는 없다.
-2. `VncPassword`는 RFB 보안 종류 2만 선택한다. Linux에서는 `service=dev.zzabbaxterm.desktop.vnc`, `target=default`, `user=[정규화된 호스트]:포트`가 일치하고 32자리 16진수 `vnc-item-id`를 가진 잠금 해제 항목 하나만 승인 후보가 된다. Rust가 Secret Service의 D-Bus 고유 소유자, 객체 경로, 항목 ID, 생성·변경 시각을 승인 전에 고정한다. 챌린지 이후 콜백은 승인당 한 번, 정확한 대상과 동일 항목만 읽는다. D-Bus 호출은 세션 버스의 고유 소유자에게만 보내며, Secret Service의 `plain` 세션을 사용한다. 철회는 RFB 응답 쓰기와 직렬화된다.
-3. Windows는 금고 대신 로컬 Win32 비밀번호 입력을 사용한다. 이름이 확인된 Direct TLS 스트림에서 RFB 버전과 보안 종류 2를 확인하고 전체 16바이트 챌린지를 받은 후에만 대상과 함께 마스킹 입력을 열며, 60초 안에 입력한 Latin-1 1~8바이트를 Rust에서 같은 연결의 일회성 응답에만 사용한다. 탭·문서·연결 철회 또는 취소는 응답을 막는다. `ExplicitNone`은 사용자가 별도 승인한 보안 종류 1이며 비밀번호 실패 시 대체 경로가 아니다. Windows와 Linux 이외 플랫폼은 비밀번호 연결을 소켓 연결 전에 거부한다.
-4. R01 연결점은 `vnc::transport::TunnelRegistry::open_verified<'a>(&'a self, owner: &'a str, tunnel_id: &'a str, target: &'a Target) -> Pin<Box<dyn Future<Output = Result<VerifiedTunnel, Error>> + Send + 'a>>`이다. SSH 어댑터의 연결점은 `tunnels::ipc::TunnelTabs::open_stream(handle, id, DesktopRoute { target, ssh, destination, protocol: Protocol::Vnc })`이다. 어댑터는 현재 문서의 승인된 소유 핸들·터널 ID, 저장된 SSH 신원, 원격 VNC 목적지와 포트를 Rust에서 결합하고, 소유권·준비 상태·서비스와 목적지를 확인한 소켓을 비차단 Tokio 소켓으로 변환한다. `Target { profile_id, host, port }`는 원격 서비스의 신원을 가리킨다. 원격 `127.0.0.1:5900`은 SSH 호스트가 다르면 서로 다른 서비스이며, 로컬 리슨 주소는 대상이나 서비스 비밀번호 조회 키가 아니다. 엔진은 `VerifiedTunnel { target, stream }`의 대상 일치와 루프백 피어를 재검사한다. 현재 앱에서 선택 가능한 경로는 직접 TLS이며, R01 어댑터와 SSM 포워딩은 연결되지 않았다.
+2. `VncPassword`는 RFB 보안 종류 2만 선택한다. Linux에서는 `service=dev.zzabbaxterm.desktop.vnc`, `target=default`, 경로별 `user` 범위가 일치하고 32자리 16진수 `vnc-item-id`를 가진 잠금 해제 항목 하나만 승인 후보가 된다. 직접 TLS의 `user`는 `[정규화된 호스트]:포트`다. Rust가 Secret Service의 D-Bus 고유 소유자, 객체 경로, 항목 ID, 생성·변경 시각을 승인 전에 고정한다. 챌린지 이후 콜백은 승인당 한 번 같은 대상의 같은 항목만 읽는다. D-Bus 호출은 세션 버스의 고유 소유자에게만 보내며, Secret Service의 `plain` 세션을 사용한다. 철회는 RFB 응답 쓰기와 직렬화된다.
+3. Windows는 검증된 직접 TLS 또는 SSH 터널에서 전체 16바이트 챌린지를 받은 뒤 로컬 Win32 입력을 연다. 60초 안에 입력한 Latin-1 1~8바이트는 같은 연결의 일회성 응답에만 사용된다. `ExplicitNone`은 별도 승인한 보안 종류 1이다. 이외 플랫폼은 비밀번호 모드를 소켓 연결 전에 거부한다.
+4. 터널 초안의 `source`는 `{tabHandle,tunnelId,targetId,destination:{host,port}}`이다. 문서 증표에 묶인 R01 세대로 네이티브 승인 당시의 저장 SSH 스냅샷과 정확한 원격 루프백 목적지를 확인하고, `Protocol::Vnc` 전용 `DesktopLease`에서 이미 연결된 소켓을 인계받는다. SSH 터널과 직접 TLS는 서로 대체 경로가 아니다.
+5. Linux 터널 모드의 금고 `user` 범위는 `ssh://계정@[SSH 호스트]:SSH 포트#호스트 키 지문|vnc://[원격 호스트]:원격 포트`이다. 직접 TLS 범위나 로컬 리슨 주소를 사용하지 않는다. 임대 발급 후 이 범위의 항목 ID를 별도 승인한다. 임대가 끊기면 추가 조회와 대기 중인 결과의 사용을 중단하고, RFB 인증 응답을 쓰는 각 비차단 호출은 R01 철회와 직렬화한다. 비밀·금고 객체 경로·SSH 인증 경로는 VNC IPC나 새 명령행 인자로 전달되지 않는다.
 
 ## 탭과 출력
 

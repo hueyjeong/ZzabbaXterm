@@ -5,7 +5,8 @@ use tokio::sync::oneshot;
 use windows_sys::Win32::{Foundation::HWND, UI::{Controls::EM_SETLIMITTEXT, WindowsAndMessaging::*}};
 use zeroize::Zeroizing;
 
-use super::{Target, lifetime::Lifetime};
+use tokio_util::sync::CancellationToken;
+use super::lifetime::Lifetime;
 
 const EDIT: i32 = 100;
 const MAX_PASSWORD: usize = 8;
@@ -13,22 +14,21 @@ const TIMER: usize = 1;
 const DIALOG_USER: i32 = (2 * size_of::<isize>()) as i32;
 type Secret = Zeroizing<Vec<u8>>;
 
-pub(super) async fn read(window: &WebviewWindow, target: &Target, life: &Arc<Lifetime>) -> Option<Secret> {
+pub(super) async fn read(window: &WebviewWindow, target: String, life: &Arc<Lifetime>, loss: Option<CancellationToken>) -> Option<Secret> {
     let (send, reply) = oneshot::channel();
     let owner = window.clone();
-    let target = target.profile_id.clone();
     let life = life.clone();
     window.run_on_main_thread(move || {
-        if send.is_closed() || life.revoked() { return; }
+        let mut state = Dialog { send, life, loss, password: None };
+        if state.revoked() { return; }
         let Ok(hwnd) = owner.hwnd() else { return; };
-        let mut state = Dialog { send, life, password: None };
         let template = template(&target);
         // 템플릿과 콜백 상태는 동기 모달 호출의 반환까지 살아 있다.
         let accepted = unsafe {
             DialogBoxIndirectParamW(ptr::null_mut(), template.0.as_ptr().cast(), hwnd.0.cast(),
                 Some(dialog_proc), &mut state as *mut Dialog as isize)
         } == IDOK as isize;
-        if accepted && !state.life.revoked() { let _ = state.send.send(state.password.take()); }
+        if accepted && !state.revoked() { let _ = state.send.send(state.password.take()); }
     }).ok()?;
     tokio::time::timeout(Duration::from_secs(60), reply).await.ok()?.ok()?
 }
@@ -36,7 +36,14 @@ pub(super) async fn read(window: &WebviewWindow, target: &Target, life: &Arc<Lif
 struct Dialog {
     send: oneshot::Sender<Option<Secret>>,
     life: Arc<Lifetime>,
+    loss: Option<CancellationToken>,
     password: Option<Secret>,
+}
+
+impl Dialog {
+    fn revoked(&self) -> bool {
+        self.send.is_closed() || self.life.revoked() || self.loss.as_ref().is_some_and(CancellationToken::is_cancelled)
+    }
 }
 
 unsafe extern "system" fn dialog_proc(hwnd: HWND, msg: u32, wparam: usize, lparam: isize) -> isize {
@@ -45,7 +52,7 @@ unsafe extern "system" fn dialog_proc(hwnd: HWND, msg: u32, wparam: usize, lpara
         if msg == WM_INITDIALOG {
             SetWindowLongPtrW(hwnd, DIALOG_USER, lparam);
             let state = &*(lparam as *const Dialog);
-            if state.send.is_closed() || state.life.revoked() || SetTimer(hwnd, TIMER, 100, None) == 0 {
+            if state.revoked() || SetTimer(hwnd, TIMER, 100, None) == 0 {
                 EndDialog(hwnd, IDCANCEL as isize);
             }
             // 아홉 번째 문자는 과다 입력을 감지하기 위해 남겨 둔다.
@@ -55,7 +62,7 @@ unsafe extern "system" fn dialog_proc(hwnd: HWND, msg: u32, wparam: usize, lpara
         let data = GetWindowLongPtrW(hwnd, DIALOG_USER) as *mut Dialog;
         if data.is_null() { return 0; }
         let command = if msg == WM_COMMAND { (wparam & 0xffff) as i32 } else { 0 };
-        let revoked = (*data).send.is_closed() || (*data).life.revoked();
+        let revoked = (*data).revoked();
         if msg == WM_CLOSE || command == IDCANCEL || (msg == WM_TIMER && wparam == TIMER && revoked) {
             SetDlgItemTextW(hwnd, EDIT, [0_u16].as_ptr());
             EndDialog(hwnd, IDCANCEL as isize);

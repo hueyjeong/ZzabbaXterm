@@ -1,4 +1,4 @@
-use super::{COMMIT, OpenError, Version, check_parent, os};
+use super::{COMMIT, OpenError, Version, check_parent, os, publication::PublicationError};
 use sha2::{Digest, Sha256};
 use std::{ffi::OsString, fs::{self, File}, io::{self, Read}, path::{Path, PathBuf}};
 
@@ -89,24 +89,14 @@ pub(crate) struct DownloadStage<'a> {
     temp: os::Temporary<'a>,
 }
 
-#[derive(Debug)]
-pub(crate) enum DownloadPublicationError {
-    Io(io::Error),
-    Unconfirmed(PathBuf),
-}
-
-impl From<io::Error> for DownloadPublicationError {
-    fn from(error: io::Error) -> Self { Self::Io(error) }
-}
-
 impl DownloadStage<'_> {
     pub(crate) fn writer(&mut self) -> io::Result<File> { self.temp.file().try_clone() }
 
-    pub(crate) fn commit(self, closed: &tokio::sync::watch::Sender<bool>, digest: [u8; 32]) -> Result<(), DownloadPublicationError> {
+    pub(crate) fn commit(self, closed: &tokio::sync::watch::Sender<bool>, digest: [u8; 32]) -> Result<(), PublicationError> {
         self.commit_inner(closed, digest, || {})
     }
 
-    fn commit_inner(mut self, closed: &tokio::sync::watch::Sender<bool>, digest: [u8; 32], before_publish: impl FnOnce()) -> Result<(), DownloadPublicationError> {
+    fn commit_inner(mut self, closed: &tokio::sync::watch::Sender<bool>, digest: [u8; 32], before_publish: impl FnOnce()) -> Result<(), PublicationError> {
         let target = &self.target.location;
         let _commit = COMMIT.lock().map_err(|_| io::Error::other("local file commit lock poisoned"))?;
         if let Some((original, _)) = &self.target.original {
@@ -200,7 +190,7 @@ mod tests {
         let late = dir.path().join("late.bin");
         let approval = DownloadTarget::open(&late).unwrap();
         fs::write(&late, b"external").unwrap();
-        assert!(matches!(transfer(&approval), Err(DownloadPublicationError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists));
+        assert!(matches!(transfer(&approval), Err(PublicationError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists));
         assert_eq!(fs::read(&late).unwrap(), b"external");
 
         let link = dir.path().join("link.bin");
@@ -292,14 +282,14 @@ mod tests {
                 fs::write(&path, b"external").unwrap();
             });
             if cfg!(target_os = "linux") && action != "create" {
-                let Err(DownloadPublicationError::Unconfirmed(recovery)) = result else {
+                let Err(PublicationError::Unconfirmed(recovery)) = result else {
                     panic!("{action}: expected a recovery path, got {result:?}");
                 };
                 assert!(!path.exists(), "{action}");
                 assert_eq!(fs::read(&recovery).unwrap(), b"external", "{action}");
                 assert_eq!(fs::read_dir(recovery.parent().unwrap()).unwrap().count(), 1);
             } else {
-                let Err(DownloadPublicationError::Io(error)) = result else {
+                let Err(PublicationError::Io(error)) = result else {
                     panic!("{action}: expected a local IO error, got {result:?}");
                 };
                 if action == "create" {

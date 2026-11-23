@@ -1,4 +1,6 @@
-use std::{future::Future, io, pin::Pin};
+use std::{future::Future, io};
+#[cfg(test)]
+use std::pin::Pin;
 
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -7,6 +9,7 @@ use tokio::{
 use tokio_native_tls::{TlsConnector, native_tls};
 use zeroize::Zeroizing;
 
+use crate::tunnels::ipc::{DesktopLease, Protocol};
 use super::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -22,8 +25,7 @@ pub(crate) enum Auth {
     ExplicitNone,
 }
 
-// 등록부가 소유 ID, 살아 있는 터널, 인증된 동일 호스트 목적지를 검사하고
-// 해당 터널에 묶인 스트림을 연다. 주소만 반환하면 교체된 리스너와 경합한다.
+#[cfg(test)]
 pub(crate) trait TunnelRegistry: Sync {
     fn open_verified<'a>(
         &'a self,
@@ -33,6 +35,7 @@ pub(crate) trait TunnelRegistry: Sync {
     ) -> Pin<Box<dyn Future<Output = Result<VerifiedTunnel, Error>> + Send + 'a>>;
 }
 
+#[cfg(test)]
 pub(crate) struct VerifiedTunnel {
     pub(crate) target: Target,
     pub(crate) stream: TcpStream,
@@ -42,8 +45,9 @@ pub(crate) enum Route<'a> {
     DirectTls {
         trust_anchor_pem: Option<&'a [u8]>,
     },
-    #[allow(dead_code)] // 실제 등록부 어댑터가 통합되기 전에는 테스트에서만 연다.
-    R01 {
+    R01 { lease: &'a DesktopLease, stream: std::net::TcpStream },
+    #[cfg(test)]
+    Fixture {
         registry: &'a dyn TunnelRegistry,
         owner: &'a str,
         tunnel_id: &'a str,
@@ -80,7 +84,19 @@ pub(super) async fn connect(target: &Target, route: Route<'_>) -> Result<Box<dyn
                 .map_err(|_| Error::TlsIdentity)?;
             Ok(Box::new(tls))
         }
-        Route::R01 {
+        Route::R01 { lease, stream } => {
+            let destination = lease.destination();
+            if lease.protocol() != Protocol::Vnc || target.host != destination.host || target.port != destination.port ||
+                !stream.peer_addr()?.ip().is_loopback()
+            {
+                return Err(Error::UnverifiedRoute);
+            }
+            lease.while_live(|| ()).ok_or(Error::Disconnected)?;
+            stream.set_nonblocking(true)?;
+            Ok(Box::new(TcpStream::from_std(stream)?))
+        }
+        #[cfg(test)]
+        Route::Fixture {
             registry,
             owner,
             tunnel_id,

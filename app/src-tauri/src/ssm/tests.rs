@@ -131,6 +131,7 @@ fn online_list_only_accepts_complete_inventory() {
         let result = fixture_cli().parse_online_nodes(
             &scope,
             Arc::from("fixture-owner"),
+            None,
             fixture_credentials(),
             response(*exit, stdout, stderr),
         );

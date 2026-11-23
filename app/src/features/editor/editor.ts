@@ -28,8 +28,15 @@ export interface EditorState {
   readonly comparison: string | null | undefined;
 }
 
+export interface EditorCloseState {
+  readonly dirty: boolean;
+  readonly uncertain: boolean;
+  readonly pending: boolean;
+}
+
 export interface EditorConnection {
   setActive(active: boolean): void;
+  closeState(): EditorCloseState;
   save(): Promise<void>;
   compare(): Promise<void>;
   reload(confirm: ConfirmEditorDiscard): Promise<void>;
@@ -77,7 +84,7 @@ export function connectEditor(
     if (busy !== "reload") busy = null;
     update();
   });
-  const current = (id: number) => active && !disposed && generation === id;
+  const current = (id: number) => !disposed && generation === id;
   function start(action: NonNullable<EditorState["busy"]>) {
     const id = ++generation;
     busy = action;
@@ -110,11 +117,16 @@ export function connectEditor(
 
   update();
   return {
+    closeState() {
+      return { dirty: savedVersion !== model.getAlternativeVersionId(), uncertain, pending: closing || saving || busy === "reload" };
+    },
     setActive(value) {
       if (active === value || disposed) return;
       active = value;
-      generation++;
-      if (busy === "compare") busy = null;
+      if (busy === "compare") {
+        generation++;
+        busy = null;
+      }
       update();
     },
     async save() {
@@ -159,14 +171,8 @@ export function connectEditor(
         }
       } finally {
         saving = false;
-        if (current(id) || busy === "save") {
-          if (!current(id) && !disposed) {
-            comparison = undefined;
-            uncertain = true;
-            status = { kind: "unknown", message: "탭이 바뀌었습니다" };
-          }
-          finish();
-        } else update();
+        if (current(id)) finish();
+        else update();
       }
     },
     async compare() {
@@ -193,16 +199,15 @@ export function connectEditor(
       const version = model.getVersionId();
       const id = start("reload");
       try {
-        if (!await confirmDiscard(confirm, "reload", id) || !current(id) || model.getVersionId() !== version) return;
+        if (!await confirmDiscard(confirm, "reload", id) || !current(id) || !active || model.getVersionId() !== version) return;
         // Rust 기준을 갱신한 뒤 응답이 무효화되면 다시 승인받기 전에는 저장을 막는다.
         const previousNeedsReload = needsReload;
         needsReload = true;
         comparison = undefined;
         const result = await transport.reload(file.handle);
-        if (!current(id) || model.getVersionId() !== version) {
-          if (status.kind !== "unknown" && status.kind !== "disconnected") {
-            status = { kind: "failed", message: "다시 읽기가 필요합니다" };
-          }
+        if (!current(id)) return;
+        if (model.getVersionId() !== version) {
+          status = { kind: "failed", message: "다시 읽기가 필요합니다" };
           return;
         }
         if (result.kind !== "read") {

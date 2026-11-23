@@ -32,6 +32,10 @@ export const localEditorTransport: EditorTransport = {
       return { kind: "saved" };
     } catch (error) {
       if (!error || typeof error !== "object" || !("kind" in error)) throw error;
+      if (error.kind === "publicationUnconfirmed") {
+        const path = "recoveryPath" in error ? error.recoveryPath : undefined;
+        return { kind: "unknown", message: typeof path === "string" ? `복구 파일: ${path}` : error.kind };
+      }
       if (error.kind === "conflict" && "conflict" in error) {
         const { reason, diskText } = error.conflict as { reason: string; diskText?: string | null };
         if (reason === "missing") return { kind: "conflict", current: null };

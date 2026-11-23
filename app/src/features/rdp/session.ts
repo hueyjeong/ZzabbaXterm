@@ -1,8 +1,9 @@
 import { Channel, convertFileSrc, invoke, type InvokeArgs } from "@tauri-apps/api/core";
 import type { RemoteDesktopEvent, RemoteDesktopIdentity, RemoteDesktopSession } from "../remoteDesktop/session";
+import type { DesktopTunnelSource } from "../tunnels/tunnelIpc";
 import { scanCode } from "./keys";
 
-interface Draft { readonly host: string; readonly port: number }
+interface Draft { readonly host: string; readonly port: number; readonly source?: DesktopTunnelSource }
 export interface Capabilities { readonly copy: boolean; readonly paste: boolean; readonly resize: boolean }
 export interface Connection extends RemoteDesktopSession {
   clipboard(action: "copy" | "paste"): void;
@@ -30,7 +31,7 @@ type Frame = Extract<RemoteDesktopEvent, { kind: "full" | "patch" }>;
 
 export function connect(draft: Draft, opened: (connection: Connection) => void,
   caps: (value: Capabilities) => void, ready: (value: boolean) => void, notice: (message: string) => void,
-  ended: (message: string) => void, clipboard: Pick<Clipboard, "readText" | "writeText"> = navigator.clipboard): () => void {
+  ended: (message: string, closed: boolean) => void, clipboard: Pick<Clipboard, "readText" | "writeText"> = navigator.clipboard): () => Promise<void> {
   const document = proof();
   const life = new AbortController();
   let output: Channel<string> | undefined;
@@ -45,23 +46,40 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
   let reading = false;
   let done = false;
   let active = false;
-  let displayed = false;
+  let displayGeneration = 0;
+  let frameGeneration = 0;
   let epoch = 0;
   let serial = 0;
   let lastPacket = 0;
   let lastFrame = 0;
-  const queue: { action: Action; epoch: number }[] = [];
+  const queue: { action: Action; epoch: number; displayGeneration: number }[] = [];
   let sending = false;
-  const end = (message?: string) => {
+  let closing: Promise<void> | undefined;
+  const stop = () => {
     if (done) return;
     done = true;
     life.abort();
     waiting?.();
     if (output) output.onmessage = () => { };
-    if (id) void run("rdp_close", { id }).catch(() => { });
     queue.length = 0;
     pending = undefined;
-    if (message) ended(message);
+  };
+  const close = () => {
+    stop();
+    if (!closing) {
+      closing = (async () => {
+        await prepared.catch(() => undefined);
+        if (id) await run("rdp_close", { id });
+      })().catch((error: unknown) => {
+        closing = undefined;
+        throw error;
+      });
+    }
+    return closing;
+  };
+  const end = (message: string) => {
+    if (done) return;
+    void close().then(() => ended(message, true), (error: unknown) => ended(String(error), false));
   };
 
   async function flush() {
@@ -69,7 +87,14 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
     sending = true;
     try {
       for (let next = queue.shift(); next && !done; next = queue.shift()) {
-        try { await run("rdp_input", { id, input: { ...next, sequence: ++serial } }); }
+        try {
+          const accepted = await run<boolean>("rdp_input", { id, input: { ...next, sequence: ++serial } });
+          if (accepted === false && next.displayGeneration === displayGeneration) {
+            displayGeneration = 0;
+            queue.length = 0;
+            epoch++;
+          }
+        }
         catch (error) {
           if (done) return;
           if (next.action.kind === "copy" || next.action.kind === "paste" || next.action.kind === "resize") notice(String(error));
@@ -79,11 +104,11 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
     } finally { sending = false; }
   }
   function send(action: Action) {
-    if (done || !displayed || (action.kind !== "active" && !active)) return;
+    if (done || !displayGeneration || (action.kind !== "active" && !active)) return;
     const last = queue[queue.length - 1];
     if (action.kind === "pointer" && last?.action.kind === "pointer" && last.action.buttons === action.buttons) {
       last.action = action;
-    } else if (queue.length < 32) queue.push({ action, epoch });
+    } else if (queue.length < 32) queue.push({ action, epoch, displayGeneration });
     else { end("RDP 입력 큐가 가득 찼습니다"); return; }
     void flush();
   }
@@ -95,7 +120,7 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
     send({ kind: "active", active });
   }
   function clipboardAction(action: "copy" | "paste") {
-    if (done || !active || !displayed) return;
+    if (done || !active || !displayGeneration) return;
     if (!clipboard) { notice("로컬 클립보드를 사용할 수 없습니다"); return; }
     if (action === "copy") { send({ kind: "copy" }); return; }
     const previous = epoch;
@@ -149,11 +174,18 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
         sequence = lastPacket = value.sequence;
         switch (value.kind) {
           case "frame": {
-            const { width, height, x, y, w, h, full, frameSequence } = value;
+            const { width, height, x, y, w, h, full, frameSequence, displayGeneration: generation } = value;
             if (!positive(width) || !positive(height) || width > 4096 || height > 4096 || width * height > MAX_PIXELS ||
               !nonnegative(x) || !nonnegative(y) || !positive(w) || !positive(h) || w > width - x || h > height - y ||
-              frameSequence !== lastFrame + 1 || typeof full !== "boolean" || (!lastFrame && !full) ||
+              frameSequence !== lastFrame + 1 || typeof full !== "boolean" || !positive(generation) || generation < frameGeneration ||
+              (generation !== frameGeneration && !full) ||
               (full && (x !== 0 || y !== 0 || w !== width || h !== height))) throw new Error();
+            if (generation !== frameGeneration) {
+              frameGeneration = generation;
+              displayGeneration = 0;
+              queue.length = 0;
+              epoch++;
+            }
             pending = {
               packet: sequence, bytes: 0, frame: {
                 ...id, sequence: frameSequence, kind: full ? "full" : "patch",
@@ -163,19 +195,17 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
             break;
           }
           case "display":
-            if (!lastFrame) throw new Error();
-            if (!displayed) {
-              displayed = true;
-              if (epoch !== 0) send({ kind: "active", active });
-              ready(true);
-            }
+            if (!lastFrame || value.displayGeneration !== frameGeneration || displayGeneration) throw new Error();
+            displayGeneration = frameGeneration;
+            send({ kind: "active", active });
+            ready(true);
             break;
           case "channels":
             if (typeof value.copy !== "boolean" || typeof value.paste !== "boolean" || typeof value.resize !== "boolean") throw new Error();
             caps({ copy: value.copy, paste: value.paste, resize: value.resize });
             break;
           case "clipboard":
-            if (positive(value.epoch) && value.epoch === epoch && active && clipboard) {
+            if (displayGeneration && positive(value.epoch) && value.epoch === epoch && active && clipboard) {
               if (typeof value.text === "string" && value.text.length <= MAX_CLIPBOARD_BYTES &&
                 !value.text.includes("\0") && new TextEncoder().encode(value.text).length <= MAX_CLIPBOARD_BYTES) {
                 void clipboard.writeText(value.text).catch(() => { if (!done) notice("로컬 클립보드 쓰기 실패"); });
@@ -191,16 +221,19 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
     } catch { end("RDP 화면 또는 상태를 적용할 수 없습니다"); }
   }
 
+  const prepared = run<unknown>("rdp_prepare").then((assigned) => {
+    if (!record(assigned) || typeof assigned.sessionId !== "string" || !token.test(assigned.sessionId) || !positive(assigned.generation)) throw new Error("RDP 세션 ID 오류");
+    id = { sessionId: assigned.sessionId, generation: assigned.generation };
+    return id;
+  });
   void (async () => {
     try {
-      const assigned: unknown = await run("rdp_prepare");
-      if (!record(assigned) || typeof assigned.sessionId !== "string" || !token.test(assigned.sessionId) || !positive(assigned.generation)) throw new Error("RDP 세션 ID 오류");
-      id = { sessionId: assigned.sessionId, generation: assigned.generation };
-      if (done) { await run("rdp_close", { id }); return; }
+      const assigned = await prepared;
+      if (done) return;
       output = new Channel<string>((ticket: unknown) => { void packet(ticket); });
       const completion = run("rdp_connect", { id, draft, output });
       opened({
-        ...id,
+        ...assigned,
         subscribe(listener) {
           receive = listener;
           waiting?.();
@@ -227,5 +260,5 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
       end("RDP 연결이 종료되었습니다");
     } catch (error) { end(error instanceof Error ? error.message : String(error)); }
   })();
-  return () => end();
+  return close;
 }

@@ -1,4 +1,5 @@
 import type { ApprovedEditorFile, EditorTransport } from "../editor/contract";
+import type { CompatibleAddressing } from "./compatible-settings";
 
 export type S3Location = Readonly<{ bucket: string; prefix: string; region: string }>;
 
@@ -8,6 +9,7 @@ export type S3Session = Readonly<{
   region: string;
   endpoint: string;
   location?: S3Location;
+  compatible?: Readonly<{ serviceId: string; addressing: CompatibleAddressing }>;
 }>;
 
 export type BucketRow = Readonly<{ name: string; region: string }>;
@@ -27,10 +29,12 @@ type Stage = "profile" | "identity" | "listBuckets" | "headBucket" | "listObject
 type Failure =
   | Readonly<{
     kind: "invalidSsoProfile" | "retestRequired" | "accountMismatch" | "invalidRegion" | "invalidBucket" | "invalidResponse" |
-    "credentials" | "ssoLoginRequired" | "loginFailed" | "request" | "timedOut" | "bodyRead" | "checksum"
+    "credentials" | "ssoLoginRequired" | "loginFailed" | "request" | "timedOut" | "bodyRead" | "checksum" | "destination" | "tls"
   }>
   | Readonly<{ kind: "bucketRegionMismatch"; region: string }>
   | Readonly<{ kind: "service"; status: number; code: string | null }>
+  | Readonly<{ kind: "redirect"; status: number; code: string | null }>
+  | Readonly<{ kind: "signingRegion"; status: number; code: string }>
   | Readonly<{ kind: "localIo"; errorKind: string }>
   | Readonly<{ kind: "recoveryUnconfirmed"; recoveryPath: string }>
   | Readonly<{ kind: "length"; expected: number | null }>;

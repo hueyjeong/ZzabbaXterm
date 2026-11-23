@@ -25,48 +25,54 @@ mod linux {
         scope: String,
     }
 
-    pub(super) fn freeze(scope: &str) -> Option<Frozen> {
-        freeze_on(SyncConnection::new_session().ok()?, scope)
+    pub(super) fn freeze(scope: &str, live: &impl Fn() -> bool) -> Option<Frozen> {
+        if !live() { return None; }
+        freeze_on(SyncConnection::new_session().ok()?, scope, live)
     }
 
-    pub(super) fn freeze_on(connection: SyncConnection, scope: &str) -> Option<Frozen> {
+    pub(super) fn freeze_on(connection: SyncConnection, scope: &str, live: &impl Fn() -> bool) -> Option<Frozen> {
+        if !live() { return None; }
         let bus = connection.with_proxy("org.freedesktop.DBus", "/org/freedesktop/DBus", TIMEOUT);
         let (owner,): (String,) = bus.method_call("org.freedesktop.DBus", "GetNameOwner", ("org.freedesktop.secrets",)).ok()?;
         if !owner.starts_with(':') { return None; }
-        let identity = identity(&connection, &owner, scope)?;
+        let identity = identity(&connection, &owner, scope, live)?;
         Some(Frozen { connection, owner, identity, scope: scope.into() })
     }
 
-    fn identity(connection: &SyncConnection, owner: &str, scope: &str) -> Option<Identity> {
+    fn identity(connection: &SyncConnection, owner: &str, scope: &str, live: &impl Fn() -> bool) -> Option<Identity> {
+        if !live() { return None; }
         let service = connection.with_proxy(owner, "/org/freedesktop/secrets", TIMEOUT);
         let attrs = HashMap::from([("service", super::SERVICE), ("target", "default"), ("user", scope)]);
         let (mut unlocked, locked): (Vec<ItemPath>, Vec<ItemPath>) = service.method_call(SERVICE, "SearchItems", (&attrs,)).ok()?;
-        if !locked.is_empty() || unlocked.len() != 1 { return None; }
+        if !live() || !locked.is_empty() || unlocked.len() != 1 { return None; }
         let path = unlocked.pop()?;
         let item = connection.with_proxy(owner, path.clone(), TIMEOUT);
         let properties: HashMap<String, String> = item.get(ITEM, "Attributes").ok()?;
-        if !attrs.iter().all(|(key, value)| properties.get(*key).is_some_and(|s| s == value)) { return None; }
+        if !live() || !attrs.iter().all(|(key, value)| properties.get(*key).is_some_and(|s| s == value)) { return None; }
         let item_id = properties.get("vnc-item-id")?.clone();
         if item_id.len() != 32 || !item_id.bytes().all(|b| b.is_ascii_hexdigit()) { return None; }
-        if item.get::<bool>(ITEM, "Locked").ok()? { return None; }
-        Some(Identity { path, created: item.get(ITEM, "Created").ok()?, modified: item.get(ITEM, "Modified").ok()?, item_id })
+        if item.get::<bool>(ITEM, "Locked").ok()? || !live() { return None; }
+        let created = item.get(ITEM, "Created").ok()?;
+        if !live() { return None; }
+        let modified = item.get(ITEM, "Modified").ok()?;
+        live().then_some(Identity { path, created, modified, item_id })
     }
 
     impl Frozen {
         pub(super) fn id(&self) -> &str { &self.identity.item_id }
 
         pub(super) fn read(&self, live: &impl Fn() -> bool) -> Option<Zeroizing<Vec<u8>>> {
-            if !live() || identity(&self.connection, &self.owner, &self.scope).as_ref() != Some(&self.identity) { return None; }
+            if identity(&self.connection, &self.owner, &self.scope, live).as_ref() != Some(&self.identity) || !live() { return None; }
             let service = self.connection.with_proxy(&self.owner, "/org/freedesktop/secrets", TIMEOUT);
             // 세션 버스의 고정된 고유 목적지에만 유니캐스트한다.
             let (_, session): (Variant<String>, ItemPath) = service.method_call(SERVICE, "OpenSession", ("plain", Variant(""))).ok()?;
             let result = (|| {
-                if !live() || identity(&self.connection, &self.owner, &self.scope).as_ref() != Some(&self.identity) { return None; }
+                if identity(&self.connection, &self.owner, &self.scope, live).as_ref() != Some(&self.identity) || !live() { return None; }
                 let item = self.connection.with_proxy(&self.owner, self.identity.path.clone(), TIMEOUT);
                 let ((returned, params, bytes, _),): (Secret,) = item.method_call(ITEM, "GetSecret", (session.clone(),)).ok()?;
                 let bytes = Zeroizing::new(bytes);
-                if returned != session || !params.is_empty() || !live() ||
-                    identity(&self.connection, &self.owner, &self.scope).as_ref() != Some(&self.identity) { return None; }
+                if returned != session || !params.is_empty() ||
+                    identity(&self.connection, &self.owner, &self.scope, live).as_ref() != Some(&self.identity) { return None; }
                 Some(bytes)
             })();
             let session = self.connection.with_proxy(&self.owner, session, TIMEOUT);
@@ -82,11 +88,11 @@ pub(super) struct Frozen(linux::Frozen);
 pub(super) struct Frozen(std::convert::Infallible);
 
 impl Frozen {
-    pub(super) fn freeze(scope: &str) -> Option<Self> {
+    pub(super) fn freeze(scope: &str, live: impl Fn() -> bool) -> Option<Self> {
         #[cfg(target_os = "linux")]
-        { linux::freeze(scope).map(Self) }
+        { linux::freeze(scope, &live).map(Self) }
         #[cfg(not(target_os = "linux"))]
-        { let _ = scope; None }
+        { let _ = (scope, live); None }
     }
 
     pub(super) fn id(&self) -> &str {
@@ -123,11 +129,14 @@ mod tests {
         let address = address.trim().to_owned();
         let client = SyncConnection::new_address(&address).unwrap();
         let replacement = Arc::new(AtomicBool::new(false));
+        let stop_on_attributes = Arc::new(AtomicBool::new(false));
+        let revoked = Arc::new(AtomicBool::new(false));
         let reads = Arc::new(AtomicUsize::new(0));
         let running = Arc::new(AtomicBool::new(true));
         let (ready, online) = std::sync::mpsc::channel();
         let server = {
             let (replacement, reads, running) = (replacement.clone(), reads.clone(), running.clone());
+            let (stop_on_attributes, revoked) = (stop_on_attributes.clone(), revoked.clone());
             std::thread::spawn(move || {
                 let server = Connection::new_address(&address).unwrap();
                 server.request_name("org.freedesktop.secrets", false, false, true).unwrap();
@@ -146,10 +155,13 @@ mod tests {
                             reply.append2(vec![path_for(replacement.load(Ordering::Acquire))], Vec::<Path>::new())
                         }
                         "Get" => match msg.read2::<String, String>().unwrap().1.as_str() {
-                            "Attributes" => reply.append1(Variant(HashMap::from([
-                                ("service", SERVICE), ("target", "default"), ("user", "[localhost]:5900"),
-                                ("vnc-item-id", "1234567890abcdef1234567890abcdef"),
-                            ]))),
+                            "Attributes" => {
+                                if stop_on_attributes.load(Ordering::Acquire) { revoked.store(true, Ordering::Release); }
+                                reply.append1(Variant(HashMap::from([
+                                    ("service", SERVICE), ("target", "default"), ("user", "[localhost]:5900"),
+                                    ("vnc-item-id", "1234567890abcdef1234567890abcdef"),
+                                ])))
+                            }
                             "Locked" => reply.append1(Variant(false)),
                             "Created" | "Modified" => reply.append1(Variant(1_u64)),
                             _ => panic!("메타데이터: {path}"),
@@ -170,11 +182,15 @@ mod tests {
             })
         };
         online.recv().unwrap();
-        let frozen = Frozen(linux::freeze_on(client, "[localhost]:5900").unwrap());
+        let frozen = Frozen(linux::freeze_on(client, "[localhost]:5900", &|| true).unwrap());
         replacement.store(true, Ordering::Release);
         assert!(frozen.read(|| true).is_none());
         replacement.store(false, Ordering::Release);
         assert!(frozen.read(|| false).is_none());
+        stop_on_attributes.store(true, Ordering::Release);
+        assert!(frozen.read(|| !revoked.load(Ordering::Acquire)).is_none());
+        assert!(revoked.load(Ordering::Acquire));
+        stop_on_attributes.store(false, Ordering::Release);
         assert_eq!(reads.load(Ordering::Relaxed), 0);
         assert_eq!(frozen.read(|| true).unwrap().as_slice(), b"isolated");
         assert_eq!(reads.load(Ordering::Relaxed), 1);

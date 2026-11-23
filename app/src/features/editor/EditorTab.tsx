@@ -1,11 +1,12 @@
 import { useImperativeHandle, useLayoutEffect, useRef, useState, type Ref } from "react";
 import type { ApprovedEditorFile, ConfirmEditorDiscard, EditorFileHandle, EditorTransport } from "./contract";
-import { connectEditor, type EditorConnection, type EditorState } from "./editor";
+import { connectEditor, type EditorCloseState, type EditorConnection, type EditorState } from "./editor";
 import { createFileModel, editor } from "./monaco";
 import "./editor.css";
 
 export interface EditorTabActions {
   setActive(active: boolean): void;
+  closeState(): EditorCloseState | undefined;
   requestClose(): Promise<void>;
 }
 
@@ -13,6 +14,7 @@ export interface EditorTabProps {
   readonly ref?: Ref<EditorTabActions>;
   readonly file: ApprovedEditorFile;
   readonly active: boolean;
+  readonly readOnly?: boolean;
   readonly focusRequested?: boolean;
   readonly transport: EditorTransport;
   readonly confirmDiscard: ConfirmEditorDiscard;
@@ -51,7 +53,7 @@ export function EditorTab(props: EditorTabProps) {
   return <EditorTabContent key={props.file.handle} {...props} />;
 }
 
-function EditorTabContent({ ref, file, active, focusRequested, transport, confirmDiscard, onClose }: EditorTabProps) {
+function EditorTabContent({ ref, file, active, readOnly = false, focusRequested, transport, confirmDiscard, onClose }: EditorTabProps) {
   const host = useRef<HTMLDivElement>(null);
   const diffHost = useRef<HTMLDivElement>(null);
   const mono = useRef<editor.IStandaloneCodeEditor | null>(null);
@@ -64,6 +66,7 @@ function EditorTabContent({ ref, file, active, focusRequested, transport, confir
 
   useImperativeHandle(ref, () => ({
     setActive(value) { connection.current?.setActive(value); },
+    closeState() { return connection.current?.closeState(); },
     async requestClose() { await connection.current?.requestClose(confirmDiscard, onClose); },
   }), [confirmDiscard, onClose]);
 
@@ -83,6 +86,10 @@ function EditorTabContent({ ref, file, active, focusRequested, transport, confir
       model.dispose();
     };
   }, [binding]);
+
+  useLayoutEffect(() => {
+    mono.current?.updateOptions({ readOnly });
+  }, [readOnly]);
 
   useLayoutEffect(() => {
     const modified = mono.current?.getModel();
@@ -120,12 +127,12 @@ function EditorTabContent({ ref, file, active, focusRequested, transport, confir
       if (!active || event.nativeEvent.isComposing || !(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey || event.key.toLowerCase() !== "s") return;
       event.preventDefault();
       event.stopPropagation();
-      void connection.current?.save();
+      if (!readOnly) void connection.current?.save();
     }}>
       <header className="editor-toolbar">
-        <button type="button" disabled={!active || state.saving || Boolean(state.busy) || !state.dirty || state.needsReload} onClick={() => void connection.current?.save()}>저장</button>
-        <button type="button" disabled={!active || Boolean(state.busy)} onClick={() => void connection.current?.compare()}>원본과 비교</button>
-        <button type="button" disabled={!active || state.saving || Boolean(state.busy)} onClick={() => void connection.current?.reload(confirmDiscard)}>다시 읽기</button>
+        <button type="button" disabled={readOnly || !active || state.saving || Boolean(state.busy) || !state.dirty || state.needsReload} onClick={() => void connection.current?.save()}>저장</button>
+        <button type="button" disabled={readOnly || !active || Boolean(state.busy)} onClick={() => void connection.current?.compare()}>원본과 비교</button>
+        <button type="button" disabled={readOnly || !active || state.saving || Boolean(state.busy)} onClick={() => void connection.current?.reload(confirmDiscard)}>다시 읽기</button>
         {comparison !== undefined && <button type="button" onClick={() => connection.current?.dismissComparison()}>비교 닫기</button>}
         <output role="status">
           {[statusText(state), state.saving && state.busy !== "save" && "저장 응답 대기",

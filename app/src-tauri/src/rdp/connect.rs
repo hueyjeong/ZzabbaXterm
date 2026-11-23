@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{future::poll_fn, pin::Pin, sync::Arc, task::Poll};
 
 use ironrdp::{
     connector::{
@@ -22,7 +22,7 @@ use tokio_rustls::{
 };
 use x509_cert::{Certificate, der::Decode as _};
 
-use super::{Account, Error, Target, clipboard::TextClipboard, route::Endpoint};
+use super::{Account, Error, Target, clipboard::TextClipboard, ipc::AuthIo, route::Endpoint};
 
 pub(super) type Transport = TokioFramed<TlsStream<TcpStream>>;
 
@@ -220,6 +220,7 @@ pub(super) async fn connect<F, Fut>(
     tls: Arc<rustls::ClientConfig>,
     resolve: F,
     display: ironrdp::displaycontrol::client::DisplayControlClient,
+    auth: AuthIo<'_>,
 ) -> Result<(ConnectionResult, Transport), Error>
 where
     F: FnOnce() -> Fut,
@@ -228,7 +229,7 @@ where
     let mut verified = tokio::time::timeout(super::CONNECT_TIMEOUT, verify(target, name, tls))
         .await.map_err(|_| Error::Timeout)??;
     let account = resolve().await?;
-    tokio::time::timeout(super::CONNECT_TIMEOUT, verified.authenticate(account))
+    tokio::time::timeout(super::CONNECT_TIMEOUT, verified.authenticate(account, &auth))
         .await.map_err(|_| Error::Timeout)??;
     verified
         .connector
@@ -262,7 +263,7 @@ where
 }
 
 impl Verified {
-    async fn authenticate(&mut self, mut account: Account) -> Result<(), Error> {
+    async fn authenticate(&mut self, mut account: Account, auth: &AuthIo<'_>) -> Result<(), Error> {
         if account.username.is_empty()
             || account.password.is_empty()
             || [account.username.as_str(), account.password.as_str()]
@@ -298,15 +299,12 @@ impl Verified {
                 .size()
                 .is_some()
             {
-                self.transport
-                    .write_all(output.filled())
-                    .await
-                    .map_err(|_| Error::Authentication)?;
+                write_credssp(self.transport.get_inner_mut().0, output.filled(), auth).await?;
             }
             let Some(hint) = sequence.next_pdu_hint() else {
                 break;
             };
-            let pdu = read_bounded(&mut self.transport, hint, Error::Authentication).await?;
+            let pdu = read_bounded(&mut self.transport, hint, Error::Authentication, Some(auth)).await?;
             let Some(next) = sequence
                 .decode_server_message(&pdu)
                 .map_err(|_| Error::Authentication)?
@@ -326,6 +324,26 @@ impl Verified {
     }
 }
 
+async fn write_credssp<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    mut bytes: &[u8],
+    auth: &AuthIo<'_>,
+) -> Result<(), Error> {
+    // TLS가 보관한 바이트는 flush에서도 전송되므로 각 poll을 철회와 직렬화한다.
+    while !bytes.is_empty() {
+        let count = poll_fn(|cx| {
+            auth.poll(|| Pin::new(&mut *stream).poll_write(cx, bytes))
+        }).await?;
+        if count == 0 {
+            return Err(Error::Authentication);
+        }
+        bytes = &bytes[count..];
+    }
+    poll_fn(|cx| {
+        auth.poll(|| Pin::new(&mut *stream).poll_flush(cx))
+    }).await
+}
+
 pub(super) async fn step<S: AsyncRead + AsyncWrite + Send + Sync + Unpin>(
     transport: &mut TokioFramed<S>,
     sequence: &mut dyn Sequence,
@@ -333,7 +351,7 @@ pub(super) async fn step<S: AsyncRead + AsyncWrite + Send + Sync + Unpin>(
 ) -> Result<(), Error> {
     let mut output = WriteBuf::new();
     let written = if let Some(hint) = sequence.next_pdu_hint() {
-        let pdu = read_bounded(transport, hint, failure).await?;
+        let pdu = read_bounded(transport, hint, failure, None).await?;
         sequence.step(&pdu, &mut output)
     } else {
         sequence.step_no_input(&mut output)
@@ -352,6 +370,7 @@ pub(super) async fn read_bounded<S: AsyncRead + Unpin>(
     transport: &mut TokioFramed<S>,
     hint: &dyn PduHint,
     failure: Error,
+    auth: Option<&AuthIo<'_>>,
 ) -> Result<Bytes, Error> {
     const LIMIT: usize = 65_535;
     let (stream, buffer) = transport.get_inner_mut();
@@ -369,13 +388,16 @@ pub(super) async fn read_bounded<S: AsyncRead + Unpin>(
             return Err(failure);
         }
         buffer.reserve(remaining.min(4096));
-        if (&mut *stream)
-            .take(remaining as u64)
-            .read_buf(buffer)
-            .await
-            .map_err(|_| failure)?
-            == 0
-        {
+        let mut stream = (&mut *stream).take(remaining as u64);
+        let read = stream.read_buf(buffer);
+        let count = if let Some(auth) = auth {
+            // TLS 읽기 오류도 소켓에 alert를 쓸 수 있다.
+            let mut read = std::pin::pin!(read);
+            poll_fn(|cx| auth.poll(|| read.as_mut().poll(cx))).await?
+        } else {
+            read.await.map_err(|_| failure)?
+        };
+        if count == 0 {
             return Err(failure);
         }
     }

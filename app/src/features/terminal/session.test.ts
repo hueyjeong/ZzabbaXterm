@@ -1,5 +1,8 @@
+import { invoke } from "@tauri-apps/api/core";
 import { describe, expect, it, vi } from "vitest";
 import { connectLocalTerminal, type LocalTerminalIpc, type TerminalStatus } from "./session";
+
+vi.mock("@tauri-apps/api/core", () => ({ Channel: class {}, invoke: vi.fn() }));
 
 const dimensions = { rows: 24, cols: 80 };
 
@@ -30,6 +33,20 @@ function nativePeer() {
 }
 
 describe("L01 터미널 세션", () => {
+  it("기본 열기 요청의 형태를 유지하고 nano 옵트인에만 remoteEditor를 보낸다", async () => {
+    const ipcInvoke = vi.mocked(invoke).mockRejectedValue(new Error("시험 종료"));
+    const write = vi.fn();
+    const status = vi.fn();
+    connectLocalTerminal(dimensions, write, status);
+    connectLocalTerminal(dimensions, write, status, undefined, "saved-ssh");
+    connectLocalTerminal(dimensions, write, status, undefined, "saved-ssh", false, true, true);
+    await vi.waitFor(() => expect(ipcInvoke.mock.calls).toEqual([
+      ["terminal_open", { ...dimensions, output: expect.any(Object) }],
+      ["terminal_open", { ...dimensions, output: expect.any(Object), targetId: "saved-ssh" }],
+      ["terminal_open", { ...dimensions, output: expect.any(Object), targetId: "saved-ssh", remoteEditor: true }],
+    ]));
+  });
+
   it("세션별 바이트를 분리하고 파서 완료까지 누적 ACK를 보류한다", async () => {
     const a = nativePeer();
     const b = nativePeer();

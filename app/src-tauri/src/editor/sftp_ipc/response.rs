@@ -133,8 +133,16 @@ impl From<sftp::Cleanup> for Cleanup {
 #[serde(tag = "status", rename_all = "camelCase")]
 pub(super) enum SaveResult {
     Saved,
-    Conflict { remote: RemoteVersion, cleanup: Cleanup },
-    Unknown { error: Error },
+    Conflict {
+        remote: RemoteVersion,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cleanup: Option<Cleanup>,
+    },
+    Unknown {
+        error: Error,
+        #[serde(rename = "recoveryPath", skip_serializing_if = "Option::is_none")]
+        recovery_path: Option<String>,
+    },
     Failed {
         stage: SaveStage,
         error: Error,
@@ -153,8 +161,8 @@ impl From<sftp::SaveOutcome> for SaveResult {
     fn from(outcome: sftp::SaveOutcome) -> Self {
         match outcome {
             sftp::SaveOutcome::Saved => Self::Saved,
-            sftp::SaveOutcome::Conflict { remote, cleanup } => Self::Conflict { remote: remote.into(), cleanup: cleanup.into() },
-            sftp::SaveOutcome::Unconfirmed(error) => Self::Unknown { error: error.into() },
+            sftp::SaveOutcome::Conflict { remote, cleanup } => Self::Conflict { remote: remote.into(), cleanup: Some(cleanup.into()) },
+            sftp::SaveOutcome::Unconfirmed(error) => Self::Unknown { error: error.into(), recovery_path: None },
             sftp::SaveOutcome::Failed { stage, error, cleanup } => Self::Failed {
                 stage: stage.into(), error: error.into(), cleanup: cleanup.map(Into::into),
             },

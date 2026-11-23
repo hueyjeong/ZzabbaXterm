@@ -74,6 +74,7 @@ pub enum Error {
     Closed,
     Credentials,
     InvalidServerName,
+    InvalidForwardDestination,
     Tcp,
     Negotiation,
     TrustStore,
@@ -81,6 +82,7 @@ pub enum Error {
     Authentication,
     Activation,
     Protocol,
+    StaleDisplay,
     Transport,
     Timeout,
 }
@@ -135,15 +137,16 @@ pub enum MouseButton {
     Right,
 }
 
-type Command = (Input, oneshot::Sender<Result<(), Error>>);
+type Command = (Option<u64>, Input, oneshot::Sender<Result<(), Error>>);
 
 /// The owning tab must close this session before dropping its tunnel or reconnecting.
 /// Send input only from the focused tab. A fresh session owns a fresh command queue.
 pub struct Session {
     id: SessionId,
     input: mpsc::Sender<Command>,
-    events: mpsc::Receiver<Event>,
+    events: mpsc::Receiver<(u64, Event)>,
     task: JoinHandle<Result<(), Error>>,
+    display_generation: u64,
 }
 
 /// Clone for focused input while the session owner awaits events.
@@ -161,6 +164,7 @@ impl Session {
         target: Target,
         approved_roots: rustls::RootCertStore,
         resolve: F,
+        auth: ipc::AuthIo<'_>,
     ) -> Result<Self, Error>
     where
         F: FnOnce() -> Fut,
@@ -174,7 +178,7 @@ impl Session {
             .map_err(|_| Error::InvalidServerName)?;
         let permit = SLOTS.try_acquire().map_err(|_| Error::Busy)?;
         let roots = connect::trusted_roots(approved_roots)?;
-        Self::open_with_tls(target, name, connect::tls_config(roots), resolve, permit).await
+        Self::open_with_tls(target, name, connect::tls_config(roots), resolve, permit, auth).await
     }
 
     async fn open_with_tls<F, Fut>(
@@ -183,6 +187,7 @@ impl Session {
         tls: Arc<rustls::ClientConfig>,
         resolve: F,
         permit: tokio::sync::SemaphorePermit<'static>,
+        auth: ipc::AuthIo<'_>,
     ) -> Result<Self, Error>
     where
         F: FnOnce() -> Fut,
@@ -196,7 +201,7 @@ impl Session {
                 Ok(Vec::new())
             }
         });
-        let (result, mut transport) = connect::connect(target, name, tls, resolve, display).await?;
+        let (result, mut transport) = connect::connect(target, name, tls, resolve, display, auth).await?;
         let id = SessionId(
             NEXT_ID
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
@@ -229,18 +234,19 @@ impl Session {
             timeout(MAX_LIFETIME, async {
                 let mut channels = Channels::default();
                 let mut pending = VecDeque::new();
+                let mut display_generation = 1_u64;
                 loop {
                     let clipboard_deadline = clipboard::deadline(&mut active);
                     tokio::select! {
                         permit = event_tx.reserve(), if !pending.is_empty() => {
                             let event = pending.pop_front().expect("pending event");
                             if matches!(event, Event::Frame(_)) { graphics.ready = true; }
-                            permit.map_err(|_| Error::Closed)?.send(event);
+                            permit.map_err(|_| Error::Closed)?.send((display_generation, event));
                         }
                         () = wait_deadline(clipboard_deadline) => {
                             if let Some(event) = clipboard::expire(&mut active) { pending.push_back(event); }
                         }
-                        next = connect::read_bounded(&mut transport, &ironrdp::pdu::RDP_HINT, Error::Transport), if pending.is_empty() => {
+                        next = connect::read_bounded(&mut transport, &ironrdp::pdu::RDP_HINT, Error::Transport, None), if pending.is_empty() => {
                             let pdu = next?;
                             let action = ironrdp::pdu::find_size(&pdu).map_err(|_| Error::Protocol)?.ok_or(Error::Protocol)?.action;
                             let pixels = inbound.check(action, &pdu, &graphics.image)?;
@@ -256,6 +262,7 @@ impl Session {
                                     ActiveStageOutput::DeactivateAll => {
                                         graphics = timeout(IO_TIMEOUT, reactivate(&mut transport, &mut active, &result.activation_factory))
                                             .await.map_err(|_| Error::Timeout)??;
+                                        display_generation += 1;
                                         inbound.reset_graphics();
                                         dirty = None;
                                     }
@@ -276,8 +283,12 @@ impl Session {
                             if let Some(event) = event { pending.push_back(event); }
                         }
                         command = rx.recv() => {
-                            let Some((command, ack)) = command else { return Ok(()) };
+                            let Some((generation, command, ack)) = command else { return Ok(()) };
                             if ack.is_closed() { continue; }
+                            if generation.is_some_and(|generation| generation != display_generation) {
+                                let _ = ack.send(Err(Error::StaleDisplay));
+                                continue;
+                            }
                             if matches!(command, Input::ReadClipboardText) && !pending.is_empty() {
                                 let _ = ack.send(Err(Error::Busy));
                                 continue;
@@ -299,6 +310,7 @@ impl Session {
             input: tx,
             events,
             task,
+            display_generation: 0,
         })
     }
 
@@ -319,7 +331,9 @@ impl Session {
 
     /// Drain events to resume server reads; a full queue never blocks local input or timers.
     pub async fn next(&mut self) -> Option<Event> {
-        self.events.recv().await
+        let (generation, event) = self.events.recv().await?;
+        self.display_generation = generation;
+        Some(event)
     }
 
     /// Cancels the task and waits for the socket and queued input to be dropped.
@@ -338,6 +352,10 @@ impl Session {
 impl InputHandle {
     /// Takes one bounded command; rejects mismatched IDs and full input queues.
     pub async fn input(&self, id: SessionId, input: Input) -> Result<(), Error> {
+        self.send(id, None, input).await
+    }
+
+    async fn send(&self, id: SessionId, generation: Option<u64>, input: Input) -> Result<(), Error> {
         if id != self.id {
             return Err(Error::Closed);
         }
@@ -348,7 +366,7 @@ impl InputHandle {
         }
         let (tx, rx) = oneshot::channel();
         self.input
-            .try_send((input, tx))
+            .try_send((generation, input, tx))
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => Error::Busy,
                 mpsc::error::TrySendError::Closed(_) => Error::Closed,

@@ -74,14 +74,29 @@ pub(crate) fn dispatch(invoke: Invoke) -> Result<(), Invoke> {
             resolver.reject(EditorError::InvalidSelection);
             return Ok(());
         }
+        let window = webview.window();
+        let picker_scope = if window.label() == crate::workspace_window::MAIN {
+            let scope = crate::workspace_window::window_key(&window).ok_or(EditorError::Unavailable)
+                .and_then(|key| editors.begin_main_picker(key, document));
+            match scope {
+                Ok(scope) => Some(scope),
+                Err(error) => {
+                    resolver.reject(error);
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        };
         let picker = rfd::AsyncFileDialog::new()
-            .set_parent(&webview.window())
+            .set_parent(&window)
             .set_title("파일 열기")
             .pick_file();
         let webview = webview.clone();
         resolver.respond_async(async move {
             let selected = picker.await;
             tauri::async_runtime::spawn_blocking(move || {
+                let _picker_scope = picker_scope;
                 webview.state::<LocalEditors>().selected(
                     webview.label(),
                     document,

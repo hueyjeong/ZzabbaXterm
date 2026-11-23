@@ -3,6 +3,7 @@
   --accent: #9cd9bf;
   --title-height: 38px;
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: var(--title-height) minmax(0, 1fr) 24px;
   height: 100vh;
   overflow: hidden;

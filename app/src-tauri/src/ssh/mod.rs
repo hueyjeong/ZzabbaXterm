@@ -1,4 +1,5 @@
 mod public_key_file;
+pub(crate) mod nano;
 pub(crate) mod registration;
 pub(crate) mod terminal;
 mod trust;
@@ -76,6 +77,7 @@ pub(crate) struct ConnectionPlan {
     config: PathBuf,
     #[cfg(any(windows, target_os = "linux"))]
     stored: Option<Stored>,
+    public_key: bool,
     _files: SessionFiles,
     _root: trust::RootGuard,
 }
@@ -247,6 +249,7 @@ impl ConnectionPlan {
             ssh, config,
             #[cfg(any(windows, target_os = "linux"))]
             stored,
+            public_key: public_key == "yes",
             _files: files, _root: root,
         })
     }
@@ -259,6 +262,19 @@ impl ConnectionPlan {
     pub(crate) fn stored_ssh_invocation(&self) -> Result<Invocation<'_>, Error> {
         self.stored().ok_or(Error::StoredAuthenticationUnavailable)?;
         Ok(self.client_invocation(Client::Ssh))
+    }
+
+    // 원격 nano는 배치 로그인이 가능한 Agent·키 대상에서만 연다.
+    fn editor_invocation(&self, tty: bool) -> Option<Invocation<'_>> {
+        if !self.public_key { return None; }
+        // 저장 암호 대상은 배치 로그인이 불가능하므로 편집기 경로를 열지 않는다.
+        let mut invocation = self.invocation(Client::Ssh).ok()?;
+        invocation.args.splice(..0, [
+            if tty { "-tt" } else { "-T" },
+            "-oBatchMode=yes", "-oPreferredAuthentications=publickey",
+            "-oPasswordAuthentication=no", "-oKbdInteractiveAuthentication=no",
+        ].map(OsStr::new));
+        Some(invocation)
     }
 
     /// argv는 셸 문자열로 조합하지 않고, 자식 환경에 지정한 항목을 모두 적용한다.

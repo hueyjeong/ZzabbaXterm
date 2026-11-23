@@ -6,10 +6,11 @@ use tokio_util::sync::CancellationToken;
 use crate::rdp::{Channels, Error, Input, InputHandle, MouseButton, Pointer, SessionId};
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct Command {
     sequence: u64,
     epoch: u64,
+    display_generation: u64,
     action: Action,
 }
 
@@ -31,6 +32,7 @@ pub(super) struct Controls {
     sequence: u64,
     epoch: u64,
     active: bool,
+    display_generation: u64,
     display: Option<(SessionId, InputHandle, (u16, u16))>,
     channels: Channels,
     keys: BTreeSet<(u8, bool)>,
@@ -41,7 +43,9 @@ pub(super) struct Controls {
 const BUTTONS: [MouseButton; 3] = [MouseButton::Left, MouseButton::Right, MouseButton::Middle];
 
 impl Controls {
-    pub(super) fn display(&mut self, id: SessionId, handle: InputHandle, size: (u16, u16)) {
+    pub(super) fn display(&mut self, id: SessionId, handle: InputHandle, size: (u16, u16), generation: u64) {
+        self.display_generation = generation;
+        self.active = false;
         self.pointer.0 = self.pointer.0.min(size.0 - 1);
         self.pointer.1 = self.pointer.1.min(size.1 - 1);
         self.display = Some((id, handle, size));
@@ -53,6 +57,8 @@ impl Controls {
     pub(super) async fn send(&mut self, life: &CancellationToken, command: Command) -> Result<(), Error> {
         if life.is_cancelled() || command.sequence != self.sequence + 1 || command.sequence > super::MAX_SAFE { return Err(Error::Closed); }
         self.sequence = command.sequence;
+        if command.display_generation == 0 || command.display_generation > self.display_generation { return Err(Error::Closed); }
+        if command.display_generation < self.display_generation { return Err(Error::StaleDisplay); }
         let result = async {
             if let Action::Active { active } = command.action {
                 if command.epoch <= self.epoch || command.epoch > super::MAX_SAFE { return Err(Error::Closed); }
@@ -73,13 +79,15 @@ impl Controls {
                     if x >= size.0 || y >= size.1 || buttons & !7 != 0 { return Err(Error::Bounds); }
                     let (_, _, previous) = self.pointer;
                     self.write(Input::Pointer { x, y, action: Pointer::Move }).await?;
+                    self.pointer.0 = x;
+                    self.pointer.1 = y;
                     for (index, button) in BUTTONS.into_iter().enumerate() {
                         let bit = 1 << index;
                         if (previous ^ buttons) & bit != 0 {
                             self.write(Input::Pointer { x, y, action: Pointer::Button { button, pressed: buttons & bit != 0 } }).await?;
+                            self.pointer.2 ^= bit;
                         }
                     }
-                    self.pointer = (x, y, buttons);
                 }
                 Action::Release => self.release().await?,
                 Action::Copy => {
@@ -104,7 +112,7 @@ impl Controls {
 
     async fn write(&self, input: Input) -> Result<(), Error> {
         let (id, handle, _) = self.display.as_ref().ok_or(Error::Busy)?;
-        handle.input(*id, input).await
+        handle.send(*id, Some(self.display_generation), input).await
     }
 
     async fn release(&mut self) -> Result<(), Error> {
@@ -121,5 +129,25 @@ impl Controls {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn old_display_is_discarded_but_current_coordinates_are_validated() {
+        let mut controls = Controls::default();
+        let id = SessionId(1);
+        let (input, mut commands) = tokio::sync::mpsc::channel(1);
+        controls.display(id, InputHandle { id, input }, (640, 480), 2);
+        let life = CancellationToken::new();
+        let command = |sequence, display_generation, action| Command { sequence, display_generation, epoch: 1, action };
+        let pointer = || Action::Pointer { x: 640, y: 0, buttons: 1 };
+        assert_eq!(controls.send(&life, command(1, 1, pointer())).await, Err(Error::StaleDisplay));
+        assert_eq!(controls.send(&life, command(2, 2, Action::Active { active: true })).await, Ok(()));
+        assert_eq!(controls.send(&life, command(3, 2, pointer())).await, Err(Error::Bounds));
+        assert!(commands.try_recv().is_err());
     }
 }

@@ -1,10 +1,13 @@
 // @vitest-environment jsdom
 
+import { act, createElement, createRef } from "react";
+import { createRoot } from "react-dom/client";
 import { expect, it, vi } from "vitest";
 import { createRemoteDesktopViewSession, type RemoteDesktopViewSession } from "../remoteDesktop/session";
 import { connect, type Connection } from "./session";
+import { VncView, type VncTabActions } from "./VncView";
 
-const { invoke } = vi.hoisted(() => ({ invoke: vi.fn<(name: string, args: Record<string, unknown>) => Promise<void>>() }));
+const { invoke } = vi.hoisted(() => ({ invoke: vi.fn<(name: string, args: Record<string, unknown>) => Promise<unknown>>() }));
 vi.mock("@tauri-apps/api/core", () => ({
   invoke, Channel: class {
     constructor(readonly onmessage: (message: unknown) => void) { }
@@ -136,4 +139,76 @@ it("Canvas에 그린 뒤에만 마지막 화면 조각을 ACK한다", async () =
     view?.dispose();
     vi.unstubAllGlobals();
   }
+});
+
+it("터널 요청은 원격 목적지만 전달하고 실패 후 직접 TLS를 시도하지 않는다", async () => {
+  invoke.mockReset().mockRejectedValue("터널 종료");
+  const owner = { tab: "viewer", document: 1 };
+  const source = { tabHandle: "a".repeat(32), tunnelId: "7", targetId: "server", destination: { host: "::1", port: 5900 } };
+  const failed = vi.fn();
+  connect(owner, { source, password: true }, vi.fn(), vi.fn(), failed);
+  await Promise.resolve();
+  expect(invoke).toHaveBeenCalledTimes(1);
+  expect(invoke).toHaveBeenCalledWith("vnc_connect", { owner, draft: { source, password: true }, output: expect.anything() });
+  expect(failed).toHaveBeenCalledWith("터널 종료");
+});
+
+it("탭 종료가 미확인이면 같은 소유자로만 재확인한다", async () => {
+  const owner = { tab: "viewer", document: 1 };
+  const close = Promise.withResolvers<boolean>();
+  invoke.mockReset().mockImplementation((name) => {
+    switch (name) {
+      case "vnc_create": return Promise.resolve(owner);
+      case "vnc_connect": return Promise.resolve();
+      case "vnc_close": return close.promise;
+      default: throw new Error(name);
+    }
+  });
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const host = document.createElement("div");
+  const root = createRoot(host);
+  const ref = createRef<VncTabActions>();
+  const source = { tabHandle: "a".repeat(32), tunnelId: "7", targetId: "server", destination: { host: "::1", port: 5900 } };
+  try {
+    await act(async () => root.render(createElement(VncView, { active: true, source, ref })));
+    const form = host.querySelector("form");
+    const actions = ref.current;
+    if (!form || !actions) throw new Error("VNC 탭 없음");
+    await act(async () => form.requestSubmit());
+
+    expect(host.querySelector("[role=alert], dialog")).toBeNull();
+    await act(async () => {
+      const pending = actions.requestClose();
+      expect(actions.requestClose()).toBe(pending);
+      close.resolve(false);
+      await expect(pending).resolves.toBe(false);
+    });
+    expect(host.querySelector('[role="alert"]')?.textContent).toBe("종료 확인 불가");
+    expect(form.querySelector("button")?.disabled).toBe(true);
+    await act(async () => form.requestSubmit());
+    expect(invoke.mock.calls.map(([name]) => name)).toEqual(["vnc_create", "vnc_connect", "vnc_close"]);
+
+    invoke.mockResolvedValueOnce(true);
+    await act(async () => { await expect(actions.requestClose()).resolves.toBe(true); });
+    expect(host.querySelector('[role="alert"]')).toBeNull();
+    expect(invoke.mock.calls.filter(([name]) => name === "vnc_close")).toEqual([
+      ["vnc_close", { owner, generation: null }],
+      ["vnc_close", { owner, generation: null, retry: true }],
+    ]);
+  } finally {
+    await act(async () => root.unmount());
+    vi.unstubAllGlobals();
+  }
+});
+
+it("연결 준비 중 발견한 정리 미확인을 연결 오류와 함께 전달한다", async () => {
+  invoke.mockReset().mockRejectedValue("종료 확인 불가");
+  const failed = vi.fn();
+  const unconfirmed = vi.fn();
+  connect({ tab: "viewer", document: 1 }, { host: "localhost", port: 5900, password: false },
+    vi.fn(), vi.fn(), failed, undefined, { closeOpening: vi.fn(), unconfirmed });
+  await Promise.resolve();
+  expect(failed).toHaveBeenCalledWith("종료 확인 불가");
+  expect(unconfirmed).toHaveBeenCalledOnce();
+  expect(invoke.mock.calls.map(([name]) => name)).toEqual(["vnc_connect"]);
 });

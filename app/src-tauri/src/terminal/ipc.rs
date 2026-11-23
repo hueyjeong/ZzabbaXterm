@@ -1,4 +1,4 @@
-use super::{Launch, Sessions, saved, shell, size, stage};
+use super::{Launch, Sessions, saved, shell, size, stage, validate_size};
 use tauri::{Manager, WebviewWindow, ipc::{Channel, CommandArg, CommandItem, Invoke, InvokeResponseBody}};
 
 async fn blocking<T: Send + 'static>(job: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
@@ -20,9 +20,10 @@ pub(crate) fn terminal_open(invoke: Invoke) {
             u16::from_command(argument("cols"))?,
             Channel::<InvokeResponseBody>::from_command(argument("output"))?,
             Option::<String>::from_command(argument("targetId"))?,
+            Option::<bool>::from_command(argument("remoteEditor"))?,
         ))
     };
-    let (webview, rows, cols, output, target_id) = match parse() {
+    let (webview, rows, cols, output, target_id, remote_editor) = match parse() {
         Ok(args) => args,
         Err(error) => { resolver.invoke_error(error); return; }
     };
@@ -30,18 +31,38 @@ pub(crate) fn terminal_open(invoke: Invoke) {
         resolver.reject("앱의 로컬 기본 창에서만 저장된 연결을 열 수 있습니다");
         return;
     }
+    let remote_editor = remote_editor == Some(true);
+    if remote_editor && target_id.is_none() {
+        resolver.reject("nano 연동에는 저장된 SSH 연결이 필요합니다");
+        return;
+    }
+    let window = remote_editor.then(|| caller.window());
     resolver.respond_async(async move {
         blocking(move || {
-            let command = match target_id {
-                Some(id) => {
-                    let directory = webview.path().app_config_dir().map_err(|error| stage("앱 설정 디렉터리", error))?;
-                    saved::launch(&directory, &id)?
-                }
-                None => Launch::Local(shell()),
+            let sessions = webview.state::<Sessions>();
+            let owner = webview.label();
+            let size = size(rows, cols);
+            let send = move |event: super::Event| event.send(&output).map_err(|error| error.to_string());
+            let Some(id) = target_id else {
+                return sessions.open_document(owner, document, size, Launch::Local(shell()), send);
             };
-            webview.state::<Sessions>().open_document(webview.label(), document, size(rows, cols), command, move |event| {
-                event.send(&output).map_err(|error| error.to_string())
-            })
+            let directory = webview.path().app_config_dir().map_err(|error| stage("앱 설정 디렉터리", error))?;
+            let Some(window) = window else {
+                return sessions.open_document(owner, document, size, saved::launch(&directory, &id)?, send);
+            };
+            validate_size(size)?;
+            let (registration, command, parent) = saved::approve_remote_editor(&directory, &id, |message| {
+                sessions.with_probe_access(owner, document, true, |_| Ok(()))?;
+                crate::ssh::registration::confirm_remote_editor(&window, message)
+            }, |mut launch| {
+                let parent = launch.enable_editor(webview.app_handle().clone(), owner.into(), document);
+                let command = Launch::Ssh(launch);
+                let registration = sessions.register_document(owner, document, &command, true)?;
+                Ok((registration, command, parent))
+            })?;
+            let id = sessions.launch_document(registration, size, command, send)?;
+            let _ = parent.send(id.clone());
+            Ok(id)
         }).await.map_err(Into::into)
     });
 }

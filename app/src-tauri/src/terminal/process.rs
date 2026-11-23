@@ -1,7 +1,7 @@
 use super::remote;
 use crate::ssm::CancellationToken;
-use crate::ssh::{ConnectionPlan, terminal::DirectLaunch};
-use super::{CHUNK, CLOSED, CloseResult, Event, LiveSsmIdentity, LocalClose, WINDOW, stage};
+use crate::ssh::{ConnectionPlan, nano::Startup, terminal::DirectLaunch};
+use super::{CHUNK, CLOSED, CloseResult, ControlBinding, Event, LocalClose, WINDOW, stage};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::{
     io::{self, Read, Write},
@@ -34,6 +34,9 @@ struct Flow {
     stop: Option<Stop>,
     ssm_identity: Option<remote::SsmIdentity>,
     sftp: Option<SftpOwner>,
+    editor_cancel: Option<CancellationToken>,
+    editor_start: Option<tokio::sync::oneshot::Sender<()>>,
+    editor_startup: Option<Startup>,
     sent: u64,
     acked: u64,
     ack_deadline: Option<std::time::Instant>,
@@ -76,7 +79,7 @@ impl Flow {
 pub(crate) enum Launch {
     Local(CommandBuilder),
     Ssm(remote::Target),
-    AiControl(remote::Target, LiveSsmIdentity),
+    AiControl(remote::Target, Arc<ControlBinding>),
     Ssh(DirectLaunch),
 }
 
@@ -91,6 +94,7 @@ pub(crate) struct Session {
     pub(super) document: Option<u64>,
     control: bool,
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
+    pub(super) control_submit: Mutex<()>,
     cancel: Option<CancellationToken>,
     close_result: Mutex<CloseResult>,
     unconfirmed: Mutex<Option<remote::Remote>>,
@@ -110,8 +114,8 @@ impl Session {
         Self::with_cancel(owner, ssm.then(CancellationToken::new), false)
     }
 
-    pub(crate) fn dedicated(cancel: CancellationToken) -> Self {
-        Self::with_cancel("", Some(cancel), true)
+    pub(crate) fn dedicated(binding: &ControlBinding) -> Self {
+        Self::with_cancel("", Some(binding.cancel_token().clone()), true)
     }
 
     fn with_cancel(owner: &str, cancel: Option<CancellationToken>, control: bool) -> Self {
@@ -120,6 +124,7 @@ impl Session {
             document: None,
             control,
             cancel,
+            control_submit: Mutex::new(()),
             close_result: Mutex::new(CloseResult::default()),
             unconfirmed: Mutex::new(None),
             ssh_pending: Mutex::new(None),
@@ -134,11 +139,12 @@ impl Session {
         self.cancel.is_some()
     }
 
-    pub(super) fn with_ssm_identity<T>(&self, check: impl FnOnce(&remote::SsmIdentity) -> T) -> Option<T> {
+    pub(super) fn with_ssm_identity<T>(&self, check: impl FnOnce(&remote::SsmIdentity, &CancellationToken) -> T) -> Option<T> {
         let flow = self.flow.lock().unwrap();
         flow.live().ok()?;
-        if flow.finished || self.cancel.as_ref()?.is_cancelled() { return None; }
-        Some(check(flow.ssm_identity.as_ref()?))
+        let cancel = self.cancel.as_ref()?;
+        if flow.finished || cancel.is_cancelled() { return None; }
+        Some(check(flow.ssm_identity.as_ref()?, cancel))
     }
 
     pub(super) fn sftp_context(&self) -> Option<(Arc<ConnectionPlan>, CancellationToken, TaskTrackerToken)> {
@@ -149,7 +155,7 @@ impl Session {
         Some((Arc::clone(&sftp.plan), sftp.cancel.child_token(), worker))
     }
 
-    pub(crate) fn launch(
+    pub(super) fn launch(
         self: &Arc<Self>,
         size: PtySize,
         command: Launch,
@@ -168,18 +174,19 @@ impl Session {
         retired: impl FnOnce(&Arc<Session>) + Send + 'static,
     ) -> Result<mpsc::Receiver<Result<(), String>>, String> {
         if self.control != matches!(command, Launch::AiControl(..)) || self.control && self.document.is_some() {
-            self.finish();
+            if !self.control { self.finish(); }
             return Err(stage("open", "제어 세션에는 전용 PTY가 필요합니다"));
         }
         let this = Arc::clone(self);
         let (ready, opened) = mpsc::sync_channel(1);
         let ssm = command.is_ssm();
+        if self.control && self.flow.lock().unwrap().stop.is_some() { return Err(CLOSED.into()); }
         if let Err(error) = thread::Builder::new().name("terminal-pty".into()).spawn(move || {
             let mut retired = Some(retired);
             let mut complete = || {
                 if let Some(retired) = retired.take() {
                     retired(&this);
-                    this.finish();
+                    if !this.control { this.finish(); }
                 }
             };
             let result = this.run(size, command, send, &ready, &mut complete);
@@ -196,7 +203,7 @@ impl Session {
                 thread::sleep(Duration::from_millis(250));
             }
         }) {
-            self.finish();
+            if !self.control { self.finish(); }
             return Err(stage("PTY worker", error));
         }
         Ok(opened)
@@ -212,9 +219,10 @@ impl Session {
     ) -> Result<(), String> {
         let ssm = command.is_ssm();
         if ssm {
-            self.flow.lock().unwrap().start_deadline = Some(std::time::Instant::now() + START_TIMEOUT);
-            let _ = ready.send(Ok(()));
             let mut flow = self.flow.lock().unwrap();
+            if self.control && flow.stop.is_some() { return Err(CLOSED.into()); }
+            flow.start_deadline = Some(std::time::Instant::now() + START_TIMEOUT);
+            let _ = ready.send(Ok(()));
             while let Some(deadline) = flow.start_deadline {
                 flow.expire_start();
                 if flow.stop.is_some() { return Err(CLOSED.into()); }
@@ -222,9 +230,19 @@ impl Session {
             }
             if flow.stop.is_some() { return Err(CLOSED.into()); }
         }
+        let control = match &command {
+            Launch::AiControl(_, binding) => Some(binding.as_ref()),
+            _ => None,
+        };
+        let _cancel_control = control.map(|binding| {
+            let guard = binding.cancel_token().clone().drop_guard();
+            binding.admit(|| Ok(()))?;
+            binding.forward_request_cancel();
+            Ok::<_, String>(guard)
+        }).transpose()?;
         let mut remote = match &command {
             Launch::Ssm(target) => Some(tauri::async_runtime::block_on(target.prepare(None, self.cancel.as_ref().unwrap()))?),
-            Launch::AiControl(target, identity) => Some(tauri::async_runtime::block_on(target.prepare(Some(identity), self.cancel.as_ref().unwrap()))?),
+            Launch::AiControl(target, binding) => Some(tauri::async_runtime::block_on(target.prepare_control(binding))?),
             Launch::Local(_) | Launch::Ssh(_) => None,
         };
         if self.flow.lock().unwrap().stop.is_some() {
@@ -311,10 +329,26 @@ impl Session {
                     return Err(self.after_failed_spawn(stage("reader worker", error), remote.take()));
                 }
             };
+            let mut editor = None;
             let command = match command {
                 Launch::Ssm(_) | Launch::AiControl(..) => None,
                 Launch::Local(command) => Some(command),
-                Launch::Ssh(launch) => {
+                Launch::Ssh(mut launch) => {
+                    if launch.editor_requested() {
+                        let cancel = CancellationToken::new();
+                        {
+                            let mut flow = self.flow.lock().unwrap();
+                            if flow.stop.is_some() { cancel.cancel(); }
+                            flow.editor_cancel = Some(cancel.clone());
+                        }
+                        if let Some((mut running, started)) = launch.prepare_editor(cancel) {
+                            let startup = running.take_startup();
+                            let mut flow = self.flow.lock().unwrap();
+                            flow.editor_start = Some(started);
+                            flow.editor_startup = startup;
+                            editor = Some(running);
+                        }
+                    }
                     let (command, plan) = launch.into_parts();
                     ssh_plan = Some(plan);
                     Some(command)
@@ -382,11 +416,14 @@ impl Session {
                 }
                 let event = self.reap(child.as_mut(), ssh_plan.is_some());
                 if let Some(cancel) = &self.cancel { cancel.cancel(); }
+                // 레지스트리에서 세션을 빼기 전에 승인된 로컬 생성 호출을 회수한다.
+                if self.document.is_some() && ssm { self.wait_control_submit(); }
                 event
             });
             let sftp = self.flow.lock().unwrap().sftp.take();
-            if let Some(SftpOwner { cancel, workers, .. }) = sftp {
-                cancel.cancel();
+            if let Some(owner) = &sftp { owner.cancel.cancel(); }
+            drop(editor);
+            if let Some(SftpOwner { workers, .. }) = sftp {
                 if let Some(workers) = workers {
                     workers.close();
                     if !workers.is_empty() {
@@ -430,7 +467,7 @@ impl Session {
         })
     }
 
-    fn cleanup(&self, remote: Option<remote::Remote>) {
+    pub(super) fn cleanup(&self, remote: Option<remote::Remote>) {
         if let Some(mut remote) = remote {
             let (status, target) = remote.close();
             let mut result = self.close_result.lock().unwrap();
@@ -612,13 +649,20 @@ impl Session {
         }
     }
 
+    #[cfg(all(test, any(windows, unix)))]
+    pub(super) fn terminate_fixture(&self, child: &mut dyn Child, master: &dyn MasterPty) {
+        self.terminate(child, Some(master));
+    }
+
     fn drain(&self, mut reader: Box<dyn Read + Send>, send: &impl Fn(Event) -> Result<(), String>, mut diagnostic: Option<&mut remote::StartDiagnostic>) -> Result<(), String> {
         let mut buffer = [0; CHUNK];
+        let mut startup: Option<Startup> = None;
         loop {
             let mut flow = self.flow.lock().unwrap();
             while flow.stop.is_none() && (!flow.started || flow.sent - flow.acked == WINDOW as u64) {
                 flow = self.wait_for_ack(flow);
             }
+            if let Some(editor) = flow.editor_startup.take() { startup = Some(editor); }
             let limit = if flow.stop.is_some() {
                 #[cfg(unix)]
                 return Ok(());
@@ -659,24 +703,46 @@ impl Session {
                     return Err(stage("read", error));
                 }
             };
-            if let Some(output) = &mut diagnostic { output.record(&buffer[..count]); }
-            let mut flow = self.flow.lock().unwrap();
-            if flow.stop.is_some() { continue; }
-            if flow.sent == flow.acked {
-                flow.ack_deadline = Some(std::time::Instant::now() + ACK_TIMEOUT);
-            }
-            flow.sent += count as u64;
-            drop(flow);
-            if let Err(error) = send(Event::Bytes(buffer[..count].to_vec())) {
-                self.stop(Stop::Disconnected(stage("channel", error)));
+            let bytes = &buffer[..count];
+            if let Some(output) = &mut diagnostic { output.record(bytes); }
+            if let Some(filter) = &mut startup {
+                filter.filter(bytes, |part| self.send_output(part, send));
+                // 시작 서명이 다시 보이면 다른 세션이 로그인을 가로챈 것으로 보고 세션을 끝낸다.
+                if filter.hijacked() { return Err("원격 편집 시작 서명이 다시 관측되었습니다".into()); }
+            } else {
+                self.send_output(bytes, send);
             }
         }
         drop(reader);
+        if let Some(mut filter) = startup {
+            filter.finish(|bytes| self.send_output(bytes, send));
+        }
         let mut flow = self.flow.lock().unwrap();
         while flow.stop.is_none() && flow.sent != flow.acked {
             flow = self.wait_for_ack(flow);
         }
         Ok(())
+    }
+
+    fn send_output(&self, mut bytes: &[u8], send: &impl Fn(Event) -> Result<(), String>) {
+        while !bytes.is_empty() {
+            let mut flow = self.flow.lock().unwrap();
+            while flow.stop.is_none() && flow.sent - flow.acked == WINDOW as u64 {
+                flow = self.wait_for_ack(flow);
+            }
+            if flow.stop.is_some() { return; }
+            if flow.sent == flow.acked {
+                flow.ack_deadline = Some(Instant::now() + ACK_TIMEOUT);
+            }
+            let count = bytes.len().min(WINDOW - (flow.sent - flow.acked) as usize);
+            flow.sent += count as u64;
+            drop(flow);
+            if let Err(error) = send(Event::Bytes(bytes[..count].to_vec())) {
+                self.stop(Stop::Disconnected(stage("channel", error)));
+                return;
+            }
+            bytes = &bytes[count..];
+        }
     }
 
     fn wait_for_ack<'a>(&'a self, flow: std::sync::MutexGuard<'a, Flow>) -> std::sync::MutexGuard<'a, Flow> {
@@ -700,6 +766,7 @@ impl Session {
         }
         flow.started = true;
         flow.start_deadline = None;
+        if let Some(editor) = flow.editor_start.take() { let _ = editor.send(()); }
         self.wake.notify_all();
         if self.cancel.is_some() {
             let pending = |flow: &mut Flow| !flow.attached && !flow.finished && flow.stop.is_none();
@@ -741,17 +808,19 @@ impl Session {
             && self.cancel.as_ref().is_some_and(|cancel| !cancel.is_cancelled())
     }
 
-    pub(crate) fn control_input(&self, bytes: &[u8], deadline: Instant) -> Result<(), String> {
+    pub(crate) fn control_input(&self, binding: &ControlBinding, bytes: &[u8], deadline: Instant, frame: bool) -> Result<(), String> {
         if !self.control { return Err(CLOSED.into()); }
         let cancel = self.cancel.as_ref().unwrap();
-        {
+        binding.admit(|| {
             let mut flow = self.flow.lock().unwrap();
+            if frame && !flow.connected { return Err("공식 SSM 연결을 확인할 수 없습니다".into()); }
             flow.live()?;
             if cancel.is_cancelled() || flow.write_deadline.is_some() { return Err(CLOSED.into()); }
             flow.write_deadline = Some(deadline);
             self.wake.notify_all();
-        }
-        let result = self.input(bytes);
+            Ok(())
+        })?;
+        let result = self.write_input(bytes, Some(binding));
         let mut flow = self.flow.lock().unwrap();
         flow.expire_write();
         flow.write_deadline = None;
@@ -763,14 +832,20 @@ impl Session {
         }
     }
 
-    pub(super) fn input(&self, mut bytes: &[u8]) -> Result<(), String> {
+    pub(super) fn input(&self, bytes: &[u8]) -> Result<(), String> {
+        if self.control { return Err(CLOSED.into()); }
+        self.write_input(bytes, None)
+    }
+
+    fn write_input(&self, mut bytes: &[u8], control: Option<&ControlBinding>) -> Result<(), String> {
         self.flow.lock().unwrap().live()?;
         let mut writer = self.writer.lock().unwrap();
         let writer = writer.as_mut().ok_or(CLOSED)?;
         while !bytes.is_empty() {
             {
                 let mut flow = self.flow.lock().unwrap();
-                if self.control {
+                if let Some(binding) = control {
+                    binding.check_request()?;
                     flow.expire_write();
                     if self.cancel.as_ref().unwrap().is_cancelled() { return Err(CLOSED.into()); }
                 }
@@ -797,16 +872,23 @@ impl Session {
     }
 
     pub(crate) fn stop(&self, reason: Stop) {
-        if let Some(cancel) = &self.cancel { cancel.cancel(); }
+        // 중앙 세션 확인과 수동 종료는 같은 흐름 잠금에서 순서를 정한다.
         let mut flow = self.flow.lock().unwrap();
+        if let Some(cancel) = &self.cancel { cancel.cancel(); }
         if let Some(sftp) = &flow.sftp { sftp.cancel.cancel(); }
+        if let Some(cancel) = &flow.editor_cancel { cancel.cancel(); }
         if flow.stop.is_none() || matches!(reason, Stop::Closed) {
             flow.stop = Some(reason);
         }
         self.wake.notify_all();
     }
 
-    fn finish(&self) {
+    pub(super) fn wait_control_submit(&self) {
+        debug_assert!(self.is_ssm());
+        drop(self.control_submit.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+    }
+
+    pub(super) fn finish(&self) {
         self.flow.lock().unwrap().finished = true;
         self.wake.notify_all();
     }
@@ -863,9 +945,30 @@ pub(crate) struct LiveSsmFixture<'a> {
 }
 
 #[cfg(test)]
+impl LiveSsmFixture<'_> {
+    pub(crate) fn without_role(mut self) -> Self {
+        self.identity.role = None;
+        let registry = self.sessions.registry.lock().unwrap();
+        registry.sessions[&self.id].flow.lock().unwrap().ssm_identity.as_mut().unwrap().role = None;
+        drop(registry);
+        self
+    }
+
+    pub(crate) fn stop(&self) {
+        let session = self.sessions.registry.lock().unwrap().sessions[&self.id].clone();
+        session.stop(Stop::Closed);
+        session.wait_control_submit();
+    }
+}
+
+#[cfg(test)]
 impl Drop for LiveSsmFixture<'_> {
     fn drop(&mut self) {
-        self.sessions.registry.lock().unwrap().sessions.remove(&self.id);
+        let session = self.sessions.registry.lock().unwrap().sessions.remove(&self.id);
+        if let Some(session) = session {
+            session.stop(Stop::Closed);
+            session.wait_control_submit();
+        }
     }
 }
 
@@ -874,10 +977,12 @@ impl super::Sessions {
     pub(crate) fn insert_live_ssm_fixture(&self, owner: &str, document: u64, account_id: &str, region: &str, instance_id: &str) -> super::LiveSsmFixture<'_> {
         let mut session = Session::new(owner, true);
         session.document = Some(document);
+        let role = Some(crate::ssm::AssumedRole::fixture(account_id));
         *session.flow.get_mut().unwrap() = Flow {
             started: true,
             ssm_identity: Some(remote::SsmIdentity {
                 account_id: account_id.into(), profile: "fixture".into(), region: region.into(), instance_id: instance_id.into(),
+                role: role.clone(),
             }),
             ..Flow::default()
         };
@@ -885,8 +990,20 @@ impl super::Sessions {
         self.registry.lock().unwrap().sessions.insert(id.clone(), Arc::new(session));
         let identity = super::LiveSsmIdentity {
             id: id.clone(), document, account_id: account_id.into(), profile: "fixture".into(), region: region.into(), instance_id: instance_id.into(),
+            role,
         };
         LiveSsmFixture { sessions: self, id, identity }
+    }
+}
+
+#[cfg(test)]
+impl Session {
+    pub(crate) fn attach_control_writer_fixture(&self, writer: impl Write + Send + 'static) {
+        assert!(self.control);
+        *self.writer.lock().unwrap() = Some(Box::new(writer));
+        let mut flow = self.flow.lock().unwrap();
+        flow.started = true;
+        flow.connected = true;
     }
 }
 
@@ -918,6 +1035,9 @@ fn live_ssm_identity_is_checked_under_registry_and_flow_locks() {
     let wrong_profile = sessions.with_live_ssm_session("main", &LiveSsmIdentity {
         profile: "another-profile".into(), ..expected.clone()
     }, || 7);
+    let wrong_role = sessions.with_live_ssm_session("main", &LiveSsmIdentity {
+        role: None, ..expected.clone()
+    }, || 7);
     session.flow.lock().unwrap().child_exited = true;
     let exited = check();
     session.flow.lock().unwrap().child_exited = false;
@@ -939,6 +1059,7 @@ fn live_ssm_identity_is_checked_under_registry_and_flow_locks() {
     assert_eq!(locked, Some((true, true)));
     assert_eq!(wrong_node, None);
     assert_eq!(wrong_profile, None);
+    assert_eq!(wrong_role, None);
     assert_eq!(exited, None);
     assert_eq!(cancelled, None);
     assert_eq!(stopped, None);
@@ -950,15 +1071,18 @@ fn live_ssm_identity_is_checked_under_registry_and_flow_locks() {
 #[cfg(test)]
 #[test]
 fn control_input_is_dedicated_and_checks_deadline_before_writing() {
-    let central = Session::new("main", true);
-    assert_eq!(central.control_input(b"frame", Instant::now()), Err(CLOSED.into()));
+    let sessions = super::Sessions::default();
+    let fixture = sessions.insert_live_ssm_fixture("main", 0, "123456789012", "us-west-2", "i-01234567");
+    let binding = sessions.bind_ssm_control("main", &fixture.identity, &CancellationToken::new()).unwrap();
+    let central = sessions.get("main", &fixture.identity.id).unwrap();
+    assert_eq!(central.control_input(&binding, b"frame", Instant::now(), true), Err(CLOSED.into()));
 
-    let control = Session::dedicated(CancellationToken::new());
+    let control = Session::dedicated(&binding);
     assert_eq!(control.document, None);
     assert!(!control.connected());
     control.flow.lock().unwrap().started = true;
     control.flow.lock().unwrap().connected = true;
     assert!(control.connected());
-    assert_eq!(control.control_input(b"frame", Instant::now()), Err(WRITE_TIMED_OUT.into()));
+    assert_eq!(control.control_input(&binding, b"frame", Instant::now(), true), Err(WRITE_TIMED_OUT.into()));
     assert!(!control.connected());
 }

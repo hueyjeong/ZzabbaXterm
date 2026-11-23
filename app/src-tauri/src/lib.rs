@@ -40,6 +40,7 @@ pub fn run() {
         .manage(Sessions::default())
         .manage(LocalEditors::default())
         .manage(SftpIpc::default())
+        .manage(editor::nano_bridge::NanoBridge::default())
         .manage(StorageIpc::default())
         .manage(ai::ipc::State::default())
         .manage(ai::session_selection::State::default())
@@ -56,8 +57,17 @@ pub fn run() {
             ai::cli::start(app.handle().clone());
             Ok(())
         })
+        .on_window_event(|window, event| {
+            if window.label() == workspace_window::MAIN
+                && let tauri::WindowEvent::CloseRequested { api, .. } = event
+            {
+                api.prevent_close();
+                workspace_window::request_close(window, None);
+            }
+        })
         .on_page_load(|webview, payload| {
             if payload.event() == tauri::webview::PageLoadEvent::Started {
+                webview.state::<LocalEditors>().navigate(webview.label());
                 let main = webview.label() == "main" && webview.window_ref().label() == "main";
                 if main {
                     webview.state::<rdp::ipc::Sessions>().retire();
@@ -71,7 +81,6 @@ pub fn run() {
                 webview.state::<ai::session_selection::State>()
                     .document_changed(webview.label(), sessions.document(webview.label()));
                 webview.state::<SftpIpc>().navigate(webview.label(), sessions.document(webview.label()));
-                webview.state::<LocalEditors>().navigate(webview.label());
                 webview.state::<StorageIpc>().navigate(webview.label());
                 if main {
                     webview.state::<tunnels::ipc::TunnelTabs>().navigate(false);
@@ -105,6 +114,8 @@ pub fn run() {
                 true
             } else if invoke.message.command().starts_with("editor_sftp_") {
                 editor::sftp_ipc::dispatch(invoke)
+            } else if invoke.message.command().starts_with("editor_remote_nano_") {
+                editor::nano_ipc::dispatch(invoke)
             } else if invoke.message.command().starts_with("storage_") {
                 storage_ipc::dispatch(invoke)
             } else {
@@ -118,12 +129,16 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| match event {
             tauri::RunEvent::WindowEvent { label, event: tauri::WindowEvent::CloseRequested { api, .. }, .. } => {
-                if !app.state::<Sessions>().close_ssh_probes(Some(&label)) {
+                if label != workspace_window::MAIN && !app.state::<Sessions>().close_ssh_probes(Some(&label)) {
                     api.prevent_close();
                 }
             }
-            tauri::RunEvent::ExitRequested { api, .. } => {
-                if !app.state::<Sessions>().close_ssh_probes(None) {
+            tauri::RunEvent::ExitRequested { api, code, .. } => {
+                let sessions = app.state::<Sessions>();
+                if let Some(main) = app.get_webview_window(workspace_window::MAIN) {
+                    api.prevent_exit();
+                    workspace_window::request_close(&main.as_ref().window(), code);
+                } else if !sessions.consume_control_exit_approval(code) && !sessions.close_ssh_probes(None) {
                     api.prevent_exit();
                 }
             }
@@ -136,7 +151,7 @@ pub fn run() {
                     registration.document_changed(&label);
                 }
                 let sessions = app.state::<Sessions>();
-                sessions.destroy(&label);
+                let exit_code = sessions.destroy(&label);
                 app.state::<ai::session_selection::State>()
                     .document_changed(&label, sessions.document(&label));
                 app.state::<SftpIpc>().destroy(&label);
@@ -145,6 +160,9 @@ pub fn run() {
                 if label == "main" {
                     app.state::<tunnels::ipc::TunnelTabs>().navigate(true);
                 }
+                // Wry는 이 콜백 뒤 마지막 창의 자동 종료 이벤트를 보낸다.
+                // 명시적 종료만 재예약하고, 자동 이벤트에는 그 승인 코드를 소비시키지 않는다.
+                if let Some(code) = exit_code { app.exit(code); }
             }
             tauri::RunEvent::Exit => {
                 app.state::<rdp::ipc::Sessions>().retire();

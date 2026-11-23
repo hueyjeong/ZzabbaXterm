@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::ssh::ConnectionPlan;
+use super::nano_wire::MAX_CONTENT;
 
 mod pipe;
 pub(crate) use pipe::Session;
@@ -98,6 +99,15 @@ pub(crate) struct File {
     path: String,
     baseline: Revision,
     unconfirmed: bool,
+}
+
+impl File {
+    pub(super) fn recovery_path(&self, relative: &str) -> Option<String> {
+        if !relative.split('/').all(valid_component) {
+            return None;
+        }
+        Some(child_path(&self.directory.canonical_path, relative))
+    }
 }
 
 #[derive(Debug)]
@@ -295,20 +305,41 @@ impl Connection {
         if entry.is_directory {
             return Err(Error::NotRegular);
         }
-        self.open_bound(&entry.directory, &entry.path).await
+        self.open_bound(&entry.directory, &entry.path, FILE_LIMIT).await
+    }
+
+    pub(super) async fn open_nano(&mut self, path: &str) -> Result<(File, String)> {
+        validate_absolute(path)?;
+        let (parent, name) = path.rsplit_once('/').ok_or(Error::InvalidPath)?;
+        if name.is_empty() || name.starts_with(".zzabba-edit-") {
+            return Err(Error::InvalidPath);
+        }
+        let parent = if parent.is_empty() { "/" } else { parent };
+        let directory = Arc::new(ListedDirectory {
+            plan: Arc::clone(&self.plan),
+            access_path: parent.to_owned(),
+            canonical_path: parent.to_owned(),
+        });
+        self.open_bound(&directory, path, MAX_CONTENT).await
     }
 
     /// 결과 미확인이나 충돌 이후 같은 연결 계획과 경로에서 새 기준본을 읽는다.
     pub(crate) async fn reopen(&mut self, file: &File) -> Result<(File, String)> {
-        self.open_bound(&file.directory, &file.path).await
+        self.open_bound(&file.directory, &file.path, FILE_LIMIT).await
+    }
+
+    async fn read_nano(&self, file: &File) -> Result<String> {
+        let (bytes, _) = self.read_path(&file.directory, &file.path, MAX_CONTENT).await?;
+        String::from_utf8(bytes).map_err(|_| Error::InvalidUtf8)
     }
 
     async fn open_bound(
         &self,
         directory: &Arc<ListedDirectory>,
         path: &str,
+        limit: usize,
     ) -> Result<(File, String)> {
-        let (bytes, access) = self.read_path(directory, path).await?;
+        let (bytes, access) = self.read_path(directory, path, limit).await?;
         let baseline = Revision::new(&bytes, access);
         let text = String::from_utf8(bytes).map_err(|_| Error::InvalidUtf8)?;
         Ok((
@@ -442,6 +473,7 @@ impl Connection {
         &self,
         directory: &ListedDirectory,
         path: &str,
+        limit: usize,
     ) -> Result<(Vec<u8>, Access)> {
         directory.check(self).await?;
         let before = self.channel.lstat(path).await?.attrs;
@@ -454,11 +486,11 @@ impl Connection {
             .handle;
         let result = async {
             let attrs = self.channel.fstat(&handle).await?.attrs;
-            if attrs.size.is_some_and(|len| len > FILE_LIMIT as u64) {
+            if attrs.size.is_some_and(|len| len > limit as u64) {
                 return Err(Error::LimitExceeded);
             }
             unchanged(&before, &attrs)?;
-            let bytes = self.read_contents(&handle).await?;
+            let bytes = self.read_contents(&handle, limit).await?;
             let after = self.channel.fstat(&handle).await?.attrs;
             unchanged(&attrs, &after)?;
             if after.size.is_some_and(|len| len != bytes.len() as u64) {
@@ -483,7 +515,7 @@ impl Connection {
         Ok(())
     }
 
-    async fn read_contents(&self, handle: &SftpHandle) -> Result<Vec<u8>> {
+    async fn read_contents(&self, handle: &SftpHandle, limit: usize) -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
         loop {
             match self
@@ -495,7 +527,7 @@ impl Connection {
                     if reply.data.is_empty() || reply.data.len() > CHUNK {
                         return Err(Error::InvalidReply);
                     }
-                    if bytes.len() + reply.data.len() > FILE_LIMIT {
+                    if bytes.len() + reply.data.len() > limit {
                         return Err(Error::LimitExceeded);
                     }
                     if bytes.is_empty() {
@@ -560,7 +592,7 @@ impl Connection {
     }
 
     async fn recheck(&self, file: &File) -> Result<Option<RemoteVersion>> {
-        match self.read_path(&file.directory, &file.path).await {
+        match self.read_path(&file.directory, &file.path, FILE_LIMIT).await {
             Ok((bytes, access)) if Revision::new(&bytes, access) == file.baseline => Ok(None),
             Ok((bytes, _)) => Ok(Some(match String::from_utf8(bytes) {
                 Ok(text) => RemoteVersion::Text(text),
@@ -659,4 +691,4 @@ fn failed(stage: SaveStage, error: Error, cleanup: Option<Cleanup>) -> SaveOutco
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

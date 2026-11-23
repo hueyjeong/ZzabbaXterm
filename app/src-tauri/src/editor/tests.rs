@@ -1,4 +1,5 @@
 use super::*;
+use super::publication::temporary_name;
 
 struct Sandbox(PathBuf);
 
@@ -245,7 +246,7 @@ fn read_only_file_is_not_replaced() {
     let (mut file, _) = LocalFile::open(&path).unwrap();
     let result = file.save("mine");
     assert!(
-        matches!(result, Err(SaveError::Io { stage: SaveStage::Replace, ref source }) if source.kind() == io::ErrorKind::PermissionDenied),
+        matches!(result, Err(SaveError::Io { stage: SaveStage::Replace | SaveStage::PreservePermissions, ref source }) if source.kind() == io::ErrorKind::PermissionDenied),
         "{result:?}"
     );
     assert_eq!(fs::read(&path).unwrap(), b"original");
@@ -601,6 +602,98 @@ fn ipc_conflict_preserves_disk_and_buffer_until_explicit_reload() {
     assert_eq!(editors.reload("main", document, &handle).unwrap(), "disk\n");
     editors.save("main", document, &handle, &buffer).unwrap();
     assert_eq!(fs::read_to_string(&path).unwrap(), buffer);
+    dir.cleanup_checked(1);
+}
+
+#[test]
+fn document_revoked_after_staging_cannot_publish() {
+    use registry::{EditorError, LocalEditors, Selected};
+
+    let dir = Sandbox::new();
+    let path = dir.path("selected.txt");
+    fs::write(&path, "base").unwrap();
+    let editors = LocalEditors::default();
+    editors.navigate("main");
+    let document = editors.document("main").unwrap();
+    let Selected::Opened { handle, .. } = editors.selected("main", document, Some(&path)).unwrap() else {
+        panic!("the selected file was not opened");
+    };
+    let error = editors.save_with_sync("main", document, &handle, "mine", |staged| {
+        staged.sync_all()?;
+        editors.navigate("main");
+        Ok(())
+    }).unwrap_err();
+    assert!(matches!(error, EditorError::DocumentClosed));
+    assert_eq!(fs::read(&path).unwrap(), b"base");
+    dir.cleanup_checked(1);
+}
+
+#[cfg(any(target_os = "linux", windows))]
+#[test]
+fn editor_verifies_the_original_again_at_publication() {
+    let dir = Sandbox::new();
+    let path = dir.path("target.txt");
+    fs::write(&path, "base").unwrap();
+    let (mut file, _) = LocalFile::open(&path).unwrap();
+    let original_id = file.version.id;
+    let original_digest = file.version.digest;
+    let error = file.save_checked("mine", File::sync_all, || {
+        fs::write(&path, "disk").unwrap();
+        Ok(())
+    }).unwrap_err();
+    assert!(file.version.id == original_id);
+    assert_eq!(file.version.digest, original_digest);
+    assert!(os::file_id(&file.original).unwrap() == original_id);
+    match error {
+        SaveError::Io { stage: SaveStage::Replace, .. } => {
+            assert_eq!(fs::read(&path).unwrap(), b"disk");
+            assert!(os::file_id(&File::open(&path).unwrap()).unwrap() == original_id);
+            dir.cleanup_checked(1);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(file.compare().unwrap(), "disk");
+    assert_eq!(file.reload().unwrap(), "disk");
+    file.save("retry").unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"retry");
+}
+
+#[cfg(windows)]
+#[test]
+fn editor_rejects_alternate_stream_before_staging() {
+    let dir = Sandbox::new();
+    let path = dir.path("target.txt");
+    let stream = dir.path("target.txt:fixture");
+    fs::write(&path, "base").unwrap();
+    fs::write(&stream, "tag").unwrap();
+    let (mut file, _) = LocalFile::open(&path).unwrap();
+    let result = file.save_with_sync("mine", |_| panic!("stream was discovered after staging"));
+    assert!(matches!(result, Err(SaveError::Io { stage: SaveStage::PreservePermissions, .. })));
+    assert_eq!(fs::read(&path).unwrap(), b"base");
+    assert_eq!(fs::read(&stream).unwrap(), b"tag");
+    dir.cleanup_checked(1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn editor_rejects_user_xattr_before_staging() {
+    use std::os::fd::AsRawFd;
+
+    let dir = Sandbox::new();
+    let path = dir.path("target.txt");
+    fs::write(&path, "base").unwrap();
+    let disk = File::open(&path).unwrap();
+    let name = c"user.fixture";
+    // SAFETY: the descriptor and attribute bytes live through the call.
+    assert_eq!(unsafe { libc::fsetxattr(disk.as_raw_fd(), name.as_ptr(), b"tag".as_ptr().cast(), 3, 0) }, 0);
+    let (mut file, _) = LocalFile::open(&path).unwrap();
+    let result = file.save_with_sync("mine", |_| panic!("attribute was discovered after staging"));
+    assert!(matches!(result, Err(SaveError::Io { stage: SaveStage::PreservePermissions, .. })));
+    let mut actual = [0u8; 3];
+    // SAFETY: the descriptor, name and output buffer live through the call.
+    assert_eq!(unsafe { libc::fgetxattr(disk.as_raw_fd(), name.as_ptr(), actual.as_mut_ptr().cast(), actual.len()) }, 3);
+    assert_eq!(&actual, b"tag");
+    assert_eq!(fs::read(&path).unwrap(), b"base");
     dir.cleanup_checked(1);
 }
 
