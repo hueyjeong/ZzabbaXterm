@@ -338,3 +338,56 @@ it("전송 중에는 루트를 바꾸지 않고 로컬 목록을 읽는 동안 �
   expect((control(localPane(), "로컬 폴더 열기") as HTMLButtonElement).disabled).toBe(false);
   expect(local.openRoot).toHaveBeenCalledTimes(1);
 });
+
+it("클라우드 전용 파일은 오프라인 아이콘으로 보이고 올리거나 끌 수 없다", async () => {
+  const offline: LocalListing = {
+    truncated: false,
+    entries: [...rootListing.entries, { name: "클라우드 파일.txt", kind: "file", bytes: 5, modified: null, offline: true }],
+  };
+  const local = localActions({ list: vi.fn<LocalFileActions["list"]>().mockResolvedValue({ ok: true, value: offline }) });
+  await render(s3Actions(), local);
+  await openBucket();
+  await click("로컬 폴더 열기", localPane());
+  const row = fileRow(host, "클라우드 파일.txt");
+  expect(row.querySelector('.file-icon[data-type="offline"]')).not.toBeNull();
+  expect(row.getAttribute("aria-description")).toBe("클라우드 전용");
+  expect(fileRow(host, "바깥 링크").getAttribute("aria-description")).toBe("링크");
+  expect(fileRow(host, "올릴 파일.txt").hasAttribute("aria-description")).toBe(false);
+  expect(fileRow(host, "올릴 파일.txt").querySelector('.file-icon[data-type="offline"]')).toBeNull();
+  await act(async () => row.click());
+  expect((control(localPane(), "S3로 업로드") as HTMLButtonElement).disabled).toBe(true);
+  expect((await drag(row, "dragstart", transfer())).defaultPrevented).toBe(true);
+  expect(local.select).not.toHaveBeenCalled();
+});
+
+it("클라우드 전용 거부와 조건부 업로드 충돌을 전송 행에 표시한다", async () => {
+  const select = vi.fn<LocalFileActions["select"]>()
+    .mockResolvedValueOnce({ kind: "rejected", reason: { kind: "cloudOnly" } })
+    .mockResolvedValueOnce({ kind: "approved", approvalId: "local-approval" });
+  const upload = vi.fn<S3Actions["upload"]>().mockResolvedValue({
+    ok: false, error: { stage: "putObject", failure: { kind: "preconditionFailed" }, bytes: 0 },
+  });
+  await render(s3Actions({ upload }), localActions({ select }));
+  await openBucket();
+  await click("로컬 폴더 열기", localPane());
+  await act(async () => fileRow(host, objectKey).click());
+  await click("로컬 폴더로 다운로드");
+  await act(async () => fileRow(host, "올릴 파일.txt").click());
+  await click("S3로 업로드", localPane());
+  const rows = Array.from(host.querySelectorAll(".transfer-table tbody tr"));
+  expect(rows.map(row => row.getAttribute("data-state"))).toEqual(["failed", "rejected"]);
+  expect(rows[0].querySelector(".transfer-result")?.textContent).toBe("객체 업로드: 다른 곳에서 객체가 바뀜 · 0 바이트");
+  expect(rows[1].querySelector(".transfer-result")?.textContent).toBe("클라우드 전용 파일");
+});
+
+it("같은 키가 없을 때만 보낸 업로드가 거부되면 같은 키의 객체 있음으로 표시한다", async () => {
+  const upload = vi.fn<S3Actions["upload"]>().mockResolvedValue({
+    ok: false, error: { stage: "putObject", failure: { kind: "alreadyExists" }, bytes: 0 },
+  });
+  await render(s3Actions({ upload }), localActions());
+  await openBucket();
+  await click("로컬 폴더 열기", localPane());
+  await act(async () => fileRow(host, "올릴 파일.txt").click());
+  await click("S3로 업로드", localPane());
+  expect(host.querySelector(".transfer-table tbody tr .transfer-result")?.textContent).toBe("객체 업로드: 같은 키의 객체 있음 · 0 바이트");
+});

@@ -118,14 +118,16 @@ export function LocalPane({ sessionId, view, actions, update, fileView, canTrans
     const key = joinLocal(path, entry.name);
     if (entry.kind === "folder") return { kind: "folder", key, name: entry.name, title: entry.name };
     return {
-      kind: "file", key, name: entry.name, title: entry.name, link: entry.kind === "link",
+      kind: "file", key, name: entry.name, title: entry.name, link: entry.kind === "link", offline: !!entry.offline,
       bytes: entry.kind === "file" ? entry.bytes : null,
       modified: entry.modified === null ? null : new Date(entry.modified).toISOString(),
     };
   }) ?? [], [listing, path]);
 
   const selected = entries.find(entry => sameEntry(entry, view.selected)) ?? null;
-  const uploadable = (entry: FileEntry | null): entry is Extract<FileEntry, { kind: "file" }> => entry?.kind === "file" && !entry.link;
+  // 링크와 클라우드 전용 파일은 올리거나 끌 수 없다.
+  const uploadable = (entry: FileEntry | null): entry is Extract<FileEntry, { kind: "file" }> =>
+    entry?.kind === "file" && !entry.link && !entry.offline;
   const upload = (entry: FileEntry | null) => {
     if (canTransfer && uploadable(entry)) onUpload(entry.key, entry.name ?? entry.key, entry.bytes);
   };

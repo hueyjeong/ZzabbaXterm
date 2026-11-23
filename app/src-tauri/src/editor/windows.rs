@@ -229,12 +229,10 @@ impl Directory {
         };
         let metadata = file.metadata()?;
         let attributes = metadata.file_attributes();
-        // 클라우드 자리 표시자는 데이터가 로컬에 있을 때만(회수 표시 없음) 일반 파일로 쓴다.
-        let local_cloud = self.cloud
-            && attributes & (FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_RECALL_ON_OPEN) == 0
-            && is_cloud_tag(reparse_tag(&file)?);
+        // 스토리지는 클라우드 자리 표시자 파일 핸들을 받아 데이터를 읽기 전에 회수 표시를 직접 확인한다.
+        let cloud = self.cloud && is_cloud_tag(reparse_tag(&file)?);
         Ok(
-            (metadata.is_file() && (attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 || local_cloud))
+            (metadata.is_file() && (attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 || cloud))
                 .then_some(file),
         )
     }
@@ -386,13 +384,15 @@ impl Access {
         Ok(access)
     }
 
+    /// 기본 스트림 외에는 `Zone.Identifier` 스트림 하나만 허용한다. 편집기 저장은 그 내용을 새 파일에 옮기고,
+    /// 다운로드 교체는 새 파일에 인터넷 영역 표시를 새로 기록한다.
     pub(super) fn read_editor(file: &File) -> io::Result<Self> {
-        check_auxiliary_data(file)?;
+        check_auxiliary_data(file, true)?;
         Self::read(file)
     }
 
     pub(super) fn matches_editor(&self, file: &File) -> io::Result<bool> {
-        check_auxiliary_data(file)?;
+        check_auxiliary_data(file, true)?;
         self.matches(file)
     }
 
@@ -476,7 +476,7 @@ fn reject_central_access_policy(sacl: *const ACL) -> io::Result<()> {
     Ok(())
 }
 
-fn check_auxiliary_data(file: &File) -> io::Result<()> {
+fn check_auxiliary_data(file: &File, zone: bool) -> io::Result<()> {
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     // SAFETY: the file handle and correctly sized output are valid.
     if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
@@ -493,8 +493,8 @@ fn check_auxiliary_data(file: &File) -> io::Result<()> {
     }
 
     const UNNAMED: [u16; 7] = [58, 58, 36, 68, 65, 84, 65]; // ::$DATA
-    // The aligned buffer has space for only the unnamed stream.
-    let mut buffer = [0u64; 5];
+    // The aligned buffer has space for the unnamed stream and, for downloads, a zone stream.
+    let mut buffer = [0u64; 32];
     // SAFETY: the output buffer is writable and its byte size is supplied.
     if unsafe {
         GetFileInformationByHandleEx(
@@ -507,15 +507,34 @@ fn check_auxiliary_data(file: &File) -> io::Result<()> {
     {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: the buffer is aligned, initialized, and holds the header and seven UTF-16 units.
-    let (streams, name) = unsafe {
-        let ptr = buffer.as_ptr();
-        let name = ptr.cast::<u8>().add(offset_of!(FILE_STREAM_INFO, StreamName));
-        (
-            ptr.cast::<FILE_STREAM_INFO>().read(),
-            slice::from_raw_parts(name.cast::<u16>(), UNNAMED.len()),
-        )
-    };
+    let mut offset = 0;
+    let mut extra = false;
+    loop {
+        let header = offset + offset_of!(FILE_STREAM_INFO, StreamName);
+        if header > size_of_val(&buffer) {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        // SAFETY: the entry header lies inside the aligned, initialized buffer.
+        let entry = unsafe { buffer.as_ptr().cast::<u8>().add(offset).cast::<FILE_STREAM_INFO>().read_unaligned() };
+        let length = entry.StreamNameLength as usize;
+        if header + length > size_of_val(&buffer) {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        // SAFETY: the name bytes were bounds-checked against the buffer above.
+        let name: Vec<u16> = unsafe {
+            slice::from_raw_parts(buffer.as_ptr().cast::<u8>().add(header), length)
+                .chunks_exact(2)
+                .map(|unit| u16::from_ne_bytes([unit[0], unit[1]]))
+                .collect()
+        };
+        let allowed = name == UNNAMED
+            || (zone && String::from_utf16_lossy(&name).eq_ignore_ascii_case(":Zone.Identifier:$DATA"));
+        extra |= !allowed;
+        if entry.NextEntryOffset == 0 {
+            break;
+        }
+        offset += entry.NextEntryOffset as usize;
+    }
     let mut ea = FILE_EA_INFORMATION { EaSize: 0 };
     // SAFETY: the synchronous file handle and fixed-size NT query output are live.
     let status = unsafe {
@@ -530,11 +549,7 @@ fn check_auxiliary_data(file: &File) -> io::Result<()> {
     if status < 0 {
         return Err(nt_error(status));
     }
-    if streams.NextEntryOffset != 0
-        || streams.StreamNameLength as usize != size_of_val(&UNNAMED)
-        || name != UNNAMED
-        || ea.EaSize != 0
-    {
+    if extra || ea.EaSize != 0 {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "file streams or extended attributes cannot be preserved",
@@ -553,6 +568,29 @@ fn reopen(file: &File, access: u32, share: u32) -> io::Result<File> {
     Ok(unsafe { File::from_raw_handle(handle) })
 }
 
+/// 인터넷 영역(ZoneId=3)이다. HostUrl은 S3 주소를 남기지 않도록 `about:internet`으로 둔다.
+const ZONE_STREAM: &str = ":Zone.Identifier";
+/// 편집기 저장이 옮기는 `Zone.Identifier` 스트림의 최대 크기다.
+pub(super) const ZONE_LIMIT: usize = 4096;
+
+/// 파일의 `Zone.Identifier` 스트림을 읽는다. 없으면 None, 상한을 넘으면 오류다.
+pub(super) fn read_zone(file: &File) -> io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034_u32 as i32;
+    let stream = match Directory::open_at(file, OsStr::new(ZONE_STREAM), FILE_OPEN, GENERIC_READ, null(), false) {
+        Err(STATUS_OBJECT_NAME_NOT_FOUND) => return Ok(None),
+        result => result.map_err(nt_error)?,
+    };
+    let mut content = Vec::new();
+    stream.take(ZONE_LIMIT as u64 + 1).read_to_end(&mut content)?;
+    if content.len() > ZONE_LIMIT {
+        return Err(io::Error::new(io::ErrorKind::Unsupported, "zone identifier stream is too large"));
+    }
+    Ok(Some(content))
+}
+
+pub(super) const ZONE_IDENTIFIER: &[u8] = b"[ZoneTransfer]\r\nZoneId=3\r\nHostUrl=about:internet\r\n";
+
 pub(super) struct Temporary<'a> {
     directory: &'a Directory,
     file: Option<File>,
@@ -568,6 +606,21 @@ struct Rename {
 }
 
 impl Temporary<'_> {
+    /// 게시 전 임시 파일에 인터넷 영역 표시(Mark of the Web)를 기록한다. 이름을 바꿔도 스트림은 파일과 함께 간다.
+    pub(super) fn mark_internet(&mut self) -> io::Result<()> {
+        self.write_zone(ZONE_IDENTIFIER)
+    }
+
+    /// 임시 파일의 `Zone.Identifier` 스트림을 content로 기록하고 디스크에 반영한다.
+    pub(super) fn write_zone(&mut self, content: &[u8]) -> io::Result<()> {
+        use std::io::Write;
+        let mut stream = Directory::open_at(
+            self.file(), OsStr::new(ZONE_STREAM), FILE_OVERWRITE_IF, GENERIC_WRITE, null(), false,
+        ).map_err(nt_error)?;
+        stream.write_all(content)?;
+        stream.sync_all()
+    }
+
     pub(super) fn file(&mut self) -> &mut File {
         self.file.as_mut().expect("temporary file is open")
     }
@@ -795,6 +848,52 @@ mod tests {
     use windows_sys::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
     };
+
+    #[test]
+    fn auxiliary_data_allows_only_the_zone_identifier_stream() {
+        use std::fs;
+
+        let sandbox = tempfile::tempdir().unwrap();
+        let path = sandbox.path().join("target.txt");
+        let stream = |name: &str| {
+            let mut stream = path.as_os_str().to_owned();
+            stream.push(name);
+            PathBuf::from(stream)
+        };
+        fs::write(&path, b"original").unwrap();
+        let open = || File::open(&path).unwrap();
+        check_auxiliary_data(&open(), true).unwrap();
+        fs::write(stream(":Zone.Identifier"), ZONE_IDENTIFIER).unwrap();
+        check_auxiliary_data(&open(), true).unwrap();
+        assert_eq!(read_zone(&open()).unwrap().as_deref(), Some(ZONE_IDENTIFIER));
+        fs::write(stream(":other"), b"other").unwrap();
+        assert!(check_auxiliary_data(&open(), true).is_err());
+        fs::remove_file(stream(":Zone.Identifier")).unwrap();
+        assert!(check_auxiliary_data(&open(), true).is_err());
+        fs::remove_file(stream(":other")).unwrap();
+        check_auxiliary_data(&open(), true).unwrap();
+        assert_eq!(read_zone(&open()).unwrap(), None);
+
+        #[repr(align(4))]
+        struct EaRecord([u8; 17]);
+        // FILE_FULL_EA_INFORMATION: 다음 항목 없음, 이름 X, 값 outside.
+        let ea = EaRecord(*b"\0\0\0\0\0\x01\x07\0X\0outside");
+        let file = reopen(&open(), FILE_WRITE_EA, SHARE).unwrap();
+        // SAFETY: 동기 파일 핸들과 EA 레코드가 호출 동안 유효하다.
+        let status = unsafe {
+            NtSetEaFile(file.as_raw_handle(), &mut IO_STATUS_BLOCK::default(), ea.0.as_ptr().cast(), ea.0.len() as u32)
+        };
+        assert_eq!(status, 0, "{}", nt_error(status));
+        fs::write(stream(":Zone.Identifier"), ZONE_IDENTIFIER).unwrap();
+        assert!(check_auxiliary_data(&open(), true).is_err());
+
+        let large = sandbox.path().join("large.txt");
+        fs::write(&large, b"a").unwrap();
+        let mut large_stream = large.as_os_str().to_owned();
+        large_stream.push(":Zone.Identifier");
+        fs::write(large_stream, vec![b'z'; ZONE_LIMIT + 1]).unwrap();
+        assert!(read_zone(&File::open(&large).unwrap()).is_err());
+    }
 
     #[test]
     fn cli_rejects_directory_reparse_points_in_the_parent_path() {

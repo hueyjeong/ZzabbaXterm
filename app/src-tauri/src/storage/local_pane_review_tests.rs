@@ -5,7 +5,7 @@ use aws_sdk_s3::primitives::SdkBody;
 use super::{super::{super::*, *}, approve, list_request};
 use crate::storage::tests::{client, replay, response};
 
-fn select_request(session: &Session, root_id: &str, key: &str, path: &str, direction: Direction) -> SelectRequest {
+pub(super) fn select_request(session: &Session, root_id: &str, key: &str, path: &str, direction: Direction) -> SelectRequest {
     SelectRequest {
         target: Target { session_id: session.session_id.clone(), bucket: "selected-bucket".into(), region: session.region.clone(), key: key.into() },
         root_id: root_id.into(),
@@ -14,10 +14,10 @@ fn select_request(session: &Session, root_id: &str, key: &str, path: &str, direc
     }
 }
 
-type Prompts = std::sync::Arc<std::sync::Mutex<Vec<(&'static str, String)>>>;
+pub(super) type Prompts = std::sync::Arc<std::sync::Mutex<Vec<(&'static str, String)>>>;
 
 /// 네이티브 확인 대신 제목·내용을 기록하고 정해 둔 답을 돌려준다.
-fn answer(prompts: &Prompts, accept: bool) -> impl FnOnce(&'static str, String, watch::Receiver<bool>) -> std::future::Ready<bool> {
+pub(super) fn answer(prompts: &Prompts, accept: bool) -> impl FnOnce(&'static str, String, watch::Receiver<bool>) -> std::future::Ready<bool> {
     let prompts = prompts.clone();
     move |dialog, prompt, _| {
         prompts.lock().unwrap().push((dialog, prompt));
@@ -25,11 +25,11 @@ fn answer(prompts: &Prompts, accept: bool) -> impl FnOnce(&'static str, String, 
     }
 }
 
-fn no_prompt(_: &'static str, prompt: String, _: watch::Receiver<bool>) -> std::future::Ready<bool> {
+pub(super) fn no_prompt(_: &'static str, prompt: String, _: watch::Receiver<bool>) -> std::future::Ready<bool> {
     panic!("예상하지 않은 확인: {prompt}")
 }
 
-fn release(state: &StorageIpc, document: &Document, session: &Session, result: SelectResult) {
+pub(super) fn release(state: &StorageIpc, document: &Document, session: &Session, result: SelectResult) {
     let SelectResult::Approved { approval_id } = result else { panic!("승인 아님: {result:?}") };
     assert!(state.cancel_approval(document, &ApprovalId { session_id: session.session_id.clone(), approval_id }));
 }
@@ -121,10 +121,10 @@ fn storage_local_executable_names_are_case_insensitive() {
 #[tokio::test]
 async fn storage_local_select_confirms_existing_object_executable_and_replacement() {
     let reply = replay([
-        response(200, SdkBody::empty()),
-        response(200, SdkBody::empty()),
+        super::followup::head("\"etag-1\""),
+        super::followup::head("\"etag-1\""),
         response(404, SdkBody::empty()),
-        response(403, SdkBody::empty()),
+        response(500, SdkBody::empty()),
     ]);
     let state = StorageIpc::default();
     let document = state.document("main");
@@ -147,7 +147,7 @@ async fn storage_local_select_confirms_existing_object_executable_and_replacemen
     // 존재 확인이 실패하면 업로드하지 않고 실제 오류를 돌려준다.
     let SelectResult::Failed { error } = state.select_local(&document, upload(), no_prompt).await else { panic!("오류 아님") };
     assert_eq!(error.stage, Stage::HeadObject);
-    assert!(matches!(error.failure, crate::storage::Failure::Service { status: 403, .. }), "{error:?}");
+    assert!(matches!(error.failure, crate::storage::Failure::Service { status: 500, .. }), "{error:?}");
     let requests: Vec<_> = reply.actual_requests().collect();
     assert_eq!(requests.len(), 4);
     assert!(requests.iter().all(|request| request.method() == "HEAD"));

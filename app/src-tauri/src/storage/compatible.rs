@@ -200,8 +200,18 @@ impl CompatibleS3 {
         key: &str,
         source: File,
     ) -> Result<u64, CompatibleError> {
+        self.upload_if(bucket, key, source, &super::UploadCondition::None).await
+    }
+
+    pub(crate) async fn upload_if(
+        &self,
+        bucket: &str,
+        key: &str,
+        source: File,
+        condition: &super::UploadCondition,
+    ) -> Result<u64, CompatibleError> {
         self.operations
-            .upload(bucket, key, source)
+            .upload(bucket, key, source, condition)
             .await
             .map_err(|err| self.with_target(err))
     }
@@ -219,9 +229,9 @@ impl CompatibleS3 {
             .map_err(|err| self.with_target(err))
     }
 
-    pub(crate) async fn object_exists(&self, bucket: &str, key: &str) -> Result<bool, CompatibleError> {
+    pub(crate) async fn object_head(&self, bucket: &str, key: &str) -> Result<super::ObjectHead, CompatibleError> {
         self.operations
-            .object_exists(bucket, key)
+            .object_head(bucket, key)
             .await
             .map_err(|err| self.with_target(err))
     }

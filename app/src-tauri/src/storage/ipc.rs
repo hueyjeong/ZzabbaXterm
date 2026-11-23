@@ -20,7 +20,7 @@ use crate::{
 };
 
 use super::{
-    AwsS3, BucketRow, Downloaded, Error, Failure, ObjectRow, Page, Stage, VerifiedSsoSelection, check_bucket,
+    AwsS3, BucketRow, Downloaded, Error, Failure, ObjectRow, Page, Stage, UploadCondition, VerifiedSsoSelection, check_bucket,
     compatible::CompatibleS3,
 };
 
@@ -131,6 +131,8 @@ struct Selection {
     target: Target,
     direction: Direction,
     file: Option<ApprovedFile>,
+    /// 로컬 창 업로드가 HeadObject 결과로 정한 PUT 조건이다.
+    condition: UploadCondition,
 }
 
 enum ApprovedFile {
@@ -382,6 +384,7 @@ impl StorageIpc {
             target,
             direction,
             file: None,
+            condition: UploadCondition::None,
         });
         Some(id)
     }
@@ -392,6 +395,18 @@ impl StorageIpc {
         session_id: &str,
         id: String,
         selected: Option<Result<ApprovedFile, std::io::Error>>,
+    ) -> LocalFileApproval {
+        self.finish_selection_with(document, session_id, id, selected, UploadCondition::None)
+    }
+
+    /// 승인한 파일과 업로드 PUT 조건을 같은 잠금 안에서 기록한다.
+    fn finish_selection_with(
+        &self,
+        document: &Document,
+        session_id: &str,
+        id: String,
+        selected: Option<Result<ApprovedFile, std::io::Error>>,
+        condition: UploadCondition,
     ) -> LocalFileApproval {
         let mut registry = self.0.lock().unwrap();
         let Some(tab) = registry.tab(document, session_id) else {
@@ -407,6 +422,7 @@ impl StorageIpc {
         match selected {
             Some(Ok(file)) => {
                 selection.file = Some(file);
+                selection.condition = condition;
                 LocalFileApproval::Approved { approval_id: id }
             }
             Some(_) => {
@@ -476,6 +492,7 @@ impl StorageIpc {
             closed: tab.closed.clone(),
             target: selection.target,
             file: selection.file?,
+            condition: selection.condition,
         })
     }
 
@@ -687,8 +704,8 @@ impl StorageIpc {
         let result = until_closed(&closed, Stage::PutObject, async {
             match transfer.client {
                 TabClient::AwsSso(client) => client.in_region(&target.region, Stage::PutObject)?
-                    .upload(&target.bucket, &target.key, file).await,
-                TabClient::Compatible(client) => client.upload(&target.bucket, &target.key, file)
+                    .upload_if(&target.bucket, &target.key, file, &transfer.condition).await,
+                TabClient::Compatible(client) => client.upload_if(&target.bucket, &target.key, file, &transfer.condition)
                     .await.map_err(|error| error.operation),
             }
         }).await;
@@ -740,6 +757,7 @@ struct Transfer {
     closed: Arc<watch::Sender<bool>>,
     target: Target,
     file: ApprovedFile,
+    condition: UploadCondition,
 }
 
 async fn until_closed<T>(
