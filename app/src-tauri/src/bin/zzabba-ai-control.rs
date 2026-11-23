@@ -82,6 +82,8 @@ mod linux {
             // SAFETY: raw는 초기화된 termios이며 INPUT은 위에서 검사한 FD다.
             unsafe {
                 libc::cfmakeraw(&mut raw);
+                // Windows ConPTY와 SSM 플러그인은 프레임 끝 LF를 Enter(CR)로 보낸다. 프레임에는 CR이 없으므로 LF로 되돌린다.
+                raw.c_iflag |= libc::ICRNL;
                 raw.c_lflag &= !libc::ECHONL;
                 raw.c_cc[libc::VMIN] = 1;
                 raw.c_cc[libc::VTIME] = 0;
