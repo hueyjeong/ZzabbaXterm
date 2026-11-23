@@ -1591,7 +1591,11 @@ describe("C02 SSM 연결", () => {
     await key(row!, "ContextMenu");
     expect([...find('[role="menu"]').querySelectorAll('[role="menuitem"]')].map(item => item.textContent))
       .toEqual(["AWS Systems Manager", "S3 버킷 열기", "터널 열기"]);
-    await press("AWS Systems Manager");
+    // 메뉴 항목은 동작 뒤 포커스를 트리 행으로 돌려보내므로, 준비 후 터미널 포커스는 더블클릭 열기에서 확인한다.
+    await key(find('[role="menu"]'), "Escape");
+    expect(host.querySelector('[role="menu"]')).toBeNull();
+    expect(document.activeElement).toBe(row);
+    await dblclick(row!);
     const [{ output, ...args }] = calls("open").slice(-1);
     expect(output).toBeDefined();
     expect(args).toEqual({ targetId: "saved-ssm", cols: 80, rows: 24 });

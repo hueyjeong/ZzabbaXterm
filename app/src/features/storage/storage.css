@@ -299,6 +299,7 @@ tr[data-state="failed"] .transfer-result { white-space: normal; }
 .storage-card {
   display: grid;
   gap: 14px;
+  box-sizing: border-box;
   width: min(520px, 100%);
   padding: 20px;
   border: 1px solid var(--border);

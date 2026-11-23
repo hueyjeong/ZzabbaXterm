@@ -103,13 +103,10 @@ export function Menu({ x, y, items, label, onClose, restoreFocus }: {
       if (item.kind === "label") return <div key={index} className="ui-menu-label">{item.label}</div>;
       const Icon = item.icon;
       return <button key={index} type="button" role="menuitem" disabled={item.disabled} onClick={() => {
+        // 먼저 메뉴를 연 요소로 포커스를 돌려놓고 동작을 실행한다. 동작이 요청한 포커스(새 터미널 등)가 마지막에 이긴다.
+        if (restoreFocus?.isConnected) restoreFocus.focus();
         onClose();
         item.onSelect();
-        // 동작이 포커스를 옮기지 않았으면 메뉴를 연 요소로 돌려보낸다.
-        queueMicrotask(() => {
-          const focused = document.activeElement;
-          if ((!focused || focused === document.body) && restoreFocus?.isConnected) restoreFocus.focus();
-        });
       }}>
         {Icon ? <Icon aria-hidden="true" /> : <span style={{ width: 15 }} />}
         <span>{item.label}</span>

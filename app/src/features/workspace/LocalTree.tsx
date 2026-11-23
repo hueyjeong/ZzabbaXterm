@@ -1,5 +1,5 @@
 import { useState, useRef, type KeyboardEvent } from "react";
-import { ChevronRight, Database, Folder, FolderOpen, KeyRound, Pencil, RefreshCcw, ShieldAlert, SquareTerminal, Waypoints, type LucideIcon } from "lucide-react";
+import { ChevronRight, Database, Monitor, MonitorSmartphone, Folder, FolderOpen, KeyRound, Pencil, RefreshCcw, ShieldAlert, SquareTerminal, Waypoints, type LucideIcon } from "lucide-react";
 import type { SavedConnections } from "../connections/connectionIpc";
 import { Menu, ProtocolIcon, type MenuItem, type ProtocolKind } from "../ui/controls";
 
@@ -32,9 +32,12 @@ export function LocalTree({ profiles, openCounts, onOpen, onElevate, onLocalElev
       targets: profiles.targets.filter(({ profile: target }) => target.groupId === profile.id).map(({ profile: target }) => ({
         key: `target:${target.id}`, name: target.displayName, id: target.id, open: () => onOpen(target),
         kind: (target.defaultMethod === "local" ? "local" : target.defaultMethod) as ProtocolKind,
-        viaSsm: target.defaultMethod === "ssh" && target.ssh.transport.kind === "ssm",
+        viaSsm: (target.defaultMethod === "ssh" && target.ssh.transport.kind === "ssm")
+          || (target.defaultMethod === "rdp" && target.rdp.route.kind === "ssm")
+          || (target.defaultMethod === "vnc" && target.vnc.route.kind === "ssm"),
         method: target.defaultMethod === "ssm" ? "AWS Systems Manager" : target.defaultMethod === "ssh" ? "SSH"
-          : target.defaultMethod === "s3" ? "S3" : "로컬",
+          : target.defaultMethod === "s3" ? "S3" : target.defaultMethod === "rdp" ? "RDP"
+            : target.defaultMethod === "vnc" ? "VNC" : "로컬",
         sshTargetId: target.defaultMethod === "ssh" ? target.id : undefined,
         openRemoteEditor: target.defaultMethod === "ssh" && target.ssh.transport.kind === "direct" &&
           (target.ssh.auth.kind === "agent" || target.ssh.auth.kind === "keyFile")
@@ -70,7 +73,8 @@ export function LocalTree({ profiles, openCounts, onOpen, onElevate, onLocalElev
   }
 
   function menuItems({ target }: NonNullable<typeof menu>): MenuItem[] {
-    const items: MenuItem[] = [{ label: target.method, icon: target.kind === "s3" ? Database : SquareTerminal, onSelect: target.open }];
+    const items: MenuItem[] = [{ label: target.method, icon: target.kind === "s3" ? Database : target.kind === "rdp" ? Monitor
+      : target.kind === "vnc" ? MonitorSmartphone : SquareTerminal, onSelect: target.open }];
     const add = (label: string, icon: LucideIcon, action?: () => void) => {
       if (action) items.push({ label, icon, onSelect: action });
     };

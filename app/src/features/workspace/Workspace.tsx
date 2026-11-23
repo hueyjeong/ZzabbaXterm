@@ -14,6 +14,7 @@ import type { ApprovedEditorFile, ConfirmEditorDiscard, EditorTransport } from "
 import { closeLocalFile, localEditorError, localEditorTransport, openLocalFile } from "../editor/localEditorIpc";
 import { subscribeRemoteNanoOpen, type RemoteNanoFile } from "../editor/nanoOpen";
 import { RdpTab, type RdpTabActions } from "../rdp/RdpTab";
+import { openDesktopProfile, type DesktopPreset, type DesktopProfile } from "../remoteDesktop/desktopProfile";
 import { SftpPanel, type SftpPanelActions } from "../sftp/SftpPanel";
 import { sftpError } from "../sftp/sftpIpc";
 import type { SsmTarget } from "../ssm/ssm";
@@ -41,8 +42,8 @@ type Tab = { id: number; label: string } & (
   | { kind: "terminal"; targetId?: string; remoteEditor?: true; elevation?: ElevationRequest; ssm?: SsmTarget; ssh?: SshTransport["kind"]; status: TerminalStatus; sessionId?: string; sftpSessionId?: string; closeStatus?: CloseStatus }
   | { kind: "editor"; file: ApprovedEditorFile; transport: EditorTransport; close: () => Promise<void>; source: EditorSource; attaching?: true; readOnly?: true; nano?: Pick<RemoteNanoFile, "sessionId" | "disconnect"> }
   | { kind: "tunnel"; handle: string; targetId: string; name: string; method: "ssh" | "ssm"; closeStatus?: CloseStatus; closeError?: string }
-  | { kind: "rdp"; source?: DesktopTunnelSource; tlsOnly?: boolean; closeStatus?: CloseStatus }
-  | { kind: "vnc"; source?: DesktopTunnelSource; closeStatus?: CloseStatus }
+  | { kind: "rdp"; source?: DesktopTunnelSource; tlsOnly?: boolean; closeStatus?: CloseStatus; targetId?: string; preset?: DesktopPreset; release?: () => Promise<void> }
+  | { kind: "vnc"; source?: DesktopTunnelSource; closeStatus?: CloseStatus; targetId?: string; preset?: DesktopPreset; release?: () => Promise<void> }
   | { kind: "storage"; storage: StorageTarget; closeStatus?: CloseStatus }
 );
 type ProfileLoad = { kind: "loading" | "ready"; profiles?: SavedConnections }
@@ -132,6 +133,7 @@ export function Workspace() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [aiOpen, setAiOpen] = useState(true);
   const [quickOpen, setQuickOpen] = useState(false);
+  const [desktopOpening, setDesktopOpening] = useState("");
   // Windows Terminal과 같은 Ctrl+Shift+P로 빠른 열기를 연다. 셸이 쓰는 Ctrl+K·Ctrl+P는 가로채지 않는다.
   useEffect(() => {
     const open = (event: KeyboardEvent) => {
@@ -474,6 +476,10 @@ export function Workspace() {
       openStorageTarget({ kind: "aws", targetId: target.id, label: target.displayName });
       return;
     }
+    if (target?.defaultMethod === "rdp" || target?.defaultMethod === "vnc") {
+      void openDesktopTarget(target, split);
+      return;
+    }
     const id = nextTab.current++;
     setTabs((current) => [...current, {
       id, label: target?.displayName ?? `로컬 ${id}`, kind: "terminal", targetId: target?.id,
@@ -495,6 +501,28 @@ export function Workspace() {
     }
     const target = profileLoad.profiles?.targets.find(({ profile }) => profile.id === tab.targetId)?.profile;
     if (target) openTab(target, tab.remoteEditor ? { remoteEditor: true } : undefined, placement);
+  }
+
+  /** 저장된 RDP·VNC 프로필의 경로를 연 뒤 입력칸을 채운 화면 탭을 만든다. 서비스 연결은 탭에서 사용자가 시작한다. */
+  async function openDesktopTarget(target: DesktopProfile, split?: Placement) {
+    setWindowError("");
+    setDesktopOpening(target.displayName);
+    try {
+      const opened = await openDesktopProfile(target);
+      if (closingWindow.current) {
+        await opened.close();
+        return;
+      }
+      const id = nextTab.current++;
+      setTabs(current => [...current, {
+        id, label: opened.label, kind: opened.kind, source: opened.source, targetId: target.id, preset: opened.preset, release: opened.close,
+      }]);
+      placeTab(id, split);
+    } catch (error) {
+      setWindowError(`${target.displayName} 열기 실패: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setDesktopOpening(current => current === target.displayName ? "" : current);
+    }
   }
 
   function openElevation(request: ElevationRequest) {
@@ -604,6 +632,8 @@ export function Workspace() {
         selectTab(id);
         return;
       }
+      // 프로필 경로로 연 전달은 화면 탭과 함께 닫는다.
+      void tab.release?.().catch(error => setWindowError(`${tab.label} 경로 종료 실패: ${String(error)}`));
     }
     if (tab.kind === "tunnel" || tab.kind === "storage" || (tab.kind === "terminal" && (tab.ssm || tab.ssh))) {
       closingTabs.current.add(id);
@@ -679,7 +709,8 @@ export function Workspace() {
   }, [active, activeSftp, attachedSftp]);
   const openCounts = new Map<string, number>();
   for (const tab of tabs) {
-    const key = tab.kind === "terminal" && !tab.elevation ? tab.targetId ?? "" : tab.kind === "storage" ? tab.storage.targetId : undefined;
+    const key = tab.kind === "terminal" && !tab.elevation ? tab.targetId ?? "" : tab.kind === "storage" ? tab.storage.targetId
+      : (tab.kind === "rdp" || tab.kind === "vnc") ? tab.targetId : undefined;
     if (key !== undefined) openCounts.set(key, (openCounts.get(key) ?? 0) + 1);
   }
   const sideWidth = sidebarOpen ? left : 0;
@@ -733,7 +764,9 @@ export function Workspace() {
       id: `target:${profile.id}`, section: "연결", label: profile.displayName,
       detail: [profileLoad.profiles?.groups.find(group => group.profile.id === profile.groupId)?.profile.displayName,
         profile.defaultMethod === "ssm" ? `SSM · ${profile.ssm.instanceId}` : profile.defaultMethod === "ssh" ? `SSH · ${profile.ssh.account}@${profile.ssh.host}`
-          : profile.defaultMethod === "s3" ? `S3 · ${profile.s3.bucket}` : "로컬"].filter(Boolean).join(" · "),
+          : profile.defaultMethod === "s3" ? `S3 · ${profile.s3.bucket}`
+            : profile.defaultMethod === "rdp" ? `RDP · ${profile.rdp.host || profile.rdp.route.kind}`
+              : profile.defaultMethod === "vnc" ? `VNC · ${profile.vnc.host || profile.vnc.route.kind}` : "로컬"].filter(Boolean).join(" · "),
       icon: <ProtocolIcon kind={profile.defaultMethod === "local" ? "local" : profile.defaultMethod as ProtocolKind} />,
       run: () => openTab(profile),
     })),
@@ -930,11 +963,11 @@ export function Workspace() {
                   onShare={(targetId, tabHandle, tunnelId) => openTunnel(targetId, tab.name, tab.method, { tab: tabHandle, id: tunnelId })}
                   onOpenDesktop={openDesktop} />
               ) : tab.kind === "rdp" ? (
-                <RdpTab ref={bindDesktopClose} active={visible} label={label} source={tab.source}
+                <RdpTab ref={bindDesktopClose} active={visible} label={label} source={tab.source} preset={tab.preset}
                   onSecurityMode={(tlsOnly) => setTabs(current => current.map(item => item.id === id && item.kind === "rdp"
                     ? { ...item, tlsOnly } : item))} />
               ) : tab.kind === "vnc" ? (
-                <VncView ref={bindDesktopClose} active={visible} source={tab.source} />
+                <VncView ref={bindDesktopClose} active={visible} source={tab.source} preset={tab.preset} />
               ) : tab.kind === "storage" ? (
                 <div className="workspace-storage">
                   <div inert={!!tab.closeStatus}>
@@ -984,12 +1017,13 @@ export function Workspace() {
         {windowError && <span role="alert">{windowError}</span>}
         {fileError && <span role="alert">{fileError}</span>}
         {hostRegistration && <span role={hostRegistration.kind}>{hostRegistration.message}</span>}
+        {desktopOpening && <span role="status">{desktopOpening} 경로 여는 중</span>}
       </footer>
       {elevationContext && <ElevationDialog context={elevationContext} onClose={() => setElevationContext(undefined)} onSubmit={(request) => {
         setElevationContext(undefined);
         openElevation(request);
       }} />}
-      {wizard && <LocalConnectionWizard {...wizard} groups={profileLoad.profiles?.groups ?? []}
+      {wizard && <LocalConnectionWizard {...wizard} groups={profileLoad.profiles?.groups ?? []} targets={profileLoad.profiles?.targets}
         capabilities={connections.capabilities}
         verifySshHost={connections.verifySshHost}
         test={connections.test} cancelTest={connections.cancelTest} save={connections.save} onClose={closeWizard} />}
