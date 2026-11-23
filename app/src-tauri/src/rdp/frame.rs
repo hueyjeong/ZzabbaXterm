@@ -360,11 +360,7 @@ fn validate(bitmap: &BitmapUpdateData<'_>, image: &DecodedImage) -> Result<(), E
         }
         // 원격이 선언한 크기로 디코드하기 전에 기존 프레임 한도를 먼저 적용한다.
         frame_len(update.width, update.height)?;
-        if update.compression_flags.contains(Compression::BITMAP_COMPRESSION) {
-            if update.bits_per_pixel != 32 {
-                return Err(Error::Bounds);
-            }
-        } else {
+        if !update.compression_flags.contains(Compression::BITMAP_COMPRESSION) {
             let row = row_bytes(update.width, update.bits_per_pixel).map_err(|_| Error::Bounds)?;
             let row = (row + 3) & !3;
             if update.bitmap_data.len() < row * usize::from(update.height) {
@@ -387,6 +383,10 @@ fn decode_rect(update: &BitmapData<'_>) -> Result<(u16, Vec<u8>), Error> {
         return Err(Error::Bounds);
     }
     if update.compression_flags.contains(Compression::BITMAP_COMPRESSION) {
+        // 잘라 내야 하는 압축 비트맵은 RDP6(32bpp)만 디코드한다. 그 밖의 압축은 IronRDP가 그대로 처리한다.
+        if update.bits_per_pixel != 32 {
+            return Err(Error::Bounds);
+        }
         // 압축은 원본 폭으로 디코드한 뒤 목적지 폭으로 잘라 낸다(행 밀림 방지).
         let mut rgb = Vec::new();
         BitmapStreamDecoder::default()

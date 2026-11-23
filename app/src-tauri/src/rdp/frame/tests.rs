@@ -293,7 +293,8 @@ fn xrdp_compressed_bitmap_crops_source_stride_without_shear() {
 
 #[test]
 fn oversized_declared_bitmap_is_rejected_before_decoding() {
-    let data = encoded_bitmap(InclusiveRectangle { left: 0, top: 0, right: 10, bottom: 9 }, 65535, 10, 32, Compression::empty(), &[]);
+    let data = encoded_bitmap(InclusiveRectangle { left: 0, top: 0, right: 10, bottom: 9 }, 65535, 10, 32,
+        Compression::BITMAP_COMPRESSION | Compression::NO_BITMAP_COMPRESSION_HDR, &[]);
     let pdu = fastpath_frame(&[(Fragmentation::Single, UpdateCode::Bitmap, &data)]);
     assert!(matches!(Normalizer::default().normalize(Action::FastPath, &pdu, &test_image()), Err(Error::Bounds)));
 }
@@ -410,11 +411,19 @@ fn invalid_bits_per_pixel_is_bounds_without_panic() {
 }
 
 #[test]
+fn compressed_low_depth_bitmap_without_crop_passes_through() {
+    let data = encoded_bitmap(InclusiveRectangle { left: 0, top: 0, right: 3, bottom: 1 }, 4, 2, 16,
+        Compression::BITMAP_COMPRESSION | Compression::NO_BITMAP_COMPRESSION_HDR, &[0; 8]);
+    let pdu = fastpath_frame(&[(Fragmentation::Single, UpdateCode::Bitmap, &data)]);
+    assert!(matches!(Normalizer::default().normalize(Action::FastPath, &pdu, &test_image()).unwrap(), Normalized::Pass));
+}
+
+#[test]
 fn a_single_bitmap_drops_an_older_fragment() {
     let (encoded, _) = rdp6(8, 3);
     let data = encoded_bitmap(InclusiveRectangle { left: 0, top: 0, right: 6, bottom: 2 }, 8, 3, 32,
         Compression::BITMAP_COMPRESSION | Compression::NO_BITMAP_COMPRESSION_HDR, &encoded);
-    let first = fastpath_frame(&[(Fragmentation::First, UpdateCode::Bitmap, &data[..4])]);
+    let first = fastpath_frame(&[(Fragmentation::First, UpdateCode::Bitmap, &data)]);
     let mut normalizer = Normalizer::default();
     assert!(matches!(normalizer.normalize(Action::FastPath, &first, &test_image()).unwrap(), Normalized::Drop));
     let single = fastpath_frame(&[(Fragmentation::Single, UpdateCode::Bitmap, &data)]);
