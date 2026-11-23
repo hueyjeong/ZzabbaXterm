@@ -557,7 +557,8 @@ mod tests {
         let alias = root.path().join("alias");
         fs::hard_link(&path, &alias).unwrap();
         assert_eq!(GuardedFile::prepare(&path).err().unwrap().kind(), io::ErrorKind::Unsupported);
-        assert!(matches!(guarded.compare(), Err(Error::Conflict)));
+        // 링크 수 변화는 충돌이 아니라 지원 밖 상태다. 앱은 다시 불러오기를 권하지 않는다.
+        assert!(matches!(guarded.compare(), Err(Error::Io(error)) if error.kind() == io::ErrorKind::Unsupported));
         fs::remove_file(&alias).unwrap();
         symlink(&path, &alias).unwrap();
         assert!(GuardedFile::prepare(&alias).is_err());
