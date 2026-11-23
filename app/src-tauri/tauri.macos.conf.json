@@ -3,6 +3,7 @@
     "windows": [
       {
         "title": "ZzabbaXterm",
+        "dragDropEnabled": false,
         "width": 1200,
         "height": 720,
         "minWidth": 660,

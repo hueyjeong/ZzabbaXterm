@@ -5,6 +5,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../../App";
 import { editor } from "../editor/monaco";
+import { contextMenu, control, dblclick, fileRow } from "../files/testing";
 import type { SavedConnections } from "../connections/connectionIpc";
 import type { ConnectionRequest, ConnectionTestDraft, ConnectionTestRun } from "../connections/profiles";
 import * as rdp from "../rdp/RdpTab";
@@ -204,18 +205,108 @@ function button(name: string) {
   return [...host.querySelectorAll("button")].find((item) => (item.getAttribute("aria-label") ?? item.textContent) === name);
 }
 
+async function chooseMethod(value: string) {
+  const tile = host.querySelector<HTMLButtonElement>(`dialog [role="radiogroup"][aria-label="접속 방식"] [role="radio"][value="${value}"]`);
+  expect(tile, value).not.toBeNull();
+  await act(async () => { tile!.click(); });
+  expect(tile!.getAttribute("aria-checked")).toBe("true");
+}
+
 async function press(name: string) {
   const control = button(name);
   expect(control, name).toBeDefined();
   await act(async () => { control!.click(); });
 }
 
-async function chooseFileConnection(targetId: string) {
-  const select = find<HTMLSelectElement>('select[aria-label="파일 연결"]');
-  await act(async () => {
-    select.value = targetId;
-    select.dispatchEvent(new Event("change", { bubbles: true }));
-  });
+/** 열린 메뉴(role="menu") 가운데 마지막 것을 찾는다. 이름을 주면 aria-label이 같은 메뉴만 찾는다. */
+function openMenu(label?: string) {
+  const menus = [...host.querySelectorAll<HTMLElement>('[role="menu"]')]
+    .filter(menu => label === undefined || menu.getAttribute("aria-label") === label);
+  expect(menus.length, `메뉴 ${label ?? ""}`).toBeGreaterThan(0);
+  return menus[menus.length - 1];
+}
+
+function menuItemNames(menu = openMenu()) {
+  return [...menu.querySelectorAll('[role="menuitem"]')].map(item => item.textContent);
+}
+
+async function chooseMenuItem(name: string, menu = openMenu()) {
+  const item = [...menu.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find(entry => entry.textContent === name);
+  expect(item, name).toBeDefined();
+  await act(async () => { item!.click(); });
+}
+
+/** 단추(aria-label 또는 요소)로 메뉴를 열고 그 메뉴를 돌려준다. */
+async function showMenu(control: string | HTMLElement) {
+  const element = typeof control === "string" ? button(control) : control;
+  expect(element, String(control)).toBeDefined();
+  await act(async () => { element!.click(); });
+  return openMenu();
+}
+
+async function closeMenu(menu = openMenu()) {
+  await key(menu.querySelector<HTMLElement>('[role="menuitem"]') ?? menu, "Escape");
+}
+
+/** 제목줄 `새 탭 종류` 메뉴의 항목을 실행한다. */
+async function openNewTab(name: "파일 열기…" | "RDP 연결" | "VNC 연결" | "S3 호환 스토리지" | "새 연결 프로필…" | "로컬 터미널") {
+  await chooseMenuItem(name, await showMenu("새 탭 종류"));
+}
+
+/** 탭 이름으로 탭 문맥 메뉴를 연다. */
+async function showTabMenu(label: string) {
+  const tab = button(label)?.closest<HTMLElement>(".workspace-tab");
+  expect(tab, label).toBeDefined();
+  await act(async () => { tab!.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true })); });
+  return openMenu(`${label} 탭 메뉴`);
+}
+
+async function tabMenuAction(label: string, action: string) {
+  await chooseMenuItem(action, await showTabMenu(label));
+}
+
+/** 탭이 속한 탭 그룹 번호(왼쪽부터 1)다. */
+function tabGroup(label: string) {
+  const head = button(label)?.closest(".workspace-group-head");
+  return head ? [...host.querySelectorAll(".workspace-group-head")].indexOf(head) + 1 : 0;
+}
+
+/** 세션 화면이 놓인 탭 그룹 번호(왼쪽부터 1)다. */
+function sessionGroup(element: Element) {
+  const session = element.closest<HTMLElement>(".workspace-session");
+  return session ? (Number(session.style.gridColumn) + 1) / 2 : 0;
+}
+
+/** 탭 종료 상태 문구(종료 중·종료 확인 불가)다. */
+function tabCloseStatus(label: string) {
+  return button(label)?.closest(".workspace-tab")?.querySelector(".workspace-tab-close-status")?.textContent?.trim();
+}
+
+/** 연결 트리에서 이름이 같은 대상 행을 찾는다. */
+function treeTarget(label: string) {
+  const row = [...tree().querySelectorAll<HTMLElement>('[role="treeitem"]:not([aria-expanded])')]
+    .find(item => item.querySelector(":scope > .tree-row > span")?.textContent === label);
+  expect(row, label).toBeDefined();
+  return row!;
+}
+
+/** 연결 트리 대상의 문맥 메뉴 항목을 실행한다. */
+async function treeMenuAction(label: string, action: string) {
+  await key(treeTarget(label), "ContextMenu");
+  await chooseMenuItem(action);
+}
+
+/** 파일 목록 행의 문맥 메뉴(파일 작업·폴더 작업) 항목을 실행한다. */
+async function fileMenuAction(title: string, action: string, scope: ParentNode = host) {
+  await contextMenu(fileRow(scope, title));
+  await chooseMenuItem(action);
+}
+
+const sftpSidebar = () => find('.workspace-sidebar[aria-label="SFTP 파일"]');
+
+/** 키보드 입력이 가는 탭(포커스 그룹의 활성 탭) 이름이다. */
+function focusedTabLabel() {
+  return host.querySelector('.workspace-tabstrip[data-focused] .workspace-tab-select[aria-pressed="true"]')?.textContent;
 }
 
 async function key(element: HTMLElement, value: string) {
@@ -260,7 +351,7 @@ async function requestWindowClose(requestId: string) {
 const closeReplies = () => connectionCalls("workspace_window").map(([, args]) => args)
   .filter(args => args.action === "respondToClose");
 
-const status = () => find("footer").textContent;
+const status = () => find("footer.workspace-status").textContent;
 const tree = () => find('[role="tree"]');
 async function openSecond() {
   const group = find('[role="treeitem"][aria-expanded]');
@@ -326,7 +417,7 @@ describe("작업 공간 창 닫기", () => {
 
   it("포커스 해제로 확정된 편집을 폐기 확인 목록에 포함한다", async () => {
     openFile = async () => ({ status: "opened", handle: "blur-file", name: "입력.txt", text: "원본" });
-    await press("파일 열기");
+    await openNewTab("파일 열기…");
     const model = editor.getModels().find(item => item.uri.query === "blur-file")!;
     const tab = button("입력.txt")!;
     await act(async () => { tab.focus(); });
@@ -345,13 +436,13 @@ describe("작업 공간 창 닫기", () => {
     const response = Promise.withResolvers<boolean>();
     respondToWindowClose = () => response.promise;
     openFile = async () => ({ status: "opened", handle: "dirty-file", name: "미저장.txt", text: "원본" });
-    await press("파일 열기");
+    await openNewTab("파일 열기…");
     const dirty = editor.getModels().find(model => model.uri.query === "dirty-file")!;
     await act(async () => dirty.setValue("편집본"));
     openFile = async () => ({ status: "opened", handle: "clean-file", name: "저장됨.txt", text: "원본" });
-    await press("파일 열기");
+    await openNewTab("파일 열기…");
     openFile = async () => ({ status: "opened", handle: "uncertain-file", name: "저장 미확인.txt", text: "원본" });
-    await press("파일 열기");
+    await openNewTab("파일 열기…");
     expect(confirm).not.toHaveBeenCalled();
     const uncertain = editor.getModels().find(model => model.uri.query === "uncertain-file")!;
     const version = uncertain.getAlternativeVersionId();
@@ -361,7 +452,7 @@ describe("작업 공간 창 닫기", () => {
     const recoveryPath = String.raw`C:\작업 폴더\한글 복구.txt`;
     saveFile = async () => { throw { kind: "publicationUnconfirmed", recoveryPath }; };
     const activeEditor = find('.editor-tab[aria-label="저장 미확인.txt"]:not([hidden])');
-    const save = [...activeEditor.querySelectorAll("button")].find(button => button.textContent === "저장");
+    const save = [...activeEditor.querySelectorAll("button")].find(button => (button.getAttribute("aria-label") ?? button.textContent) === "저장");
     expect(save?.disabled).toBe(false);
     await act(async () => { save?.click(); });
     expect(connectionCalls("editor_local_save")).toEqual([["editor_local_save", { handle: "uncertain-file", text: "수정 원본" }]]);
@@ -394,13 +485,14 @@ describe("작업 공간 창 닫기", () => {
     const response = Promise.withResolvers<boolean>();
     respondToWindowClose = () => response.promise;
     openFile = async () => ({ status: "opened", handle: "keep-file", name: "유지.txt", text: "원본" });
-    await press("파일 열기");
+    await openNewTab("파일 열기…");
     const model = editor.getModels().find(item => item.uri.query === "keep-file")!;
     await act(async () => model.setValue("편집본"));
     const previousFocus = document.activeElement;
     await requestWindowClose("approve");
     expect(find("main").hasAttribute("inert")).toBe(true);
-    await press("파일 열기");
+    await press("새 탭 종류");
+    expect(host.querySelector('[role="menu"]')).toBeNull();
     await press("유지.txt 닫기");
     expect(connectionCalls("editor_local_open")).toHaveLength(1);
     expect(button("유지.txt")).toBeDefined();
@@ -441,7 +533,7 @@ describe("작업 공간 창 닫기", () => {
     native.invoke.mockRejectedValueOnce("최소화 거부");
     await press("최소화");
     openFile = () => picker.promise;
-    await press("파일 열기");
+    await openNewTab("파일 열기…");
     await requestWindowClose("picker");
     expect(status()).toContain("파일 선택 중 · 창 닫기 보류");
     expect(confirm).not.toHaveBeenCalled();
@@ -516,7 +608,7 @@ describe("중앙 원격 화면", () => {
 
     await openSecond();
     const terminal = find<HTMLTextAreaElement>('section[aria-label="로컬 2"] textarea');
-    await press(`${protocol.toUpperCase()} 탭 열기`);
+    await openNewTab(`${protocol.toUpperCase() as "RDP" | "VNC"} 연결`);
     expect(button(label)?.getAttribute("aria-pressed")).toBe("true");
     expect(status()).toBe(`${label} · 직접 · ${protocol === "rdp" ? "NLA" : "TLS"}`);
     const pane = find(".workspace-session.workspace-desktop");
@@ -582,17 +674,16 @@ describe("중앙 원격 화면", () => {
     expect(canvas.closest("[hidden][inert]")).not.toBeNull();
     await act(async () => dispatchTrusted(canvas, input()));
     expect(keyCalls()).toHaveLength(1);
-    const choice = find<HTMLSelectElement>(".workspace-center-actions select");
-    expect([...choice.options].map(option => option.text)).toEqual(["선택", "로컬 1"]);
-    await act(async () => {
-      choice.selectedIndex = 1;
-      choice.dispatchEvent(new Event("change", { bubbles: true }));
-    });
-    expect(terminal.closest('[data-pane="left"]')).not.toBeNull();
-    const boundary = find(".splitter-center");
+    expect(menuItemNames(await showTabMenu("로컬 1"))).toEqual(["오른쪽으로 분리", "같은 연결 새 탭", "같은 연결 오른쪽에 열기", "닫기"]);
+    await chooseMenuItem("오른쪽으로 분리");
+    expect([tabGroup("로컬 2"), tabGroup(label), tabGroup("로컬 1")]).toEqual([1, 1, 2]);
+    expect(sessionGroup(terminal)).toBe(1);
+    expect(terminal.closest("[hidden], [inert]")).toBeNull();
+    const boundary = find(".workspace-group-splitter");
     await press(label);
-    expect(find(".splitter-center")).toBe(boundary);
-    expect(host.querySelector(".workspace-center-split")).toBeNull();
+    expect(find(".workspace-group-splitter")).toBe(boundary);
+    expect(sessionGroup(pane)).toBe(1);
+    expect(find('section[aria-label="로컬 1"]').closest("[hidden], [inert]")).toBeNull();
     expect(terminal.closest("[hidden][inert]")).not.toBeNull();
     expect(pane.querySelector("canvas")).toBe(canvas);
     expect(pane.textContent).toContain("연결됨 · 1 × 1");
@@ -625,9 +716,10 @@ describe("중앙 원격 화면", () => {
     expect(confirm).not.toHaveBeenCalled();
     expect(pane.isConnected).toBe(false);
     expect(document.activeElement).toBe(terminal);
-    expect(terminal.closest('[data-pane="left"]')).not.toBeNull();
-    expect(find(".splitter-center")).toBe(boundary);
-    expect(boundary.parentElement?.classList.contains("workspace-center-split")).toBe(true);
+    expect(sessionGroup(terminal)).toBe(1);
+    expect(tabGroup("로컬 2")).toBe(1);
+    expect(find(".workspace-group-splitter")).toBe(boundary);
+    expect(host.querySelectorAll(".workspace-group-head")).toHaveLength(2);
     expect(calls("open")).toHaveLength(2);
     expect(calls("close")).toEqual([]);
   });
@@ -766,7 +858,7 @@ describe("L02", () => {
   it("창 축소와 집중 보기 복귀에서 선택 탭을 노출한다", async () => {
     await openSecond();
     const list = find(".workspace-tabs");
-    const selected = find('button[aria-pressed="true"]').parentElement!;
+    const selected = find('.workspace-tab-select[aria-pressed="true"]').parentElement!;
     let listWidth = 200;
     vi.spyOn(list, "getBoundingClientRect").mockImplementation(() => new DOMRect(0, 0, listWidth, 38));
     vi.spyOn(selected, "getBoundingClientRect").mockImplementation(() => new DOMRect(90 - list.scrollLeft, 0, 90, 38));
@@ -834,7 +926,7 @@ describe("L02", () => {
     await type(input, "echo B_READY");
     const draft = find<HTMLTextAreaElement>('textarea[aria-label="메시지 입력"]');
     await type(draft, "CHAT_ONLY");
-    const treeSplitter = find('[role="separator"][aria-label="트리 너비"]');
+    const treeSplitter = find('[role="separator"][aria-label="사이드바 너비"]');
     treeSplitter.setPointerCapture = vi.fn();
     await act(async () => {
       treeSplitter.dispatchEvent(new PointerEvent("pointerdown", { pointerId: 1, clientX: 280, bubbles: true }));
@@ -843,7 +935,7 @@ describe("L02", () => {
     });
     await key(find('[role="separator"][aria-label="AI 열 너비"]'), "ArrowLeft");
     expect(host.querySelector('[role="separator"][aria-label="AI 채팅 높이"]')).toBeNull();
-    const values = () => ["트리 너비", "AI 열 너비"].map((label) =>
+    const values = () => ["사이드바 너비", "AI 열 너비"].map((label) =>
       find(`[role="separator"][aria-label="${label}"]`).getAttribute("aria-valuenow"));
     expect(values()).toEqual(["340", "380"]);
     await act(async () => { viewportWidth = 660; observeWorkspace(); });
@@ -880,44 +972,41 @@ describe("L02", () => {
       return invoke(command, args);
     });
     await press("모델 및 대상 새로고침");
-    const aiTarget = find<HTMLSelectElement>(".a01-proposals select");
-    await act(async () => {
-      aiTarget.closest("details:not([open])")?.querySelector("summary")?.click();
-      aiTarget.selectedIndex = 1;
-      aiTarget.dispatchEvent(new Event("change", { bubbles: true }));
-    });
-    const aiValue = aiTarget.value;
-    expect(aiValue).not.toBe("");
+    const aiTarget = find<HTMLButtonElement>('button[aria-label^="조회 대상"]');
+    expect(aiTarget.getAttribute("aria-label")).toBe("조회 대상: 선택 안 함");
+    expect(menuItemNames(await showMenu(aiTarget))).toEqual(["조회 A (local-a)"]);
+    await chooseMenuItem("조회 A (local-a)");
+    const aiValue = aiTarget.getAttribute("aria-label");
+    expect(aiValue).toBe("조회 대상: 조회 A (local-a)");
 
     await openSecond();
-    await press("로컬 1");
     const left = find<HTMLTextAreaElement>('section[aria-label="로컬 1"] textarea');
     const right = find<HTMLTextAreaElement>('section[aria-label="로컬 2"] textarea');
+    // 탭이 둘인 그룹의 분할 단추는 활성 탭(로컬 2)을 오른쪽 새 그룹으로 옮긴다.
+    await press("오른쪽으로 분할");
+    await press("로컬 1");
     await type(left, "echo ");
-    const choice = find<HTMLSelectElement>(".workspace-center-actions select");
-    expect([...choice.options].map((option) => option.text)).toEqual(["선택", "로컬 2"]);
-    await act(async () => {
-      choice.selectedIndex = 1;
-      choice.dispatchEvent(new Event("change", { bubbles: true }));
-    });
-    expect(left.closest('[data-pane="left"]')).not.toBeNull();
-    expect(right.closest('[data-pane="right"]')).not.toBeNull();
+    expect([tabGroup("로컬 1"), tabGroup("로컬 2")]).toEqual([1, 2]);
+    expect([sessionGroup(left), sessionGroup(right)]).toEqual([1, 2]);
     expect(right.closest("[hidden], [inert]")).toBeNull();
     expect(document.activeElement).toBe(left);
+    expect(focusedTabLabel()).toBe("로컬 1");
     await type(right, "UNFOCUSED");
     expect(calls("input")).toEqual([{ id: "pty-10", bytes: Array.from(new TextEncoder().encode("echo ")) }]);
-    const boundary = find('[role="separator"][aria-label="중앙 터미널 분할"]');
+    const boundary = find('[role="separator"][aria-label="탭 그룹 1·2 경계"]');
     expect(boundary.getAttribute("aria-orientation")).toBe("vertical");
     await act(async () => boundary.focus());
     await key(boundary, "ArrowRight");
     expect(boundary.getAttribute("aria-valuenow")).toBe("55");
     expect(document.activeElement).toBe(boundary);
-    vi.spyOn(boundary.parentElement!, "clientWidth", "get").mockReturnValue(508);
-    vi.spyOn(boundary, "offsetWidth", "get").mockReturnValue(8);
+    // 두 그룹 머리의 합친 폭은 50~450px이다.
+    const [leftHead, rightHead] = host.querySelectorAll(".workspace-group-head");
+    vi.spyOn(leftHead, "getBoundingClientRect").mockReturnValue(new DOMRect(50, 0, 198, 38));
+    vi.spyOn(rightHead, "getBoundingClientRect").mockReturnValue(new DOMRect(253, 0, 197, 38));
     boundary.setPointerCapture = vi.fn();
     await act(async () => {
       boundary.dispatchEvent(new PointerEvent("pointerdown", { pointerId: 1, clientX: 250, bubbles: true }));
-      boundary.dispatchEvent(new PointerEvent("pointermove", { pointerId: 1, clientX: 300, bubbles: true }));
+      boundary.dispatchEvent(new PointerEvent("pointermove", { pointerId: 1, clientX: 310, bubbles: true }));
       boundary.dispatchEvent(new PointerEvent("lostpointercapture", { pointerId: 1, bubbles: true }));
     });
     expect(boundary.getAttribute("aria-valuenow")).toBe("65");
@@ -926,14 +1015,17 @@ describe("L02", () => {
     await type(right, "RIGHT");
     expect(document.activeElement).toBe(right);
     expect(button("로컬 2")?.getAttribute("aria-pressed")).toBe("true");
+    expect(focusedTabLabel()).toBe("로컬 2");
     expect(status()).toContain("pty-11");
     await press("집중 보기");
     await press("기본 보기");
-    expect(find(".splitter-center")).toBe(boundary);
+    expect(find(".workspace-group-splitter")).toBe(boundary);
     expect(boundary.getAttribute("aria-valuenow")).toBe("65");
     await press("로컬 1");
     expect(document.activeElement).toBe(left);
-    await press("분할 닫기");
+    await tabMenuAction("로컬 1", "모든 그룹 합치기");
+    expect(host.querySelectorAll(".workspace-group-head")).toHaveLength(1);
+    expect(boundary.isConnected).toBe(false);
     expect(right.closest("[hidden][inert]")).not.toBeNull();
     await press("로컬 2");
     expect(document.activeElement).toBe(right);
@@ -944,7 +1036,7 @@ describe("L02", () => {
       { id: "pty-10", bytes: Array.from(new TextEncoder().encode("echo ")) },
       { id: "pty-11", bytes: Array.from(new TextEncoder().encode("RIGHT")) },
     ]);
-    expect(aiTarget.value).toBe(aiValue);
+    expect(find('button[aria-label^="조회 대상"]').getAttribute("aria-label")).toBe(aiValue);
     expect(connectionCalls("ai_select")).toEqual([["ai_select", { target }]]);
     expect(connectionCalls("ai_set_policy")).toEqual([]);
   });
@@ -995,7 +1087,7 @@ describe("L02", () => {
 
   it("창 이동은 핸들과 여백에서만 시작하며 오류를 표시한다", async () => {
     native.invoke.mockClear();
-    for (const selector of ['.workspace-tab button', '.workspace-desktop-actions button', '.workspace-mode', '.window-control.close']) {
+    for (const selector of ['.workspace-tab button', '.workspace-new-tab button', '.workspace-view-actions button', '.workspace-mode', '.window-control.close']) {
       await act(async () => {
         find(selector).dispatchEvent(new MouseEvent("mousedown", { bubbles: true, detail: 1 }));
       });
@@ -1036,7 +1128,7 @@ describe("C01 저장된 로컬 연결", () => {
       search.dispatchEvent(new Event("input", { bubbles: true }));
     });
     const groups = [...tree().querySelectorAll<HTMLElement>('[aria-expanded]')];
-    expect(groups.map((group) => group.firstElementChild?.textContent)).toEqual(["▾ 회사 개발alpha", "▾ 회사 개발beta"]);
+    expect(groups.map((group) => group.firstElementChild?.textContent)).toEqual(["회사 개발alpha", "회사 개발beta"]);
     await act(async () => { groups[1].focus(); });
     await key(groups[1], "ArrowRight");
     expect(document.activeElement?.textContent).toBe("작업 셸");
@@ -1054,7 +1146,8 @@ describe("C01 저장된 로컬 연결", () => {
   });
 
   it("빈 저장소에서 + 마법사로 시험한 뒤 Rust 저장 응답 이후에만 다시 읽고 재시작 시 표시한다", async () => {
-    expect([...tree().querySelectorAll('[role="treeitem"] > .tree-row > span:not([aria-hidden])')].map(item => item.textContent)).toEqual(["로컬", "내 PC"]);
+    expect([...tree().querySelectorAll('[role="treeitem"] > .tree-row > span:not([aria-hidden], .tree-open, .tree-via)')].map(item => item.textContent)).toEqual(["로컬", "내 PC"]);
+    expect(tree().querySelector(".tree-open")?.getAttribute("aria-label")).toBe("열린 탭 1개");
     const save = Promise.withResolvers<void>();
     const reload = Promise.withResolvers<SavedConnections>();
     let store = emptyStore;
@@ -1219,7 +1312,7 @@ describe("C02 SSM 연결", () => {
     await changeInput("표시명", "관리 노드");
     await press("다음");
     expect(connectionCalls("ssm_discovery")).toHaveLength(0);
-    await select("접속 방식", "ssm");
+    await chooseMethod("ssm");
     await press("다음");
     expect(button("다음")?.disabled).toBe(true);
     await select("프로필", node.profile);
@@ -1282,7 +1375,7 @@ describe("C02 SSM 연결", () => {
     };
     await press("연결 추가");
     await press("다음");
-    await select("접속 방식", "ssm");
+    await chooseMethod("ssm");
     await press("다음");
     await select("프로필", node.profile);
     await select("온라인 노드", node.instanceId);
@@ -1330,7 +1423,7 @@ describe("C02 SSM 연결", () => {
     };
     await press("연결 추가");
     await press("다음");
-    await select("접속 방식", "ssm");
+    await chooseMethod("ssm");
     await press("다음");
     await select("프로필", node.profile);
     await select("온라인 노드", node.instanceId);
@@ -1360,9 +1453,9 @@ describe("C02 SSM 연결", () => {
     });
     runStorage = async () => ({ ok: false, error: { stage: "profile", failure: { kind: "retestRequired" }, bytes: 0 } });
     await restartWorkspace();
-    await press("파일");
-    await chooseFileConnection("legacy");
-    expect(find('section[aria-label="AWS S3"] [role="alert"]').textContent).toContain("다시 시험하고 저장");
+    await treeMenuAction("관리 노드", "S3 버킷 열기");
+    expect(button("관리 노드")?.getAttribute("aria-pressed")).toBe("true");
+    expect(find('.workspace-storage section[aria-label="AWS S3"] [role="alert"]').textContent).toContain("다시 시험하고 저장");
     await press("연결 재시험");
     expect(find<HTMLInputElement>('dialog input').value).toBe("관리 노드");
     expect(connectionCalls("connection_save")).toHaveLength(0);
@@ -1377,8 +1470,7 @@ describe("C02 SSM 연결", () => {
     const opening = Promise.withResolvers<unknown>();
     runStorage = async command => command === "storage_open" ? opening.promise : true;
     await restartWorkspace();
-    await press("파일");
-    await chooseFileConnection("saved-ssm");
+    await treeMenuAction("관리 노드", "S3 버킷 열기");
     const id = storageOpenId();
     await press("관리 노드 닫기");
     expect(host.querySelector(".workspace-storage")).toBeNull();
@@ -1400,12 +1492,13 @@ describe("C02 SSM 연결", () => {
       throw new Error(command);
     };
     await restartWorkspace();
-    await press("파일");
-    await chooseFileConnection("saved-ssm");
+    await treeMenuAction("관리 노드", "S3 버킷 열기");
+    expect(connectionCalls("storage_open")[0][1]).toMatchObject({ request: { targetId: "saved-ssm" } });
     expect(connectionCalls("storage_relogin")).toHaveLength(0);
     await press("SSO 재로그인");
     expect(connectionCalls("storage_relogin")).toEqual([["storage_relogin", { request: { id: storageOpenId() } }]]);
-    expect(find<HTMLSelectElement>('select[aria-label="파일 연결"]').value).toBe("saved-ssm");
+    expect(host.querySelectorAll(".workspace-storage")).toHaveLength(1);
+    expect(button("관리 노드")?.getAttribute("aria-pressed")).toBe("true");
     expect(connectionCalls("storage_open")).toHaveLength(1);
     expect(connectionCalls("storage_upload")).toHaveLength(0);
     expect(connectionCalls("storage_download")).toHaveLength(0);
@@ -1444,19 +1537,19 @@ describe("C02 SSM 연결", () => {
         default: throw new Error(command);
       }
     };
-    await press("파일");
-    await chooseFileConnection("saved-ssm");
+    await treeMenuAction("관리 노드", "S3 버킷 열기");
     expect(connectionCalls("storage_open")).toEqual([["storage_open", { request: { targetId: "saved-ssm", id: session.sessionId } }]]);
+    const storage = find(".workspace-storage");
     await changeInput("버킷", "test-bucket");
     await press("버킷 열기");
-    await press(key);
+    await act(async () => fileRow(storage, key).click());
     await press("다운로드");
     openFile = async () => ({ status: "opened", handle: "local-fixture", name: "격리.txt", text: "원본" });
-    await press("파일 열기");
+    await openNewTab("파일 열기…");
     const model = editor.getModels().find(item => item.uri.query === "local-fixture")!;
     await act(async () => model.setValue("미저장 편집"));
     expect(button("격리.txt")?.getAttribute("aria-pressed")).toBe("true");
-    await press("AI 채팅");
+    expect(storage.closest("[hidden][inert]")).not.toBeNull();
     await act(async () => picker.resolve({ kind: "approved", approvalId: "approved-id" }));
     expect(connectionCalls("storage_download")).toEqual([["storage_download", {
       request: {
@@ -1468,8 +1561,13 @@ describe("C02 SSM 연결", () => {
     const terminal = find('section[aria-label="로컬 1"] textarea');
     expect(terminal).toBe(document.activeElement);
     await act(async () => downloaded.resolve({ ok: true, value: { bytes: 7, integrity: "sdkChecksumVerified" } }));
-    await press("파일");
-    expect(find('section[aria-label="AWS S3"]').textContent).toContain("다운로드 완료: 7 바이트 · SDK 체크섬 검증됨");
+    await press("관리 노드");
+    expect(find(".workspace-storage")).toBe(storage);
+    expect(storage.closest("[hidden]")).toBeNull();
+    const transfers = [...storage.querySelectorAll(".transfer-table tbody tr")].map(row => row.textContent);
+    expect(transfers).toHaveLength(1);
+    expect(transfers[0]).toContain("완료");
+    expect(transfers[0]).toContain("7 바이트 · SDK 체크섬 검증됨");
     await press("격리.txt");
     await press("관리 노드 닫기");
     expect(connectionCalls("storage_close")).toEqual([["storage_close", { request: { sessionId: session.sessionId } }]]);
@@ -1492,7 +1590,7 @@ describe("C02 SSM 연결", () => {
     expect(row).toBeDefined();
     await key(row!, "ContextMenu");
     expect([...find('[role="menu"]').querySelectorAll('[role="menuitem"]')].map(item => item.textContent))
-      .toEqual(["AWS Systems Manager", "터널 열기"]);
+      .toEqual(["AWS Systems Manager", "S3 버킷 열기", "터널 열기"]);
     await press("AWS Systems Manager");
     const [{ output, ...args }] = calls("open").slice(-1);
     expect(output).toBeDefined();
@@ -1513,13 +1611,15 @@ describe("C02 SSM 연결", () => {
     expect(status()).toContain("연결됨");
     expect(screen.hasAttribute("inert")).toBe(false);
     expect(document.activeElement).toBe(field);
-    const aiSession = find<HTMLSelectElement>(`.workspace-chat select:has(option[value="${sessionId}"])`);
-    expect([...aiSession.options].map(option => option.value)).toEqual(["", sessionId]);
-    await press("RDP 탭 열기");
-    expect([...aiSession.options].map(option => option.value)).toEqual(["", sessionId]);
+    const aiSession = find<HTMLButtonElement>('.workspace-chat button[aria-label^="AI 작업 세션"]');
+    expect(menuItemNames(await showMenu(aiSession))).toEqual([`관리 노드 (세션 ${sessionId})`]);
+    await closeMenu();
+    await openNewTab("RDP 연결");
+    expect(menuItemNames(await showMenu(aiSession))).toEqual([`관리 노드 (세션 ${sessionId})`]);
+    await closeMenu();
     await press("RDP 3 닫기");
     expect(document.activeElement).toBe(field);
-    await press("파일");
+    await press("SFTP 파일");
     expect(find(".workspace-file-status").textContent).toBe("활성 SSH 연결 없음");
     expect(connectionCalls("editor_sftp_attach")).toHaveLength(0);
     await act(async () => field.focus());
@@ -1571,10 +1671,10 @@ describe("C02 SSM 연결", () => {
     native.invoke.mockClear();
     await press("관리 노드 닫기");
     expect(calls("close").slice(-1)).toEqual([{ id: remoteId }]);
-    await press("파일 열기");
+    await openNewTab("파일 열기…");
     expect(button("관리 노드")?.getAttribute("aria-pressed")).toBe("true");
     openFile = async () => ({ status: "opened", handle: "selected-file", name: "시험.txt", text: "원본" });
-    await press("파일 열기");
+    await openNewTab("파일 열기…");
     const model = editor.getModels().find((item) => item.uri.query === "selected-file")!;
     await act(async () => model.setValue("첫 편집"));
     await press("로컬 1");
@@ -1637,7 +1737,7 @@ describe("F01 직접 SSH", () => {
     await changeInput("그룹", "작업");
     await changeInput("표시명", "개발 서버");
     await press("다음");
-    await select("접속 방식", "ssh");
+    await chooseMethod("ssh");
     expect(find<HTMLOptionElement>('option[value="ssm"][disabled]').textContent).toContain("SSH-over-SSM");
     await changeInput("서버 호스트", "dev.example.invalid");
     await changeInput("SSH 포트", "2222");
@@ -1705,7 +1805,7 @@ describe("F01 직접 SSH", () => {
     await changeInput("그룹", "작업");
     await changeInput("표시명", "개발 서버");
     await press("다음");
-    await select("접속 방식", "ssh");
+    await chooseMethod("ssh");
     await changeInput("서버 호스트", "dev.example.invalid");
     await changeInput("SSH 계정", "deploy");
     await changeInput("호스트 키 SHA256 지문", fingerprint);
@@ -1747,7 +1847,7 @@ describe("F01 직접 SSH", () => {
       }],
     });
     expect(tree().textContent).not.toContain("개발 서버");
-    await press("새로고침");
+    await press("연결 새로고침");
     const target = [...tree().querySelectorAll<HTMLElement>('[role="treeitem"]')].find(item => item.textContent === "개발 서버")!;
     expect(target).toBeDefined();
 
@@ -1758,7 +1858,7 @@ describe("F01 직접 SSH", () => {
 
     await key(target, "ContextMenu");
     expect([...find('[role="menu"]').querySelectorAll('[role="menuitem"]')].map(item => item.textContent))
-      .toEqual(["SSH", "호스트 키 등록", "터널 열기"]);
+      .toEqual(["SSH", "터널 열기", "호스트 키 등록"]);
     await press("호스트 키 등록");
     expect(host.querySelector('[role="menu"]')).toBeNull();
     expect(find('footer [role="alert"]').textContent).toContain("SSH 호스트 키 등록이 취소되었습니다");
@@ -1953,10 +2053,7 @@ describe("현재 SSH 세션의 SFTP", () => {
   });
 
   async function openTarget(label: string) {
-    const row = [...tree().querySelectorAll<HTMLElement>('[role="treeitem"]:not([aria-expanded])')]
-      .find(item => item.querySelector(":scope > .tree-row > span")?.textContent === label);
-    expect(row, label).toBeDefined();
-    await key(row!, "Enter");
+    await key(treeTarget(label), "Enter");
   }
 
   async function openSsh(label: string) {
@@ -1980,8 +2077,10 @@ describe("현재 SSH 세션의 SFTP", () => {
       throw new Error(command);
     };
     await openSecond();
-    await press("파일");
-    const fileConnection = find('select[aria-label="파일 연결"]');
+    await press("SFTP 파일");
+    const fileView = find(".workspace-sidebar > .workspace-side-body:not([hidden])");
+    expect(fileView.closest("[hidden], [inert]")).toBeNull();
+    expect(sftpSidebar().contains(fileView)).toBe(true);
     const row = [...tree().querySelectorAll<HTMLElement>('[role="treeitem"]')]
       .find(item => item.querySelector(":scope > .tree-row > span")?.textContent === "서버 A");
     expect(row).toBeDefined();
@@ -1995,11 +2094,12 @@ describe("현재 SSH 세션의 SFTP", () => {
     const panel = find('.workspace-center section[aria-label="터널"]');
     expect(panel.closest("[hidden]")).toBeNull();
     expect(status()).toContain(title);
-    expect(find('select[aria-label="파일 연결"]')).toBe(fileConnection);
-    expect(fileConnection.closest("[hidden], [inert]")).toBeNull();
+    expect(find(".workspace-sidebar > .workspace-side-body:not([hidden])")).toBe(fileView);
+    expect(fileView.closest("[hidden], [inert]")).toBeNull();
     await press("로컬 2");
-    expect([...find<HTMLSelectElement>(".workspace-center-actions select").options].map(option => option.text))
-      .toEqual(["선택", "로컬 1"]);
+    // 터널 탭은 같은 연결의 새 터미널로 복제하지 않는다.
+    expect(menuItemNames(await showTabMenu(title))).toEqual(["오른쪽으로 분리", "닫기"]);
+    await closeMenu();
     await press(title);
 
     await press("새 탭에 공유");
@@ -2019,7 +2119,7 @@ describe("현재 SSH 세션의 SFTP", () => {
     expect(close).toHaveBeenNthCalledWith(3, { tab: "tunnel-1" });
     expect(button(title)).toBeUndefined();
     expect(button("서버 A · 터널 5")?.getAttribute("aria-pressed")).toBe("true");
-    expect(find('select[aria-label="파일 연결"]')).toBe(fileConnection);
+    expect(find(".workspace-sidebar > .workspace-side-body:not([hidden])")).toBe(fileView);
   });
 
   it.each(["rdp", "vnc"] as const)("Ready 터널의 %s 선택자를 중앙 탭에 전달한다", async protocol => {
@@ -2069,30 +2169,29 @@ describe("현재 SSH 세션의 SFTP", () => {
     expect(connectionCalls("editor_sftp_attach")).toEqual([]);
     await act(async () => starting.resolve());
     expect(connectionCalls("editor_sftp_attach")).toEqual([]);
-    await press("파일");
-    const sftp = find<HTMLButtonElement>('[role="tab"][aria-selected="true"]');
-    expect(sftp.textContent).toBe("파일");
-    expect(document.activeElement).toBe(sftp);
+    await press("SFTP 파일");
+    expect(button("SFTP 파일")?.getAttribute("aria-pressed")).toBe("true");
     expect(find('section[aria-label="서버 A"]').closest("[hidden]")).toBeNull();
-    expect(draft.closest("[hidden][inert]")).not.toBeNull();
-    const firstFile = button(`${first.id}.txt`)!;
-    await press(`${first.id}.txt`);
-    expect(firstFile.getAttribute("aria-pressed")).toBe("true");
-    await press("AI 채팅");
+    expect(draft.closest("[hidden], [inert]")).toBeNull();
+    const firstFile = fileRow(host, `${first.id}.txt`);
+    await act(async () => firstFile.click());
+    expect(firstFile.getAttribute("aria-selected")).toBe("true");
+    // SFTP 보기를 닫아도 패널과 선택은 유지한다.
+    await press("SFTP 파일");
     expect(firstFile.closest("[hidden][inert]")).not.toBeNull();
     expect(draft.value).toBe("유지할 채팅 초안");
     expect(connectionCalls("editor_sftp_detach")).toEqual([]);
-    await press("파일");
-    expect(button(`${first.id}.txt`)).toBe(firstFile);
-    expect(firstFile.getAttribute("aria-pressed")).toBe("true");
+    await press("SFTP 파일");
+    expect(fileRow(host, `${first.id}.txt`)).toBe(firstFile);
+    expect(firstFile.getAttribute("aria-selected")).toBe("true");
 
     const second = await openSsh("서버 B");
     expect(firstFile.closest("[hidden][inert]")).not.toBeNull();
-    const secondFile = button(`${second.id}.txt`)!;
+    const secondFile = fileRow(host, `${second.id}.txt`);
     expect(secondFile.closest("[hidden]")).toBeNull();
     expect(firstFile.closest("[hidden][inert]")).not.toBeNull();
     await press("서버 A");
-    expect(button(`${first.id}.txt`)).toBe(firstFile);
+    expect(fileRow(host, `${first.id}.txt`)).toBe(firstFile);
     expect(firstFile.closest("[hidden]")).toBeNull();
     expect(secondFile.closest("[hidden][inert]")).not.toBeNull();
     expect(connectionCalls("editor_sftp_attach")).toEqual([
@@ -2100,7 +2199,7 @@ describe("현재 SSH 세션의 SFTP", () => {
     ]);
 
     await act(async () => second.receive({ kind: "exited", value: 0 }));
-    expect(button(`${second.id}.txt`)).toBeUndefined();
+    expect(() => fileRow(host, `${second.id}.txt`)).toThrow();
     expect(firstFile.closest("[hidden]")).toBeNull();
     expect(connectionCalls("editor_sftp_detach")).toEqual([["editor_sftp_detach", { sessionId: second.id }]]);
     expect(calls("close").some(args => args.id === second.id)).toBe(false);
@@ -2132,21 +2231,22 @@ describe("현재 SSH 세션의 SFTP", () => {
       throw new Error(command);
     };
     const ssh = await openSsh("서버 A");
-    await press("파일");
+    await press("SFTP 파일");
     const follow = find(".workspace-sftp:not([hidden])");
-    const select = find<HTMLSelectElement>('select[aria-label="파일 연결"]');
-    const compatible = [...select.options].filter(option => option.text === "S3 호환 HTTPS");
-    expect(compatible).toHaveLength(1);
-    const key = compatible[0].value;
-    await chooseFileConnection(key);
-    const panel = find(".workspace-storage:not([hidden])");
+    await openNewTab("S3 호환 스토리지");
+    const panel = find(".workspace-storage");
+    expect(panel.closest("[hidden]")).toBeNull();
+    expect(follow.matches("[hidden][inert]")).toBe(true);
     await changeInput("서비스 ID", target.serviceId);
     const draft = panel.querySelector("input");
-    await chooseFileConnection("");
+    await press("서버 A");
     expect(find(".workspace-sftp:not([hidden])")).toBe(follow);
-    expect(panel.matches("[hidden][inert]")).toBe(true);
-    await chooseFileConnection(key);
-    expect(find(".workspace-storage:not([hidden])")).toBe(panel);
+    expect(panel.closest("[hidden][inert]")).not.toBeNull();
+    // 같은 대상을 다시 열면 기존 탭으로 이동한다.
+    await openNewTab("S3 호환 스토리지");
+    expect(host.querySelectorAll(".workspace-storage")).toHaveLength(1);
+    expect(find(".workspace-storage")).toBe(panel);
+    expect(panel.closest("[hidden]")).toBeNull();
     expect(panel.querySelector("input")).toBe(draft);
     expect(draft?.value).toBe(target.serviceId);
     expect(connectionCalls("storage_compatible_open")).toHaveLength(0);
@@ -2166,22 +2266,24 @@ describe("현재 SSH 세션의 SFTP", () => {
     expect(opens[0][1].request).toMatchObject({ scope: { kind: "service_browse" } });
     const { sessionId } = opens[0][1].request as { sessionId: string };
     expect(sessionId).toBeTruthy();
-    const bucket = button("fixture-bucket");
-    expect(bucket).toBeDefined();
-    await chooseFileConnection("");
-    await chooseFileConnection(key);
-    expect(button("fixture-bucket")).toBe(bucket);
+    const bucket = control(panel, "fixture-bucket");
+    await press("서버 A");
+    expect(panel.closest("[hidden][inert]")).not.toBeNull();
+    await openNewTab("S3 호환 스토리지");
+    expect(control(panel, "fixture-bucket")).toBe(bucket);
     expect(connectionCalls("storage_compatible_open")).toHaveLength(1);
     expect(connectionCalls("storage_list_buckets")).toHaveLength(0);
     expect(connectionCalls("storage_close")).toHaveLength(0);
     await press("S3 호환 HTTPS 닫기");
-    expect(panel.querySelector('[role="alert"]')?.textContent).toBe("종료 확인 불가");
+    expect(tabCloseStatus("S3 호환 HTTPS")).toBe("종료 확인 불가");
+    expect(panel.isConnected).toBe(true);
     failClose = false;
     await press("S3 호환 HTTPS 종료 다시 확인");
     const close = ["storage_close", { request: { sessionId } }];
     expect(connectionCalls("storage_close")).toEqual([close, close]);
     expect(panel.isConnected).toBe(false);
-    expect(select.value).toBe("");
+    expect(button("S3 호환 HTTPS")).toBeUndefined();
+    expect(button("서버 A")?.getAttribute("aria-pressed")).toBe("true");
     expect(find(".workspace-sftp:not([hidden])")).toBe(follow);
     expect(connectionCalls("editor_sftp_attach")).toEqual([["editor_sftp_attach", { sessionId: ssh.id }]]);
     expect(connectionCalls("editor_sftp_detach")).toHaveLength(0);
@@ -2219,80 +2321,83 @@ describe("현재 SSH 세션의 SFTP", () => {
     };
     const second = await openSsh("서버 B");
     const first = await openSsh("서버 A");
-    const choice = find<HTMLSelectElement>(".workspace-center-actions select");
-    await act(async () => {
-      choice.value = [...choice.options].find(option => option.text === "서버 B")!.value;
-      choice.dispatchEvent(new Event("change", { bubbles: true }));
-    });
+    await tabMenuAction("서버 B", "오른쪽으로 분리");
+    await press("서버 A");
+    expect([tabGroup("서버 A"), tabGroup("서버 B")]).toEqual([1, 2]);
     const right = find<HTMLTextAreaElement>('section[aria-label="서버 B"] textarea');
-    const split = find(".splitter-center");
+    const split = find(".workspace-group-splitter");
     const openedTerminals = calls("open").length;
     const visible = (element: HTMLElement) => element.closest("[hidden], [inert]") === null;
-    await press("파일");
-    await press(`폴더 ${first.id}`);
-    const firstPath = find(".sftp-location span");
+    const sftpLocation = () => find('.workspace-sftp:not([hidden]) [aria-label="SFTP 경로"] [aria-current="location"]');
+    await press("SFTP 파일");
+    await dblclick(fileRow(host, `폴더 ${first.id}`));
+    const firstPath = sftpLocation();
+    expect(firstPath.textContent).toBe(`폴더 ${first.id}`);
     expect(visible(firstPath)).toBe(true);
 
     await openTarget("개발 버킷");
     const pinned = find(".workspace-storage");
-    const object = button("saved-0/notes.txt")!;
-    await press("saved-0/notes.txt");
+    expect(tabGroup("개발 버킷")).toBe(1);
+    const object = fileRow(pinned, "saved-0/notes.txt");
+    await act(async () => object.click());
+    expect(object.getAttribute("aria-selected")).toBe("true");
     expect(visible(pinned)).toBe(true);
     expect(visible(firstPath)).toBe(false);
-    expect(button("서버 A")?.getAttribute("aria-pressed")).toBe("true");
-    await press("VNC 탭 열기");
-    expect(visible(pinned)).toBe(true);
-    expect(visible(firstPath)).toBe(false);
-    expect(right.closest("[hidden][inert]")).not.toBeNull();
-    await press("서버 A");
-    expect(find(".workspace-storage")).toBe(pinned);
-    await act(async () => right.focus());
-    expect(visible(pinned)).toBe(true);
-    expect(status()).toContain(second.id);
-    expect(connectionCalls("editor_sftp_attach")).toEqual([["editor_sftp_attach", { sessionId: first.id }]]);
-    await press("AI 채팅");
+    expect(visible(right)).toBe(true);
+    await openNewTab("VNC 연결");
     expect(visible(pinned)).toBe(false);
     expect(pinned.isConnected).toBe(true);
-    await press("파일");
-    expect(visible(pinned)).toBe(true);
+    expect(visible(firstPath)).toBe(false);
+    expect(visible(right)).toBe(true);
+    await press("서버 A");
+    expect(sftpLocation()).toBe(firstPath);
+    expect(visible(firstPath)).toBe(true);
+    expect(connectionCalls("editor_sftp_attach")).toEqual([["editor_sftp_attach", { sessionId: first.id }]]);
 
-    await chooseFileConnection("");
-    await press(`폴더 ${second.id}`);
-    const secondPath = find('.workspace-sftp:not([hidden]) .sftp-location span');
+    // SFTP 보기는 포커스된 직접 SSH 탭을 따라간다.
+    await act(async () => right.focus());
+    expect(status()).toContain(second.id);
+    await dblclick(fileRow(host, `폴더 ${second.id}`));
+    const secondPath = sftpLocation();
+    expect(secondPath.textContent).toBe(`폴더 ${second.id}`);
     expect(visible(secondPath)).toBe(true);
     expect(visible(firstPath)).toBe(false);
     expect(visible(pinned)).toBe(false);
-    await chooseFileConnection("s3-0");
     await openTarget("개발 버킷");
     expect(find(".workspace-storage")).toBe(pinned);
-    expect(button("saved-0/notes.txt")).toBe(object);
-    expect(object.getAttribute("aria-pressed")).toBe("true");
-    expect(find(".storage-location").textContent).toContain("saved-0/");
+    expect(visible(pinned)).toBe(true);
+    expect(fileRow(pinned, "saved-0/notes.txt")).toBe(object);
+    expect(object.getAttribute("aria-selected")).toBe("true");
+    expect(find(".workspace-storage .s3-crumbs").textContent).toContain("saved-0");
     expect(visible(firstPath)).toBe(false);
     expect(visible(secondPath)).toBe(false);
     expect(connectionCalls("storage_open")).toHaveLength(1);
     expect(connectionCalls("storage_list_objects")).toHaveLength(1);
 
     await openTarget("격리 버킷");
-    const other = find(".workspace-storage:not([hidden])");
-    expect(other).not.toBe(pinned);
+    const other = [...host.querySelectorAll<HTMLElement>(".workspace-storage")].find(item => item !== pinned)!;
+    expect(other).toBeDefined();
+    expect(visible(other)).toBe(true);
     expect(visible(pinned)).toBe(false);
     expect(connectionCalls("storage_open")).toHaveLength(2);
     await press("격리 버킷 닫기");
-    expect(find(".workspace-storage:not([hidden])")).toBe(other);
-    expect(find(".workspace-storage [role=alert]").textContent?.trim()).toBe("종료 확인 불가");
+    expect(visible(other)).toBe(true);
+    expect(tabCloseStatus("격리 버킷")).toBe("종료 확인 불가");
     failClose = false;
     await press("격리 버킷 종료 다시 확인");
     const secondOpen = connectionCalls("storage_open")[1]?.[1]?.request as { id: string };
     const closeRequest = ["storage_close", { request: { sessionId: secondOpen.id } }];
     expect(connectionCalls("storage_close")).toEqual([closeRequest, closeRequest]);
     expect(other.isConnected).toBe(false);
-    await chooseFileConnection("s3-0");
-    expect(find(".workspace-storage:not([hidden])")).toBe(pinned);
-    expect(connectionCalls("editor_sftp_attach")).toHaveLength(2);
+    await openTarget("개발 버킷");
+    expect(visible(pinned)).toBe(true);
+    expect(connectionCalls("storage_open")).toHaveLength(2);
+    expect(connectionCalls("editor_sftp_attach")).toEqual([
+      ["editor_sftp_attach", { sessionId: first.id }], ["editor_sftp_attach", { sessionId: second.id }],
+    ]);
     expect(connectionCalls("editor_sftp_detach")).toHaveLength(0);
     expect(calls("open")).toHaveLength(openedTerminals);
-    expect(find(".splitter-center")).toBe(split);
+    expect(find(".workspace-group-splitter")).toBe(split);
     expect(button("서버 B")?.getAttribute("aria-pressed")).toBe("true");
     await press("개발 버킷 닫기");
   });
@@ -2310,13 +2415,12 @@ describe("현재 SSH 세션의 SFTP", () => {
     const openBaseline = calls("open").length;
     const first = await openSsh("서버 A");
     const second = await openSsh("서버 B");
-    await press("서버 A");
-    await press("파일");
-    const choice = find<HTMLSelectElement>(".workspace-center-actions select");
-    await act(async () => {
-      choice.value = [...choice.options].find((option) => option.text === "서버 B")!.value;
-      choice.dispatchEvent(new Event("change", { bubbles: true }));
-    });
+    // 서버 A만 오른쪽 그룹에 두고 서버 B는 왼쪽 그룹의 활성 탭으로 남긴다.
+    await tabMenuAction("서버 A", "오른쪽으로 분리");
+    expect([tabGroup("서버 B"), tabGroup("서버 A")]).toEqual([1, 2]);
+    expect(focusedTabLabel()).toBe("서버 A");
+    const split = find(".workspace-group-splitter");
+    await press("SFTP 파일");
     expect(connectionCalls("editor_sftp_attach")).toEqual([["editor_sftp_attach", { sessionId: first.id }]]);
     const closeBaseline = calls("close").length;
     closeTerminal = async (id) => {
@@ -2326,19 +2430,20 @@ describe("현재 SSH 세션의 SFTP", () => {
     await press("서버 A 닫기");
     expect(button("서버 A 종료 다시 확인")).toBeDefined();
     expect(calls("close").slice(closeBaseline)).toEqual([{ id: first.id }]);
-    const right = find<HTMLTextAreaElement>('section[aria-label="서버 B"] textarea');
-    await act(async () => right.focus());
+    const remaining = find<HTMLTextAreaElement>('section[aria-label="서버 B"] textarea');
+    await act(async () => remaining.focus());
     expect(connectionCalls("editor_sftp_attach")).toEqual([
       ["editor_sftp_attach", { sessionId: first.id }], ["editor_sftp_attach", { sessionId: second.id }],
     ]);
-    await type(right, "READY");
+    await type(remaining, "READY");
     failDetach = false;
     closeTerminal = async () => null;
     await press("서버 A 종료 다시 확인");
     expect(button("서버 A")).toBeUndefined();
-    expect(host.querySelector(".splitter-center")).toBeNull();
-    expect(find('section[aria-label="서버 B"] textarea')).toBe(right);
-    expect(right.closest("[hidden], [inert]")).toBeNull();
+    expect(split.isConnected).toBe(false);
+    expect(host.querySelector(".workspace-group-splitter")).toBeNull();
+    expect(find('section[aria-label="서버 B"] textarea')).toBe(remaining);
+    expect(remaining.closest("[hidden], [inert]")).toBeNull();
     expect(status()).toContain(second.id);
     expect(calls("open").slice(openBaseline)).toHaveLength(2);
     expect(calls("close").slice(closeBaseline)).toEqual([{ id: first.id }, { id: first.id }]);
@@ -2376,12 +2481,10 @@ describe("현재 SSH 세션의 SFTP", () => {
       throw new Error(command);
     };
     const ssh = await openSsh("서버 A");
-    await press("파일");
-    await key(button("원격.txt")!, "ContextMenu");
-    await press("편집");
+    await press("SFTP 파일");
+    await fileMenuAction("원격.txt", "편집");
     await openTarget("개발 버킷");
-    await key(button("saved-0/객체.txt")!, "ContextMenu");
-    await press("편집");
+    await fileMenuAction("saved-0/객체.txt", "편집", find(".workspace-storage"));
     expect(connectionCalls("editor_sftp_open")).toHaveLength(1);
     expect(connectionCalls("storage_edit_open")).toHaveLength(1);
 
@@ -2415,9 +2518,8 @@ describe("현재 SSH 세션의 SFTP", () => {
       }
     };
     const ssh = await openSsh("서버 A");
-    await press("파일");
-    await key(button("원격.txt")!, "ContextMenu");
-    await press("편집");
+    await press("SFTP 파일");
+    await fileMenuAction("원격.txt", "편집");
     expect(connectionCalls("editor_sftp_open")).toEqual([["editor_sftp_open", { sessionId: ssh.id, entryId: "file" }]]);
     expect(status()).toBe("SFTP");
     const model = editor.getModels().find(item => item.uri.query === "remote-file")!;
@@ -2427,8 +2529,7 @@ describe("현재 SSH 세션의 SFTP", () => {
     expect(connectionCalls("editor_local_save")).toEqual([]);
     await act(async () => model.setValue("미저장 편집"));
     const other = await openSsh("서버 B");
-    const otherFile = button("다른 서버.txt");
-    expect(otherFile).toBeDefined();
+    const otherFile = fileRow(host, "다른 서버.txt");
     await press("원격.txt");
     await press("서버 A 닫기");
     expect(button("서버 A 닫기")?.disabled).toBe(true);
@@ -2442,8 +2543,8 @@ describe("현재 SSH 세션의 SFTP", () => {
     expect(button("원격.txt")?.getAttribute("aria-pressed")).toBe("true");
     expect(model.getValue()).toBe("미저장 편집");
     await press("서버 B");
-    expect(button("다른 서버.txt")).toBe(otherFile);
-    expect(otherFile?.closest("[hidden]")).toBeNull();
+    expect(fileRow(host, "다른 서버.txt")).toBe(otherFile);
+    expect(otherFile.closest("[hidden]")).toBeNull();
     await press("원격.txt");
 
     const confirm = vi.spyOn(window, "confirm").mockReturnValueOnce(false).mockReturnValueOnce(true);

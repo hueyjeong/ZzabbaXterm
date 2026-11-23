@@ -1,6 +1,7 @@
-import { useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties, type MouseEvent, type SyntheticEvent } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type DragEvent, type MouseEvent, type SyntheticEvent } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { ChevronsDownUp, Columns2, Database, FileText, FolderTree, Maximize2, Monitor, MonitorSmartphone, PanelLeft, PanelRight, Plus, RefreshCw, Search, Server, SquareTerminal } from "lucide-react";
 import { LocalAiPanel } from "../ai/LocalAiPanel";
 import { createLocalConnectionIpc, type SavedConnections } from "../connections/connectionIpc";
 import { LocalConnectionWizard } from "../connections/LocalConnectionWizard";
@@ -22,29 +23,31 @@ import { TerminalView } from "../terminal/TerminalView";
 import type { TerminalStatus } from "../terminal/session";
 import { TunnelTab } from "../tunnels/TunnelTab";
 import { tunnelIpc, type DesktopTunnelSource } from "../tunnels/tunnelIpc";
+import { IconButton, ProtocolIcon, type MenuItem, type ProtocolKind } from "../ui/controls";
 import { VncView, type VncTabActions } from "../vnc/VncView";
+import * as L from "./layout";
 import { LocalTree } from "./LocalTree";
 import { Splitter } from "./Splitter";
+import { dragTabId, TabStrip, TAB_DRAG_TYPE, type TabView } from "./TabStrip";
+import { QuickOpen, type QuickItem } from "./QuickOpen";
 import { macTitleBar, TitleBar } from "./TitleBar";
 import "./workspace.css";
 
 type CloseStatus = "closing" | "unconfirmed";
-type Split = { left: number; right: number };
 type DesktopKind = "rdp" | "vnc";
+const compatibleStorage = { kind: "compatible", targetId: "s3:compatible", label: "S3 호환 HTTPS" } as const;
+type StorageTarget = { kind: "aws"; targetId: string; label: string } | typeof compatibleStorage;
 type Tab = { id: number; label: string } & (
   | { kind: "terminal"; targetId?: string; remoteEditor?: true; elevation?: ElevationRequest; ssm?: SsmTarget; ssh?: SshTransport["kind"]; status: TerminalStatus; sessionId?: string; sftpSessionId?: string; closeStatus?: CloseStatus }
   | { kind: "editor"; file: ApprovedEditorFile; transport: EditorTransport; close: () => Promise<void>; source: EditorSource; attaching?: true; readOnly?: true; nano?: Pick<RemoteNanoFile, "sessionId" | "disconnect"> }
   | { kind: "tunnel"; handle: string; targetId: string; name: string; method: "ssh" | "ssm"; closeStatus?: CloseStatus; closeError?: string }
   | { kind: "rdp"; source?: DesktopTunnelSource; tlsOnly?: boolean; closeStatus?: CloseStatus }
   | { kind: "vnc"; source?: DesktopTunnelSource; closeStatus?: CloseStatus }
-);
-const compatibleStorage = { kind: "compatible", targetId: "s3:compatible", label: "S3 호환 HTTPS" } as const;
-type StorageTarget = { closeStatus?: CloseStatus } & (
-  | { kind: "aws"; targetId: string; label: string }
-  | typeof compatibleStorage
+  | { kind: "storage"; storage: StorageTarget; closeStatus?: CloseStatus }
 );
 type ProfileLoad = { kind: "loading" | "ready"; profiles?: SavedConnections }
   | { kind: "error"; profiles?: SavedConnections; error: string };
+type SideView = "connections" | "files";
 const connections = createLocalConnectionIpc();
 type EditorSource = "local" | "sftp" | "s3";
 async function confirmEditorDiscard(source: EditorSource, { label, reason }: Parameters<ConfirmEditorDiscard>[0]) {
@@ -65,20 +68,81 @@ function terminalStatus(status: TerminalStatus) {
   }
 }
 
+function tabIcon(tab: Tab): ProtocolKind {
+  switch (tab.kind) {
+    case "terminal": return tab.elevation ? "sudo" : tab.ssm ? "ssm" : tab.ssh ? "ssh" : "local";
+    case "storage": return "s3";
+    default: return tab.kind;
+  }
+}
+
+function tabState(tab: Tab): TabView["state"] {
+  const closeStatus = tab.kind === "editor" ? undefined : tab.closeStatus;
+  if (closeStatus === "unconfirmed") return "error";
+  if (closeStatus === "closing" || (tab.kind === "editor" && tab.attaching)) return "busy";
+  if (tab.kind !== "terminal") return "idle";
+  switch (tab.status.kind) {
+    case "running": return "running";
+    case "opening": case "connecting": return "busy";
+    default: return "error";
+  }
+}
+
+function GroupSplitter({ column, label, ratio, onChange }: { column: number; label: string; ratio: number; onChange: (ratio: number) => void }) {
+  const drag = useRef<number | null>(null);
+  function pairBounds(element: HTMLElement) {
+    const strips = [...(element.closest(".workspace-center") ?? element.parentElement!).querySelectorAll<HTMLElement>(".workspace-group-head")];
+    const left = strips.find(strip => Number(strip.style.gridColumnStart) === column - 1)?.getBoundingClientRect();
+    const right = strips.find(strip => Number(strip.style.gridColumnStart) === column + 1)?.getBoundingClientRect();
+    return left && right ? { start: left.left, width: right.right - left.left } : undefined;
+  }
+  return <div className="workspace-group-splitter" role="separator" tabIndex={0} aria-label={label} aria-orientation="vertical"
+    aria-valuemin={15} aria-valuemax={85} aria-valuenow={Math.round(ratio * 100)} aria-valuetext={`${Math.round(ratio * 100)}%`}
+    style={{ gridColumn: column }}
+    onPointerDown={event => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      event.currentTarget.focus();
+      event.currentTarget.setPointerCapture(event.pointerId);
+      drag.current = event.pointerId;
+    }}
+    onPointerMove={event => {
+      if (drag.current !== event.pointerId) return;
+      const bounds = pairBounds(event.currentTarget);
+      if (bounds && bounds.width > 0) onChange((event.clientX - bounds.start) / bounds.width);
+    }}
+    onLostPointerCapture={() => { drag.current = null; }}
+    onKeyDown={event => {
+      const step = event.key === "ArrowLeft" ? -0.05 : event.key === "ArrowRight" ? 0.05 : 0;
+      if (!step) return;
+      event.preventDefault();
+      onChange(ratio + step);
+    }} />;
+}
+
 export function Workspace() {
   const nextTab = useRef(2);
   const [tabs, setTabs] = useState<Tab[]>([{ id: 1, label: "로컬 1", kind: "terminal", status: { kind: "opening" } }]);
-  const [active, setActive] = useState(1);
+  const [layout, setLayout] = useState<L.Layout>(() => L.initialLayout(1));
+  const liveLayout = useRef(layout);
   const activeId = useRef(1);
-  const [split, setSplit] = useState<Split | null>(null);
-  const liveSplit = useRef<Split | null>(null);
-  const [splitPosition, setSplitPosition] = useState(50);
-  const paneId = useId();
-  const [showFiles, setShowFiles] = useState(false);
-  const [pinnedStorage, setPinnedStorage] = useState("");
-  const [storageTargets, setStorageTargets] = useState<StorageTarget[]>([]);
-  const storageClosers = useRef(new Map<string, { confirmClose(): Promise<void> }>());
-  const closingStorage = useRef(new Set<string>());
+  const [dragging, setDragging] = useState<number | null>(null);
+  const [dropTarget, setDropTarget] = useState<{ group: number; side: "left" | "right" | "center" }>();
+  const [sideView, setSideView] = useState<SideView>("connections");
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [aiOpen, setAiOpen] = useState(true);
+  const [quickOpen, setQuickOpen] = useState(false);
+  // Windows Terminal과 같은 Ctrl+Shift+P로 빠른 열기를 연다. 셸이 쓰는 Ctrl+K·Ctrl+P는 가로채지 않는다.
+  useEffect(() => {
+    const open = (event: KeyboardEvent) => {
+      if (!event.ctrlKey || !event.shiftKey || event.altKey || event.metaKey || event.key.toLowerCase() !== "p" || event.isComposing) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (!closingWindow.current) setQuickOpen(true);
+    };
+    window.addEventListener("keydown", open, true);
+    return () => window.removeEventListener("keydown", open, true);
+  }, []);
   const sftpPanels = useRef(new Map<string, SftpPanelActions>());
   const editorActions = useRef(new Map<number, EditorTabActions>());
   const desktopActions = useRef(new Map<number, RdpTabActions | VncTabActions>());
@@ -94,6 +158,8 @@ export function Workspace() {
   const sessionClosers = useRef(new Map<number, { confirmClose(): Promise<void> }>());
   const [closeBlock, setCloseBlock] = useState<{ kind: "picker" | "cli" | "mount"; message: string }
     | { kind: "editor"; id: number; message: string }>();
+  const active = L.focusedTab(layout) ?? 0;
+  const visibleSet = L.visibleTabs(layout);
   useLayoutEffect(() => {
     liveTabs.current = tabs;
     const mountingEditors = pendingEditorMounts.current.size;
@@ -114,6 +180,11 @@ export function Workspace() {
       setCloseBlock(current => current?.kind === "mount" ? undefined : current);
     }
   }, [tabs]);
+  // 보이는 편집기만 활성 상태로 둔다. 그룹마다 활성 탭이 하나씩 보인다.
+  useLayoutEffect(() => {
+    const visible = L.visibleTabs(layout);
+    for (const [id, actions] of editorActions.current) actions.setActive(visible.has(id));
+  }, [layout, tabs]);
   const [focused, setFocused] = useState(false);
   const [windowError, setWindowError] = useState("");
   const [closeError, setCloseError] = useState("");
@@ -129,10 +200,17 @@ export function Workspace() {
   const [bodyWidth, setBodyWidth] = useState(1200);
   const workspace = useRef<HTMLElement>(null);
   const body = useRef<HTMLDivElement>(null);
-  const activeButton = useRef<HTMLButtonElement>(null);
   const sideLimit = Math.min(640, Math.floor(bodyWidth * 0.32));
   const left = Math.min(treeWidth, sideLimit);
   const right = Math.min(aiWidth, sideLimit);
+
+  function updateLayout(change: (current: L.Layout) => L.Layout) {
+    const next = change(liveLayout.current);
+    if (next === liveLayout.current) return;
+    liveLayout.current = next;
+    activeId.current = L.focusedTab(next) ?? 0;
+    setLayout(next);
+  }
 
   useEffect(() => {
     if (closeBlock?.kind !== "editor") return;
@@ -244,7 +322,10 @@ export function Workspace() {
         tab.kind === "editor" && tab.source === source && tab.file.handle === file.handle)) return;
       attachingHandles.add(file.handle);
       const id = nextTab.current++;
-      const removePreview = () => setTabs(current => current.filter(tab => tab.id !== id));
+      const removePreview = () => {
+        setTabs(current => current.filter(tab => tab.id !== id));
+        updateLayout(current => L.removeTab(current, id));
+      };
       const { promise: mounted, resolve } = Promise.withResolvers<boolean>();
       cliMounts.current.set(id, resolve);
       const abort = () => {
@@ -253,6 +334,7 @@ export function Workspace() {
       };
       signal.addEventListener("abort", abort, { once: true });
       setTabs(current => [...current, { id, label: file.label, kind: "editor", file, source, transport, close, attaching: true, nano }]);
+      updateLayout(current => L.appendTab(current, id));
       try {
         const committed = await mounted;
         if (signal.aborted) return;
@@ -379,24 +461,15 @@ export function Workspace() {
     return () => observer.disconnect();
   }, []);
 
-  useLayoutEffect(() => {
-    const button = activeButton.current;
-    const list = button?.closest("nav");
-    if (!button || !list) return;
-    const reveal = () => {
-      const bounds = list.getBoundingClientRect();
-      const tab = button.parentElement!.getBoundingClientRect();
-      const selected = tab.width <= bounds.width ? tab : button.getBoundingClientRect();
-      if (selected.left < bounds.left) list.scrollLeft += selected.left - bounds.left;
-      else if (selected.right > bounds.right) list.scrollLeft += selected.right - bounds.right;
-    };
-    reveal();
-    const observer = new ResizeObserver(reveal);
-    observer.observe(list);
-    return () => observer.disconnect();
-  }, [active, left, focused]);
+  type Placement = { group: number; side: "left" | "right" };
 
-  function openTab(target?: SavedConnections["targets"][number]["profile"], options?: { readonly remoteEditor?: true }) {
+  /** 새 탭을 포커스 그룹(또는 지정한 그룹 옆의 새 그룹)에 놓고 선택한다. */
+  function placeTab(id: number, split?: Placement) {
+    updateLayout(current => split ? L.addTabInSplit(current, id, split.group, split.side) : L.addTab(current, id));
+    setFocusTab(id);
+  }
+
+  function openTab(target?: SavedConnections["targets"][number]["profile"], options?: { readonly remoteEditor?: true }, split?: Placement) {
     if (target?.defaultMethod === "s3") {
       openStorageTarget({ kind: "aws", targetId: target.id, label: target.displayName });
       return;
@@ -408,7 +481,20 @@ export function Workspace() {
       ssm: target?.defaultMethod === "ssm" ? target.ssm : undefined,
       ssh: target?.ssh?.transport.kind, status: { kind: "opening" },
     }]);
-    selectTab(id);
+    placeTab(id, split);
+  }
+
+  function duplicateTab(id: number, split: boolean) {
+    const tab = liveTabs.current.find(item => item.id === id);
+    if (tab?.kind !== "terminal" || tab.elevation) return;
+    const group = L.groupOf(liveLayout.current, id);
+    const placement = split && group ? { group: group.id, side: "right" as const } : undefined;
+    if (!tab.targetId) {
+      openTab(undefined, undefined, placement);
+      return;
+    }
+    const target = profileLoad.profiles?.targets.find(({ profile }) => profile.id === tab.targetId)?.profile;
+    if (target) openTab(target, tab.remoteEditor ? { remoteEditor: true } : undefined, placement);
   }
 
   function openElevation(request: ElevationRequest) {
@@ -417,13 +503,13 @@ export function Workspace() {
     setTabs((current) => [...current, {
       id, label: `승격 · ${name}`, kind: "terminal", elevation: request, status: { kind: "opening" },
     }]);
-    selectTab(id);
+    placeTab(id);
   }
 
   function openDesktop(kind: DesktopKind, source?: DesktopTunnelSource) {
     const id = nextTab.current++;
     setTabs(current => [...current, { id, label: `${kind.toUpperCase()} ${id}`, kind, source }]);
-    selectTab(id);
+    placeTab(id);
   }
 
   async function openTunnel(targetId: string, name: string, method: "ssh" | "ssm", share?: { tab: string; id: string }) {
@@ -439,38 +525,24 @@ export function Workspace() {
           await tunnelIpc.close(handle);
         } catch (closeError) {
           setTabs(current => [...current, { ...tab, closeStatus: "unconfirmed", closeError: String(closeError) }]);
+          updateLayout(current => L.appendTab(current, id));
         }
         throw error;
       }
     }
     setTabs(current => [...current, tab]);
-    selectTab(id);
+    placeTab(id);
   }
 
   function openStorageTarget(target: StorageTarget) {
-    setStorageTargets(current => current.some(open => open.targetId === target.targetId)
-      ? current : [...current, target]);
-    setPinnedStorage(target.targetId);
-    setShowFiles(true);
-  }
-
-  async function closeStorageTarget(targetId: string) {
-    if (closingStorage.current.has(targetId)) return;
-    closingStorage.current.add(targetId);
-    setStorageTargets(current => current.map(target => target.targetId === targetId
-      ? { ...target, closeStatus: "closing" } : target));
-    try {
-      const session = storageClosers.current.get(targetId);
-      if (!session) throw new Error("세션 종료 상태를 확인할 수 없습니다");
-      await session.confirmClose();
-      setStorageTargets(current => current.filter(target => target.targetId !== targetId));
-      setPinnedStorage(current => current === targetId ? "" : current);
-    } catch {
-      setStorageTargets(current => current.map(target => target.targetId === targetId
-        ? { ...target, closeStatus: "unconfirmed" } : target));
-    } finally {
-      closingStorage.current.delete(targetId);
+    const existing = liveTabs.current.find(tab => tab.kind === "storage" && tab.storage.targetId === target.targetId);
+    if (existing) {
+      selectTab(existing.id);
+      return;
     }
+    const id = nextTab.current++;
+    setTabs(current => [...current, { id, label: target.label, kind: "storage", storage: target }]);
+    placeTab(id);
   }
 
   function releaseEditorFile(source: EditorSource, close: () => Promise<void>) {
@@ -489,7 +561,7 @@ export function Workspace() {
     const id = nextTab.current++;
     pendingEditorMounts.current.add(id);
     setTabs((current) => [...current, { id, label: file.label, kind: "editor", file, transport, close, source }]);
-    selectTab(id);
+    placeTab(id);
   }
 
   async function openEditor() {
@@ -511,18 +583,8 @@ export function Workspace() {
   }
 
   function selectTab(id: number, requestFocus = true) {
-    if (id !== activeId.current) {
-      editorActions.current.get(activeId.current)?.setActive(false);
-      activeId.current = id;
-      editorActions.current.get(id)?.setActive(true);
-    }
-    setActive(id);
+    updateLayout(current => L.selectTab(current, id));
     setFocusTab(requestFocus ? id : null);
-  }
-
-  function updateSplit(next: Split | null) {
-    liveSplit.current = next;
-    setSplit(next);
   }
 
   async function closeTab(id: number) {
@@ -543,15 +605,15 @@ export function Workspace() {
         return;
       }
     }
-    if (tab.kind === "tunnel" || (tab.kind === "terminal" && (tab.ssm || tab.ssh))) {
+    if (tab.kind === "tunnel" || tab.kind === "storage" || (tab.kind === "terminal" && (tab.ssm || tab.ssh))) {
       closingTabs.current.add(id);
-      setTabs(current => current.map(item => item.id === id && (item.kind === "terminal" || item.kind === "tunnel")
+      setTabs(current => current.map(item => item.id === id && (item.kind === "terminal" || item.kind === "tunnel" || item.kind === "storage")
         ? { ...item, closeStatus: "closing" } : item));
       try {
         if (tab.kind === "tunnel") {
           await tunnelIpc.close(tab.handle);
         } else {
-          if (tab.sftpSessionId) {
+          if (tab.kind === "terminal" && tab.sftpSessionId) {
             const sftp = sftpPanels.current.get(tab.sftpSessionId);
             try {
               await sftp?.confirmClose();
@@ -567,7 +629,7 @@ export function Workspace() {
         }
       } catch (error) {
         setTabs(current => current.map(item => {
-          if (item.id !== id || (item.kind !== "terminal" && item.kind !== "tunnel")) return item;
+          if (item.id !== id || (item.kind !== "terminal" && item.kind !== "tunnel" && item.kind !== "storage")) return item;
           return item.kind === "tunnel" ? { ...item, closeStatus: "unconfirmed", closeError: String(error) }
             : { ...item, closeStatus: "unconfirmed" };
         }));
@@ -576,16 +638,18 @@ export function Workspace() {
         closingTabs.current.delete(id);
       }
     }
-    const current = liveTabs.current;
-    const index = current.findIndex(item => item.id === id);
-    if (index < 0) return;
-    const split = liveSplit.current;
-    const partner = split?.left === id ? split.right : split?.right === id ? split.left : undefined;
-    if (partner !== undefined) updateSplit(null);
-    const remaining = current.filter((tab) => tab.id !== id);
-    if (id === activeId.current) selectTab(partner ?? remaining[index]?.id ?? remaining[index - 1]?.id ?? 0);
-    liveTabs.current = remaining;
+    if (!liveTabs.current.some(item => item.id === id)) return;
+    const wasFocused = id === activeId.current;
+    updateLayout(current => L.removeTab(current, id));
+    if (wasFocused) setFocusTab(L.focusedTab(liveLayout.current));
+    liveTabs.current = liveTabs.current.filter(item => item.id !== id);
     setTabs((current) => current.filter((tab) => tab.id !== id));
+  }
+
+  function requestClose(id: number) {
+    const tab = liveTabs.current.find(item => item.id === id);
+    if (tab?.kind === "editor") void editorActions.current.get(id)?.requestClose();
+    else void closeTab(id);
   }
 
   function updateStatus(id: number, status: TerminalStatus, sessionId?: string) {
@@ -602,14 +666,10 @@ export function Workspace() {
     tab.status.kind === "running" && !tab.closeStatus
     ? [{ id: tab.sessionId, label: tab.label, region: tab.ssm.region, node: tab.ssm.instanceId }]
     : []);
-  const visibleSplit = split && (active === split.left || active === split.right) ? split : null;
-  const splitCandidates = !visibleSplit && current?.kind === "terminal" && !current.closeStatus &&
-    (current.status.kind === "running" || current.status.kind === "opening" || current.status.kind === "connecting")
-    ? tabs.filter((tab) => tab.kind === "terminal" && tab.id !== active && !tab.closeStatus &&
-      (tab.status.kind === "running" || tab.status.kind === "opening" || tab.status.kind === "connecting"))
-    : [];
-  const activeSftp = showFiles && !focused && !pinnedStorage && current?.kind === "terminal" && current.ssh === "direct" &&
+  const sidebarVisible = sidebarOpen && !focused;
+  const sftpCandidate = current?.kind === "terminal" && current.ssh === "direct" &&
     !current.closeStatus && current.status.kind === "running" ? current.sessionId : undefined;
+  const activeSftp = sidebarVisible && sideView === "files" ? sftpCandidate : undefined;
   const attachedSftp = current?.kind === "terminal" ? current.sftpSessionId : undefined;
   useLayoutEffect(() => {
     if (!activeSftp || attachedSftp === activeSftp) return;
@@ -617,15 +677,19 @@ export function Workspace() {
       tab.status.kind === "running" && tab.sessionId === activeSftp && !tab.closeStatus
       ? { ...tab, sftpSessionId: activeSftp } : tab));
   }, [active, activeSftp, attachedSftp]);
-  const selectedStorage = storageTargets.find(target => target.targetId === pinnedStorage);
-  const openAwsStorage = storageTargets.filter(target => target.kind === "aws");
-  const savedStorageTargets = profileLoad.profiles?.targets.filter(({ profile }) =>
-    (profile.defaultMethod === "s3" || profile.defaultMethod === "ssm") &&
-    !storageTargets.some(target => target.targetId === profile.id)) ?? [];
-  const layout = {
-    "--tree-width": `${left}px`, "--ai-width": `${right}px`,
-    "--center-left": `${splitPosition}fr`, "--center-right": `${100 - splitPosition}fr`,
+  const openCounts = new Map<string, number>();
+  for (const tab of tabs) {
+    const key = tab.kind === "terminal" && !tab.elevation ? tab.targetId ?? "" : tab.kind === "storage" ? tab.storage.targetId : undefined;
+    if (key !== undefined) openCounts.set(key, (openCounts.get(key) ?? 0) + 1);
+  }
+  const sideWidth = sidebarOpen ? left : 0;
+  const style = {
+    "--tree-width": `${sideWidth}px`, "--ai-width": `${aiOpen ? right : 0}px`,
+    "--side-width": `calc(var(--rail-width) + ${sideWidth}px)`,
   } as CSSProperties;
+  const columns = layout.groups.map(group => `minmax(0, ${group.size}fr)`).join(" 5px ");
+  const groupColumn = new Map(layout.groups.map((group, index) => [group.id, index * 2 + 1]));
+  const tabColumn = (id: number) => groupColumn.get(L.groupOf(layout, id)?.id ?? -1) ?? 1;
 
   function blockClosingInput(event: SyntheticEvent) {
     if (!closingWindow.current) return;
@@ -633,73 +697,186 @@ export function Workspace() {
     event.stopPropagation();
   }
 
+  function toggleSide(view: SideView) {
+    if (sidebarOpen && sideView === view) setSidebarOpen(false);
+    else {
+      setSideView(view);
+      setSidebarOpen(true);
+    }
+  }
+
+  function dropSide(event: DragEvent<HTMLElement>): "left" | "right" | "center" {
+    const rect = event.currentTarget.getBoundingClientRect();
+    const x = (event.clientX - rect.left) / Math.max(1, rect.width);
+    return x < 0.3 ? "left" : x > 0.7 ? "right" : "center";
+  }
+
+  const newTabItems: MenuItem[] = [
+    { label: "로컬 터미널", icon: SquareTerminal, onSelect: () => openTab() },
+    { label: "파일 열기…", icon: FileText, disabled: filePickerBusy, onSelect: () => void openEditor() },
+    { kind: "separator" },
+    { label: "RDP 연결", icon: Monitor, onSelect: () => openDesktop("rdp") },
+    { label: "VNC 연결", icon: MonitorSmartphone, onSelect: () => openDesktop("vnc") },
+    { label: "S3 호환 스토리지", icon: Database, onSelect: () => openStorageTarget(compatibleStorage) },
+    { kind: "separator" },
+    { label: "새 연결 프로필…", icon: Plus, disabled: !!wizard, onSelect: openWizard },
+  ];
+
+  const quickItems: QuickItem[] = [
+    ...tabs.map(tab => ({
+      id: `tab:${tab.id}`, section: "열린 탭", label: tab.label, icon: <ProtocolIcon kind={tabIcon(tab)} />,
+      detail: layout.groups.length > 1 ? `그룹 ${layout.groups.findIndex(group => group.tabs.includes(tab.id)) + 1}` : undefined,
+      run: () => selectTab(tab.id),
+    })),
+    { id: "target:local", section: "연결", label: "내 PC", detail: "로컬", icon: <ProtocolIcon kind="local" />, run: () => openTab() },
+    ...(profileLoad.profiles?.targets ?? []).map(({ profile }) => ({
+      id: `target:${profile.id}`, section: "연결", label: profile.displayName,
+      detail: [profileLoad.profiles?.groups.find(group => group.profile.id === profile.groupId)?.profile.displayName,
+        profile.defaultMethod === "ssm" ? `SSM · ${profile.ssm.instanceId}` : profile.defaultMethod === "ssh" ? `SSH · ${profile.ssh.account}@${profile.ssh.host}`
+          : profile.defaultMethod === "s3" ? `S3 · ${profile.s3.bucket}` : "로컬"].filter(Boolean).join(" · "),
+      icon: <ProtocolIcon kind={profile.defaultMethod === "local" ? "local" : profile.defaultMethod as ProtocolKind} />,
+      run: () => openTab(profile),
+    })),
+    ...newTabItems.flatMap(item => item.kind ? [] : item.disabled ? [] : [{
+      id: `command:${item.label}`, section: "명령", label: item.label, icon: item.icon ? <item.icon className="proto-icon" aria-hidden="true" /> : null, run: item.onSelect,
+    }]),
+    { id: "command:sidebar", section: "명령", label: sidebarOpen ? "사이드바 숨기기" : "사이드바 보이기", icon: <PanelLeft className="proto-icon" aria-hidden="true" />, run: () => setSidebarOpen(!sidebarOpen) },
+    { id: "command:ai", section: "명령", label: aiOpen ? "AI 패널 숨기기" : "AI 패널 보이기", icon: <PanelRight className="proto-icon" aria-hidden="true" />, run: () => setAiOpen(!aiOpen) },
+    { id: "command:focus", section: "명령", label: focused ? "기본 보기" : "집중 보기", icon: <Maximize2 className="proto-icon" aria-hidden="true" />, run: () => setFocused(!focused) },
+    ...(layout.groups.length > 1 ? [{ id: "command:merge", section: "명령", label: "모든 그룹 합치기", icon: <Columns2 className="proto-icon" aria-hidden="true" />, run: () => updateLayout(L.mergeGroups) }] : []),
+  ];
+
   return (
-    <main ref={workspace} className={`workspace${macTitleBar ? " workspace-mac" : ""}${focused ? " workspace-focused" : ""}`} style={layout}
+    <main ref={workspace} className={`workspace${macTitleBar ? " workspace-mac" : ""}${focused ? " workspace-focused" : ""}`} style={style}
       onClickCapture={blockClosingInput} onMouseDownCapture={blockClosingInput}
       onKeyDownCapture={blockClosingInput} onPointerMoveCapture={blockClosingInput}
       onFocusCapture={(event) => { if (!event.target.closest(".terminal-screen, .monaco-editor")) setFocusTab(null); }}>
-      <TitleBar focused={focused} onToggle={() => setFocused(!focused)} onWindowError={setWindowError}
-        onOpenRdp={() => openDesktop("rdp")} onOpenVnc={() => openDesktop("vnc")}>
-        {tabs.map((tab) => {
-          const { id, label, kind } = tab;
-          const closeStatus = kind === "editor" ? undefined : tab.closeStatus;
-          return <div className="workspace-tab" key={id}>
-            <button ref={id === active ? activeButton : undefined} aria-pressed={id === active}
-              disabled={kind === "editor" && tab.attaching} onClick={() => selectTab(id)}>{label}</button>
-            <button aria-label={`${label} ${closeStatus === "unconfirmed" ? "종료 다시 확인" : "닫기"}`}
-              disabled={closeStatus === "closing" || (kind === "editor" && tab.attaching)} onClick={() => {
-                if (kind === "editor") void editorActions.current.get(id)?.requestClose();
-                else void closeTab(id);
-              }}>×</button>
-            {closeStatus && <span role={closeStatus === "closing" ? "status" : "alert"}>
-              {closeStatus === "closing" ? "종료 중" : "종료 확인 불가"}
-            </span>}
-          </div>
-        })}
+      <TitleBar focused={focused} sidebar={sidebarOpen} aiPanel={aiOpen} newTabItems={newTabItems}
+        onNewTerminal={() => openTab()} onToggle={() => setFocused(!focused)}
+        onToggleSidebar={() => setSidebarOpen(!sidebarOpen)} onToggleAi={() => setAiOpen(!aiOpen)} onWindowError={setWindowError}>
+        <button type="button" className="workspace-search" aria-label="빠른 열기" title="빠른 열기 (Ctrl+Shift+P)"
+          onMouseDown={event => { if (document.activeElement?.closest(".terminal-screen")) event.preventDefault(); }}
+          onClick={() => setQuickOpen(true)}>
+          <Search aria-hidden="true" /><span>연결, 명령, 탭 검색</span><kbd>Ctrl+Shift+P</kbd>
+        </button>
       </TitleBar>
+      {quickOpen && <QuickOpen items={quickItems} onClose={() => setQuickOpen(false)} />}
       <div className="workspace-body" ref={body}>
-        <aside className="workspace-tree" hidden={focused}>
-          <button className="connection-add" type="button" aria-label="연결 추가" onClick={openWizard}>+</button>
-          <button className="local-file-open" type="button" disabled={filePickerBusy} onClick={() => void openEditor()}>파일 열기</button>
-          {profileLoad.kind === "ready" && <button className="local-file-open" type="button" onClick={reloadProfiles}>새로고침</button>}
-          {profileLoad.kind === "loading" && <div className="connection-status" role="status">저장된 연결 불러오는 중</div>}
-          {profileLoad.kind === "error" && <div className="connection-status">
-            <div role="alert">연결 불러오기 실패: {profileLoad.error}</div>
-            <button onClick={reloadProfiles}>다시 불러오기</button>
-          </div>}
-          <LocalTree profiles={profileLoad.profiles} onOpen={openTab}
-            onLocalElevate={elevation.local ? () => setElevationContext({}) : undefined}
-            onElevate={elevation.remote ? (target) => {
-              if (target?.defaultMethod !== "ssh") return;
-              setElevationContext({
-                targetId: target.id,
-                target: `${target.ssh.account}@${target.ssh.host}:${target.ssh.port}`,
-                account: target.ssh.account,
-              });
-            } : undefined}
-            onRegisterSshHost={(targetId) => void registerSavedSshHost(targetId)}
-            onRetestS3={retestStorageTarget} onOpenTunnel={(targetId, name, method) => {
-              setWindowError("");
-              void openTunnel(targetId, name, method).catch(error => setWindowError(String(error)));
-            }} />
-        </aside>
-        <div className={`workspace-center${visibleSplit ? " workspace-center-split" : ""}`}>
-          <div className="workspace-center-actions" hidden={!visibleSplit && !splitCandidates.length}>
-            {visibleSplit ? <button type="button" onClick={() => {
-              updateSplit(null);
-              selectTab(active);
-            }}>분할 닫기</button> : splitCandidates.length > 0 && <label>
-              오른쪽 터미널 <select value="" onChange={(event) => {
-                const id = Number(event.target.value);
-                if (!splitCandidates.some((tab) => tab.id === id)) return;
-                updateSplit({ left: active, right: id });
-                selectTab(active);
-              }}>
-                <option value="">선택</option>
-                {splitCandidates.map(({ id, label }) => <option key={id} value={id}>{label}</option>)}
-              </select>
-            </label>}
+        <nav className="workspace-rail" aria-label="사이드바 보기" hidden={focused}>
+          <IconButton icon={Server} label="연결" aria-pressed={sidebarOpen && sideView === "connections"} onClick={() => toggleSide("connections")} />
+          <IconButton icon={FolderTree} label="SFTP 파일" aria-pressed={sidebarOpen && sideView === "files"} onClick={() => toggleSide("files")}>
+            {sftpCandidate && <span className="workspace-rail-badge" aria-hidden="true" />}
+          </IconButton>
+        </nav>
+        <aside className="workspace-sidebar workspace-tree" hidden={!sidebarVisible} aria-label={sideView === "connections" ? "연결" : "SFTP 파일"}>
+          <div hidden={sideView !== "connections"} className="workspace-side-body">
+            <div className="workspace-side-head">
+              <h2>연결</h2>
+              <IconButton icon={Plus} label="연결 추가" disabled={!!wizard} onClick={openWizard} />
+              <IconButton icon={RefreshCw} label="연결 새로고침" disabled={profileLoad.kind === "loading"} onClick={reloadProfiles} />
+            </div>
+            {profileLoad.kind === "loading" && <div className="connection-status" role="status">저장된 연결 불러오는 중</div>}
+            {profileLoad.kind === "error" && <div className="connection-status">
+              <div role="alert">연결 불러오기 실패: {profileLoad.error}</div>
+              <button className="ui-button" onClick={reloadProfiles}>다시 불러오기</button>
+            </div>}
+            <LocalTree profiles={profileLoad.profiles} openCounts={openCounts} onOpen={openTab}
+              onLocalElevate={elevation.local ? () => setElevationContext({}) : undefined}
+              onElevate={elevation.remote ? (target) => {
+                if (target?.defaultMethod !== "ssh") return;
+                setElevationContext({
+                  targetId: target.id,
+                  target: `${target.ssh.account}@${target.ssh.host}:${target.ssh.port}`,
+                  account: target.ssh.account,
+                });
+              } : undefined}
+              onRegisterSshHost={(targetId) => void registerSavedSshHost(targetId)}
+              onRetestS3={retestStorageTarget} onOpenTunnel={(targetId, name, method) => {
+                setWindowError("");
+                void openTunnel(targetId, name, method).catch(error => setWindowError(String(error)));
+              }}
+              onOpenStorage={(targetId, label) => openStorageTarget({ kind: "aws", targetId, label })} />
           </div>
+          <div hidden={sideView !== "files"} className="workspace-side-body">
+            <div className="workspace-side-head">
+              <h2>{current?.kind === "terminal" && sftpCandidate ? `SFTP · ${current.label}` : "SFTP"}</h2>
+              <IconButton icon={ChevronsDownUp} label="사이드바 닫기" onClick={() => setSidebarOpen(false)} />
+            </div>
+            {!activeSftp && <p className="workspace-file-status" role="status">활성 SSH 연결 없음</p>}
+            {tabs.map((tab) => {
+              if (tab.kind !== "terminal" || !tab.sftpSessionId) return null;
+              const sessionId = tab.sftpSessionId;
+              const visible = tab.id === active && activeSftp === sessionId;
+              return <div className="workspace-sftp" key={sessionId} hidden={!visible} inert={!visible}>
+                <SftpPanel sshSessionId={sessionId} closing={!!tab.closeStatus}
+                  closeRef={(actions) => {
+                    if (actions) sftpPanels.current.set(sessionId, actions);
+                    else sftpPanels.current.delete(sessionId);
+                  }}
+                  onEditFile={(file, transport, close) => openEditorTab(file, transport, close, "sftp")} />
+              </div>;
+            })}
+          </div>
+        </aside>
+        <div className="workspace-center" style={{ gridTemplateColumns: columns }}>
+          {layout.groups.map((group, index) => {
+            const views = group.tabs.flatMap(id => {
+              const tab = tabs.find(item => item.id === id);
+              if (!tab) return [];
+              const closeStatus = tab.kind === "editor" ? undefined : tab.closeStatus;
+              return [{
+                id, label: tab.label, icon: tabIcon(tab), state: tabState(tab), closeStatus,
+                locked: tab.kind === "editor" && !!tab.attaching,
+                duplicable: tab.kind === "terminal" && !tab.elevation,
+              } satisfies TabView];
+            });
+            return <div key={group.id} className="workspace-tabstrip-slot" style={{ display: "contents" }}>
+              <div className="workspace-group-head" style={{ gridColumnStart: index * 2 + 1, gridRow: 1 }}>
+                <TabStrip tabs={views} active={group.active} focused={group.id === layout.focused} reveal={[left, focused]}
+                  groupIndex={index} groupCount={layout.groups.length} canAddGroup={layout.groups.length < L.MAX_GROUPS}
+                  onSelect={id => selectTab(id)} onClose={requestClose}
+                  onMove={(id, at) => updateLayout(current => L.moveTab(current, id, group.id, at))}
+                  onSplit={(id, side) => updateLayout(current => L.splitTab(current, id, group.id, side))}
+                  onMoveToNeighbor={(id, direction) => {
+                    const neighbor = layout.groups[index + direction];
+                    if (neighbor) updateLayout(current => L.moveTab(current, id, neighbor.id));
+                  }}
+                  onDuplicate={duplicateTab} onMerge={() => updateLayout(L.mergeGroups)}
+                  onDragState={id => { setDragging(id); if (id === null) setDropTarget(undefined); }} />
+              </div>
+              {index > 0 && <GroupSplitter column={index * 2} label={`탭 그룹 ${index}·${index + 1} 경계`}
+                ratio={layout.groups[index - 1].size / (layout.groups[index - 1].size + group.size)}
+                onChange={ratio => updateLayout(current => L.resizeGroups(current, index - 1, ratio))} />}
+              {!group.tabs.length && <div className="workspace-empty" style={{ gridColumn: index * 2 + 1 }}>
+                <SquareTerminal width={40} height={40} strokeWidth={1.25} aria-hidden="true" />
+                <div className="workspace-empty-actions">
+                  <button type="button" className="ui-button" onClick={() => openTab()}><SquareTerminal aria-hidden="true" />로컬 터미널</button>
+                  <button type="button" className="ui-button" disabled={!!wizard} onClick={openWizard}><Plus aria-hidden="true" />연결 추가</button>
+                  <button type="button" className="ui-button" disabled={filePickerBusy} onClick={() => void openEditor()}><FileText aria-hidden="true" />파일 열기</button>
+                </div>
+              </div>}
+              {dragging !== null && <div className="workspace-drop-zone" style={{ gridColumn: index * 2 + 1 }}
+                data-side={dropTarget?.group === group.id && dropTarget.side !== "center" ? dropTarget.side : undefined}
+                onDragOver={event => {
+                  if (!event.dataTransfer.types.includes(TAB_DRAG_TYPE)) return;
+                  event.preventDefault();
+                  const side = dropSide(event);
+                  setDropTarget(current => current?.group === group.id && current.side === side ? current : { group: group.id, side });
+                }}
+                onDragLeave={event => {
+                  if (!event.currentTarget.contains(event.relatedTarget as Node)) setDropTarget(undefined);
+                }}
+                onDrop={event => {
+                  const id = dragTabId(event);
+                  const side = dropSide(event);
+                  setDragging(null);
+                  setDropTarget(undefined);
+                  if (id === undefined) return;
+                  event.preventDefault();
+                  updateLayout(current => side === "center" ? L.moveTab(current, id, group.id) : L.splitTab(current, id, group.id, side));
+                }} />}
+            </div>;
+          })}
           {tabs.map(tab => {
             const { id, label } = tab;
             const bindClose = (handle: { confirmClose(): Promise<void> } | null) => {
@@ -710,10 +887,9 @@ export function Workspace() {
               if (actions) desktopActions.current.set(id, actions);
               else desktopActions.current.delete(id);
             };
-            const pane = id === visibleSplit?.left ? "left" : id === visibleSplit?.right ? "right" : undefined;
-            const visible = id === active || pane !== undefined;
+            const visible = visibleSet.has(id) && !(tab.kind === "editor" && tab.attaching && id !== active);
             const desktop = tab.kind === "rdp" || tab.kind === "vnc";
-            // 분할 상태에서 화면 출력은 유지하되, 사용자 입력은 포커스된 터미널에만 전달한다.
+            // 여러 그룹이 보일 때 화면 출력은 유지하되, 사용자 입력은 포커스된 터미널에만 전달한다.
             const terminalHasFocus = (element: HTMLElement) =>
               id === activeId.current && element.contains(element.ownerDocument.activeElement?.closest(".terminal-screen") ?? null);
             const blockTerminalInput = (event: SyntheticEvent<HTMLDivElement>) => {
@@ -733,11 +909,14 @@ export function Workspace() {
               },
               onMouseUpCapture: blockTerminalInput, onMouseMoveCapture: blockTerminalInput,
               onWheelCapture: blockTerminalInput, onAuxClickCapture: blockTerminalInput, onContextMenuCapture: blockTerminalInput,
-            } : undefined;
+            } : {
+              onMouseDownCapture: () => { if (visible && id !== activeId.current) selectTab(id, false); },
+            };
             return <div className={`workspace-session${desktop ? " workspace-desktop" : ""}`} key={id}
-              id={pane && `${paneId}-${pane}`} data-pane={pane} hidden={!visible} inert={!visible} {...terminalInput}
+              style={{ gridColumn: tabColumn(id) }} data-tab={id}
+              hidden={!visible} inert={!visible} {...terminalInput}
               onFocusCapture={(event) => {
-                if (pane && id !== activeId.current && event.target.closest(".terminal-screen")) selectTab(id, false);
+                if (visible && id !== activeId.current && (tab.kind !== "terminal" || event.target.closest(".terminal-screen"))) selectTab(id, false);
               }}>
               {tab.kind === "terminal" ? (
                 <TerminalView active={visible} focusRequested={id === focusTab} label={label} targetId={tab.targetId}
@@ -751,13 +930,22 @@ export function Workspace() {
                   onShare={(targetId, tabHandle, tunnelId) => openTunnel(targetId, tab.name, tab.method, { tab: tabHandle, id: tunnelId })}
                   onOpenDesktop={openDesktop} />
               ) : tab.kind === "rdp" ? (
-                <RdpTab ref={bindDesktopClose} active={id === active} label={label} source={tab.source}
+                <RdpTab ref={bindDesktopClose} active={visible} label={label} source={tab.source}
                   onSecurityMode={(tlsOnly) => setTabs(current => current.map(item => item.id === id && item.kind === "rdp"
                     ? { ...item, tlsOnly } : item))} />
               ) : tab.kind === "vnc" ? (
-                <VncView ref={bindDesktopClose} active={id === active} source={tab.source} />
+                <VncView ref={bindDesktopClose} active={visible} source={tab.source} />
+              ) : tab.kind === "storage" ? (
+                <div className="workspace-storage">
+                  <div inert={!!tab.closeStatus}>
+                    {tab.storage.kind === "compatible" ? <CompatibleStorageTab closing={!!tab.closeStatus} closeRef={bindClose} /> :
+                      <StorageTab profiles={profileLoad.profiles} targetId={tab.storage.targetId} active={visible} closing={!!tab.closeStatus}
+                        closeRef={bindClose} onRetest={retestStorageTarget}
+                        onEditFile={({ file, transport, close }) => openEditorTab(file, transport, close, "s3")} />}
+                  </div>
+                </div>
               ) : (
-                <EditorTab file={tab.file} active={id === active && !tab.attaching} transport={tab.transport} readOnly={tab.readOnly}
+                <EditorTab file={tab.file} active={visible && !tab.attaching} transport={tab.transport} readOnly={tab.readOnly}
                   confirmDiscard={(request) => confirmEditorDiscard(tab.source, request)}
                   focusRequested={id === focusTab}
                   ref={(actions) => {
@@ -772,90 +960,25 @@ export function Workspace() {
               )}
             </div>;
           })}
-          {split && <Splitter edge="center" label="중앙 터미널 분할" controls={`${paneId}-left`}
-            value={splitPosition} min={20} max={80} onChange={setSplitPosition} />}
         </div>
-        <aside className="workspace-ai" hidden={focused} aria-label="오른쪽 도구">
-          <LocalAiPanel profilesVersion={loadVersion} sessionCandidates={aiSessions} focused={focused} topTabs={{
-            item: {
-              id: "files", label: "파일",
-              content: <>
-                <div className="workspace-file-connections">
-                  <select aria-label="파일 연결" value={pinnedStorage} onChange={event => {
-                    const targetId = event.target.value;
-                    if (targetId === compatibleStorage.targetId) {
-                      openStorageTarget(compatibleStorage);
-                      return;
-                    }
-                    const saved = savedStorageTargets.find(({ profile }) => profile.id === targetId);
-                    if (saved) openStorageTarget({ kind: "aws", targetId, label: saved.profile.displayName });
-                    else setPinnedStorage(targetId);
-                  }}>
-                    <option value="">활성 SSH 따라가기</option>
-                    <option value={compatibleStorage.targetId}>{compatibleStorage.label}</option>
-                    {openAwsStorage.length > 0 && <optgroup label="열린 S3">
-                      {openAwsStorage.map(({ targetId, label }) => <option key={targetId} value={targetId}>{label}</option>)}
-                    </optgroup>}
-                    {savedStorageTargets.length > 0 && <optgroup label="저장된 S3 연결 열기">
-                      {savedStorageTargets.map(({ profile }) => <option key={profile.id} value={profile.id}>{profile.displayName}</option>)}
-                    </optgroup>}
-                  </select>
-                  {selectedStorage && <button type="button" disabled={selectedStorage.closeStatus === "closing"}
-                    aria-label={`${selectedStorage.label} ${selectedStorage.closeStatus === "unconfirmed" ? "종료 다시 확인" : "닫기"}`}
-                    onClick={() => void closeStorageTarget(selectedStorage.targetId)}>×</button>}
-                </div>
-                {showFiles && !pinnedStorage && !activeSftp && <p className="workspace-file-status" role="status">활성 SSH 연결 없음</p>}
-                {tabs.map((tab) => {
-                  if (tab.kind !== "terminal" || !tab.sftpSessionId) return null;
-                  const sessionId = tab.sftpSessionId;
-                  const visible = tab.id === active && activeSftp === sessionId;
-                  return <div className="workspace-sftp" key={sessionId} hidden={!visible} inert={!visible}>
-                    <SftpPanel sshSessionId={sessionId} closing={!!tab.closeStatus}
-                      closeRef={(actions) => {
-                        if (actions) sftpPanels.current.set(sessionId, actions);
-                        else sftpPanels.current.delete(sessionId);
-                      }}
-                      onEditFile={(file, transport, close) => openEditorTab(file, transport, close, "sftp")} />
-                  </div>;
-                })}
-                {storageTargets.map(({ kind, targetId, closeStatus }) => {
-                  const visible = showFiles && !focused && targetId === pinnedStorage;
-                  const bindClose = (actions: { confirmClose(): Promise<void> } | null) => {
-                    if (actions) storageClosers.current.set(targetId, actions);
-                    else storageClosers.current.delete(targetId);
-                  };
-                  return <div className="workspace-storage" key={targetId} hidden={!visible} inert={!visible}>
-                    {closeStatus && <p className="workspace-file-status" role={closeStatus === "closing" ? "status" : "alert"}>
-                      {closeStatus === "closing" ? "종료 중" : "종료 확인 불가"}
-                    </p>}
-                    <div inert={!!closeStatus}>
-                      {kind === "compatible" ? <CompatibleStorageTab closing={!!closeStatus} closeRef={bindClose} /> :
-                        <StorageTab profiles={profileLoad.profiles} targetId={targetId} active={visible} closing={!!closeStatus}
-                          closeRef={bindClose} onRetest={retestStorageTarget}
-                          onEditFile={({ file, transport, close }) => openEditorTab(file, transport, close, "s3")} />}
-                    </div>
-                  </div>;
-                })}
-              </>,
-            },
-            selectedId: showFiles ? "files" : null,
-            onSelect: id => setShowFiles(id === "files"),
-          }} />
+        <aside className="workspace-ai" hidden={focused || !aiOpen} aria-label="AI">
+          <LocalAiPanel profilesVersion={loadVersion} sessionCandidates={aiSessions} focused={focused || !aiOpen} />
         </aside>
         {!focused && <>
-          <Splitter edge="left" label="트리 너비" value={left} preferred={treeWidth} min={Math.min(160, sideLimit)} max={sideLimit} onChange={setTreeWidth} />
-          <Splitter edge="right" label="AI 열 너비" value={right} preferred={aiWidth} min={Math.min(200, sideLimit)} max={sideLimit} onChange={setAiWidth} />
+          {sidebarOpen && <Splitter edge="left" label="사이드바 너비" value={left} preferred={treeWidth} min={Math.min(160, sideLimit)} max={sideLimit} onChange={setTreeWidth} />}
+          {aiOpen && <Splitter edge="right" label="AI 열 너비" value={right} preferred={aiWidth} min={Math.min(200, sideLimit)} max={sideLimit} onChange={setAiWidth} />}
         </>}
       </div>
       <footer className="workspace-status">
-        <span role="status">{current?.kind === "terminal"
+        <span role="status" className="workspace-status-main">{current && <ProtocolIcon kind={tabIcon(current)} />}{current?.kind === "terminal"
           ? [current.targetId ? current.label : "내 PC", current.ssm ?
             `SSM · ${current.ssm.profile} / ${current.ssm.region} / ${current.ssm.instanceId}` : current.ssh ? "SSH" : current.elevation ? "sudo 승격" : "로컬", current.sessionId,
           !current.closeStatus && terminalStatus(current.status)].filter(Boolean).join(" · ")
           : current?.kind === "tunnel" ? current.label
-            : current?.kind === "rdp" || current?.kind === "vnc"
-              ? `${current.label} · ${current.source ? (current.kind === "rdp" ? `SSH 터널 · ${current.tlsOnly ? "TLS 전용(표준 RDP 보안 없음)" : "NLA"}` : "SSH 터널") : (current.kind === "rdp" ? `직접 · ${current.tlsOnly ? "TLS 전용(표준 RDP 보안 없음)" : "NLA"}` : "직접 · TLS")}`
-              : current ? (current.source === "local" ? "내 PC · 로컬 파일" : current.source === "sftp" ? "SFTP" : "S3") : "연결 없음"}</span>
+            : current?.kind === "storage" ? `${current.label} · ${current.storage.kind === "compatible" ? "S3 호환" : "S3"}`
+              : current?.kind === "rdp" || current?.kind === "vnc"
+                ? `${current.label} · ${current.source ? (current.kind === "rdp" ? `SSH 터널 · ${current.tlsOnly ? "TLS 전용(표준 RDP 보안 없음)" : "NLA"}` : "SSH 터널") : (current.kind === "rdp" ? `직접 · ${current.tlsOnly ? "TLS 전용(표준 RDP 보안 없음)" : "NLA"}` : "직접 · TLS")}`
+                : current ? (current.source === "local" ? "내 PC · 로컬 파일" : current.source === "sftp" ? "SFTP" : "S3") : "연결 없음"}</span>
         {closeBlock && <span role="status">{closeBlock.message}</span>}
         {closeError && <span role="alert">{closeError}</span>}
         {windowError && <span role="alert">{windowError}</span>}
