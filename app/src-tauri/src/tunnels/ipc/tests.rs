@@ -2,6 +2,7 @@ use std::{cell::Cell, io};
 
 use super::super::{Observation, Transport};
 use super::*;
+use crate::{connections::with_saved_ssh, tunnels::ssh::SavedSsh};
 use serde_json::json;
 
 struct Probe<'a> { signal: Observation, closes: &'a Cell<usize>, close_failures: usize }
@@ -22,8 +23,8 @@ fn tunnels_ipc_rejects_raw_destinations_and_unsupported_transports() {
     assert!(serde_json::from_value::<Start>(forged).is_err());
     let remote_vnc = PortRequest::Local { listen: 5901, host: "other.example".into(), port: 5900, protocol: Some(Protocol::Vnc) };
     assert!(remote_vnc.ssh("saved".into()).unwrap_err().contains("루프백"));
-    let ssm = PortRequest::Ssm { listen: 3391, port: 3389 };
-    assert!(ssm.ssh("saved".into()).unwrap_err().contains("바이너리 보존"));
+    let ssm = PortRequest::Ssm { listen: 3391, port: 3389, host: None, protocol: None };
+    assert!(ssm.ssh("saved".into()).unwrap_err().contains("SSM 경로"));
     #[cfg(windows)]
     assert!(PortRequest::Remote { listen: 3391, host: "127.0.0.1".into(), port: 3389 }
         .ssh("saved".into()).unwrap_err().contains("Windows OpenSSH"));
@@ -33,9 +34,16 @@ fn tunnels_ipc_rejects_raw_destinations_and_unsupported_transports() {
 fn unsupported_ssm_stops_before_approval_or_process_creation() {
     let tabs = TunnelTabs::default();
     let dir = tempfile::tempdir().unwrap();
-    let result = tabs.start(0, dir.path(), "unused", PortRequest::Ssm { listen: 3391, port: 3389 },
-        |_| panic!("SSM 승인 창을 열었습니다"));
-    assert!(result.unwrap_err().contains("바이너리 보존"));
+    let request = || PortRequest::Ssm { listen: 3391, port: 3389, host: None, protocol: None };
+    let result = tabs.start(0, dir.path(), "unused", request(), |_| panic!("SSM 승인 창을 열었습니다"));
+    assert_eq!(result.unwrap_err(), STALE);
+    // SSH 대상 탭에서는 SSM 전달을 승인하거나 실행하지 않는다.
+    let draft = serde_json::from_value::<crate::connections::profile::Draft>(crate::connections::tests::ssh_draft(dir.path()))
+        .unwrap().validate().unwrap();
+    crate::connections::save_test_profile(dir.path(), draft);
+    let handle = tabs.open(0, dir.path(), "ssh-server".into(), "SSH 탭".into()).unwrap();
+    let result = tabs.start(0, dir.path(), &handle, request(), |_| panic!("SSM 승인 창을 열었습니다"));
+    assert_eq!(result.unwrap_err(), "저장된 SSM 대상이 필요합니다");
     assert!(tabs.document(0).unwrap().entries.is_empty());
 }
 
@@ -320,7 +328,7 @@ fn test_lease_at(directory: &Path, protocol: Protocol) -> (TunnelTabs, DesktopLe
     let lease = {
         let mut doc = tabs.document(0).unwrap();
         let source = doc.tabs[&handle].owner.clone();
-        let ssh = doc.tabs[&handle].ssh.clone().unwrap();
+        let route = doc.tabs[&handle].saved.clone();
         let id = doc.tunnels.begin(source.clone(), Route::SshLocal {
             server: target.into(), listen: ([127, 0, 0, 1], 5901).into(), destination: destination.clone(),
         }).unwrap();
@@ -328,7 +336,7 @@ fn test_lease_at(directory: &Path, protocol: Protocol) -> (TunnelTabs, DesktopLe
         tunnel.state = State::Ready;
         let loss = tunnel.desktop_loss.get_or_insert_with(CancellationToken::new).child_token();
         let owner = doc.tunnels.retain_desktop(id, &source).unwrap();
-        DesktopLease { document: Arc::downgrade(&tabs.0), epoch: 0, id, owner: Some(owner), target: target.into(), ssh,
+        DesktopLease { document: Arc::downgrade(&tabs.0), epoch: 0, id, owner: Some(owner), target: target.into(), route,
             destination, protocol, stream: None, loss }
     };
     (tabs, lease)
@@ -500,7 +508,7 @@ fn confirmed_close_blocks_mutations_but_not_status_or_shared_desktop_release() {
         |_| panic!("창을 닫는 중에 SSH 승인을 요청했습니다")).unwrap_err(), CLOSING);
     assert_eq!(tabs.preflight_desktop(0, (&source, &selector), target, lease.destination(), Protocol::Vnc).unwrap_err(), CLOSING);
     assert_eq!(tabs.open_desktop(0, dir.path(), (&source, &selector), target, lease.destination(), Protocol::Vnc,
-        lease.ssh()).err().unwrap(), CLOSING);
+        lease.approval()).err().unwrap(), CLOSING);
 
     assert_eq!(tabs.snapshot(0, &source).unwrap().len(), 1);
     assert_eq!(lease.while_live(|| 7), Some(7));
@@ -608,4 +616,125 @@ fn isolated_openssh_desktop_lease_outlives_source_tab() {
     assert!(loss.is_cancelled());
     let error = TcpStream::connect_timeout(&listen, timeout).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::ConnectionRefused, "마지막 소유자가 닫힌 뒤 SSH 수신 포트");
+}
+
+fn save_draft(directory: &Path, profile: serde_json::Value) {
+    let draft = serde_json::from_value::<crate::connections::profile::Draft>(profile).unwrap().validate().unwrap();
+    crate::connections::save_test_profile(directory, draft);
+}
+
+fn ssm_desktop_draft(directory: &Path, id: &str, protocol: &str, host: &str, port: u16) -> serde_json::Value {
+    let mut profile = crate::connections::tests::draft(directory, "work", id);
+    let route = json!({"kind": "ssm", "profile": "company-sso", "region": "ap-northeast-2", "instanceId": "i-0123456789abcdef0"});
+    let settings = if protocol == "rdp" { json!({"host": host, "port": port, "tlsOnly": false, "route": route}) }
+        else { json!({"host": host, "port": port, "route": route}) };
+    profile["target"] = json!({"id": id, "groupId": "work", "displayName": "원격 화면", "defaultMethod": protocol, protocol: settings});
+    profile
+}
+
+#[test]
+fn ssm_start_binds_saved_scope_and_fixed_desktop_route_before_approval() {
+    let tabs = TunnelTabs::default();
+    let dir = tempfile::tempdir().unwrap();
+    save_draft(dir.path(), crate::connections::tests::ssm_draft(dir.path()));
+    let node = tabs.open(0, dir.path(), "ssm-node".into(), "SSM 탭".into()).unwrap();
+    let ssm = |port, host: Option<&str>, protocol| PortRequest::Ssm { listen: 50022, port, host: host.map(Into::into), protocol };
+    assert_eq!(tabs.start(0, dir.path(), &node, ssm(5901, Some("vnc.example.test"), Some(Protocol::Vnc)),
+        |_| panic!("승인 창을 열었습니다")).unwrap_err(), "VNC SSM 터널은 노드 자신의 서비스만 지원합니다");
+    assert!(tabs.start(0, dir.path(), &node, ssm(22, Some("a,b"), None), |_| panic!("승인 창을 열었습니다"))
+        .unwrap_err().starts_with("SSM 전달 승인"));
+    let declined = tabs.start(0, dir.path(), &node, ssm(22, None, None), |description| {
+        assert_eq!(description, "SSM 프로필: company-sso\nSSM 리전: ap-northeast-2\nSSM 관리 노드: i-0123456789abcdef0\n문서: AWS-StartPortForwardingSession\n매개변수: portNumber=22,localPortNumber=50022\nSSM 127.0.0.1:50022 → i-0123456789abcdef0:22");
+        Ok(false)
+    });
+    assert_eq!(declined.unwrap(), None);
+    assert!(tabs.document(0).unwrap().entries.is_empty());
+    // SSM 대상 탭에서는 SSH 전달을 시작하지 않는다.
+    assert_eq!(tabs.start(0, dir.path(), &node, PortRequest::Dynamic { listen: 1080 }, |_| panic!("승인 창을 열었습니다"))
+        .unwrap_err(), "저장된 직접 SSH 대상이 필요합니다");
+
+    save_draft(dir.path(), ssm_desktop_draft(dir.path(), "rdp-ssm", "rdp", "rdp.example.test", 3389));
+    let desktop = tabs.open(0, dir.path(), "rdp-ssm".into(), "RDP 경로".into()).unwrap();
+    for changed in [ssm(3390, Some("rdp.example.test"), Some(Protocol::Rdp)), ssm(3389, None, Some(Protocol::Rdp)),
+        ssm(3389, Some("other.example.test"), Some(Protocol::Rdp)), ssm(3389, Some("rdp.example.test"), None)]
+    {
+        assert_eq!(tabs.start(0, dir.path(), &desktop, changed, |_| panic!("승인 창을 열었습니다")).unwrap_err(),
+            "저장된 원격 화면 경로와 전달 요청이 일치하지 않습니다");
+    }
+    let declined = tabs.start(0, dir.path(), &desktop, ssm(3389, Some("rdp.example.test"), Some(Protocol::Rdp)), |description| {
+        assert!(description.contains("문서: AWS-StartPortForwardingSessionToRemoteHost\n매개변수: host=rdp.example.test,portNumber=3389,localPortNumber=50022"));
+        assert!(description.ends_with("SSM 127.0.0.1:50022 → i-0123456789abcdef0 → rdp.example.test:3389\n서비스: RDP"));
+        Ok(false)
+    });
+    assert_eq!(declined.unwrap(), None);
+    // 다른 저장 대상의 탭에는 공유하지 않는다.
+    assert_eq!(tabs.share(0, &node, &desktop, TunnelId(1)).unwrap_err(), "같은 저장 대상의 탭에만 터널을 공유할 수 있습니다");
+}
+
+#[test]
+fn ssm_status_exposes_only_ready_desktop_destinations() {
+    let owners = Default::default();
+    let listen = ([127, 0, 0, 1], 50389).into();
+    let route = |host: Option<&str>| Route::Ssm { listen, node: "i-0123456789abcdef0".into(), port: 3389, host: host.map(Into::into) };
+    let encode = |route: &Route, state: &State, protocol| serde_json::to_value(status(
+        View { id: TunnelId(1), route, owners: &owners, state }, Vec::new(),
+        &Entry { endpoint: String::new(), protocol }, "rdp-ssm",
+    )).unwrap();
+    let remote = route(Some("rdp.example.test"));
+    assert_eq!(encode(&remote, &State::Ready, Some(Protocol::Rdp))["desktop"], json!({
+        "protocol": "rdp", "targetId": "rdp-ssm", "destination": {"host": "rdp.example.test", "port": 3389}
+    }));
+    assert_eq!(encode(&route(None), &State::Ready, Some(Protocol::Vnc))["desktop"]["destination"], json!({"host": "127.0.0.1", "port": 3389}));
+    assert_eq!(encode(&remote, &State::Ready, None)["route"], "SSM 127.0.0.1:50389 → i-0123456789abcdef0 → rdp.example.test:3389");
+    assert!(encode(&remote, &State::Starting, Some(Protocol::Rdp)).get("desktop").is_none());
+    assert!(encode(&remote, &State::Ready, None).get("desktop").is_none());
+}
+
+#[test]
+fn ssm_desktop_lease_uses_the_owned_plugin_listener_and_outlives_the_source_tab() {
+    use std::io::{Read, Write};
+
+    let tabs = TunnelTabs::default();
+    let dir = tempfile::tempdir().unwrap();
+    save_draft(dir.path(), ssm_desktop_draft(dir.path(), "vnc-ssm", "vnc", "", 5900));
+    let saved = with_saved_route(dir.path(), "vnc-ssm", |saved| saved.unwrap()).unwrap();
+    let epoch = tabs.epoch();
+    let handle = tabs.open(epoch, dir.path(), "vnc-ssm".into(), "VNC 경로".into()).unwrap();
+    let listen = super::super::ssm::tests::bind_loopback().local_addr().unwrap();
+    let selector = {
+        let mut doc = tabs.document(epoch).unwrap();
+        let owner = doc.tabs[&handle].owner.clone();
+        let id = doc.tunnels.begin(owner, Route::Ssm { listen, node: "i-0123456789abcdef0".into(), port: 5900, host: None }).unwrap();
+        doc.tabs.get_mut(&handle).unwrap().ids.push(id);
+        doc.entries.insert(id, Entry { endpoint: String::new(), protocol: Some(Protocol::Vnc) });
+        let child = super::super::ssm::fixture_child("cli", listen, None, Ok("fixture-0123456789abcdef0"), None).unwrap();
+        assert!(doc.tunnels.finish_start(id, Ok(Forward::Ssm(child))).unwrap());
+        id.0.to_string()
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        let snapshot = tabs.snapshot(epoch, &handle).unwrap();
+        let status = serde_json::to_value(&snapshot[0]).unwrap();
+        if status["state"] == "ready" { break status; }
+        assert!(status["state"] == "starting" && std::time::Instant::now() < deadline, "{status}");
+        thread::sleep(Duration::from_millis(20));
+    };
+    let destination = Destination { host: "127.0.0.1".into(), port: 5900 };
+    assert_eq!(status["desktop"], json!({"protocol": "vnc", "targetId": "vnc-ssm", "destination": {"host": "127.0.0.1", "port": 5900}}));
+    tabs.preflight_desktop(epoch, (&handle, &selector), "vnc-ssm", &destination, Protocol::Vnc).unwrap();
+    assert_eq!(tabs.preflight_desktop(epoch, (&handle, &selector), "vnc-ssm", &Destination { host: "::1".into(), port: 5900 }, Protocol::Vnc)
+        .unwrap_err(), "승인된 터널 목적지가 일치하지 않습니다");
+    let mut lease = tabs.open_desktop(epoch, dir.path(), (&handle, &selector), "vnc-ssm", &destination, Protocol::Vnc, &saved).unwrap();
+    assert_eq!(lease.approval(), Confirmed::from(&saved));
+    let mut stream = lease.take_stream().unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    tabs.close(epoch, &handle).unwrap();
+    let sample = [0x00, b'\r', b'\n', 0x1b, 0xff];
+    stream.write_all(&sample).unwrap();
+    let mut echoed = [0; 5];
+    stream.read_exact(&mut echoed).unwrap();
+    assert_eq!(echoed, sample);
+    drop(stream);
+    lease.release().unwrap();
+    super::super::ssm::tests::assert_closed(listen);
 }

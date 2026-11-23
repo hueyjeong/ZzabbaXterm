@@ -1,5 +1,5 @@
 import type { RdpSettings, VncSettings } from "../connections/profiles";
-import { tunnelIpc, type DesktopTunnelSource, type TunnelStatus } from "../tunnels/tunnelIpc";
+import { tunnelIpc, type DesktopTunnelSource, type TunnelRequest, type TunnelStatus } from "../tunnels/tunnelIpc";
 
 export type DesktopProfile = Readonly<{ id: string; displayName: string } & (
   | { defaultMethod: "rdp"; rdp: RdpSettings }
@@ -28,10 +28,8 @@ type Options = Readonly<{
 
 /** 경로 터널을 열다 실패했고 그 터널의 종료도 확인하지 못했다. 호출자는 handle로 종료를 다시 확인할 탭을 남긴다. */
 export class DesktopRouteError extends Error {
-  constructor(message: string, readonly handle: string, readonly targetId: string) { super(message); }
+  constructor(message: string, readonly handle: string, readonly targetId: string, readonly method: "ssh" | "ssm" = "ssh") { super(message); }
 }
-
-export const SSM_FORWARD_UNAVAILABLE = "공식 SSM 포트 전달의 바이너리 보존을 확인할 수 없습니다";
 
 function ephemeralPort() {
   const [value] = crypto.getRandomValues(new Uint16Array(1));
@@ -46,8 +44,10 @@ const wait = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve, r
 });
 
 /**
- * 저장된 RDP·VNC 프로필을 열 정보로 바꾼다. SSH 경로는 그 SSH 대상의 서버 루프백으로 로컬 전달을 열고
- * Rust가 준비 완료로 확인한 전달만 source로 돌려준다. 서비스 연결은 탭에서 사용자가 시작한다.
+ * 저장된 RDP·VNC 프로필을 열 정보로 바꾼다. SSH 경로는 그 SSH 대상의 서버 루프백으로 로컬 전달을 열고,
+ * SSM 경로는 프로필 자신을 경로 대상으로 공식 SSM 포트 전달을 연다(RDP는 TLS 인증 DNS 이름을 노드에서 접속할
+ * 원격 호스트로, VNC는 노드 자신의 서비스로). Rust가 준비 완료로 확인한 전달만 source로 돌려준다.
+ * 서비스 연결은 탭에서 사용자가 시작한다.
  */
 export async function openDesktopProfile(profile: DesktopProfile, options: Options = {}): Promise<OpenedDesktop> {
   const { signal, ipc = tunnelIpc, listenPort = ephemeralPort, pollMs = 300, timeoutMs = 120_000 } = options;
@@ -59,15 +59,21 @@ export async function openDesktopProfile(profile: DesktopProfile, options: Optio
     : { host: profile.vnc.host, port: profile.vnc.port };
   const { route } = settings;
   if (route.kind === "direct") return { kind, label, preset, close: async () => { } };
-  if (route.kind === "ssm") throw new Error(SSM_FORWARD_UNAVAILABLE);
 
+  const method = route.kind;
+  const routeTarget = route.kind === "ssh" ? route.targetId : profile.id;
+  const request: TunnelRequest = route.kind === "ssh"
+    ? { direction: "local", listen: listenPort(), host: "127.0.0.1", port: settings.port, protocol: kind }
+    : profile.defaultMethod === "rdp"
+      ? { direction: "ssm", listen: listenPort(), port: settings.port, host: profile.rdp.host, protocol: kind }
+      : { direction: "ssm", listen: listenPort(), port: settings.port, protocol: kind };
   signal?.throwIfAborted();
-  const handle = await ipc.open(route.targetId, `${label} · ${kind.toUpperCase()} 경로`);
+  const handle = await ipc.open(routeTarget, `${label} · ${kind.toUpperCase()} 경로`);
   const close = async () => { await ipc.close(handle); };
   try {
     signal?.throwIfAborted();
-    const id = await ipc.start(handle, { direction: "local", listen: listenPort(), host: "127.0.0.1", port: settings.port, protocol: kind });
-    if (id === null) throw new Error("SSH 터널 승인이 취소되었습니다");
+    const id = await ipc.start(handle, request);
+    if (id === null) throw new Error(`${method.toUpperCase()} 터널 승인이 취소되었습니다`);
     const deadline = Date.now() + timeoutMs;
     for (; ;) {
       signal?.throwIfAborted();
@@ -87,7 +93,7 @@ export async function openDesktopProfile(profile: DesktopProfile, options: Optio
     }
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
-    try { await close(); } catch (failure) { throw new DesktopRouteError(`${reason} · 터널 종료 확인 불가: ${String(failure)}`, handle, route.targetId); }
+    try { await close(); } catch (failure) { throw new DesktopRouteError(`${reason} · 터널 종료 확인 불가: ${String(failure)}`, handle, routeTarget, method); }
     throw error instanceof Error ? error : new Error(reason);
   }
 }

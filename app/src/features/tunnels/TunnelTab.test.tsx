@@ -75,16 +75,33 @@ it.each(["rdp", "vnc"] as const)("offers only the Ready %s desktop action with t
   expect(actions()).toEqual([]);
 });
 
-it("reports Windows -R and official SSM limits before start", async () => {
+it("reports the Windows -R limit before start", async () => {
   vi.spyOn(navigator, "userAgent", "get").mockReturnValue("Windows");
   invoke.mockResolvedValue([]);
   await act(async () => root.render(<TunnelTab {...props} />));
   expect(host.querySelector<HTMLOptionElement>('option[value="remote"]')?.disabled).toBe(true);
   expect(host.textContent).toContain("Windows에서 -R 원격 수신을 지원하지 않음");
-  await act(async () => root.render(<TunnelTab {...props} method="ssm" />));
-  expect(host.textContent).toContain("공식 SSM 포트 전달의 바이너리 보존을 확인할 수 없습니다");
-  expect(host.querySelector('button[type="submit"]')).toBeNull();
   expect(invoke.mock.calls).toEqual([["tunnel_status", { tab: "owned" }]]);
+});
+
+it.each([
+  ["노드 자신", "", "vnc", { direction: "ssm", listen: 15901, port: 5901, protocol: "vnc" }],
+  ["원격 호스트", " rdp.internal.example ", "rdp", { direction: "ssm", listen: 15901, port: 5901, host: "rdp.internal.example", protocol: "rdp" }],
+] as const)("starts an SSM route to %s on the owned handle", async (_, remote, service, request) => {
+  vi.spyOn(navigator, "userAgent", "get").mockReturnValue("Windows");
+  invoke.mockResolvedValueOnce([]).mockResolvedValueOnce("9");
+  await act(async () => root.render(<TunnelTab {...props} method="ssm" />));
+  expect(host.querySelector('select:not([name])')).toBeNull();
+  expect(host.textContent).not.toContain("Windows에서 -R");
+  const field = (name: string) => host.querySelector<HTMLInputElement | HTMLSelectElement>(`[name="${name}"]`);
+  const [listen, address, port, protocol] = ["listen", "host", "port", "protocol"].map(field);
+  if (!listen || !address || !port || !protocol) throw new Error("SSM 터널 입력이 없습니다");
+  listen.value = "15901";
+  address.value = remote;
+  port.value = "5901";
+  protocol.value = service;
+  await act(async () => host.querySelector<HTMLButtonElement>('button[type="submit"]')?.click());
+  expect(invoke).toHaveBeenNthCalledWith(2, "tunnel_start", { tab: "owned", request });
 });
 
 it("keeps the close error and retries the same owned handle", async () => {

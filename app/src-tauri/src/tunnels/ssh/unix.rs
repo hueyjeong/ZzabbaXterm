@@ -52,26 +52,31 @@ impl Readiness {
     }
 
     pub(super) fn owns_stream(&self, child: &Child, listen: SocketAddr, peer: SocketAddr) -> io::Result<bool> {
-        let (SocketAddr::V4(listen), SocketAddr::V4(peer)) = (listen, peer) else { return Ok(false); };
-        let address = |addr: std::net::SocketAddrV4| format!("{:08X}:{:04X}", u32::from_ne_bytes(addr.ip().octets()), addr.port());
-        let (local, remote) = (address(listen), address(peer));
-        let root = format!("/proc/{}", child.id());
-        for row in BufReader::new(fs::File::open(format!("{root}/net/tcp"))?).lines().skip(1) {
-            let row = row?;
-            let mut fields = row.split_ascii_whitespace().skip(1);
-            if fields.next() != Some(local.as_str()) || fields.next() != Some(remote.as_str()) || fields.next() != Some("01") { continue; }
-            let Some(inode) = fields.nth(5).filter(|inode| *inode != "0") else { continue; };
-            let socket = format!("socket:[{inode}]");
-            for fd in fs::read_dir(format!("{root}/fd"))? {
-                if fs::read_link(fd?.path()).is_ok_and(|path| path.as_os_str() == std::ffi::OsStr::new(&socket)) {
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
+        owns_stream(child.id(), listen, peer)
     }
 
     pub(super) fn close(&mut self) -> io::Result<()> {
         self.request.as_mut().map_or(Ok(()), stop)
     }
+}
+
+/// `pid`의 열린 파일 중 승인 수신 주소에서 받아들인 `peer` 연결 소켓이 있는지 /proc으로 확인한다.
+pub(in crate::tunnels) fn owns_stream(pid: u32, listen: SocketAddr, peer: SocketAddr) -> io::Result<bool> {
+    let (SocketAddr::V4(listen), SocketAddr::V4(peer)) = (listen, peer) else { return Ok(false); };
+    let address = |addr: std::net::SocketAddrV4| format!("{:08X}:{:04X}", u32::from_ne_bytes(addr.ip().octets()), addr.port());
+    let (local, remote) = (address(listen), address(peer));
+    let root = format!("/proc/{pid}");
+    for row in BufReader::new(fs::File::open(format!("{root}/net/tcp"))?).lines().skip(1) {
+        let row = row?;
+        let mut fields = row.split_ascii_whitespace().skip(1);
+        if fields.next() != Some(local.as_str()) || fields.next() != Some(remote.as_str()) || fields.next() != Some("01") { continue; }
+        let Some(inode) = fields.nth(5).filter(|inode| *inode != "0") else { continue; };
+        let socket = format!("socket:[{inode}]");
+        for fd in fs::read_dir(format!("{root}/fd"))? {
+            if fs::read_link(fd?.path()).is_ok_and(|path| path.as_os_str() == std::ffi::OsStr::new(&socket)) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }

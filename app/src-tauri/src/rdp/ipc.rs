@@ -9,7 +9,7 @@ use tauri::{Manager, UriSchemeContext, UriSchemeResponder, Webview, WebviewWindo
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::{connections::{profile::{SshTransport, valid_id}, with_saved_ssh}, tunnels::{Destination, ipc::{DesktopCleanupError, DesktopLease, Protocol, TunnelTabs}}};
+use crate::{connections::{SavedRoute, profile::valid_id}, tunnels::{Destination, ipc::{DesktopCleanupError, DesktopLease, Protocol, TunnelTabs, describe_route, load_route}}};
 use super::{Error, Event, Session, native, route};
 use input::{Command, Controls};
 
@@ -124,18 +124,30 @@ fn read_source<'de, D: serde::Deserializer<'de>>(value: D) -> Result<Option<Sour
 }
 
 impl Draft {
+    #[cfg(test)]
     fn approval_text(&self, dns: &str) -> Result<String, Error> {
+        self.route_approval_text(dns, false)
+    }
+
+    /// SSH 경로는 서버 루프백만, SSM 경로는 노드 자신(루프백) 또는 TLS 인증 DNS 이름의 원격 호스트만 받는다.
+    fn route_approval_text(&self, dns: &str, ssm: bool) -> Result<String, Error> {
         if !route::dns_name(dns) || self.port == 0 { return Err(Error::InvalidServerName); }
         let login = if self.tls_only { "NLA, 미지원 시 TLS 전용(표준 RDP 보안 없음)" } else { "NLA" };
         let Some(source) = &self.source else {
             return Ok(format!("서버: {dns}:{}\n경로: 직접\n로그인: {login}", self.port));
         };
         let ForwardDestination { host, port } = &source.destination;
-        if !matches!(host.as_str(), "127.0.0.1" | "::1") || *port != self.port || !valid_id(&source.target_id) {
+        let loopback = matches!(host.as_str(), "127.0.0.1" | "::1");
+        if !(loopback || (ssm && host.eq_ignore_ascii_case(dns))) || *port != self.port || !valid_id(&source.target_id) {
             return Err(Error::InvalidForwardDestination);
         }
-        let destination = std::net::SocketAddr::new(host.parse().map_err(|_| Error::InvalidForwardDestination)?, *port);
-        Ok(format!("경로: R01 SSH 전달\nSSH 대상 ID: {}\n포워드 목적지: {destination}\nTLS 인증 DNS: {dns}\n로그인: {login}", source.target_id))
+        let destination = if loopback {
+            std::net::SocketAddr::new(host.parse().map_err(|_| Error::InvalidForwardDestination)?, *port).to_string()
+        } else {
+            format!("{host}:{port}")
+        };
+        let (via, target) = if ssm { ("SSM", "SSM 경로 대상 ID") } else { ("SSH", "SSH 대상 ID") };
+        Ok(format!("경로: R01 {via} 전달\n{target}: {}\n포워드 목적지: {destination}\nTLS 인증 DNS: {dns}\n로그인: {login}", source.target_id))
     }
 }
 
@@ -378,22 +390,24 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
     let prompt = life.child_token();
     let _prompt_lifetime = prompt.clone().drop_guard();
     let dns = draft.host.to_ascii_lowercase();
-    let description = draft.approval_text(&dns).map_err(message)?;
+    let saved = match &draft.source {
+        Some(source) => {
+            let directory = window.path().app_config_dir().map_err(|error| error.to_string())?;
+            let target_id = source.target_id.clone();
+            Some(tauri::async_runtime::spawn_blocking(move || load_route(&directory, &target_id))
+                .await.map_err(|_| message(Error::Transport))??)
+        }
+        None => None,
+    };
+    let description = draft.route_approval_text(&dns, matches!(saved, Some(SavedRoute::Ssm(_)))).map_err(message)?;
     let trust_path = window.path().app_config_dir().map_err(|error| error.to_string())?.join("rdp-trust.json");
     let size = DesktopSize { width: 1024, height: 768 };
-    let (target, loss, target_name, endpoint) = if let Some(source) = draft.source {
+    let (target, loss, target_name, endpoint) = if let (Some(source), Some(saved)) = (draft.source, saved) {
         let directory = window.path().app_config_dir().map_err(|error| error.to_string())?;
-        let load_directory = directory.clone();
-        let target_id = source.target_id.clone();
-        let (revision, ssh) = tauri::async_runtime::spawn_blocking(move || with_saved_ssh(&load_directory, &target_id, |saved| saved))
-            .await.map_err(|_| message(Error::Transport))??
-            .filter(|(_, ssh)| matches!(ssh.transport, SshTransport::Direct {}))
-            .ok_or("저장된 직접 SSH 접속 설정이 없습니다")?;
         let destination = Destination { host: source.destination.host, port: source.destination.port };
         window.state::<TunnelTabs>().preflight_desktop(tunnel_epoch, (&source.tab_handle, &source.tunnel_id),
             &source.target_id, &destination, Protocol::Rdp)?;
-        let description = format!("{description}\nSSH 서버: {}:{}\nSSH 계정: {}\nSSH 호스트 키: {}",
-            ssh.host, ssh.port, ssh.account, ssh.host_key_fingerprint);
+        let description = format!("{description}\n{}", describe_route(&saved));
         native::confirm(window.clone(), description, prompt.clone(), approval.clone()).await.map_err(message)?;
         let target_name = format!("{dns} (TLS DNS)");
         let caller = window.clone();
@@ -402,7 +416,7 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
         let (issued, approved_destination) = tauri::async_runtime::spawn_blocking(move || {
             if live.is_cancelled() { return Err(CLOSED.into()); }
             let lease = caller.state::<TunnelTabs>().open_desktop(tunnel_epoch, &directory,
-                (&source.tab_handle, &source.tunnel_id), &source.target_id, &destination, Protocol::Rdp, (revision, &ssh))?;
+                (&source.tab_handle, &source.tunnel_id), &source.target_id, &destination, Protocol::Rdp, &saved)?;
             Ok::<_, String>((lease, destination))
         }).await.map_err(|_| message(Error::Transport))??;
         let lease = lease.insert(issued);

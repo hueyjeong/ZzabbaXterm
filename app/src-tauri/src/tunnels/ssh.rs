@@ -15,9 +15,9 @@ use crate::{
 use super::{Observation, Owner, Route, Transport, TunnelId, Tunnels, transport::{Event, Failure, Listener, SshPlan, SshServerPolicy}};
 
 #[cfg(unix)]
-mod unix;
+pub(super) mod unix;
 #[cfg(windows)]
-mod windows;
+pub(super) mod windows;
 #[cfg(unix)]
 use unix::Readiness;
 #[cfg(windows)]
@@ -33,7 +33,7 @@ pub(crate) struct Start {
     plan: SshPlan,
 }
 
-impl Tunnels<SshChild> {
+impl<T: Transport> Tunnels<T> {
     /// 호출자가 같은 창·탭의 승인 레코드와 서버 정책을 확정한 후 전달한다.
     /// `approved.server`는 저장 대상 ID이고 `approved_ssh`는 승인 당시의 리비전과 SSH 설정이다.
     pub(crate) fn begin_ssh(
@@ -52,7 +52,6 @@ impl Tunnels<SshChild> {
         require_supported_listener(plan.listener())?;
         let server = match approved {
             Route::SshLocal { server, .. } | Route::SshRemote { server, .. } | Route::SshDynamic { server, .. } => server,
-            #[cfg(test)]
             Route::Ssm { .. } => unreachable!("SSH 전달 계획 필요"),
         };
         let connection = with_saved_ssh(directory, server, |current| -> Result<_, String> {
@@ -187,7 +186,7 @@ impl Drop for SshChild {
     }
 }
 
-fn silent(command: &mut Command) {
+pub(super) fn silent(command: &mut Command) {
     command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     #[cfg(windows)]
     {
@@ -210,7 +209,7 @@ fn stop(child: &mut Child) -> io::Result<()> {
     Ok(())
 }
 
-fn local_conflict(listener: Listener) -> bool {
+pub(super) fn local_conflict(listener: Listener) -> bool {
     let Listener::Local(address) = listener else { return false };
     TcpListener::bind(address).is_err_and(|error| error.kind() == io::ErrorKind::AddrInUse)
 }
