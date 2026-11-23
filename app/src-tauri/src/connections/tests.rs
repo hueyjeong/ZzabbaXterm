@@ -243,8 +243,7 @@ fn desktop_profiles_reject_secrets_unsafe_hosts_and_plaintext_routes() {
     let ssh = json!({"kind": "ssh", "targetId": "ssh-server"});
     let direct = json!({"kind": "direct"});
     for valid in [
-        rdp("win.example.test", direct.clone()), rdp("xrdp.example.test", ssh.clone()), rdp("", ssm.clone()),
-        rdp("10.0.1.25", ssm.clone()), rdp("rdp.internal.example", ssm.clone()),
+        rdp("win.example.test", direct.clone()), rdp("xrdp.example.test", ssh.clone()), rdp("rdp.internal.example", ssm.clone()),
         vnc("vnc.example.test", direct.clone()), vnc("192.0.2.10", direct.clone()), vnc("", ssh.clone()), vnc("", ssm.clone()),
     ] {
         assert!(checked(valid.clone()), "{valid}");
@@ -267,6 +266,9 @@ other", direct.clone()),
         rdp("127.0.0.1", ssh.clone()), rdp("a,b", ssm.clone()), rdp("host=other", ssm.clone()), rdp("host name", ssm.clone()),
         rdp("win.example.test", bad_ssm), rdp("win.example.test", json!({"kind": "ssh", "targetId": "--other"})),
         vnc("", direct.clone()), vnc("127.0.0.1", ssh.clone()), vnc("vnc.internal.example", ssm.clone()),
+        // RDP는 SSM 경로에서도 인증서 이름이 필요하다. 숫자 최종 라벨은 리졸버가 IP로 해석한다.
+        rdp("", ssm.clone()), rdp("10.0.1.25", ssm.clone()), rdp("2852039166", ssm.clone()), rdp("127.1", direct.clone()),
+        rdp("0x7f000001", direct.clone()), vnc("999.1.1.1", direct.clone()),
     ] {
         assert!(!checked(invalid.clone()), "{invalid}");
     }

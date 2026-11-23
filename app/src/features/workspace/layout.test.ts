@@ -29,6 +29,14 @@ describe("중앙 탭 그룹", () => {
     expect(focusedTab(layout)).toBe(2);
   });
 
+  it("같은 그룹 안에서 놓은 자리의 바로 앞으로 옮긴다", () => {
+    const layout = addTab(addTab(initialLayout(1), 2), 3);
+    expect(tabsOf(moveTab(layout, 1, 1, 2))).toEqual([[2, 1, 3]]);
+    expect(tabsOf(moveTab(layout, 1, 1, 1))).toEqual([[1, 2, 3]]);
+    expect(tabsOf(moveTab(layout, 1, 1, 3))).toEqual([[2, 3, 1]]);
+    expect(tabsOf(moveTab(layout, 3, 1, 0))).toEqual([[3, 1, 2]]);
+  });
+
   it("탭 선택은 해당 그룹만 바꾸고 다른 그룹의 활성 탭은 유지한다", () => {
     let layout = splitTab(addTab(addTab(initialLayout(1), 2), 3), 3, 1);
     layout = selectTab(layout, 1);

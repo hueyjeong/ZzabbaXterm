@@ -155,7 +155,7 @@ it("채팅과 제안 카드를 하나의 대화 기록에 시간 순서로 표�
   expect(chat.querySelector("h2")?.textContent).toBe("AI");
   expect(chat.getAttribute("aria-labelledby")).toBe(chat.querySelector("h2")?.id);
   expect(host.querySelector('[role="tablist"]')).toBeNull();
-  expect(host.querySelector(".a01-empty")?.textContent).toBe("무엇을 도와드릴까요?");
+  expect(host.querySelector(".a01-empty")?.textContent).toBe("");
   expect(button("가동 시간 확인")).toBeUndefined();
   expect(chip("조회 대상")?.textContent).toBe("대상 선택");
   expect(chip("모델")?.textContent).toBe("local:latest");

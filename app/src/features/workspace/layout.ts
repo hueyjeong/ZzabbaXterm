@@ -78,6 +78,8 @@ export function moveTab(layout: Layout, tab: number, groupId: number, index?: nu
   const source = groupOf(layout, tab);
   const target = layout.groups.find(group => group.id === groupId);
   if (!source || !target) return layout;
+  // index는 끌고 있는 탭을 포함한 탭 줄 기준이다. 같은 그룹에서 오른쪽으로 옮기면 빠진 자리만큼 당긴다.
+  if (source.id === target.id && index !== undefined && source.tabs.indexOf(tab) < index) index -= 1;
   const groups = layout.groups.map(group => {
     let next = group.id === source.id ? { ...withoutTab(group, tab), active: group.id === target.id ? group.active : withoutTab(group, tab).active } : group;
     if (group.id === target.id) {

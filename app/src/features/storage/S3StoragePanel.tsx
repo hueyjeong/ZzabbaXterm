@@ -388,6 +388,7 @@ export function S3StoragePanel({ session, initialPage, actions, onRelogin, refre
         }} onSubmit={event => {
           event.preventDefault();
           const key = view.uploadKey;
+          if (!key || key.endsWith("/")) return;
           closeUpload();
           void transfer("upload", key);
         }}>
@@ -400,12 +401,15 @@ export function S3StoragePanel({ session, initialPage, actions, onRelogin, refre
               if (!/[\r\n]/.test(event.clipboardData.getData("text/plain"))) return;
               event.preventDefault();
               update(() => ({ invalidUploadPaste: true }));
+            }} onDrop={event => {
+              // 끌어 놓은 텍스트는 줄바꿈이 조용히 지워지므로 받지 않는다.
+              event.preventDefault();
             }} /></label>
           <div className="s3-popover-target"><Database aria-hidden="true" />{location.bucket}<span>{location.region}</span></div>
           {view.invalidUploadPaste && <p role="alert" className="s3-inline-error">줄바꿈이 포함된 키는 붙여넣을 수 없습니다</p>}
           <div className="s3-popover-actions">
             <button type="button" className="ui-button ghost" onClick={() => closeUpload(true)}>취소</button>
-            <button type="submit" className="ui-button primary" disabled={!view.uploadKey || !canTransfer}><Upload aria-hidden="true" />파일 선택</button>
+            <button type="submit" className="ui-button primary" disabled={!view.uploadKey || view.uploadKey.endsWith("/") || !canTransfer}><Upload aria-hidden="true" />파일 선택</button>
           </div>
         </form>}
       </span>

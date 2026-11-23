@@ -173,7 +173,7 @@ pub(crate) enum DesktopRoute {
 }
 
 fn desktop_dns(host: &str) -> bool {
-    host.parse::<IpAddr>().is_err() && host.len() <= 253 && host.split('.').all(|label| {
+    host.parse::<IpAddr>().is_err() && !crate::tunnels::transport::numeric_tail(host) && host.len() <= 253 && host.split('.').all(|label| {
         !label.is_empty() && label.len() <= 63 && !label.starts_with('-') && !label.ends_with('-')
             && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
     })
@@ -187,7 +187,8 @@ fn validate_desktop(protocol: DesktopProtocol, host: &str, port: u16, route: &De
     // RDP는 TLS 인증서 이름이 필요하다. 평문 RFB는 터널 끝과 같은 호스트의 서비스만 연다.
     let valid = match (protocol, route) {
         (DesktopProtocol::Rdp, DesktopRoute::Direct {} | DesktopRoute::Ssh { .. }) => desktop_dns(host),
-        (DesktopProtocol::Rdp, DesktopRoute::Ssm(_)) => host.is_empty() || address,
+        // SSM 경로도 RDP 인증서 이름이 필요하므로 DNS 이름을 목적지로 쓴다.
+        (DesktopProtocol::Rdp, DesktopRoute::Ssm(_)) => desktop_dns(host),
         (DesktopProtocol::Vnc, DesktopRoute::Direct {}) => address,
         (DesktopProtocol::Vnc, DesktopRoute::Ssh { .. } | DesktopRoute::Ssm(_)) => host.is_empty(),
     };

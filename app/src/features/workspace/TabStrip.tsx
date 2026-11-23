@@ -108,6 +108,8 @@ export function TabStrip(props: Props) {
       onDrop={event => {
         const id = dragTabId(event);
         setDropIndex(undefined);
+        // 끌기를 시작한 탭이 다른 그룹으로 옮겨지면 dragend가 오지 않으므로 여기서 끌기 상태를 끝낸다.
+        props.onDragState(null);
         if (id === undefined) return;
         event.preventDefault();
         props.onMove(id, indexAt(event));

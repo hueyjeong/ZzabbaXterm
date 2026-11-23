@@ -209,6 +209,15 @@ fn remove_run(runs: &mut Runs, owner: &str, document: u64, key: &RunKey) -> Resu
     Ok(())
 }
 
+/// 원격 화면의 SSH 경로는 Agent·키 파일 인증의 저장된 직접 SSH 대상만 가리킨다. 마법사와 CLI 등록이 같이 쓴다.
+pub(super) fn desktop_route_ready(draft: &ValidatedDraft, store: &Store) -> Result<bool, StoreError> {
+    let MethodRef::Desktop { route: DesktopRoute::Ssh { target_id } } = draft.method() else { return Ok(true) };
+    let file = store.load()?;
+    Ok(file.targets.iter().any(|entry| entry.profile.id.as_str() == target_id && entry.profile.id.as_str() != draft.target_id()
+        && matches!(&entry.profile.method, Method::Ssh { ssh } if matches!(ssh.transport, SshTransport::Direct {})
+            && matches!(ssh.auth, SshAuth::Agent { .. } | SshAuth::KeyFile { .. }))))
+}
+
 pub(super) fn save_confirmed(sessions: &Sessions, owner: &str, document: u64, request: SaveRequest, store: &Store) -> Result<(), String> {
     let SaveRequest { run: key, draft } = request;
     let draft = draft.validate().map_err(|error| format!("초안 검증: {error:?}"))?;
@@ -219,14 +228,8 @@ pub(super) fn save_confirmed(sessions: &Sessions, owner: &str, document: u64, re
         return saved(store.save_authorized(draft, None, || Ok(()), || {}));
     }
     // 원격 화면 프로필은 비밀 없이 경로만 저장한다. 서버 신원과 터널은 열 때 다시 확인한다.
-    if let MethodRef::Desktop { route: DesktopRoute::Ssh { target_id } } = draft.method() {
-        let file = store.load().map_err(|error| format!("프로필 읽기: {error:?}"))?;
-        let direct = file.targets.iter().any(|entry| entry.profile.id.as_str() == target_id && matches!(&entry.profile.method,
-            Method::Ssh { ssh } if matches!(ssh.transport, SshTransport::Direct {})
-                && matches!(ssh.auth, SshAuth::Agent { .. } | SshAuth::KeyFile { .. })));
-        if !direct {
-            return Err("Agent 또는 키 파일 인증의 저장된 직접 SSH 대상이 필요합니다".into());
-        }
+    if !desktop_route_ready(&draft, store).map_err(|error| format!("프로필 읽기: {error:?}"))? {
+        return Err("Agent 또는 키 파일 인증의 저장된 직접 SSH 대상이 필요합니다".into());
     }
     if matches!(draft.method(), MethodRef::Desktop { .. }) {
         return saved(store.save_authorized(draft, None, || Ok(()), || {}));

@@ -132,9 +132,16 @@ impl SshPlan {
     }
 }
 
+/// 숫자만으로 된 최종 라벨(`2852039166`, `127.1`, `0x7f000001`)은 리졸버가 IP로 해석하므로 이름으로 받지 않는다.
+pub(crate) fn numeric_tail(name: &str) -> bool {
+    let last = name.rsplit('.').next().unwrap_or(name);
+    let hex = last.strip_prefix("0x").or_else(|| last.strip_prefix("0X"));
+    last.bytes().all(|b| b.is_ascii_digit()) || hex.is_some_and(|digits| digits.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 fn dns_name(host: &str) -> bool {
     let name = host.strip_suffix('.').unwrap_or(host);
-    name.len() <= 253 && name.split('.').all(|label| {
+    !numeric_tail(name) && name.len() <= 253 && name.split('.').all(|label| {
         !label.is_empty()
             && label.len() <= 63
             && !label.starts_with('-')

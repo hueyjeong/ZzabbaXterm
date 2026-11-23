@@ -468,13 +468,17 @@ describe("저장 RDP·VNC 연결", () => {
     expect(wizard.getSnapshot().draft.target).toMatchObject({ rdp: { host: "", port: "3390", route: { kind: "ssm", ...node } } });
     wizard.go(1);
     wizard.go(1);
-    expect(wizard.canReviewDesktop(node)).toBe(true);
+    // RDP는 SSM 경로에서도 인증서 이름(DNS)이 필요하다.
+    expect(wizard.canReviewDesktop(node)).toBe(false);
     for (const [host, route, valid] of [
       ["10.0.1.25", { kind: "direct" }, false],
       ["win.example.test", { kind: "direct" }, true],
       ["127.0.0.1", { kind: "ssh", targetId: "ssh-server" }, false],
       ["host,other", { kind: "ssm", ...node }, false],
-      ["10.0.1.25", { kind: "ssm", ...node }, true],
+      ["10.0.1.25", { kind: "ssm", ...node }, false],
+      ["2852039166", { kind: "ssm", ...node }, false],
+      ["127.1", { kind: "direct" }, false],
+      ["rdp.internal.example", { kind: "ssm", ...node }, true],
     ] as const) {
       wizard.editDesktop({ host, route });
       expect(wizard.canReviewDesktop(node), `${host} ${route.kind}`).toBe(valid);

@@ -70,7 +70,8 @@ export function AiPanel(props: AiPanelProps & { sessionSelection?: SessionSelect
   const [entries, setEntries] = useState<readonly Entry[]>([]);
   const [chat, setChat] = useState<ChatState>({ kind: "idle" });
   // 사용자가 고르기 전에는 첫 모델을 쓴다.
-  const model = props.models.includes(modelName) ? modelName : props.models[0] ?? "";
+  // 고르기 전에는 첫 모델을 쓴다. 고른 모델이 목록에서 빠지면 다른 모델로 조용히 바꾸지 않고 다시 고르게 한다.
+  const model = props.models.includes(modelName) ? modelName : modelName ? "" : props.models[0] ?? "";
   const target = props.targets.find((candidate) => targetKey(candidate) === selected);
   const attempted = useRef(new Set<string>());
   const order = useRef(new Map<string, number>());
@@ -431,7 +432,6 @@ function Conversation({ model, target, entries, chat, order, nextSeq, fallbackFo
   return <>
     {empty && <div className="a01-empty">
       <span className="a01-empty-mark" aria-hidden="true"><Sparkles /></span>
-      <p className="a01-empty-title">무엇을 도와드릴까요?</p>
     </div>}
     <div className="a01-log" role="log" aria-label="대화 기록" hidden={empty}>
       {timeline.map(({ entry, proposal }) => entry

@@ -125,8 +125,15 @@ function completeS3({ profile, region, bucket }: S3Settings) {
 }
 
 const dnsLabel = /^(?!-)[A-Za-z0-9-]{1,63}(?<!-)$/;
-const ipLiteral = (host: string) => /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || (host.includes(":") && /^[0-9A-Fa-f:.]+$/.test(host));
-const dnsName = (host: string) => host.length <= 253 && !ipLiteral(host) && host.split(".").every(label => dnsLabel.test(label));
+const ipv4 = (host: string) => /^\d{1,3}(\.\d{1,3}){3}$/.test(host) && host.split(".").every(part => Number(part) <= 255 && String(Number(part)) === part);
+const ipv6 = (host: string) => {
+  if (!host.includes(":") || !/^[0-9A-Fa-f:.]+$/.test(host)) return false;
+  try { return new URL(`http://[${host}]/`).hostname.length > 2; } catch { return false; }
+};
+const ipLiteral = (host: string) => ipv4(host) || ipv6(host);
+// 숫자만으로 된 최종 라벨(2852039166, 127.1, 0x7f000001)은 리졸버가 IP로 해석하므로 이름으로 받지 않는다.
+const numericTail = (host: string) => /^(\d+|0[xX][0-9A-Fa-f]*)$/.test(host.split(".").pop() ?? host);
+const dnsName = (host: string) => host.length <= 253 && !ipLiteral(host) && !numericTail(host) && host.split(".").every(label => dnsLabel.test(label));
 
 export const desktopPorts = { rdp: 3389, vnc: 5900 } as const;
 
@@ -142,7 +149,8 @@ export function completeDesktop(kind: DesktopKind, input: DesktopInput): RdpSett
   if (route.kind === "ssm" && !route.instanceId) return null;
   if (route.kind === "ssh" && !/^[A-Za-z0-9_][A-Za-z0-9_-]*$/.test(route.targetId)) return null;
   const address = ipLiteral(host) || dnsName(host);
-  const valid = kind === "rdp" ? (route.kind === "ssm" ? !host || address : dnsName(host))
+  // RDP는 모든 경로에서 인증서 이름이 필요하다.
+  const valid = kind === "rdp" ? dnsName(host)
     : route.kind === "direct" ? address : !host;
   if (!valid) return null;
   return kind === "rdp" ? { host, port, tlsOnly, route } : { host, port, route };

@@ -14,7 +14,7 @@ import type { ApprovedEditorFile, ConfirmEditorDiscard, EditorTransport } from "
 import { closeLocalFile, localEditorError, localEditorTransport, openLocalFile } from "../editor/localEditorIpc";
 import { subscribeRemoteNanoOpen, type RemoteNanoFile } from "../editor/nanoOpen";
 import { RdpTab, type RdpTabActions } from "../rdp/RdpTab";
-import { openDesktopProfile, type DesktopPreset, type DesktopProfile } from "../remoteDesktop/desktopProfile";
+import { DesktopRouteError, openDesktopProfile, type DesktopPreset, type DesktopProfile } from "../remoteDesktop/desktopProfile";
 import { SftpPanel, type SftpPanelActions } from "../sftp/SftpPanel";
 import { sftpError } from "../sftp/sftpIpc";
 import type { SsmTarget } from "../ssm/ssm";
@@ -133,17 +133,28 @@ export function Workspace() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [aiOpen, setAiOpen] = useState(true);
   const [quickOpen, setQuickOpen] = useState(false);
-  const [desktopOpening, setDesktopOpening] = useState("");
+  const [desktopOpening, setDesktopOpening] = useState<{ label: string; controller: AbortController }>();
   // Windows Terminal과 같은 Ctrl+Shift+P로 빠른 열기를 연다. 셸이 쓰는 Ctrl+K·Ctrl+P는 가로채지 않는다.
   useEffect(() => {
     const open = (event: KeyboardEvent) => {
-      if (!event.ctrlKey || !event.shiftKey || event.altKey || event.metaKey || event.key.toLowerCase() !== "p" || event.isComposing) return;
+      if (!event.ctrlKey || !event.shiftKey || event.altKey || event.metaKey || event.isComposing ||
+        (event.code !== "KeyP" && event.key.toLowerCase() !== "p")) return;
+      // 모달 대화상자(마법사·승격) 밖의 문서는 inert이므로 그 위에 열지 않는다.
+      if (document.querySelector("dialog[open]")) return;
       event.preventDefault();
       event.stopPropagation();
       if (!closingWindow.current) setQuickOpen(true);
     };
     window.addEventListener("keydown", open, true);
-    return () => window.removeEventListener("keydown", open, true);
+    // 어디에 놓든, 끌기가 어떻게 끝나든 드롭 영역을 걷어 낸다.
+    const endDrag = () => { setDragging(null); setDropTarget(undefined); };
+    window.addEventListener("drop", endDrag, true);
+    window.addEventListener("dragend", endDrag, true);
+    return () => {
+      window.removeEventListener("keydown", open, true);
+      window.removeEventListener("drop", endDrag, true);
+      window.removeEventListener("dragend", endDrag, true);
+    };
   }, []);
   const sftpPanels = useRef(new Map<string, SftpPanelActions>());
   const editorActions = useRef(new Map<number, EditorTabActions>());
@@ -185,7 +196,10 @@ export function Workspace() {
   // 보이는 편집기만 활성 상태로 둔다. 그룹마다 활성 탭이 하나씩 보인다.
   useLayoutEffect(() => {
     const visible = L.visibleTabs(layout);
-    for (const [id, actions] of editorActions.current) actions.setActive(visible.has(id));
+    for (const [id, actions] of editorActions.current) {
+      const tab = tabs.find(item => item.id === id);
+      actions.setActive(visible.has(id) && !(tab?.kind === "editor" && tab.attaching));
+    }
   }, [layout, tabs]);
   const [focused, setFocused] = useState(false);
   const [windowError, setWindowError] = useState("");
@@ -505,10 +519,13 @@ export function Workspace() {
 
   /** 저장된 RDP·VNC 프로필의 경로를 연 뒤 입력칸을 채운 화면 탭을 만든다. 서비스 연결은 탭에서 사용자가 시작한다. */
   async function openDesktopTarget(target: DesktopProfile, split?: Placement) {
+    if (desktopOpening?.label === target.displayName) return;
     setWindowError("");
-    setDesktopOpening(target.displayName);
+    const pending = { label: target.displayName, controller: new AbortController() };
+    desktopOpening?.controller.abort();
+    setDesktopOpening(pending);
     try {
-      const opened = await openDesktopProfile(target);
+      const opened = await openDesktopProfile(target, { signal: pending.controller.signal });
       if (closingWindow.current) {
         await opened.close();
         return;
@@ -519,10 +536,20 @@ export function Workspace() {
       }]);
       placeTab(id, split);
     } catch (error) {
-      setWindowError(`${target.displayName} 열기 실패: ${error instanceof Error ? error.message : String(error)}`);
+      if (error instanceof DesktopRouteError) keepUnclosedRoute(error.handle, error.targetId, target.displayName, error.message);
+      if (!pending.controller.signal.aborted || error instanceof DesktopRouteError) {
+        setWindowError(`${target.displayName} 열기 실패: ${error instanceof Error ? error.message : String(error)}`);
+      }
     } finally {
-      setDesktopOpening(current => current === target.displayName ? "" : current);
+      setDesktopOpening(current => current === pending ? undefined : current);
     }
+  }
+
+  /** 종료를 확인하지 못한 경로 터널은 보이는 터널 탭으로 남겨 같은 핸들로 다시 닫게 한다. */
+  function keepUnclosedRoute(handle: string, targetId: string, name: string, error: string) {
+    const id = nextTab.current++;
+    setTabs(current => [...current, { kind: "tunnel", id, label: `${name} · 경로`, handle, targetId, name, method: "ssh", closeStatus: "unconfirmed", closeError: error }]);
+    updateLayout(current => L.appendTab(current, id));
   }
 
   function openElevation(request: ElevationRequest) {
@@ -633,7 +660,11 @@ export function Workspace() {
         return;
       }
       // 프로필 경로로 연 전달은 화면 탭과 함께 닫는다.
-      void tab.release?.().catch(error => setWindowError(`${tab.label} 경로 종료 실패: ${String(error)}`));
+      const source = tab.source;
+      void tab.release?.().catch(error => {
+        setWindowError(`${tab.label} 경로 종료 실패: ${String(error)}`);
+        if (source) keepUnclosedRoute(source.tabHandle, source.targetId, tab.label, String(error));
+      });
     }
     if (tab.kind === "tunnel" || tab.kind === "storage" || (tab.kind === "terminal" && (tab.ssm || tab.ssh))) {
       closingTabs.current.add(id);
@@ -893,7 +924,9 @@ export function Workspace() {
                 onDragOver={event => {
                   if (!event.dataTransfer.types.includes(TAB_DRAG_TYPE)) return;
                   event.preventDefault();
-                  const side = dropSide(event);
+                  const raw = dropSide(event);
+                  // 그룹 상한에서는 분할 대신 이동만 한다.
+                  const side = raw !== "center" && layout.groups.length >= L.MAX_GROUPS ? "center" : raw;
                   setDropTarget(current => current?.group === group.id && current.side === side ? current : { group: group.id, side });
                 }}
                 onDragLeave={event => {
@@ -901,11 +934,14 @@ export function Workspace() {
                 }}
                 onDrop={event => {
                   const id = dragTabId(event);
-                  const side = dropSide(event);
+                  const raw = dropSide(event);
+                  const side = raw !== "center" && layout.groups.length >= L.MAX_GROUPS ? "center" : raw;
                   setDragging(null);
                   setDropTarget(undefined);
                   if (id === undefined) return;
                   event.preventDefault();
+                  // 같은 그룹 가운데에 놓으면 순서를 바꾸지 않는다.
+                  if (side === "center" && group.tabs.includes(id)) return;
                   updateLayout(current => side === "center" ? L.moveTab(current, id, group.id) : L.splitTab(current, id, group.id, side));
                 }} />}
             </div>;
@@ -941,7 +977,9 @@ export function Workspace() {
                 if (visible && event.button === 0) selectTab(id);
               },
               onMouseUpCapture: blockTerminalInput, onMouseMoveCapture: blockTerminalInput,
-              onWheelCapture: blockTerminalInput, onAuxClickCapture: blockTerminalInput, onContextMenuCapture: blockTerminalInput,
+              // 휠 리스너는 passive라 기본 동작을 막을 수 없다. 전파만 막는다.
+              onWheelCapture: (event: SyntheticEvent<HTMLDivElement>) => { if (!terminalHasFocus(event.currentTarget)) event.stopPropagation(); },
+              onAuxClickCapture: blockTerminalInput, onContextMenuCapture: blockTerminalInput,
             } : {
               onMouseDownCapture: () => { if (visible && id !== activeId.current) selectTab(id, false); },
             };
@@ -1017,7 +1055,8 @@ export function Workspace() {
         {windowError && <span role="alert">{windowError}</span>}
         {fileError && <span role="alert">{fileError}</span>}
         {hostRegistration && <span role={hostRegistration.kind}>{hostRegistration.message}</span>}
-        {desktopOpening && <span role="status">{desktopOpening} 경로 여는 중</span>}
+        {desktopOpening && <span role="status" className="workspace-status-pending">{desktopOpening.label} 경로 여는 중
+          <button type="button" className="ui-button ghost" onClick={() => desktopOpening.controller.abort()}>취소</button></span>}
       </footer>
       {elevationContext && <ElevationDialog context={elevationContext} onClose={() => setElevationContext(undefined)} onSubmit={(request) => {
         setElevationContext(undefined);

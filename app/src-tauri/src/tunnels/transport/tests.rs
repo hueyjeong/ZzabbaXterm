@@ -149,7 +149,7 @@ fn ssm_remote_host_uses_the_remote_document_only_for_dns_or_ip_hosts() {
     for host in [
         "", " ", "host name", "a,b", "host=other", "host
 portNumber=22", "[fd00::25]", "fe80::1%eth0",
-        "-debug", "host_name", "host:3389", long.as_str(),
+        "-debug", "host_name", "host:3389", long.as_str(), "2852039166", "127.1", "0x7f000001", "999.1.1.1",
     ] {
         let route = ssm_remote_route(listen, host);
         assert_eq!(SsmPlan::new(&route, SCOPE, &route, SCOPE).err(), Some(PlanError::InvalidDestination), "{host:?}");

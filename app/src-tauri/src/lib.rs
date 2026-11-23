@@ -1,4 +1,5 @@
 pub mod ai;
+mod navigation;
 mod connections;
 mod editor;
 #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
@@ -60,6 +61,7 @@ pub fn run() {
         .register_asynchronous_uri_scheme_protocol("rdp-packet", rdp::ipc::protocol)
         .register_asynchronous_uri_scheme_protocol("vnc-packet", vnc::output::protocol)
         .plugin(ssm::ipc::lifecycle())
+        .plugin(navigation::guard())
         .setup(|app| {
             if let Ok(registration) = connections::ipc::initialize_ssh_registration(app) {
                 app.manage(registration);

@@ -162,9 +162,9 @@ export function LocalTree({ profiles, openCounts, onOpen, onElevate, onLocalElev
                   showMenu(event.currentTarget, target, event.clientX, event.clientY);
                 }}>
                 <div className="tree-row"><ProtocolIcon kind={target.kind} /><span>{target.name}</span>
-                  {"viaSsm" in target && target.viaSsm && <span className="tree-via" title="SSM 경유" aria-label="SSM 경유" />}
+                  {"viaSsm" in target && target.viaSsm && <span className="tree-via" role="img" title="SSM 경유" aria-label="SSM 경유" />}
                   {group.targets.some((other) => other.key !== target.key && other.name === target.name) && <small title={target.id}>{target.id.slice(0, 8)}</small>}
-                  {count > 0 && <span className="tree-open" title={`열린 탭 ${count}개`} aria-label={`열린 탭 ${count}개`} />}
+                  {count > 0 && <span className="tree-open" role="img" title={`열린 탭 ${count}개`} aria-label={`열린 탭 ${count}개`} />}
                 </div>
               </li>;
             })}

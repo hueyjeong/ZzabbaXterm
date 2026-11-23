@@ -26,6 +26,11 @@ type Options = Readonly<{
   timeoutMs?: number;
 }>;
 
+/** 경로 터널을 열다 실패했고 그 터널의 종료도 확인하지 못했다. 호출자는 handle로 종료를 다시 확인할 탭을 남긴다. */
+export class DesktopRouteError extends Error {
+  constructor(message: string, readonly handle: string, readonly targetId: string) { super(message); }
+}
+
 export const SSM_FORWARD_UNAVAILABLE = "공식 SSM 포트 전달의 바이너리 보존을 확인할 수 없습니다";
 
 function ephemeralPort() {
@@ -60,6 +65,7 @@ export async function openDesktopProfile(profile: DesktopProfile, options: Optio
   const handle = await ipc.open(route.targetId, `${label} · ${kind.toUpperCase()} 경로`);
   const close = async () => { await ipc.close(handle); };
   try {
+    signal?.throwIfAborted();
     const id = await ipc.start(handle, { direction: "local", listen: listenPort(), host: "127.0.0.1", port: settings.port, protocol: kind });
     if (id === null) throw new Error("SSH 터널 승인이 취소되었습니다");
     const deadline = Date.now() + timeoutMs;
@@ -81,7 +87,7 @@ export async function openDesktopProfile(profile: DesktopProfile, options: Optio
     }
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
-    try { await close(); } catch (failure) { throw new Error(`${reason} · 터널 종료 확인 불가: ${String(failure)}`); }
+    try { await close(); } catch (failure) { throw new DesktopRouteError(`${reason} · 터널 종료 확인 불가: ${String(failure)}`, handle, route.targetId); }
     throw error instanceof Error ? error : new Error(reason);
   }
 }

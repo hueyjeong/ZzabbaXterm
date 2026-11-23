@@ -332,6 +332,8 @@
 .workspace-status-main { display: flex; align-items: center; gap: 6px; }
 .workspace-status-main .proto-icon { width: 13px; height: 13px; }
 .workspace-status [role="alert"] { color: var(--danger); }
+.workspace-status-pending { display: flex; align-items: center; gap: 6px; }
+.workspace-status-pending .ui-button { min-height: 18px; padding: 0 6px; font-size: 11px; }
 .workspace-file-status { margin: 12px; color: var(--text-faint); }
 .workspace-sftp:not([hidden]) { display: flex; flex: 1; min-width: 0; min-height: 0; }
 .workspace-storage:not([hidden]) { display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; }
