@@ -1,9 +1,15 @@
 use portable_pty::{Child, CommandBuilder, SlavePty};
 use std::path::Path;
 use std::sync::Arc;
+#[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+use std::time::{Duration, Instant};
 use crate::connections::profile::{Ssh, SshAuth, SshTransport};
 
 use super::{ApprovedHost, Authentication, Client, ConnectionPlan, Error, Invocation, Transport, TrustStore};
+
+// 승인 창을 읽는 시간은 교환 예산과 분리한다. 실제 askpass 교환 기한은 spawn에서 다시 잰다.
+#[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+pub(crate) const APPROVAL_TTL: Duration = Duration::from_secs(120);
 
 pub(crate) struct DirectLaunch {
     command: CommandBuilder,
@@ -66,7 +72,7 @@ impl DirectLaunch {
                     .approval
                     .spawn_ssh(&stored.document, &self.plan, slave, stored.vault)
             })
-            .map_err(stored_error)?;
+            .map_err(|error| stored_error(&error))?;
             return Ok(SshSpawn { child, plan: self.plan, stored: Some(exchange) });
         }
         let child = slave
@@ -182,6 +188,22 @@ fn prepare_stored_with(
     vault: Result<crate::local_auth::Bitwarden, crate::local_auth::Error>,
     confirm: impl FnOnce(String) -> Result<bool, String>,
 ) -> Result<DirectLaunch, String> {
+    prepare_stored_bounded(config, ssh, endpoint, item, owner, document, APPROVAL_TTL, vault, confirm)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+fn prepare_stored_bounded(
+    config: &Path,
+    ssh: &Ssh,
+    endpoint: &super::Endpoint,
+    item: &str,
+    owner: &str,
+    document: u64,
+    budget: Duration,
+    vault: Result<crate::local_auth::Bitwarden, crate::local_auth::Error>,
+    confirm: impl FnOnce(String) -> Result<bool, String>,
+) -> Result<DirectLaunch, String> {
     let vault = match vault {
         Ok(vault) => vault,
         Err(error) => return manual(config, ssh, endpoint, fallback_reason(&error)),
@@ -203,21 +225,27 @@ fn prepare_stored_with(
         )
         .map_err(pin_error)?,
     );
+    let details = plan.stored().ok_or("저장된 SSH 암호 계획이 없습니다")?;
+    let message = format!(
+        "서버: {}\n계정: {}\n호스트 키 SHA256 지문: {}\n금고 항목 ID: {}\n\n저장된 SSH 암호로 로그인하시겠습니까?",
+        details.target, details.user, details.fingerprint, details.item,
+    );
+    let shown = Instant::now();
+    if !confirm(message)? {
+        return Err("저장된 SSH 암호 승인이 취소되었습니다".into());
+    }
+    if shown.elapsed() > budget {
+        return Err("저장된 SSH 암호 승인이 만료되었습니다".into());
+    }
+    // 승인 기산점은 창을 닫은 뒤다. 승인 소비 규칙과 askpass 교환 기한은 그대로 둔다.
     let current = crate::local_auth::Document {
         owner: owner.into(),
         document,
         tab: uuid::Uuid::new_v4().to_string(),
     };
-    let pending = crate::local_auth::Pending::request(current.clone(), Arc::clone(&plan)).map_err(stored_error)?;
-    let details = pending.details();
-    let message = format!(
-        "서버: {}\n계정: {}\n호스트 키 SHA256 지문: {}\n금고 항목 ID: {}\n\n저장된 SSH 암호로 로그인하시겠습니까?",
-        details.target, details.user, details.fingerprint, details.item,
-    );
-    if !confirm(message)? {
-        return Err("저장된 SSH 암호 승인이 취소되었습니다".into());
-    }
-    let approval = pending.approve(&current, &plan).map_err(stored_error)?;
+    let pending = crate::local_auth::Pending::request(current.clone(), Arc::clone(&plan))
+        .map_err(|error| stored_error(&error))?;
+    let approval = pending.approve(&current, &plan).map_err(|error| stored_error(&error))?;
     let command = command(plan.stored_ssh_invocation().map_err(pin_error)?);
     Ok(DirectLaunch {
         command,
@@ -257,7 +285,7 @@ fn fallback_reason(error: &crate::local_auth::Error) -> &'static str {
 }
 
 #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
-fn stored_error(error: crate::local_auth::Error) -> String {
+fn stored_error(error: &crate::local_auth::Error) -> String {
     use crate::local_auth::Error as E;
     match error {
         E::Expired => "저장된 SSH 암호 승인이 만료되었습니다".into(),
@@ -271,6 +299,15 @@ fn stored_error(error: crate::local_auth::Error) -> String {
         E::VaultUnauthenticated => "Bitwarden에 로그인되어 있지 않습니다".into(),
         E::ItemMissing => "Bitwarden 항목을 찾을 수 없습니다".into(),
         other => format!("저장된 인증: {other:?}"),
+    }
+}
+
+/// 탭이 열린 뒤 교환이 실패하면 사용자에게 금고 오류를 상태로 알린다.
+#[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+pub(crate) fn stored_failure(error: &crate::local_auth::Error) -> Option<String> {
+    match error {
+        crate::local_auth::Error::Cancelled => None,
+        other => Some(stored_error(other)),
     }
 }
 

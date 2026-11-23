@@ -1619,7 +1619,10 @@ describe("F01 직접 SSH", () => {
   const fingerprint = `SHA256:${"A".repeat(43)}`;
 
   it("네이티브 PIN 등록을 취소하면 연결 시험과 저장을 차단한다", async () => {
-    runConnectionCommand = async () => { throw "cancelled"; };
+    runConnectionCommand = async (command) => {
+      if (command === "connection_capabilities") return { storedAuth: true };
+      throw "cancelled";
+    };
     const select = async (label: string, value: string) => {
       const control = [...find("dialog").querySelectorAll("label")]
         .find(item => item.firstChild?.textContent?.trim() === label)?.querySelector("select");

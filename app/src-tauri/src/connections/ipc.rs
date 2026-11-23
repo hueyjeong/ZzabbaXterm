@@ -5,8 +5,18 @@ use tauri::{Manager, Webview, ipc::{CommandArg, CommandItem, Invoke, InvokeError
 use crate::terminal::Sessions;
 use super::{probe, store::Store};
 
+#[derive(Serialize)]
+struct Capabilities {
+    stored_auth: bool,
+}
+
 pub(crate) fn handle(invoke: Invoke, other: fn(Invoke) -> bool) -> bool {
     match invoke.message.command() {
+        "connection_capabilities" => dispatch(invoke, "connection_capabilities", |_| {
+            Ok(|_, _| Ok(Capabilities {
+                stored_auth: cfg!(all(feature = "stored-auth", any(windows, target_os = "linux"))),
+            }))
+        }),
         "connection_test_start" => dispatch(invoke, "connection_test_start", |args| {
             let draft_id = args.get("draftId")?;
             let draft_version = args.get("draftVersion")?;

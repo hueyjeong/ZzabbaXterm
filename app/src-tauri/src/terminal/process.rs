@@ -38,7 +38,7 @@ struct Flow {
     editor_start: Option<tokio::sync::oneshot::Sender<()>>,
     editor_startup: Option<Startup>,
     #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
-    stored: Option<crate::local_auth::Exchange>,
+    stored: Option<CancellationToken>,
     sent: u64,
     acked: u64,
     ack_deadline: Option<std::time::Instant>,
@@ -285,7 +285,7 @@ impl Session {
                 return Err(self.after_failed_spawn(error, remote.take()));
             }
         };
-        let send = Mutex::new(send);
+        let send = Arc::new(Mutex::new(send));
         let send_event = |event| (send.lock().unwrap())(event);
         thread::scope(|scope| {
             let (event_tx, event_rx) = mpsc::sync_channel(1);
@@ -413,8 +413,13 @@ impl Session {
                         workers: None,
                     });
                     #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
-                    {
-                        flow.stored = stored_exchange.take();
+                    if let Some(exchange) = stored_exchange.take() {
+                        let cancel = CancellationToken::new();
+                        flow.stored = Some(cancel.clone());
+                        let events = Arc::clone(&send);
+                        // 교환 결과를 관찰해 승인 뒤 금고 오류를 사용자 상태로 전달한다.
+                        let _ = thread::Builder::new().name("stored-auth".into())
+                            .spawn(move || watch_stored(exchange, cancel, events));
                     }
                 }
                 if !ssm { flow.start_deadline = Some(std::time::Instant::now() + START_TIMEOUT); }
@@ -916,7 +921,7 @@ impl Session {
         if let Some(sftp) = &flow.sftp { sftp.cancel.cancel(); }
         if let Some(cancel) = &flow.editor_cancel { cancel.cancel(); }
         #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
-        if let Some(exchange) = flow.stored.take() { exchange.cancel(); }
+        if let Some(cancel) = flow.stored.take() { cancel.cancel(); }
         if flow.stop.is_none() || matches!(reason, Stop::Closed) {
             flow.stop = Some(reason);
         }
@@ -1127,19 +1132,67 @@ fn control_input_is_dedicated_and_checks_deadline_before_writing() {
     assert!(!control.connected());
 }
 
+#[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+fn watch_stored(
+    mut exchange: crate::local_auth::Exchange,
+    cancel: CancellationToken,
+    events: Arc<Mutex<impl Fn(Event) -> Result<(), String> + Send + 'static>>,
+) {
+    let outcome = tauri::async_runtime::block_on(async {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                exchange.cancel();
+                None
+            }
+            result = exchange.result() => Some(result),
+        }
+    });
+    if let Some(Err(error)) = outcome
+        && let Some(message) = crate::ssh::terminal::stored_failure(&error)
+    {
+        let _ = (events.lock().unwrap())(Event::Notice(message));
+    }
+}
+
 #[cfg(all(test, feature = "stored-auth", any(windows, target_os = "linux")))]
 #[test]
-fn switching_tabs_cancels_stored_exchange() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    let cancelled = Arc::new(AtomicBool::new(false));
+fn closing_tab_cancels_stored_auth() {
+    let cancel = CancellationToken::new();
     let session = Session::new("main", false);
-    session.flow.lock().unwrap().stored =
-        Some(crate::local_auth::Exchange::dormant(Arc::clone(&cancelled)));
+    session.flow.lock().unwrap().stored = Some(cancel.clone());
     session.stop(Stop::Closed);
+    assert!(cancel.is_cancelled());
     assert!(session.flow.lock().unwrap().stored.is_none());
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !cancelled.load(Ordering::Relaxed) && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(cancelled.load(Ordering::Relaxed));
+}
+
+#[cfg(all(test, feature = "stored-auth", any(windows, target_os = "linux")))]
+#[test]
+fn stored_exchange_failure_is_reported_as_notice() {
+    let reported = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&reported);
+    let events = Arc::new(Mutex::new(move |event: Event| {
+        sink.lock().unwrap().push(format!("{event:?}"));
+        Ok(())
+    }));
+    watch_stored(
+        crate::local_auth::Exchange::fixture_result(Err(crate::local_auth::Error::VaultLocked)),
+        CancellationToken::new(),
+        events,
+    );
+    let failure = reported.lock().unwrap().join(" ");
+    assert!(failure.contains("Notice") && failure.contains("Bitwarden 금고가 잠겨 있습니다"), "{failure}");
+
+    let silent = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&silent);
+    let events = Arc::new(Mutex::new(move |event: Event| {
+        sink.lock().unwrap().push(format!("{event:?}"));
+        Ok(())
+    }));
+    watch_stored(
+        crate::local_auth::Exchange::fixture_result(Ok(())),
+        CancellationToken::new(),
+        events,
+    );
+    assert!(silent.lock().unwrap().is_empty());
 }

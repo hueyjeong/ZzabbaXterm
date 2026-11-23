@@ -125,6 +125,7 @@ mod stored {
     use std::{
         path::Path,
         process::Command,
+        time::Duration,
     };
 
     use serde_json::json;
@@ -135,7 +136,7 @@ mod stored {
         ssh::{ApprovedHost, Endpoint, TRUST_DIRECTORY, TrustStore},
     };
 
-    use super::super::{prepare_stored_with, saved};
+    use super::super::{APPROVAL_TTL, prepare_stored_bounded, prepare_stored_with, saved};
 
     const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti";
     const SHA: &str = "SHA256:UCUiLr7Pjs9wFFJMDByLgc3NrtdU344OgUM45wZPcIQ";
@@ -230,5 +231,36 @@ mod stored {
     fn noninteractive_paths_still_refuse_stored_password() {
         let (directory, ssh, _) = target();
         assert_eq!(saved(directory.path(), &ssh).err().unwrap(), "저장된 SSH 암호를 사용할 수 없습니다");
+    }
+
+    #[test]
+    fn approval_window_outlasts_the_old_thirty_second_basis() {
+        assert!(APPROVAL_TTL >= Duration::from_secs(120));
+        let (directory, ssh, endpoint) = target();
+        let vault = vault(directory.path());
+        // 창을 읽는 시간은 승인 기한에서 따로 재고, 승인 뒤 교환 예산은 spawn에서 새로 잰다.
+        let launch = prepare_stored_bounded(
+            directory.path(), &ssh, &endpoint, ITEM, "main", 1, Duration::from_secs(5), Ok(vault),
+            |_| {
+                std::thread::sleep(Duration::from_millis(60));
+                Ok(true)
+            },
+        ).ok().unwrap();
+        let mut launch = launch;
+        assert!(launch.stored.take().is_some());
+    }
+
+    #[test]
+    fn approval_window_expiry_is_separate_from_the_exchange_budget() {
+        let (directory, ssh, endpoint) = target();
+        let vault = vault(directory.path());
+        let result = prepare_stored_bounded(
+            directory.path(), &ssh, &endpoint, ITEM, "main", 1, Duration::from_millis(10), Ok(vault),
+            |_| {
+                std::thread::sleep(Duration::from_millis(30));
+                Ok(true)
+            },
+        ).map(|_| ());
+        assert_eq!(result.err().unwrap(), "저장된 SSH 암호 승인이 만료되었습니다");
     }
 }

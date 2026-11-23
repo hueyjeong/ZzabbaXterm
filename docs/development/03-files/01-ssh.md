@@ -35,9 +35,9 @@
 
 마법사의 `verify_ssh_host`는 Rust에서 검증한 초안의 대상·호스트·포트·지문을 대조한다. 기본 앱 창에 연결된 네이티브 파일 선택과 확인을 거치면 Rust가 문서·초안 세대에 묶인 일회 예약을 반환한다. `commit_ssh_host`는 유효한 예약만 소비해 앱 설정 디렉터리의 `ssh-trust`에 등록한다. 마법사 종료, 초안 변경, 페이지 이동은 대기 중인 예약을 취소한다.
 
-Agent 공개 키는 열린 파일의 핸들로 링크 여부, 정규 파일 여부, 16 KiB 상한을 검사한 뒤 읽는다. SSH-over-SSM과 저장 암호는 이 후보에서 사용 불가다.
+Agent 공개 키는 열린 파일의 핸들로 링크 여부, 정규 파일 여부, 16 KiB 상한을 검사한 뒤 읽는다. SSH-over-SSM은 이 후보에서 사용할 수 없다. 저장 암호 대상은 터미널 탭의 승인 경로로 연다.
 
-**저장 인증 기반의 현재 상태(비기본 기능).** `stored-auth` 기능으로 빌드할 때만 다음이 포함된다: Bitwarden CLI 호출(`auth/vault.rs`), 로컬 승인 전송(Windows named pipe / Linux Unix 소켓, 상대 프로세스·이미지·자식 관계 확인), `zzabba-askpass` helper, 승인 1회 소비(`auth/mod.rs`). 터미널 탭은 `terminal_open` → `terminal::saved::launch_interactive` → `ssh::terminal::saved_interactive`로 저장 암호 대상을 열고, `Pending::approve`로 묶은 `Approval`이 PTY 자식과 `Exchange`를 함께 만든다. `Exchange`는 탭 닫기·창 닫기·탭 전환에서 취소되고 `bw` 자식도 그 수명에 회수된다. 승인 창은 기존 네이티브 확인 패턴으로 서버·계정·지문·금고 항목 ID를 표시한다. 연결 시험·SFTP·원격 편집기·터널과 `DirectLaunch::prepare`는 지금처럼 저장 암호를 명시적 오류로 거부한다. F01 완료 판정은 실제 OpenSSH 종단 증거가 남을 때 한다.
+**저장 인증 기반의 현재 상태(비기본 기능).** `stored-auth` 기능으로 빌드할 때만 다음이 포함된다: Bitwarden CLI 호출(`auth/vault.rs`), 로컬 승인 전송(Windows named pipe / Linux Unix 소켓, 상대 프로세스·이미지·자식 관계 확인), `zzabba-askpass` helper, 승인 1회 소비(`auth/mod.rs`). 터미널 탭은 `terminal_open` → `terminal::saved::launch_interactive` → `ssh::terminal::saved_interactive`로 저장 암호 대상을 열고, `Pending::approve`로 묶은 `Approval`이 PTY 자식과 `Exchange`를 함께 만든다. 승인 창을 읽는 시간은 별도 기한(120초)으로 재고, 승인 뒤 askpass 교환 기한은 spawn 시점부터 다시 잰다. `Exchange`는 탭 닫기·문서 이동·창 닫기에서 취소되고 `bw` 자식도 그 수명에 회수된다. 교환이 실패하면 금고 오류를 탭 상태줄 알림으로 전한다. 승인 창은 기존 네이티브 확인 패턴으로 서버·계정·지문·금고 항목 ID를 표시한다. 연결 시험·SFTP·원격 편집기·터널과 `DirectLaunch::prepare`는 지금처럼 저장 암호를 명시적 오류로 거부한다. 기본 빌드에는 이 경로가 없고, 마법사는 `connection_capabilities`의 `storedAuth` 값으로 옵션 노출과 저장을 함께 막는다. F01 완료 판정은 실제 OpenSSH 종단 증거가 남을 때 한다.
 
 금고 준비와 되돌림:
 - `bw`는 고정 절대 경로(`%ProgramFiles%\Bitwarden CLI\bw.exe`, `/usr/bin/bw`, `/usr/local/bin/bw`)에서만 찾고 `Bitwarden::new`의 소유자·ACL 검사를 통과해야 한다. 세션 키는 앱 프로세스의 `BW_SESSION` 환경에서만 읽고 WebView·argv·자식 환경·로그로 내보내지 않는다.

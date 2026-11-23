@@ -1,4 +1,4 @@
-import { useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { SavedConnections } from "./connectionIpc";
 import { SsmSelectionView } from "../ssm/SsmSelectionView";
 import { useSsmSelection } from "../ssm/ssm";
@@ -8,6 +8,7 @@ import { TerminalView } from "../terminal/TerminalView";
 import { sshTestIpc } from "../terminal/session";
 import {
   createLocalConnectionWizard,
+  setStoredAuthAvailable,
   type LocalConnectionActions,
   type InitialWizardDraft,
 } from "./profiles";
@@ -16,6 +17,7 @@ export type LocalConnectionWizardProps = LocalConnectionActions & Readonly<{
   draftId: string;
   initialDraft: InitialWizardDraft;
   groups: SavedConnections["groups"];
+  capabilities?: () => Promise<{ storedAuth: boolean }>;
 }>;
 
 export function LocalConnectionWizard(props: LocalConnectionWizardProps) {
@@ -35,6 +37,19 @@ const s3Fields = [["profile", "IAM Identity Center 프로필"], ["region", "버�
 
 function Wizard(props: LocalConnectionWizardProps) {
   const [wizard] = useState(() => createLocalConnectionWizard(props.draftId, props.initialDraft));
+  const [storedAuth, setStoredAuth] = useState(false);
+  useEffect(() => {
+    let active = true;
+    props.capabilities?.().then(
+      value => {
+        if (!active) return;
+        setStoredAuth(value.storedAuth);
+        setStoredAuthAvailable(value.storedAuth);
+      },
+      () => { if (active) setStoredAuthAvailable(false); },
+    );
+    return () => { active = false; };
+  }, [props.capabilities]);
   const { step, draft, status, sshPin, remoteCleanup } = useSyncExternalStore(wizard.subscribe, wizard.getSnapshot);
   const { target } = draft;
   const useSsm = target.defaultMethod === "ssm" || (target.defaultMethod === "ssh" && target.ssh.transport.kind === "ssm" && (step === "auth" || step === "verify"));
@@ -55,7 +70,7 @@ function Wizard(props: LocalConnectionWizardProps) {
   const locked = status.kind === "saving" || status.kind === "closing" || status.kind === "closeFailed";
   const ssh = target.defaultMethod === "ssh" ? target.ssh : null;
   const canSave = status.kind === "passed" || status.kind === "saveFailed"
-    || (ssh?.auth?.kind === "storedPassword" && sshPin.kind === "verified");
+    || (storedAuth && ssh?.auth?.kind === "storedPassword" && sshPin.kind === "verified");
   const s3 = target.defaultMethod === "s3" ? target.s3 : null;
   const retestingS3 = props.initialDraft.targetRevision !== null && props.initialDraft.target.defaultMethod === "s3";
 
@@ -103,7 +118,7 @@ function Wizard(props: LocalConnectionWizardProps) {
         {step === "auth" && <>
           {target.defaultMethod === "local" && <div>현재 사용자</div>}
           {useSsm && <SsmSelectionView state={ssm} />}
-          {ssh && <SshAuthFields ssh={ssh} edit={wizard.editSsh} />}
+          {ssh && <SshAuthFields ssh={ssh} edit={wizard.editSsh} storedAuth={storedAuth} />}
           {s3 && s3Fields.map(([field, label]) => <div key={field}><label>{label} <input
             value={s3[field]} onChange={event => wizard.editS3(field, event.currentTarget.value)}
           /></label></div>)}

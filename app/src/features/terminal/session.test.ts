@@ -58,6 +58,15 @@ describe("L01 터미널 세션", () => {
     await vi.waitFor(() => expect(peer.status).toHaveBeenLastCalledWith({ kind: "running", notice }, "a"));
   });
 
+  it("terminal_open 해소 전 도착한 폴백 알림도 해소 후 표시한다", async () => {
+    const peer = nativePeer();
+    await vi.waitFor(() => expect(peer.open).toHaveBeenCalledTimes(1));
+    const notice = "저장된 인증을 사용할 수 없어 직접 입력으로 전환했습니다: Bitwarden 금고가 잠겨 있습니다";
+    peer.send({ kind: "notice", value: notice });
+    await peer.openAs("a");
+    await vi.waitFor(() => expect(peer.status).toHaveBeenLastCalledWith({ kind: "running", notice }, "a"));
+  });
+
   it("세션별 바이트를 분리하고 파서 완료까지 누적 ACK를 보류한다", async () => {
     const a = nativePeer();
     const b = nativePeer();

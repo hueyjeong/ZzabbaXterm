@@ -209,8 +209,10 @@ fn remove_run(runs: &mut Runs, owner: &str, document: u64, key: &RunKey) -> Resu
 pub(super) fn save_confirmed(sessions: &Sessions, owner: &str, document: u64, request: SaveRequest, store: &Store) -> Result<(), String> {
     let SaveRequest { run: key, draft } = request;
     let draft = draft.validate().map_err(|error| format!("초안 검증: {error:?}"))?;
-    // 저장 암호 대상은 연결 시험이 승인 창을 열 수 없어 참조만 저장하고, 실제 로그인은 탭의 승인으로 확인한다.
-    if matches!(draft.method(), MethodRef::Ssh { ssh } if matches!(ssh.auth, SshAuth::StoredPassword { .. })) {
+    // 저장 암호 대상은 승인 창을 열 수 있는 빌드에서만 연결 시험 없이 참조를 저장한다.
+    if cfg!(all(feature = "stored-auth", any(windows, target_os = "linux")))
+        && matches!(draft.method(), MethodRef::Ssh { ssh } if matches!(ssh.auth, SshAuth::StoredPassword { .. }))
+    {
         return saved(store.save_authorized(draft, None, || Ok(()), || {}));
     }
     let expected = sessions.with_probes(owner, document, |runs| {

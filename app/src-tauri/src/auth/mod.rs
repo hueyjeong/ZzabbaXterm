@@ -93,6 +93,7 @@ impl Pending {
     }
 
     /// 로컬 확인 창은 별도 입력값 대신 이 계획의 직접 SSH 대상, 계정, 지문, 금고 항목을 표시한다.
+    #[cfg(test)]
     pub(crate) fn details(&self) -> &crate::ssh::Stored {
         self.plan.stored().expect("stored SSH plan required")
     }
@@ -232,17 +233,12 @@ impl Exchange {
         }
     }
 
-    /// 탭/창 전환이 진행 중인 교환을 실제로 취소하는지 시험할 때 쓴다.
+    /// 교환 결과 관찰을 시험할 때 고정 결과를 돌려준다.
     #[cfg(test)]
-    pub(crate) fn dormant(cancelled: Arc<AtomicBool>) -> Self {
+    pub(crate) fn fixture_result(result: Result<(), Error>) -> Self {
         let cancel = CancellationToken::new();
-        let watched = cancel.clone();
         let task = tauri::async_runtime::block_on(async move {
-            tokio::spawn(async move {
-                watched.cancelled().await;
-                cancelled.store(true, Ordering::Relaxed);
-                Ok(())
-            })
+            tokio::spawn(async move { result })
         });
         Self {
             cancel,

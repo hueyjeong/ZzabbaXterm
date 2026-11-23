@@ -108,6 +108,9 @@ function completeS3({ profile, region, bucket }: S3Settings) {
 
 const steps = ["target", "method", "auth", "verify"] as const;
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
+// 기본 빌드에는 승인·askpass 경로가 없다. 앱 정보 응답으로 확인한 값만 저장을 허용한다.
+let storedAuthAvailable = false;
+export function setStoredAuthAvailable(value: boolean) { storedAuthAvailable = value; }
 const CANCEL_RESPONSE_TIMEOUT = 2_000;
 
 export interface LocalConnectionWizardState {
@@ -339,7 +342,7 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Initi
 
   async function save(actions: LocalConnectionActions) {
     const { status } = state;
-    const stored = state.draft.target.defaultMethod === "ssh" && state.draft.target.ssh.auth?.kind === "storedPassword";
+    const stored = storedAuthAvailable && state.draft.target.defaultMethod === "ssh" && state.draft.target.ssh.auth?.kind === "storedPassword";
     const passed = status.kind === "passed" || status.kind === "saveFailed";
     // 저장 암호는 승인 기반 로그인이라 연결 시험 대신 호스트 키 확인 뒤 참조만 저장한다.
     if (state.step !== "verify" || (!passed && !(stored && state.sshPin.kind === "verified"))) return;

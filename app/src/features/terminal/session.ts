@@ -91,7 +91,12 @@ export function connectLocalTerminal(
     status({ kind: started ? "disconnected" : "failed", value: String(error) }, sessionId);
   };
   const receive = (message: Message) => {
-    if (stopped || id === undefined) return;
+    if (stopped) return;
+    if (id === undefined) {
+      // terminal_open 해소 전 도착한 폴백 안내도 잃지 않는다.
+      if (!(message instanceof ArrayBuffer) && message.kind === "notice") earlyOutput.push(message);
+      return;
+    }
     if (!receiving) {
       earlyOutput.push(message);
       return;

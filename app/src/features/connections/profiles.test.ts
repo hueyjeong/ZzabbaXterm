@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { createLocalConnectionIpc } from "./connectionIpc";
-import { createLocalConnectionWizard, type ConnectionClose, type ConnectionTestRun, type InitialWizardDraft, type LocalConnectionWizardState, type LocalProfileDraft } from "./profiles";
+import { createLocalConnectionWizard, setStoredAuthAvailable, type ConnectionClose, type ConnectionTestRun, type InitialWizardDraft, type LocalConnectionWizardState, type LocalProfileDraft } from "./profiles";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const ipc = vi.mocked(invoke);
@@ -270,6 +270,7 @@ describe("F01 SSH 마법사", () => {
   });
 
   it("확인한 저장 암호 대상은 연결 시험 없이 참조만 저장한다", async () => {
+    setStoredAuthAvailable(true);
     const verifySshHost = vi.fn().mockResolvedValue(undefined);
     const peer = { ...nativePeer(), verifySshHost };
     const host = {
@@ -304,6 +305,27 @@ describe("F01 SSH 마법사", () => {
       },
     } });
     expect(wizard.getSnapshot().status).toEqual({ kind: "closed" });
+  });
+
+  it("저장 인증이 없는 빌드에서는 저장 암호 대상을 저장하지 않는다", async () => {
+    setStoredAuthAvailable(false);
+    const verifySshHost = vi.fn().mockResolvedValue(undefined);
+    const peer = { ...nativePeer(), verifySshHost };
+    const host = {
+      host: "ssh.actual.test", port: "2222", account: "deploy",
+      hostKeyFingerprint: `SHA256:${"A".repeat(43)}`,
+    };
+    const wizard = createLocalConnectionWizard("stored-draft", draft);
+    wizard.go(1);
+    wizard.selectMethod("ssh");
+    wizard.editSsh(host);
+    wizard.go(1);
+    wizard.editSsh({ auth: { kind: "storedPassword", itemId: "21eb36c3-234d-439d-9e1f-1d3cc5ba8125" } });
+    wizard.go(1, null);
+    await wizard.verifySshHost(peer);
+    await wizard.save(peer);
+    expect(ipc).not.toHaveBeenCalled();
+    expect(wizard.getSnapshot().status.kind).toBe("idle");
   });
 });
 

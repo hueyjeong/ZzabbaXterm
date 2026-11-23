@@ -828,6 +828,7 @@ export function Workspace() {
         {hostRegistration && <span role={hostRegistration.kind}>{hostRegistration.message}</span>}
       </footer>
       {wizard && <LocalConnectionWizard {...wizard} groups={profileLoad.profiles?.groups ?? []}
+        capabilities={connections.capabilities}
         verifySshHost={connections.verifySshHost}
         test={connections.test} cancelTest={connections.cancelTest} save={connections.save} onClose={closeWizard} />}
     </main>

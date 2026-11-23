@@ -18,6 +18,7 @@ type Execution = {
 export function createLocalConnectionIpc(): Omit<LocalConnectionActions, "onClose"> & {
   load(): Promise<SavedConnections>;
   registerSavedSshHost(targetId: string): Promise<null>;
+  capabilities(): Promise<{ storedAuth: boolean }>;
 } {
   const attempts = new WeakMap<ConnectionTestDraft, Execution>();
   const tested = new WeakMap<ConnectionTestRun, { attempt: ConnectionTestDraft; execution: Execution }>();
@@ -25,6 +26,7 @@ export function createLocalConnectionIpc(): Omit<LocalConnectionActions, "onClos
   return {
     load: () => invoke<SavedConnections>("connections_load", {}),
     registerSavedSshHost: (targetId) => invoke<null>("register_saved_ssh_host", { targetId }),
+    capabilities: () => invoke<{ storedAuth: boolean }>("connection_capabilities", {}),
     async verifySshHost({ targetId, host, port, hostKeyFingerprint }, draft, attempt, signal) {
       type Reply = { targetId: string; host: string; port: number; fingerprint: string };
       const request = { targetId, host, port, expectedFingerprint: hostKeyFingerprint };
