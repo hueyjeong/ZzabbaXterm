@@ -519,3 +519,35 @@ async fn s01_캐시_부재와_만료만_같은_프로필의_재로그인으로_�
     }
     assert_eq!(transport.actual_requests().count(), 0);
 }
+
+// 승인된 비운영 계정에서 S3 객체 편집 경로를 직접 확인하는 수동 하네스다.
+// ZZABBA_LIVE_PROFILE_ACCOUNT, ZZABBA_LIVE_PROFILE_ROLE, ZZABBA_LIVE_PROFILE_START_URL,
+// ZZABBA_LIVE_BUCKET, ZZABBA_LIVE_KEY가 모두 있을 때만 실행한다.
+#[tokio::test]
+#[ignore = "실제 AWS SSO 프로필과 시험 버킷이 필요하다"]
+async fn live_s3_object_edit_round_trip() {
+    let Ok(account) = std::env::var("ZZABBA_LIVE_PROFILE_ACCOUNT") else {
+        eprintln!("live S3 편집: 환경 변수가 없어 실행하지 않습니다");
+        return;
+    };
+    let role = std::env::var("ZZABBA_LIVE_PROFILE_ROLE").unwrap();
+    let start_url = std::env::var("ZZABBA_LIVE_PROFILE_START_URL").unwrap();
+    let bucket = std::env::var("ZZABBA_LIVE_BUCKET").unwrap();
+    let key = std::env::var("ZZABBA_LIVE_KEY").unwrap();
+    let config = crate::ssm::DirectSsoConfig {
+        account,
+        role,
+        region: "ap-northeast-1".into(),
+        start_url,
+        session: std::env::var("ZZABBA_LIVE_PROFILE_SESSION").ok(),
+    };
+    let client = AwsS3::for_sso_profile("ap-northeast-1", config).await.expect("SSO 프로필");
+    let opened = client.read_object_for_edit(&bucket, &key).await.expect("GetObject 검증");
+    assert!(opened.text.contains("S3"));
+    let edited = format!("{}라이브 저장 확인\n", opened.text);
+    let saved = client.save_edited_object(&opened.revision, edited.clone()).await;
+    assert!(saved.is_ok(), "If-Match 저장 실패: {:?}", saved.err());
+    let again = client.read_object_for_edit(&bucket, &key).await.expect("저장 결과 읽기");
+    assert_eq!(again.text, edited);
+    eprintln!("live S3 편집 통과: {}바이트", edited.len());
+}
