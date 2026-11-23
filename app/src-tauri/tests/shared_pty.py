@@ -275,6 +275,32 @@ def main():
         tab.read(rb'zzabba\$ ')
         assert b'/usr/bin/uptime' not in tab.transcript
 
+    with ExitStack() as stack:
+        tab = bash(stack)
+        control = stack.enter_context(Control())
+        # 거부된 입력의 나머지는 readline에 도달하지 않는다: 괄호 붙여넣기 안 줄바꿈, 일반 여러 줄, 길이 초과.
+        for attempt in (b'\x1b[200~' + control.code[:8] + b'\recho PASTE-RAN\r\x1b[201~',
+                        control.code[:8] + b'\recho RAW-RAN\r',
+                        control.code + control.code[:40] + b'echo LONG-RAN\r'):
+            tab.send(KEY_PAIR)
+            tab.read(rb'Zzabba pairing code: ')
+            tab.send(attempt)
+            tab.read(rb'zzabba\$ ')
+            control.quiet()
+        tab.send(b'echo paste-safe\n')
+        tab.read(rb'\rpaste-safe\r\n')
+        assert b'-RAN' not in tab.transcript
+        # 줄바꿈 없는 괄호 붙여넣기는 끝 표지에서 입력을 마친다.
+        tab.send(KEY_PAIR)
+        tab.read(rb'Zzabba pairing code: ')
+        tab.send(b'\x1b[200~' + control.code + b'\x1b[201~')
+        tab.read(rb'zzabba\$ ')
+        assert control.event('paired', 2)['uid'] == UID
+        tab.send(b'exit\n')
+        tab.wait()
+        absent(control.path)
+        control.wait()
+
     assert COUNT.read_bytes() == b'x'
     print('PASS: one approved uptime; no default/direct start, invalid operation, denial, wrong UID/tab/generation, editing, replay or disconnect; input preserved')
 

@@ -2,17 +2,31 @@
 [[ $- == *i* && ${BASH_VERSION-} && $BASH_SUBSHELL == 0 ]] || return 0
 
 __zzabba_shared_pair() {
-    local code= char locator end=$((SECONDS + 60))
-    # bind -x 처리기 안에서는 readline 터미널 설정이 유지된다. Enter는 클라이언트에 따라 CR 또는 LF로 온다.
+    local code= char locator now end paste=0
+    printf -v end '%(%s)T' -1
+    end=$((end + 60))
+    # Enter는 수신 시점의 터미널 설정에 따라 CR 또는 LF(빈 문자)로 온다.
+    # 괄호 붙여넣기는 끝 표지까지 읽고, 그 안의 줄바꿈은 거부한다.
     printf 'Zzabba pairing code: ' >/dev/tty
-    while (( SECONDS < end )) && IFS= read -r -s -n 1 -t "$((end - SECONDS))" char </dev/tty; do
-        [[ -z $char || $char == $'\r' ]] && break
+    while printf -v now '%(%s)T' -1 && (( now < end )) &&
+        IFS= read -r -s -n 1 -t "$((end - now))" char </dev/tty; do
+        if [[ -z $char || $char == $'\r' ]]; then
+            (( paste )) && code=
+            break
+        fi
         code+=$char
-        (( ${#code} <= 96 )) || return 1
+        [[ $code == $'\e[200~' ]] && paste=1
+        (( paste )) && [[ $code == *$'\e[201~' ]] && break
+        (( ${#code} <= 96 )) || { code=; break; }
     done
+    # 남은 입력이 readline에 넘어가 명령으로 실행되지 않도록 버린다.
+    while IFS= read -r -s -n 1 -t 0.05 char </dev/tty; do :; done
     printf '\n' >/dev/tty
-    code=${code#$'\e[200~'}
-    code=${code%$'\e[201~'}
+    if (( paste )); then
+        [[ $code == $'\e[200~'*$'\e[201~' ]] || return 1
+        code=${code#$'\e[200~'}
+        code=${code%$'\e[201~'}
+    fi
     [[ $code =~ ^[0-9a-f]{64}$ ]] || return 1
     locator=$(exec -c /usr/local/libexec/zzabba-ai-control --shared-pair <<<"$BASHPID_FOR_ZZABBA"$'\n'"$code") || return
     __zzabba_shared_locator=$locator
