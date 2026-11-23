@@ -11,7 +11,7 @@ fn nz(value: u64) -> NonZeroU64 {
 
 fn ticket(id: u64) -> Ticket {
     Ticket {
-        main_id: nz(1), main_generation: nz(2), document: 3, control_id: nz(4),
+        main_id: 1, main_generation: nz(2), document: 3, control_id: nz(4),
         control_generation: nz(5), shell_generation: nz(6), approval_id: nz(id),
         input_generation: 7, policy_revision: nz(8),
     }
@@ -199,6 +199,18 @@ fn deny_consumes_the_ticket_and_a_stale_claim_cannot_reactivate_it() {
         protocol.reserve(ticket(10), OP).unwrap();
         assert!(matches!(claim(&mut protocol, old, if claimed { 4 } else { 3 }), Err(ProtocolError::UnexpectedFrame)));
     }
+}
+
+#[test]
+fn node_reservation_expiry_is_a_distinct_denial() {
+    let mut protocol = paired();
+    assert!(matches!(receive(&mut protocol, NodeFrame::Denied { channel: CHANNEL, seq: nz(3) }), Err(ProtocolError::UnexpectedFrame)));
+    let mut protocol = paired();
+    let ticket = ticket(9);
+    protocol.reserve(ticket, OP).unwrap();
+    assert!(matches!(receive(&mut protocol, NodeFrame::Denied { channel: CHANNEL, seq: nz(3) }), Ok(Some(Event::Denied))));
+    assert!(protocol.grant(ticket, OP).is_err());
+    assert!(protocol.stop(nz(9)).is_err());
 }
 
 #[test]

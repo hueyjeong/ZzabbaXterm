@@ -1,10 +1,12 @@
 //! Linux 제어 채널과 앱이 공유하는 JSON 프레임.
 
 use serde::{Deserialize, Serialize};
-use std::num::NonZeroU64;
+use std::{num::NonZeroU64, time::Duration};
 
 pub(crate) const VERSION: u32 = 1;
 pub(crate) const MAX_FRAME_BYTES: usize = 4096;
+// 노드 예약과 앱의 대기 기한은 같은 값이어야 15초 뒤 입력이 조용히 사라지지 않는다.
+pub(crate) const APPROVAL_WINDOW: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -50,6 +52,10 @@ pub(crate) enum NodeFrame<'a> {
     HelloAck {
         version: u32,
         channel: &'a str,
+    },
+    Denied {
+        channel: &'a str,
+        seq: NonZeroU64,
     },
     Started {
         channel: &'a str,

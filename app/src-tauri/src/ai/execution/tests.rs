@@ -1,5 +1,9 @@
 use super::*;
+use crate::ai::control_wire::{ClientFrame, NodeFrame, VERSION, WireStream};
+use crate::ai::shared::ReservedKey;
+use crate::ai::shared_wire::{Client, Node, Ticket};
 use crate::terminal::LiveSsmIdentity;
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 fn generation(value: u64) -> NonZeroU64 {
@@ -29,8 +33,16 @@ fn target() -> SelectedTarget {
     }
 }
 
+fn live_with(id: &str, selection: u64) -> LiveSession {
+    LiveSession {
+        id: id.into(),
+        selection_id: generation(selection),
+        identity: LiveSsmIdentity { id: id.into(), ..identity() },
+    }
+}
+
 fn live() -> LiveSession {
-    LiveSession { id: "7".into(), selection_id: generation(2), identity: identity() }
+    live_with("7", 2)
 }
 
 fn policy(revision: u64) -> Policy {
@@ -48,8 +60,12 @@ fn approval(policy: Policy) -> NewApproval {
     }
 }
 
+fn start_for(id: NonZeroU64, session: &str, selection: u64) -> Start {
+    Start { approval_id: id, task_id: "uptime".into(), session_id: session.into(), generation: generation(selection) }
+}
+
 fn start(id: NonZeroU64) -> Start {
-    Start { approval_id: id, task_id: "uptime".into(), session_id: "7".into(), generation: generation(2) }
+    start_for(id, "7", 2)
 }
 
 fn issued(state: &State, policy: Policy, now: Instant) -> NonZeroU64 {
@@ -177,16 +193,21 @@ fn stopped_job_exposes_exit_and_unconfirmed_as_distinct_results() {
     let now = Instant::now();
     let state = State::default();
     let policy = policy(1);
-    let id = issued(&state, policy, now);
-    let (_, run, _) = state.start(&start(id), &live(), policy, 3, now).unwrap();
-    run.set_phase(Phase::Running);
-    run.progress.lock().unwrap().job_id = Some(id);
-    run.finish(Phase::Exited, Some(0), None);
+    let first = issued(&state, policy, now);
+    let (_, exited_run, _) = state.start(&start(first), &live(), policy, 3, now).unwrap();
+    exited_run.set_phase(Phase::Running);
+    exited_run.progress.lock().unwrap().job_id = Some(first);
+    exited_run.finish(Phase::Exited, Some(0), None);
     let exited = state.status(3).unwrap();
-    run.finish(Phase::Unconfirmed, None, Some("제어 채널이 끊겼습니다".into()));
+    let second = issued(&state, policy, now);
+    let (_, unconfirmed_run, _) = state.start(&start(second), &live(), policy, 3, now).unwrap();
+    unconfirmed_run.set_phase(Phase::Running);
+    unconfirmed_run.progress.lock().unwrap().job_id = Some(second);
+    unconfirmed_run.finish(Phase::Unconfirmed, None, Some("제어 채널이 끊겼습니다".into()));
     let unconfirmed = state.status(3).unwrap();
-    assert_eq!(exited.approval_id, unconfirmed.approval_id);
-    assert_eq!(exited.job_id, unconfirmed.job_id);
+    assert_ne!(exited.approval_id, unconfirmed.approval_id);
+    assert_eq!(exited.code, Some(0));
+    assert_eq!(unconfirmed.error.as_deref(), Some("제어 채널이 끊겼습니다"));
     assert_eq!(exited.phase, Phase::Exited);
     assert_eq!(unconfirmed.phase, Phase::Unconfirmed);
     assert!(state.status(4).is_none());
@@ -213,11 +234,236 @@ fn session_match_requires_the_exact_ssm_scope_and_role() {
 }
 
 #[test]
-fn only_strict_positive_ids_are_accepted() {
-    assert_eq!(parse_id("7"), Some(generation(7)));
-    for invalid in ["", "0", "07", "-1", "x", "1.0"] {
+fn session_ids_allow_zero_but_reject_leading_zeros_and_text() {
+    assert_eq!(parse_id("0"), Some(0));
+    assert_eq!(parse_id("7"), Some(7));
+    for invalid in ["", "00", "07", "-1", "x", "1.0"] {
         assert!(parse_id(invalid).is_none(), "{invalid}");
     }
+}
+
+#[test]
+fn first_session_id_zero_can_be_approved_and_started() {
+    let now = Instant::now();
+    let state = State::default();
+    let policy = policy(1);
+    let session = live_with("0", 2);
+    let id = state.issue(NewApproval { session: session.clone(), ..approval(policy) }, now).unwrap().approval_id.parse().unwrap();
+    let (_, run, _) = state.start(&start_for(id, "0", 2), &session, policy, 3, now).unwrap();
+    assert_eq!(run.main.id, 0);
+    assert_eq!(run.main.generation, generation(2));
+}
+
+#[test]
+fn stop_after_confirmed_exit_keeps_the_exit_state() {
+    let now = Instant::now();
+    let state = State::default();
+    let policy = policy(1);
+    let id = issued(&state, policy, now);
+    let (_, run, _) = state.start(&start(id), &live(), policy, 3, now).unwrap();
+    run.set_phase(Phase::Running);
+    run.finish(Phase::Exited, Some(0), None);
+    assert_eq!(state.stop(id, 3).error(), ExecError::NotRunning);
+    assert_eq!(state.status(3).unwrap().phase, Phase::Exited);
+}
+
+#[test]
+fn confirmed_exit_after_stop_request_wins() {
+    let now = Instant::now();
+    let state = State::default();
+    let policy = policy(1);
+    let id = issued(&state, policy, now);
+    let (_, run, commands) = state.start(&start(id), &live(), policy, 3, now).unwrap();
+    run.set_phase(Phase::Running);
+    assert_eq!(state.stop(id, 3).unwrap().phase, Phase::StopRequested);
+    assert!(matches!(commands.try_recv(), Ok(Command::Stop)));
+    run.finish(Phase::Exited, Some(0), None);
+    assert_eq!(state.status(3).unwrap().phase, Phase::Exited);
+    assert!(!run.active());
+}
+
+#[test]
+fn terminal_state_is_not_overwritten_by_a_late_finish() {
+    let now = Instant::now();
+    let state = State::default();
+    let policy = policy(1);
+    let id = issued(&state, policy, now);
+    let (_, run, _) = state.start(&start(id), &live(), policy, 3, now).unwrap();
+    run.finish(Phase::Unconfirmed, None, Some("단절".into()));
+    run.finish(Phase::Exited, Some(0), None);
+    let view = state.status(3).unwrap();
+    assert_eq!(view.phase, Phase::Unconfirmed);
+    assert!(view.error.is_some());
+}
+
+#[test]
+fn reserved_key_is_bound_to_the_selected_session_and_one_run() {
+    let now = Instant::now();
+    let state = State::default();
+    let policy = policy(1);
+    let session = live_with("0", 2);
+    let id = state.issue(NewApproval { session: session.clone(), ..approval(policy) }, now).unwrap().approval_id.parse().unwrap();
+    let (_, run, _) = state.start(&start_for(id, "0", 2), &session, policy, 3, now).unwrap();
+    assert_eq!(state.observe_prefix("0", &[0x18], now), None);
+    assert_eq!(state.observe_prefix("0", &[b'u'], now), Some(ReservedKey::Claim));
+    let other = LiveSsmIdentity { id: "5".into(), ..identity() };
+    let selected = LiveSsmIdentity { id: "0".into(), ..identity() };
+    state.record_key(3, "0", ReservedKey::Claim, Some((generation(2), &selected)), now);
+    state.record_key(3, "0", ReservedKey::Claim, Some((generation(2), &other)), now);
+    assert!(!run.take_key(ReservedKey::Claim, now));
+    state.record_key(3, "0", ReservedKey::Claim, Some((generation(2), &selected)), now);
+    assert!(run.take_key(ReservedKey::Claim, now));
+    assert!(!run.take_key(ReservedKey::Claim, now));
+}
+
+#[test]
+fn selection_change_or_old_approval_cannot_reuse_key_evidence() {
+    let now = Instant::now();
+    let state = State::default();
+    let policy = policy(1);
+    let session = live_with("0", 2);
+    let first = state.issue(NewApproval { session: session.clone(), ..approval(policy) }, now).unwrap().approval_id.parse().unwrap();
+    let (_, run, _) = state.start(&start_for(first, "0", 2), &session, policy, 3, now).unwrap();
+    let selected = LiveSsmIdentity { id: "0".into(), ..identity() };
+    assert_eq!(state.observe_prefix("0", &[0x18], now), None);
+    assert_eq!(state.observe_prefix("0", &[b'u'], now), Some(ReservedKey::Claim));
+    state.record_key(3, "0", ReservedKey::Claim, Some((generation(3), &selected)), now);
+    assert!(!run.take_key(ReservedKey::Claim, now));
+    state.record_key(3, "0", ReservedKey::Claim, Some((generation(2), &selected)), now);
+    run.finish(Phase::Exited, Some(0), None);
+    let second = state.issue(NewApproval { session: session.clone(), ..approval(policy) }, now).unwrap().approval_id.parse().unwrap();
+    let (_, next, _) = state.start(&start_for(second, "0", 2), &session, policy, 3, now).unwrap();
+    assert!(!next.take_key(ReservedKey::Claim, now));
+}
+
+#[test]
+fn reserved_prefix_requires_ctrl_x_then_a_single_letter() {
+    let state = State::default();
+    let now = Instant::now();
+    assert_eq!(state.observe_prefix("0", &[b'u'], now), None);
+    assert_eq!(state.observe_prefix("0", &[0x18], now), None);
+    assert_eq!(state.observe_prefix("0", &[b'p'], now), Some(ReservedKey::Pair));
+    assert_eq!(state.observe_prefix("0", &[0x18], now), None);
+    assert_eq!(state.observe_prefix("0", &[b'u'], now + Duration::from_secs(3)), None);
+    assert_eq!(state.observe_prefix("0", b"u", now), None);
+}
+
+const NONCE: &str = "0123456789abcdef0123456789abcdef";
+const PAIR_CODE: &str = "0123456789abcdef0123456789abcdefabcdef0123456789abcdef0123456789";
+
+fn frame(value: impl serde::Serialize) -> Vec<u8> {
+    let mut bytes = serde_json::to_vec(&value).unwrap();
+    bytes.push(b'\n');
+    bytes
+}
+
+#[derive(Default)]
+struct FakeChannel {
+    step: usize,
+    channel: Option<String>,
+    ticket: Option<Ticket>,
+    writes: Vec<Vec<u8>>,
+}
+
+impl Channel for FakeChannel {
+    fn poll(&mut self, _: Duration) -> Result<Option<Output>, String> {
+        self.step += 1;
+        let bytes = match self.step {
+            1 => return Ok(Some(Output::SsmConnected)),
+            2 => frame(NodeFrame::Ready { version: VERSION, nonce: NONCE }),
+            3 => {
+                let Some(channel) = self.channel.clone() else { return Ok(None) };
+                let mut bytes = frame(NodeFrame::HelloAck { version: VERSION, channel: &channel });
+                bytes.extend(frame(Node::Pairing {
+                    channel: &channel, seq: generation(1), code: PAIR_CODE, expires_in_ms: 60_000,
+                }));
+                bytes.extend(frame(Node::Paired {
+                    channel: &channel, seq: generation(2), uid: 1000, shell_generation: generation(5),
+                }));
+                bytes
+            }
+            4 => {
+                let (Some(channel), Some(ticket)) = (self.channel.clone(), self.ticket) else { return Ok(None) };
+                frame(Node::Claim { channel: &channel, seq: generation(3), ticket })
+            }
+            5 => {
+                let (Some(channel), Some(ticket)) = (self.channel.clone(), self.ticket) else { return Ok(None) };
+                frame(NodeFrame::Started { channel: &channel, job_id: ticket.approval_id, seq: generation(4) })
+            }
+            6 => {
+                let (Some(channel), Some(ticket)) = (self.channel.clone(), self.ticket) else { return Ok(None) };
+                frame(NodeFrame::Output {
+                    channel: &channel, job_id: ticket.approval_id, seq: generation(5), stream: WireStream::Stdout, data: "aGk=",
+                })
+            }
+            7 => {
+                let (Some(channel), Some(ticket)) = (self.channel.clone(), self.ticket) else { return Ok(None) };
+                frame(NodeFrame::Exited {
+                    channel: &channel, job_id: ticket.approval_id, seq: generation(6), code: Some(0), signal: None,
+                })
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(Output::Bytes(bytes)))
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+        if let Ok(ClientFrame::Hello { channel, .. }) = serde_json::from_slice::<ClientFrame<'_>>(bytes) {
+            self.channel = Some(channel.to_owned());
+        }
+        if let Ok(Client::Reserve { ticket, .. }) = serde_json::from_slice::<Client<'_>>(bytes) {
+            self.ticket = Some(ticket);
+        }
+        self.writes.push(bytes.to_vec());
+        Ok(())
+    }
+}
+
+fn fixture() -> (State, NonZeroU64, Approval, Arc<Run>, mpsc::Receiver<Command>) {
+    let now = Instant::now();
+    let state = State::default();
+    let policy = policy(1);
+    let session = live_with("0", 2);
+    let id = state.issue(NewApproval { session: session.clone(), ..approval(policy) }, now).unwrap().approval_id.parse().unwrap();
+    let (approval, run, commands) = state.start(&start_for(id, "0", 2), &session, policy, 3, now).unwrap();
+    (state, id, approval, run, commands)
+}
+
+#[test]
+fn driver_frames_one_approved_uptime_and_keeps_the_channel_sequence() {
+    let (state, id, approval, run, commands) = fixture();
+    let now = Instant::now();
+    let selected = LiveSsmIdentity { id: "0".into(), ..identity() };
+    for (key, letter) in [(ReservedKey::Pair, b'p'), (ReservedKey::Claim, b'u')] {
+        assert_eq!(state.observe_prefix("0", &[0x18], now), None);
+        assert_eq!(state.observe_prefix("0", &[letter], now), Some(key));
+        state.record_key(3, "0", key, Some((generation(2), &selected)), now);
+    }
+    let mut fake = FakeChannel::default();
+    let outcome = Driver::new(&mut fake, &run, &approval, &commands).drive();
+    assert!(outcome.is_ok(), "{outcome:?}");
+    assert_eq!(state.status(3).unwrap().phase, Phase::Exited);
+    assert_eq!(state.status(3).unwrap().output, "hi");
+    assert_eq!(fake.writes.len(), 3);
+    assert!(matches!(serde_json::from_slice::<ClientFrame<'_>>(&fake.writes[0]), Ok(ClientFrame::Hello { .. })));
+    assert!(matches!(serde_json::from_slice::<Client<'_>>(&fake.writes[1]), Ok(Client::Reserve { ticket, .. }) if ticket.main_id == 0));
+    assert!(matches!(serde_json::from_slice::<Client<'_>>(&fake.writes[2]), Ok(Client::Grant { .. })));
+    assert_eq!(id.get(), 1);
+}
+
+#[test]
+fn driver_refuses_a_pairing_without_the_selected_session_key_and_writes_no_reserve() {
+    let (state, _id, approval, run, commands) = fixture();
+    let now = Instant::now();
+    let other = LiveSsmIdentity { id: "5".into(), ..identity() };
+    assert_eq!(state.observe_prefix("0", &[0x18], now), None);
+    assert_eq!(state.observe_prefix("0", &[b'p'], now), Some(ReservedKey::Pair));
+    state.record_key(3, "0", ReservedKey::Pair, Some((generation(2), &other)), now);
+    let mut fake = FakeChannel::default();
+    let error = Driver::new(&mut fake, &run, &approval, &commands).drive().unwrap_err();
+    assert_eq!(error.0, Phase::Failed);
+    assert!(fake.writes.iter().any(|bytes| serde_json::from_slice::<ClientFrame<'_>>(bytes).is_ok()));
+    assert!(!fake.writes.iter().any(|bytes| serde_json::from_slice::<Client<'_>>(bytes).is_ok()));
 }
 
 // 실기기 시험은 승인된 비운영 노드와 배포된 ZzabbaAiSharedControl 문서에서만 확인한다.

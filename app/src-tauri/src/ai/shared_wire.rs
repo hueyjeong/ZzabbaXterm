@@ -6,7 +6,8 @@ use std::num::NonZeroU64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Ticket {
-    pub(crate) main_id: NonZeroU64,
+    // 세션 ID 0을 허용한다. 노드는 이 값을 판정에 쓰지 않는다.
+    pub(crate) main_id: u64,
     pub(crate) main_generation: NonZeroU64,
     pub(crate) document: u64,
     pub(crate) control_id: NonZeroU64,

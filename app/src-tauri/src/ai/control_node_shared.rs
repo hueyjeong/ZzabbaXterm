@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 const PAIR: Duration = Duration::from_secs(60);
-const APPROVAL: Duration = Duration::from_secs(15);
+const APPROVAL: Duration = control_wire::APPROVAL_WINDOW;
 const IO: Duration = Duration::from_secs(2);
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -397,6 +397,13 @@ fn broker(listener: UnixListener, code: &str, secret: &str) -> io::Result<()> {
             if let Some((mut wire, _)) = claiming.take() {
                 write_frame(wire.reader.get_mut(), Local::Denied)?;
             }
+            write_frame(
+                &mut session.out,
+                NodeFrame::Denied {
+                    channel,
+                    seq: next(&mut session.output_seq)?,
+                },
+            )?;
         }
         if (input_ready || fds[0].revents != 0)
             && let Some(line) = input.read_control()?

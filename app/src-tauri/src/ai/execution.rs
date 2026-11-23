@@ -16,14 +16,15 @@ use super::{
     SelectedTarget,
     approval::Policy,
     control::{ControlTransport, Output},
-    control_wire::WireOperation,
+    control_wire::{APPROVAL_WINDOW, WireOperation},
+    shared::{KeyEvidence, KeyTracker, MainSession, ReservedKey},
     shared_protocol::{Event as ProtocolEvent, SharedProtocol},
     shared_wire::Ticket,
 };
 
 const OWNER: &str = "main";
 const APPROVAL_TTL: Duration = Duration::from_secs(120);
-const CLAIM_WAIT: Duration = Duration::from_secs(20);
+const CLAIM_WAIT: Duration = APPROVAL_WINDOW;
 const START_WAIT: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(200);
 const OUTPUT_LIMIT: usize = 8 * 1024;
@@ -186,11 +187,13 @@ pub(crate) struct Run {
     proposal_id: u32,
     document: u64,
     task: &'static Task,
+    main: MainSession,
     session_id: String,
     selection_id: NonZeroU64,
     node: String,
     progress: Mutex<Progress>,
     commands: Mutex<mpsc::Sender<Command>>,
+    keys: Arc<Mutex<KeyTracker>>,
     cancel: CancellationToken,
 }
 
@@ -204,23 +207,29 @@ impl Run {
     }
 
     fn set_phase(&self, phase: Phase) {
-        self.progress.lock().unwrap().phase = phase;
+        let mut progress = self.progress.lock().unwrap();
+        if !terminal(progress.phase) {
+            progress.phase = phase;
+        }
     }
 
     fn pairing(&self, code: String) {
         let mut progress = self.progress.lock().unwrap();
+        if terminal(progress.phase) { return; }
         progress.phase = Phase::Pairing;
         progress.pairing_code = Some(code);
     }
 
     fn paired(&self) {
         let mut progress = self.progress.lock().unwrap();
+        if terminal(progress.phase) { return; }
         progress.pairing_code = None;
         progress.phase = Phase::WaitingClaim;
     }
 
     fn output(&self, bytes: &[u8]) {
         let mut progress = self.progress.lock().unwrap();
+        if terminal(progress.phase) { return; }
         if progress.output.len() < OUTPUT_LIMIT {
             if progress.output.len() + bytes.len() <= OUTPUT_LIMIT {
                 progress.output.push_str(&String::from_utf8_lossy(bytes));
@@ -232,11 +241,31 @@ impl Run {
 
     fn finish(&self, phase: Phase, code: Option<i32>, error: Option<String>) {
         let mut progress = self.progress.lock().unwrap();
+        if terminal(progress.phase) { return; }
         progress.phase = phase;
         progress.active = false;
         progress.pairing_code = None;
         progress.code = code;
         progress.error = error;
+    }
+
+    /// 중지 판정과 상태 전이를 같은 잠금에서 처리한다. 확정 종료가 먼저면 요청을 거부한다.
+    fn request_stop(&self) -> Result<(), ExecError> {
+        let mut progress = self.progress.lock().unwrap();
+        if !progress.active || progress.phase != Phase::Running {
+            return Err(ExecError::NotRunning);
+        }
+        progress.phase = Phase::StopRequested;
+        if self.commands.lock().unwrap().send(Command::Stop).is_err() {
+            progress.phase = Phase::Unconfirmed;
+            progress.active = false;
+            progress.error = Some("중지 요청을 전달하지 못했습니다".into());
+        }
+        Ok(())
+    }
+
+    fn take_key(&self, key: ReservedKey, now: Instant) -> bool {
+        self.keys.lock().unwrap().take(self.approval_id.get(), self.main, key, now)
     }
 
     fn view(&self) -> View {
@@ -274,12 +303,15 @@ struct Inner {
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct State(Arc<Mutex<Inner>>);
+pub(crate) struct State {
+    inner: Arc<Mutex<Inner>>,
+    keys: Arc<Mutex<KeyTracker>>,
+}
 
 impl State {
     /// 같은 작업의 새 승인은 이전 대기 승인을 폐기한다. 실행 중이면 승인을 발급하지 않는다.
     pub(crate) fn issue(&self, request: NewApproval, now: Instant) -> Result<Card, ExecError> {
-        let mut inner = self.0.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         if inner.run.as_ref().is_some_and(|run| run.active()) {
             return Err(ExecError::Busy);
         }
@@ -304,7 +336,7 @@ impl State {
     }
 
     pub(crate) fn snapshot(&self, approval_id: NonZeroU64) -> Option<Snapshot> {
-        let inner = self.0.lock().unwrap();
+        let inner = self.inner.lock().unwrap();
         let approval = inner.approval.as_ref().filter(|approval| approval.approval_id == approval_id)?;
         Some(Snapshot {
             proposal_id: approval.request.proposal_id,
@@ -323,7 +355,7 @@ impl State {
         document: u64,
         now: Instant,
     ) -> Result<(Approval, Arc<Run>, mpsc::Receiver<Command>), ExecError> {
-        let mut inner = self.0.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         let Some(approval) = inner.approval.take() else { return Err(ExecError::Approval) };
         let refuse = |inner: &mut Inner, approval: Approval, error: ExecError| {
             inner.approval = Some(approval);
@@ -348,17 +380,24 @@ impl State {
         if inner.run.as_ref().is_some_and(|run| run.active()) {
             return Err(refuse(&mut inner, approval, ExecError::Busy));
         }
+        let main_id = parse_id(&approval.request.session.id).ok_or(ExecError::Session)?;
         let (sender, receiver) = mpsc::channel();
         let run = Arc::new(Run {
             approval_id: approval.approval_id,
             proposal_id: approval.request.proposal_id,
             document,
             task: approval.request.task,
+            main: MainSession {
+                id: main_id,
+                generation: approval.request.session.selection_id,
+                document,
+            },
             session_id: approval.request.session.id.clone(),
             selection_id: approval.request.session.selection_id,
             node: approval.request.session.identity.instance_id.clone(),
             progress: Mutex::new(Progress::default()),
             commands: Mutex::new(sender),
+            keys: Arc::clone(&self.keys),
             cancel: CancellationToken::new(),
         });
         inner.run = Some(Arc::clone(&run));
@@ -366,31 +405,70 @@ impl State {
     }
 
     pub(crate) fn stop(&self, approval_id: NonZeroU64, document: u64) -> Result<View, ExecError> {
-        let inner = self.0.lock().unwrap();
+        let inner = self.inner.lock().unwrap();
         let run = inner.run.as_ref()
             .filter(|run| run.approval_id == approval_id && run.document == document)
             .ok_or(ExecError::NotRunning)?;
-        if !run.active() || run.phase() != Phase::Running {
-            return Err(ExecError::NotRunning);
-        }
-        run.set_phase(Phase::StopRequested);
-        if run.commands.lock().unwrap().send(Command::Stop).is_err() {
-            run.finish(Phase::Unconfirmed, None, Some("중지 요청을 전달하지 못했습니다".into()));
-        }
+        run.request_stop()?;
         Ok(run.view())
     }
 
     pub(crate) fn status(&self, document: u64) -> Option<View> {
-        let inner = self.0.lock().unwrap();
+        let inner = self.inner.lock().unwrap();
         inner.run.as_ref().filter(|run| run.document == document).map(|run| run.view())
     }
 
     /// 문서가 바뀌면 대기 승인과 실행 중 채널을 정리한다. 노드는 채널 종료로 소유 자식을 회수한다.
     pub(crate) fn cancel_all(&self) {
-        let mut inner = self.0.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         inner.approval = None;
         if let Some(run) = &inner.run {
             run.cancel.cancel();
+        }
+        self.keys.lock().unwrap().clear_all();
+    }
+
+    /// Ctrl-X 접두 뒤의 p/u만 예약 키로 인정한다. 일반 입력은 접두만 지운다.
+    pub(crate) fn observe_prefix(&self, session_id: &str, bytes: &[u8], now: Instant) -> Option<ReservedKey> {
+        let id = parse_id(session_id)?;
+        let mut keys = self.keys.lock().unwrap();
+        if bytes == [0x18] {
+            keys.prefix(id, now);
+            return None;
+        }
+        let key = match bytes {
+            [b'p'] => ReservedKey::Pair,
+            [b'u'] => ReservedKey::Claim,
+            _ => {
+                keys.clear(id);
+                return None;
+            }
+        };
+        keys.complete(id, now).then_some(key)
+    }
+
+    /// 입력이 들어온 탭과 그때 확인된 선택 세대가 실행 중인 작업과 같을 때만 증거를 남긴다.
+    pub(crate) fn record_key(
+        &self,
+        document: u64,
+        session_id: &str,
+        key: ReservedKey,
+        selection: Option<(NonZeroU64, &LiveSsmIdentity)>,
+        now: Instant,
+    ) {
+        let evidence = selection
+            .filter(|(_, identity)| identity.id == session_id)
+            .and_then(|(generation, _)| parse_id(session_id).map(|id| MainSession { id, generation, document }))
+            .and_then(|main| {
+                let inner = self.inner.lock().unwrap();
+                let run = inner.run.as_ref().filter(|run| run.active() && run.main == main)?;
+                Some(KeyEvidence { approval_id: run.approval_id.get(), main, key })
+            });
+        let mut keys = self.keys.lock().unwrap();
+        match evidence {
+            Some(evidence) => keys.record(evidence, now),
+            // 다른 탭·바뀐 선택의 예약 키는 앞선 증거까지 폐기한다.
+            None => keys.invalidate(key),
         }
     }
 }
@@ -431,8 +509,23 @@ fn worker(app: AppHandle, run: Arc<Run>, approval: Approval, commands: mpsc::Rec
     }
 }
 
+trait Channel {
+    fn poll(&mut self, timeout: Duration) -> Result<Option<Output>, String>;
+    fn write(&mut self, bytes: &[u8]) -> Result<(), String>;
+}
+
+impl Channel for ControlTransport {
+    fn poll(&mut self, timeout: Duration) -> Result<Option<Output>, String> {
+        ControlTransport::poll(self, timeout)
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+        ControlTransport::write(self, bytes)
+    }
+}
+
 struct Driver<'a> {
-    transport: &'a mut ControlTransport,
+    transport: &'a mut dyn Channel,
     run: &'a Arc<Run>,
     approval: &'a Approval,
     commands: &'a mpsc::Receiver<Command>,
@@ -448,7 +541,7 @@ struct Driver<'a> {
 
 impl<'a> Driver<'a> {
     fn new(
-        transport: &'a mut ControlTransport,
+        transport: &'a mut dyn Channel,
         run: &'a Arc<Run>,
         approval: &'a Approval,
         commands: &'a mpsc::Receiver<Command>,
@@ -538,6 +631,9 @@ impl<'a> Driver<'a> {
             ProtocolEvent::Paired { shell_generation, .. } => {
                 self.run.paired();
                 self.pair_deadline = None;
+                if !self.run.take_key(ReservedKey::Pair, Instant::now()) {
+                    return Err(self.failure("선택한 세션에서 페어링 키 입력을 확인하지 못했습니다".into()));
+                }
                 let ticket = Ticket {
                     main_id: parse_id(&self.approval.request.session.id).ok_or_else(|| self.failure("세션 ID가 올바르지 않습니다".into()))?,
                     main_generation: self.approval.request.session.selection_id,
@@ -553,11 +649,15 @@ impl<'a> Driver<'a> {
                     .map_err(|error| self.failure(error.to_string()))?;
                 self.transport.write(&bytes).map_err(|error| self.failure(error))?;
                 self.ticket = Some(ticket);
-                self.claim_deadline = Some(Instant::now() + CLAIM_WAIT);
+                // 노드 예약과 같은 기한에 한 번의 폴링 여유만 두어 명시적 거부 프레임을 읽는다.
+                self.claim_deadline = Some(Instant::now() + CLAIM_WAIT + POLL);
             }
             ProtocolEvent::Claim { ticket } => {
                 if self.ticket != Some(ticket) {
                     return Err(self.failure("인증 채널의 작업 ID가 승인과 다릅니다".into()));
+                }
+                if !self.run.take_key(ReservedKey::Claim, Instant::now()) {
+                    return Err(self.failure("선택한 세션에서 예약 키 입력을 확인하지 못했습니다".into()));
                 }
                 let bytes = self.protocol.grant(ticket, self.approval.request.task.operation)
                     .map_err(|error| self.failure(error.to_string()))?;
@@ -566,6 +666,9 @@ impl<'a> Driver<'a> {
                 self.start_deadline = Some(Instant::now() + START_WAIT);
                 self.run.set_phase(Phase::AwaitingStart);
                 self.transport.write(&bytes).map_err(|error| self.failure(error))?;
+            }
+            ProtocolEvent::Denied => {
+                return Err(self.failure("노드가 예약을 거부했습니다".into()));
             }
             ProtocolEvent::Started { job_id } => {
                 self.job = Some(job_id);
@@ -587,6 +690,10 @@ impl<'a> Driver<'a> {
     }
 }
 
+fn terminal(phase: Phase) -> bool {
+    matches!(phase, Phase::Exited | Phase::Unconfirmed | Phase::Failed)
+}
+
 /// 시작을 확인하기 전 단절은 실패이고, 인계 이후 단절은 종료 확인 불가다.
 fn failure(phase: Phase) -> Phase {
     if matches!(phase, Phase::AwaitingStart | Phase::Running | Phase::StopRequested) {
@@ -596,8 +703,11 @@ fn failure(phase: Phase) -> Phase {
     }
 }
 
-fn parse_id(value: &str) -> Option<NonZeroU64> {
-    if value.starts_with('0') || value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+fn parse_id(value: &str) -> Option<u64> {
+    if value.is_empty()
+        || (value.len() > 1 && value.starts_with('0'))
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
         return None;
     }
     value.parse().ok()
