@@ -287,13 +287,21 @@ def main():
             tab.send(attempt)
             tab.read(rb'zzabba\$ ')
             control.quiet()
+        # 붙여넣기가 나뉘어 도착해도 끝 표지까지 읽어 버린다.
+        tab.send(KEY_PAIR)
+        tab.read(rb'Zzabba pairing code: ')
+        tab.send(b'\x1b[200~' + control.code[:8] + b'\r')
+        time.sleep(0.3)
+        tab.send(b'echo SPLIT-RAN\r\x1b[201~')
+        tab.read(rb'zzabba\$ ')
+        control.quiet()
         tab.send(b'echo paste-safe\n')
         tab.read(rb'\rpaste-safe\r\n')
         assert b'-RAN' not in tab.transcript
-        # 줄바꿈 없는 괄호 붙여넣기는 끝 표지에서 입력을 마친다.
+        # 괄호 붙여넣기는 끝 표지에서 입력을 마치고, 줄 단위 복사의 끝 줄바꿈 한 개는 허용한다.
         tab.send(KEY_PAIR)
         tab.read(rb'Zzabba pairing code: ')
-        tab.send(b'\x1b[200~' + control.code + b'\x1b[201~')
+        tab.send(b'\x1b[200~' + control.code + b'\r\x1b[201~')
         tab.read(rb'zzabba\$ ')
         assert control.event('paired', 2)['uid'] == UID
         tab.send(b'exit\n')
