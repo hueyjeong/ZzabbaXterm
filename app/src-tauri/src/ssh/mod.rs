@@ -1,4 +1,5 @@
 mod public_key_file;
+pub(crate) mod nano;
 pub(crate) mod registration;
 pub(crate) mod terminal;
 mod trust;
@@ -73,6 +74,7 @@ const NO_ASKPASS: [(&str, Option<&str>); 2] = [
 pub(crate) struct ConnectionPlan {
     ssh: PathBuf,
     config: PathBuf,
+    public_key: bool,
     _files: SessionFiles,
     _root: trust::RootGuard,
 }
@@ -176,7 +178,18 @@ impl ConnectionPlan {
                 trust_windows::pin(&files.path().join("agent.pub"))?;
             }
         }
-        Ok(Self { ssh, config, _files: files, _root: root })
+        Ok(Self { ssh, config, public_key: public_key == "yes", _files: files, _root: root })
+    }
+
+    fn editor_invocation(&self, tty: bool) -> Option<Invocation<'_>> {
+        if !self.public_key { return None; }
+        let mut invocation = self.invocation(Client::Ssh);
+        invocation.args.splice(..0, [
+            if tty { "-tt" } else { "-T" },
+            "-oBatchMode=yes", "-oPreferredAuthentications=publickey",
+            "-oPasswordAuthentication=no", "-oKbdInteractiveAuthentication=no",
+        ].map(OsStr::new));
+        Some(invocation)
     }
 
     /// argv는 셸 문자열로 조합하지 않고, 자식 환경에 지정한 항목을 모두 적용한다.

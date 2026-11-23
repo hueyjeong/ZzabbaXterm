@@ -9,6 +9,7 @@ import { subscribeLocalCliOpen } from "../editor/cliOpen";
 import { EditorTab, type EditorTabActions } from "../editor/EditorTab";
 import type { ApprovedEditorFile, ConfirmEditorDiscard, EditorTransport } from "../editor/contract";
 import { closeLocalFile, localEditorError, localEditorTransport, openLocalFile } from "../editor/localEditorIpc";
+import { subscribeRemoteNanoOpen, type RemoteNanoFile } from "../editor/nanoOpen";
 import { RdpTab, type RdpTabActions } from "../rdp/RdpTab";
 import { SftpPanel, type SftpPanelActions } from "../sftp/SftpPanel";
 import { sftpError } from "../sftp/sftpIpc";
@@ -29,8 +30,8 @@ type CloseStatus = "closing" | "unconfirmed";
 type Split = { left: number; right: number };
 type DesktopKind = "rdp" | "vnc";
 type Tab = { id: number; label: string } & (
-  | { kind: "terminal"; targetId?: string; ssm?: SsmTarget; ssh?: SshTransport["kind"]; status: TerminalStatus; sessionId?: string; sftpSessionId?: string; closeStatus?: CloseStatus }
-  | { kind: "editor"; file: ApprovedEditorFile; transport: EditorTransport; close: () => Promise<void>; source: EditorSource; attaching?: true }
+  | { kind: "terminal"; targetId?: string; remoteEditor?: true; ssm?: SsmTarget; ssh?: SshTransport["kind"]; status: TerminalStatus; sessionId?: string; sftpSessionId?: string; closeStatus?: CloseStatus }
+  | { kind: "editor"; file: ApprovedEditorFile; transport: EditorTransport; close: () => Promise<void>; source: EditorSource; attaching?: true; readOnly?: true; nano?: Pick<RemoteNanoFile, "sessionId" | "disconnect"> }
   | { kind: "tunnel"; handle: string; targetId: string; name: string; method: "ssh" | "ssm"; closeStatus?: CloseStatus; closeError?: string }
   | { kind: "rdp"; source?: DesktopTunnelSource; closeStatus?: CloseStatus }
   | { kind: "vnc"; source?: DesktopTunnelSource; closeStatus?: CloseStatus }
@@ -96,6 +97,14 @@ export function Workspace() {
     const mountingEditors = pendingEditorMounts.current.size;
     for (const tab of tabs) {
       if (tab.kind !== "editor") continue;
+      if (tab.nano) {
+        const { sessionId, disconnect } = tab.nano;
+        const parent = tabs.find(item => item.kind === "terminal" && item.remoteEditor && item.sessionId === sessionId);
+        if (parent?.kind !== "terminal" || parent.closeStatus ||
+          parent.status.kind === "exited" || parent.status.kind === "disconnected" || parent.status.kind === "failed") {
+          disconnect("부모 SSH 연결을 사용할 수 없습니다");
+        }
+      }
       pendingEditorMounts.current.delete(tab.id);
       if (tab.attaching) cliMounts.current.get(tab.id)?.(editorActions.current.has(tab.id));
     }
@@ -151,7 +160,7 @@ export function Workspace() {
       setCloseError("");
       let blocked: typeof closeBlock = openingFile.current ? { kind: "picker", message: "파일 선택 중 · 창 닫기 보류" } :
         cliMounts.current.size ? { kind: "cli", message: "CLI 편집 탭 연결 중 · 창 닫기 보류" } :
-        pendingEditorMounts.current.size ? { kind: "mount", message: "편집 탭 여는 중 · 창 닫기 보류" } : undefined;
+          pendingEditorMounts.current.size ? { kind: "mount", message: "편집 탭 여는 중 · 창 닫기 보류" } : undefined;
       const element = blocked ? undefined : workspace.current;
       // showModal()로 열린 대화상자는 상위 요소의 inert를 상속하지 않는다.
       const dialog = element?.querySelector<HTMLDialogElement>("dialog[open]:not([inert])");
@@ -214,16 +223,20 @@ export function Workspace() {
     });
     return () => {
       disposed = true;
-      void registration.then(unlisten => unlisten?.(), () => {});
+      void registration.then(unlisten => unlisten?.(), () => { });
     };
   }, []);
 
   useEffect(() => {
     const attachingHandles = new Set<ApprovedEditorFile["handle"]>();
-    const report = (error: unknown) => setFileError(`CLI 파일 열기 실패: ${localEditorError(error).message}`);
-    const unsubscribe = subscribeLocalCliOpen(async (file, respond, signal) => {
+    const reportLocal = (error: unknown) => setFileError(`CLI 파일 열기 실패: ${localEditorError(error).message}`);
+    const reportNano = (error: unknown) => setFileError(`nano 편집 연결 확인 불가: ${sftpError(error).message}`);
+    async function attach(file: ApprovedEditorFile, transport: EditorTransport, close: () => Promise<void>,
+      source: "local" | "sftp", acknowledge: () => Promise<"mounted" | "unconfirmed" | "unavailable">, signal: AbortSignal,
+      nano?: Pick<RemoteNanoFile, "sessionId" | "disconnect">) {
+      // 오퍼에 기록된 백엔드 세션은 활성 탭이나 SFTP 패널과 독립적이다.
       if (closingWindow.current || signal.aborted || attachingHandles.has(file.handle) || liveTabs.current.some(tab =>
-        tab.kind === "editor" && tab.source === "local" && tab.file.handle === file.handle)) return;
+        tab.kind === "editor" && tab.source === source && tab.file.handle === file.handle)) return;
       attachingHandles.add(file.handle);
       const id = nextTab.current++;
       const removePreview = () => setTabs(current => current.filter(tab => tab.id !== id));
@@ -234,20 +247,19 @@ export function Workspace() {
         removePreview();
       };
       signal.addEventListener("abort", abort, { once: true });
-      setTabs(current => [...current, { id, label: file.label, kind: "editor", file,
-        source: "local", transport: localEditorTransport, close: () => closeLocalFile(file.handle), attaching: true }]);
+      setTabs(current => [...current, { id, label: file.label, kind: "editor", file, source, transport, close, attaching: true, nano }]);
       try {
         const committed = await mounted;
         if (signal.aborted) return;
         if (!committed) throw new Error("편집기 탭을 부착할 수 없습니다");
-        await respond({ attached: true });
+        const result = await acknowledge();
+        if (result === "unavailable") { removePreview(); return; }
         if (signal.aborted) return;
         setTabs(current => current.map(tab => tab.id === id && tab.kind === "editor"
-          ? { ...tab, attaching: undefined } : tab));
+          ? { ...tab, attaching: undefined, readOnly: result === "unconfirmed" ? true : undefined } : tab));
         selectTab(id);
       } catch (error) {
         removePreview();
-        if (!signal.aborted) report(error);
         throw error;
       } finally {
         cliMounts.current.delete(id);
@@ -255,7 +267,25 @@ export function Workspace() {
         attachingHandles.delete(file.handle);
         signal.removeEventListener("abort", abort);
       }
-    }, report);
+    }
+    const local = subscribeLocalCliOpen((file, respond, signal) =>
+      attach(file, localEditorTransport, () => closeLocalFile(file.handle), "local", async () => {
+        await respond({ attached: true });
+        return "mounted";
+      }, signal).catch(error => { if (!signal.aborted) reportLocal(error); throw error; }), reportLocal);
+    const nano = subscribeRemoteNanoOpen((file, acknowledge, signal) => {
+      if (!liveTabs.current.some(tab => tab.kind === "terminal" && tab.remoteEditor && tab.sessionId === file.sessionId &&
+        !tab.closeStatus && !closingTabs.current.has(tab.id) &&
+        tab.status.kind !== "exited" && tab.status.kind !== "disconnected" && tab.status.kind !== "failed")) {
+        return Promise.resolve();
+      }
+      return attach(file, file.transport, file.close, "sftp", async () => {
+        const result = await acknowledge();
+        if (result.kind === "unconfirmed" && !signal.aborted) reportNano(result.error);
+        return result.kind === "aborted" ? "unavailable" : result.kind;
+      }, signal, file).catch(error => { if (!signal.aborted) reportNano(error); throw error; });
+    }, reportNano);
+    const unsubscribe = () => { local(); nano(); };
     window.addEventListener("pagehide", unsubscribe);
     return () => {
       window.removeEventListener("pagehide", unsubscribe);
@@ -353,7 +383,7 @@ export function Workspace() {
     return () => observer.disconnect();
   }, [active, left, focused]);
 
-  function openTab(target?: SavedConnections["targets"][number]["profile"]) {
+  function openTab(target?: SavedConnections["targets"][number]["profile"], options?: { readonly remoteEditor?: true }) {
     if (target?.defaultMethod === "s3") {
       openStorageTarget({ kind: "aws", targetId: target.id, label: target.displayName });
       return;
@@ -361,6 +391,7 @@ export function Workspace() {
     const id = nextTab.current++;
     setTabs((current) => [...current, {
       id, label: target?.displayName ?? `로컬 ${id}`, kind: "terminal", targetId: target?.id,
+      remoteEditor: options?.remoteEditor,
       ssm: target?.defaultMethod === "ssm" ? target.ssm : undefined,
       ssh: target?.ssh?.transport.kind, status: { kind: "opening" },
     }]);
@@ -678,7 +709,7 @@ export function Workspace() {
               }}>
               {tab.kind === "terminal" ? (
                 <TerminalView active={visible} focusRequested={id === focusTab} label={label} targetId={tab.targetId}
-                  remote={!!tab.ssm} ssh={!!tab.ssh} closing={!!tab.closeStatus} closeRef={tab.ssm || tab.ssh ? bindClose : undefined}
+                  remote={!!tab.ssm} ssh={!!tab.ssh} remoteEditor={tab.remoteEditor} closing={!!tab.closeStatus} closeRef={tab.ssm || tab.ssh ? bindClose : undefined}
                   onStatus={(status, sessionId) => updateStatus(id, status, sessionId)} />
               ) : tab.kind === "tunnel" ? (
                 <TunnelTab tab={tab.handle} targetId={tab.targetId} method={tab.method}
@@ -691,7 +722,7 @@ export function Workspace() {
               ) : tab.kind === "vnc" ? (
                 <VncView ref={bindDesktopClose} active={id === active} source={tab.source} />
               ) : (
-                <EditorTab file={tab.file} active={id === active && !tab.attaching} transport={tab.transport}
+                <EditorTab file={tab.file} active={id === active && !tab.attaching} transport={tab.transport} readOnly={tab.readOnly}
                   confirmDiscard={(request) => confirmEditorDiscard(tab.source, request)}
                   focusRequested={id === focusTab}
                   ref={(actions) => {

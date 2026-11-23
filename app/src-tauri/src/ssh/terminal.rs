@@ -8,6 +8,7 @@ use super::{ApprovedHost, Authentication, Client, ConnectionPlan, Error, Invocat
 pub(crate) struct DirectLaunch {
     command: CommandBuilder,
     plan: Arc<ConnectionPlan>,
+    editor: Option<(super::nano::Binding, tokio::sync::oneshot::Sender<()>)>,
 }
 
 impl DirectLaunch {
@@ -23,7 +24,26 @@ impl DirectLaunch {
         }
         let plan = Arc::new(ConnectionPlan::prepare(store, approved_host, account, Transport::Direct, auth)?);
         let command = command(plan.invocation(Client::Ssh));
-        Ok(Self { command, plan })
+        Ok(Self { command, plan, editor: None })
+    }
+
+    pub(crate) fn enable_editor(&mut self, app: tauri::AppHandle, owner: String, document: u64) -> tokio::sync::oneshot::Sender<String> {
+        let (id, parent) = tokio::sync::oneshot::channel();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        self.editor = Some((super::nano::Binding { app, owner, document, parent, started: ready }, started));
+        id
+    }
+
+    pub(crate) fn editor_requested(&self) -> bool { self.editor.is_some() }
+
+    pub(crate) fn prepare_editor(&mut self, cancel: tokio_util::sync::CancellationToken) -> Option<(super::nano::Running, tokio::sync::oneshot::Sender<()>)> {
+        let (binding, started) = self.editor.take()?;
+        let invocation = self.plan.editor_invocation(true)?;
+        let (ready, running) = super::nano::Running::prepare(Arc::clone(&self.plan), binding, cancel)?;
+        let mut shell = command(invocation);
+        shell.args([super::nano::HELPER, "shell", &ready.session_id]);
+        self.command = shell;
+        Some((running, started))
     }
 
     /// 터미널 감독자와 SFTP 작업자가 같은 계획을 공유한다.
@@ -56,15 +76,36 @@ pub(crate) fn saved(config: &Path, ssh: &Ssh) -> Result<DirectLaunch, String> {
     if !matches!(ssh.transport, SshTransport::Direct {}) {
         return Err("SSH-over-SSM을 사용할 수 없습니다".into());
     }
+    let endpoint = super::Endpoint::new(&ssh.host, ssh.port).map_err(pin_error)?;
+    prepare_saved(config, ssh, &endpoint)
+}
+
+pub(crate) fn prepare_remote_editor(config: &Path, id: &str, revision: std::num::NonZeroU64, ssh: &Ssh)
+    -> Result<(DirectLaunch, String), String>
+{
+    if !matches!(ssh.transport, SshTransport::Direct {}) {
+        return Err("nano 연동은 직접 SSH 연결에서만 사용할 수 있습니다".into());
+    }
+    if !matches!(ssh.auth, SshAuth::Agent { .. } | SshAuth::KeyFile { .. }) {
+        return Err("nano 연동에는 SSH Agent 또는 키 파일이 필요합니다".into());
+    }
+    let endpoint = super::Endpoint::new(&ssh.host, ssh.port).map_err(pin_error)?;
+    let launch = prepare_saved(config, ssh, &endpoint)?;
+    let message = format!(
+        "프로필: {id}\n리비전: {revision}\n서버: {}\n포트: {}\n계정: {}\n호스트 키 지문: {}\n\n관리자가 SSH 셸과 SFTP에서 같은 경로가 같은 파일을 가리킨다고 확인했습니까?",
+        endpoint.host, endpoint.port, ssh.account, ssh.host_key_fingerprint,
+    );
+    Ok((launch, message))
+}
+
+fn prepare_saved(config: &Path, ssh: &Ssh, endpoint: &super::Endpoint) -> Result<DirectLaunch, String> {
     let auth = match &ssh.auth {
         SshAuth::Agent { public_key_path } => Authentication::AgentFile { public_key_path },
         SshAuth::KeyFile { private_key_path } => Authentication::KeyFile { private_key: private_key_path },
         SshAuth::ManualPassword {} => Authentication::ManualPassword,
         SshAuth::StoredPassword { .. } => return Err("저장된 SSH 암호를 사용할 수 없습니다".into()),
     };
-    // 저장본의 실제 대상과 사용자 확인값을 사용하며, 매번 PIN을 다시 검사한다.
-    let endpoint = super::Endpoint::new(&ssh.host, ssh.port).map_err(pin_error)?;
-    let approved = ApprovedHost::confirm(&endpoint, &endpoint, &ssh.host_key_fingerprint).map_err(pin_error)?;
+    let approved = ApprovedHost::confirm(endpoint, endpoint, &ssh.host_key_fingerprint).map_err(pin_error)?;
     DirectLaunch::prepare(&trust_store(config)?, &approved, &ssh.account, &ssh.account, auth).map_err(pin_error)
 }
 

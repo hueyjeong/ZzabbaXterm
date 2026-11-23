@@ -13,6 +13,7 @@ export interface TerminalViewProps {
   readonly ipc?: LocalTerminalIpc;
   readonly remote?: boolean;
   readonly ssh?: boolean;
+  readonly remoteEditor?: true;
   readonly closing?: boolean;
   readonly closeRef?: Ref<{ confirmClose(): Promise<void> }>;
   readonly onStatus?: (status: TerminalStatus, sessionId?: string) => void;
@@ -29,7 +30,7 @@ function text(status: TerminalStatus) {
   }
 }
 
-export function TerminalView({ active, focusRequested, label, targetId, ipc, remote, ssh, closing, closeRef, onStatus }: TerminalViewProps) {
+export function TerminalView({ active, focusRequested, label, targetId, ipc, remote, ssh, remoteEditor, closing, closeRef, onStatus }: TerminalViewProps) {
   const host = useRef<HTMLDivElement>(null);
   const session = useRef<LocalTerminal | undefined>(undefined);
   const stopRequested = useRef(false);
@@ -59,7 +60,7 @@ export function TerminalView({ active, focusRequested, label, targetId, ipc, rem
     let acceptsUserInput = false;
     term.attachCustomKeyEventHandler((event) => {
       if (event.type !== "keydown" || event.key !== "Enter" || !event.shiftKey ||
-          event.ctrlKey || event.altKey || event.metaKey || event.keyCode === 229) return true;
+        event.ctrlKey || event.altKey || event.metaKey || event.keyCode === 229) return true;
       if (event.isComposing) return false;
       event.preventDefault();
       if (acceptsUserInput && !stopRequested.current) term.input("\x1b[13;2u", true);
@@ -84,7 +85,7 @@ export function TerminalView({ active, focusRequested, label, targetId, ipc, rem
         session.current = connectLocalTerminal(dimensions, (bytes, parsed) => term.write(bytes, parsed), (next, id) => {
           setStatus(next);
           statusListener.current?.(next, id);
-        }, ipc, targetId, remote, !!(remote || ssh));
+        }, ipc, targetId, remote, !!(remote || ssh), remoteEditor);
       } else {
         session.current.resize(dimensions);
       }
@@ -106,7 +107,7 @@ export function TerminalView({ active, focusRequested, label, targetId, ipc, rem
       session.current = undefined;
       term.dispose();
     };
-  }, [targetId, ipc, remote, ssh]);
+  }, [targetId, ipc, remote, ssh, remoteEditor]);
 
   useLayoutEffect(() => {
     refresh.current?.(active, !closing && status.kind === "running", focusRequested);

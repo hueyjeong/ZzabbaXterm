@@ -41,6 +41,7 @@ vi.mock("@xterm/xterm", () => ({
     }
     focus() { this.field.focus(); }
     blur() { this.field.blur(); }
+    onKey() { return { dispose() { } }; }
     onData(input: (data: string) => void) {
       this.field.addEventListener("input", (event) => {
         if (event instanceof InputEvent && event.data) input(event.data);
@@ -74,6 +75,9 @@ let runStorage: (command: string, args: unknown) => Promise<unknown>;
 let runSftp: (command: string, args: unknown) => Promise<unknown>;
 let runTunnel: (command: string, args: unknown) => Promise<unknown>;
 let receiveCliOpen: EventCallback<{ requestId: string }> | undefined;
+let receiveNanoOpen: EventCallback<{ offerId: string; sessionId: string }> | undefined;
+let receiveNanoDisconnect: typeof receiveNanoOpen;
+let runNanoEditor: (command: string, args: unknown) => Promise<unknown>;
 let receiveWindowClose: EventCallback<{ requestId: string }> | undefined;
 let respondToWindowClose: () => Promise<boolean>;
 let pendingWindowClose: () => Promise<string | null>;
@@ -122,6 +126,9 @@ beforeEach(async () => {
   runSftp = async command => { throw new Error(`예상하지 않은 SFTP 명령: ${command}`); };
   runTunnel = async command => { throw new Error(`예상하지 않은 터널 명령: ${command}`); };
   receiveCliOpen = undefined;
+  receiveNanoOpen = undefined;
+  receiveNanoDisconnect = undefined;
+  runNanoEditor = async command => { throw new Error(`예상하지 않은 nano 편집 명령: ${command}`); };
   receiveWindowClose = undefined;
   respondToWindowClose = async () => false;
   pendingWindowClose = async () => null;
@@ -130,11 +137,19 @@ beforeEach(async () => {
       receiveCliOpen = receive;
       return () => { receiveCliOpen = undefined; };
     }
+    if (event === "editor-remote-nano-open") {
+      receiveNanoOpen = receive;
+      return () => { receiveNanoOpen = undefined; };
+    }
+    if (event === "editor-remote-nano-disconnected") {
+      receiveNanoDisconnect = receive;
+      return () => { receiveNanoDisconnect = undefined; };
+    }
     if (event === "workspace-close-requested") {
       receiveWindowClose = receive;
       return () => { receiveWindowClose = undefined; };
     }
-    return () => {};
+    return () => { };
   });
   runCliEditor = async command => { throw new Error(`예상하지 않은 CLI 편집 명령: ${command}`); };
   openFile = async () => ({ status: "cancelled" });
@@ -150,6 +165,8 @@ beforeEach(async () => {
     if (command.startsWith("tunnel_")) return runTunnel(command, args);
     if (command === "editor_local_cli_pending") return [];
     if (command.startsWith("editor_local_cli_")) return runCliEditor(command, args);
+    if (command === "editor_remote_nano_pending") return [];
+    if (command.startsWith("editor_remote_nano_")) return runNanoEditor(command, args);
     if (command === "editor_local_open") return openFile();
     if (command === "editor_local_save") return saveFile();
     if (command === "workspace_window" && args.action === "respondToClose") return respondToWindowClose();
@@ -157,7 +174,8 @@ beforeEach(async () => {
     if (command === "terminal_start") return starts.get(args.id);
     if (command === "terminal_close") return closeTerminal(args.id);
     if (command !== "terminal_open") return;
-    const id = `pty-${channels.size + 10}`;
+    const number = channels.size + 10;
+    const id = args.remoteEditor ? String(number) : `pty-${number}`;
     channels.set(id, args.output.receive);
     return id;
   });
@@ -1715,13 +1733,15 @@ describe("F01 직접 SSH", () => {
     loadProfiles = async () => ({
       version: 1,
       groups: [{ revision: 1, profile: { id: "work", displayName: "작업" } }],
-      targets: [{ revision: 1, profile: {
-        id: "server", groupId: "work", displayName: "개발 서버", defaultMethod: "ssh",
-        ssh: {
-          host: "dev.example.invalid", port: 2222, account: "deploy", hostKeyFingerprint: fingerprint,
-          transport: { kind: "direct" }, auth: { kind: "manualPassword" },
-        },
-      } }],
+      targets: [{
+        revision: 1, profile: {
+          id: "server", groupId: "work", displayName: "개발 서버", defaultMethod: "ssh",
+          ssh: {
+            host: "dev.example.invalid", port: 2222, account: "deploy", hostKeyFingerprint: fingerprint,
+            transport: { kind: "direct" }, auth: { kind: "manualPassword" },
+          },
+        }
+      }],
     });
     expect(tree().textContent).not.toContain("개발 서버");
     await press("새로고침");
@@ -1784,6 +1804,120 @@ describe("F01 직접 SSH", () => {
     expect(calls("close")).toEqual([{ id: first }, { id: first }]);
     expect(document.querySelector(".workspace-tab [role=alert]")).toBeNull();
     expect(status()).toContain(`SSH · ${second}`);
+  });
+
+  it.each(["unconfirmed", "close", "exited", "disconnected", "channel", "saved", "unknown"] as const)("F02 nano 편집 오퍼에 고정된 세션의 상태만 반영한다 (%s)", async (scenario) => {
+    const offerId = "1".repeat(32);
+    const handle = "f".repeat(32);
+    loadProfiles = async () => ({
+      version: 1,
+      groups: [{ revision: 1, profile: { id: "work", displayName: "작업" } }],
+      targets: [{
+        revision: 1, profile: {
+          id: "nano", groupId: "work", displayName: "nano 서버", defaultMethod: "ssh",
+          ssh: {
+            host: "nano.example.test", port: 2222, account: "test", hostKeyFingerprint: fingerprint,
+            transport: { kind: "direct" }, auth: { kind: "keyFile", privateKeyPath: "/fixture/id_ed25519" }
+          },
+        }
+      }],
+    });
+    const otherOfferId = "3".repeat(32);
+    runNanoEditor = async (command, args) => {
+      if (command === "editor_remote_nano_claim") {
+        if (args && typeof args === "object" && "offerId" in args && args.offerId === otherOfferId) {
+          return { handle: "e".repeat(32), name: "다른 편집.txt", text: "다른 원본" };
+        }
+        return { handle, name: "원격 편집.txt", text: "원격 원본" };
+      }
+      if (command === "editor_remote_nano_mounted") {
+        if (scenario === "unconfirmed") throw new Error("응답 유실");
+        return;
+      }
+      if (command === "editor_remote_nano_failed") throw new Error("부착 확인 유실");
+      throw new Error(command);
+    };
+    const save = Promise.withResolvers<unknown>();
+    runSftp = async command => {
+      if (command === "editor_sftp_save") return save.promise;
+      if (command !== "editor_sftp_close") throw new Error(command);
+    };
+    await restartWorkspace();
+    const row = [...tree().querySelectorAll<HTMLElement>('[role="treeitem"]')].find(item => item.textContent === "nano 서버")!;
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    await key(row, "ContextMenu");
+    await press("nano 연동으로 열기");
+    expect(calls("open").slice(-1)[0]).toMatchObject({ targetId: "nano", remoteEditor: true });
+    const { id: sessionId } = calls("start").slice(-1)[0];
+    expect(receiveNanoOpen).toBeDefined();
+    const event = "editor-remote-nano-open";
+    await act(async () => { void receiveNanoOpen?.({ event, id: 1, payload: { offerId: "2".repeat(32), sessionId: "999" } }); });
+    expect(button("원격 편집.txt")).toBeUndefined();
+    expect(connectionCalls("editor_remote_nano_mounted")).toHaveLength(0);
+    await act(async () => { void receiveNanoOpen?.({ event, id: 1, payload: { offerId, sessionId } }); });
+    expect(connectionCalls("editor_remote_nano_mounted")).toEqual([["editor_remote_nano_mounted", { offerId, handle }]]);
+    expect(find('.editor-tab[aria-label="원격 편집.txt"]').hidden).toBe(false);
+    const editorPane = find('.editor-tab[aria-label="원격 편집.txt"]');
+    if (scenario === "unconfirmed") {
+      expect(editorPane.querySelector<HTMLButtonElement>(".editor-toolbar button")?.disabled).toBe(true);
+      expect(connectionCalls("editor_remote_nano_failed")).toContainEqual(["editor_remote_nano_failed", { offerId, handle }]);
+      expect(status()).toContain("nano 편집 연결 확인 불가: 응답 유실");
+      await press("원격 편집.txt 닫기");
+      expect(connectionCalls("editor_sftp_close")).toEqual([["editor_sftp_close", { sessionId, handle }]]);
+    } else {
+      const output = editorPane.querySelector("output");
+      const model = editor.getModels().find(item => item.uri.query === handle)!;
+      await act(async () => model.setValue("미저장 편집"));
+      await key(row, "ContextMenu");
+      await press("nano 연동으로 열기");
+      const otherSessionId = calls("start").slice(-1)[0].id;
+      expect(otherSessionId).not.toBe(sessionId);
+      await act(async () => { channels.get(otherSessionId)?.({ kind: "exited", value: 0 }); });
+      await press("원격 편집.txt");
+      const channelEvent = "editor-remote-nano-disconnected";
+      const emitDisconnect = async (payload: { sessionId: string; offerId: string }) => {
+        await act(async () => { void receiveNanoDisconnect?.({ event: channelEvent, id: 2, payload }); });
+      };
+      await emitDisconnect({ sessionId: otherSessionId, offerId });
+      await emitDisconnect({ sessionId, offerId: otherOfferId });
+      expect(output?.textContent).toBe("미저장");
+
+      if (scenario === "saved" || scenario === "unknown") await press("저장");
+      if (scenario === "close") {
+        const closed = Promise.withResolvers<null>();
+        closeTerminal = () => closed.promise;
+        await press("nano 서버 닫기");
+        expect(output?.textContent).toContain("연결 끊김");
+        expect(button("nano 서버 닫기")?.disabled).toBe(true);
+        await act(async () => closed.resolve(null));
+        expect(calls("close")).toContainEqual({ id: sessionId });
+      } else if (scenario === "channel") {
+        await emitDisconnect({ sessionId, offerId });
+        await act(async () => { void receiveNanoOpen?.({ event, id: 3, payload: { sessionId, offerId: otherOfferId } }); });
+        expect(find('.editor-tab[aria-label="다른 편집.txt"]').hidden).toBe(false);
+        await emitDisconnect({ sessionId, offerId });
+        expect(find('.editor-tab[aria-label="다른 편집.txt"] output').textContent).toBe("");
+        await press("원격 편집.txt");
+      } else {
+        const end = scenario === "disconnected" ? { kind: "disconnected", value: "연결 단절" } : { kind: "exited", value: 0 };
+        await act(async () => { channels.get(sessionId)?.(end); });
+      }
+
+      if (scenario === "saved" || scenario === "unknown") {
+        await act(async () => save.resolve(scenario === "saved" ? { status: "saved" } : {
+          status: "unknown", error: { kind: "disconnected" }, recoveryPath: "/tmp/recovery.txt",
+        }));
+        await emitDisconnect({ sessionId, offerId });
+      }
+      expect(output?.textContent).toContain(scenario === "unknown" ? "복구 파일: /tmp/recovery.txt" : "연결 끊김");
+      expect(editor.getModels().find(item => item.uri.query === handle)).toBe(model);
+      expect(model.getValue()).toBe("미저장 편집");
+      expect(button("저장")?.disabled).toBe(scenario === "saved" || scenario === "unknown");
+      expect(connectionCalls("editor_sftp_save")).toHaveLength(scenario === "saved" || scenario === "unknown" ? 1 : 0);
+    }
+    expect(confirm).not.toHaveBeenCalled();
+    expect(connectionCalls("editor_sftp_attach")).toHaveLength(0);
+    expect(connectionCalls("editor_sftp_detach")).toHaveLength(0);
   });
 });
 
@@ -2228,9 +2362,11 @@ describe("현재 SSH 세션의 SFTP", () => {
         storageId = request.id;
         return { ok: true, value: { sessionId: storageId, profile: "dev", endpoint: "https://s3.example.invalid", region: location.region, location } };
       }
-      if (command === "storage_list_objects") return { ok: true, value: {
-        rows: [{ kind: "object", key: "saved-0/객체.txt", rowId: "object", bytes: 3 }], nextToken: null,
-      } };
+      if (command === "storage_list_objects") return {
+        ok: true, value: {
+          rows: [{ kind: "object", key: "saved-0/객체.txt", rowId: "object", bytes: 3 }], nextToken: null,
+        }
+      };
       if (command === "storage_count_previous_files") return { ok: true, value: 0 };
       if (command === "storage_edit_open") return storageOpen.promise;
       if (command === "storage_edit_close" || command === "storage_close") return true;

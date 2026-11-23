@@ -31,6 +31,7 @@ enum Scenario {
     ExternalDelete,
     ChangedHandleMetadata,
     ChangedTargetDuringRead,
+    NonRegular,
     NoExtension,
     OtherExtensionVersion,
     CreateRefused,
@@ -208,9 +209,13 @@ impl Fixture {
                 if !self.root.join(name).exists() {
                     Packet::error(id, StatusCode::NoSuchFile)
                 } else {
+                    let mut attrs = self.attrs(name, self.mode);
+                    if self.scenario == Scenario::NonRegular {
+                        attrs.permissions = Some(0o120777);
+                    }
                     Attrs {
                         id,
-                        attrs: self.attrs(name, self.mode),
+                        attrs,
                     }
                     .into()
                 }
@@ -274,9 +279,11 @@ impl Fixture {
                     b"decoy" => "decoy",
                     other => panic!("예상하지 않은 핸들: {other:?}"),
                 };
-                let contents = fs::read(self.root.join(name)).unwrap();
-                let offset = request.offset as usize;
-                if offset >= contents.len() {
+                use std::io::{Read, Seek, SeekFrom};
+                let mut file = fs::File::open(self.root.join(name)).unwrap();
+                let size = file.metadata().unwrap().len();
+                let offset = request.offset;
+                if offset >= size {
                     self.reached_eof = true;
                     if self.upload_closed {
                         self.original_rechecked = true;
@@ -284,14 +291,14 @@ impl Fixture {
                     Packet::error(id, StatusCode::Eof)
                 } else {
                     // 짧은 DATA를 보내고 소비자가 실제 받은 길이만큼 이동하는지 확인한다.
-                    let chunk_size = if contents.len() < CHUNK { 3 } else { CHUNK };
-                    let end = contents
-                        .len()
-                        .min(offset + chunk_size)
-                        .min(offset + request.len as usize);
+                    let chunk_size = if size < CHUNK as u64 { 3 } else { CHUNK };
+                    let length = (size - offset).min(chunk_size.min(request.len as usize) as u64) as usize;
+                    let mut data = vec![0; length];
+                    file.seek(SeekFrom::Start(offset)).unwrap();
+                    file.read_exact(&mut data).unwrap();
                     Data {
                         id,
-                        data: contents[offset..end].into(),
+                        data,
                     }
                     .into()
                 }
@@ -442,6 +449,53 @@ async fn connect(
             .unwrap(),
         server,
     )
+}
+
+pub(in crate::editor) async fn in_memory_session(root: &std::path::Path, text: &str) -> Session {
+    let fixture = Fixture::new(root.to_owned(), Scenario::Normal);
+    fs::write(root.join("original"), text).unwrap();
+    let plan = plan(&root.join("trust"), "editor");
+    let (connection, _) = connect(plan, fixture).await;
+    Session::in_memory(connection)
+}
+
+#[tokio::test]
+async fn nano_open_is_read_only_and_does_not_require_atomic_replace() {
+    for scenario in [Scenario::Normal, Scenario::NonRegular, Scenario::NoExtension] {
+        let root = tempfile::tempdir().unwrap();
+        let plan = plan(&root.path().join("trust"), "editor");
+        let (mut connection, server) = connect(plan, Fixture::new(root.path().into(), scenario)).await;
+        for path in ["/", "한글.txt", "C:/workspace/한글.txt", "/workspace/../한글.txt", "/workspace/.zzabba-edit-other"] {
+            assert!(matches!(connection.open_nano(path).await, Err(Error::InvalidPath)), "{path}");
+        }
+        match (scenario, connection.open_nano(FILE).await) {
+            (Scenario::Normal | Scenario::NoExtension, Ok((file, text))) => {
+                assert_eq!(text, ORIGINAL);
+                assert_eq!(connection.read_nano(&file).await.unwrap(), ORIGINAL);
+            }
+            (Scenario::NonRegular, Err(Error::NotRegular)) => (),
+            (_, result) => panic!("예상하지 않은 원격 열기 결과: {:?}", result.err()),
+        }
+        drop(connection);
+        assert!(!server.await.unwrap().renamed);
+        assert_eq!(fs::read_to_string(root.path().join("original")).unwrap(), ORIGINAL);
+    }
+}
+
+#[tokio::test]
+async fn nano_read_limit_is_independent_of_the_panel_limit() {
+    let root = tempfile::tempdir().unwrap();
+    let plan = plan(&root.path().join("trust"), "editor");
+    let (mut connection, _) = connect(plan, Fixture::new(root.path().into(), Scenario::Normal)).await;
+    let data = vec![b'a'; MAX_CONTENT];
+    let path = root.path().join("original");
+    fs::write(&path, &data).unwrap();
+    let (file, text) = connection.open_nano(FILE).await.unwrap();
+    assert_eq!(text.as_bytes(), data.as_slice());
+    fs::write(&path, [&data[..], b"a"].concat()).unwrap();
+    assert!(matches!(connection.read_nano(&file).await, Err(Error::LimitExceeded)));
+    assert!(matches!(connection.open_nano(FILE).await, Err(Error::LimitExceeded)));
+    assert_eq!(connection.reopen(&file).await.unwrap().1.len(), data.len() + 1);
 }
 
 async fn listed_file(connection: &mut Connection) -> Entry {

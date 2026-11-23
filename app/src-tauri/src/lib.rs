@@ -32,6 +32,7 @@ pub fn run() {
         .manage(Sessions::default())
         .manage(LocalEditors::default())
         .manage(SftpIpc::default())
+        .manage(editor::nano_bridge::NanoBridge::default())
         .manage(StorageIpc::default())
         .manage(ai::ipc::State::default())
         .manage(ai::session_selection::State::default())
@@ -105,6 +106,8 @@ pub fn run() {
                 true
             } else if invoke.message.command().starts_with("editor_sftp_") {
                 editor::sftp_ipc::dispatch(invoke)
+            } else if invoke.message.command().starts_with("editor_remote_nano_") {
+                editor::nano_ipc::dispatch(invoke)
             } else if invoke.message.command().starts_with("storage_") {
                 storage_ipc::dispatch(invoke)
             } else {

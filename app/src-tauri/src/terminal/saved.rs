@@ -2,7 +2,7 @@ use std::path::Path;
 
 use portable_pty::CommandBuilder;
 
-use crate::connections::{profile::{MethodRef, Shell}, with_saved_method};
+use crate::{connections::{profile::{MethodRef, Shell}, with_saved_method, with_saved_ssh}, ssh::terminal::{DirectLaunch, prepare_remote_editor}};
 
 use super::{process::Launch, remote};
 
@@ -13,6 +13,125 @@ pub(super) fn launch(config: &Path, id: &str) -> Result<Launch, String> {
         MethodRef::Ssh { ssh } => crate::ssh::terminal::saved(config, ssh).map(Launch::Ssh),
         MethodRef::S3 { .. } => Err("S3 연결은 스토리지 탭에서 열 수 있습니다".into()),
     })
+}
+
+pub(super) fn approve_remote_editor<T>(config: &Path, id: &str,
+    confirm: impl FnOnce(String) -> Result<bool, String>,
+    register: impl FnOnce(DirectLaunch) -> Result<T, String>,
+) -> Result<T, String> {
+    let saved = with_saved_ssh(config, id, |saved| saved)?.ok_or("저장된 SSH 연결을 찾을 수 없습니다")?;
+    let (launch, message) = prepare_remote_editor(config, id, saved.0, &saved.1)?;
+    if !confirm(message)? {
+        return Err("SSH nano 연동 승인이 취소되었습니다".into());
+    }
+    // 프로필과 현재 문서가 모두 일치하는 동안 세션만 등록한다.
+    with_saved_ssh(config, id, |current| {
+        if current.as_ref() != Some(&saved) {
+            return Err("저장된 SSH 연결이 바뀌었습니다".into());
+        }
+        register(launch)
+    })?
+}
+
+#[cfg(test)]
+#[test]
+fn nano_approval_admits_only_the_confirmed_saved_ssh_and_document() {
+    use crate::{connections::{profile::Draft, save_test_profile, tests::{TestDir, ssh_draft}},
+        ssh::{ApprovedHost, Client, Endpoint, TRUST_DIRECTORY, TrustStore}};
+    use serde_json::{Value, json};
+    use std::{cell::Cell, fs};
+
+    const ID: &str = "ssh-server";
+    const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti";
+    const SHA: &str = "SHA256:UCUiLr7Pjs9wFFJMDByLgc3NrtdU344OgUM45wZPcIQ";
+    let config = TestDir::new();
+    let directory = config.path();
+    let trust = TrustStore::create(&directory.join(TRUST_DIRECTORY)).unwrap();
+    let endpoint = Endpoint::new("dev.example.test", 2222).unwrap();
+    trust.register(&ApprovedHost::confirm(&endpoint, &endpoint, SHA).unwrap(), KEY).unwrap();
+    let mut draft = ssh_draft(directory);
+    let public_key = directory.join("agent.pub");
+    fs::write(&public_key, KEY).unwrap();
+    draft["target"]["ssh"]["auth"] = json!({"kind": "agent", "publicKeyPath": public_key});
+    draft["target"]["ssh"]["host"] = json!("DEV.example.test");
+    draft["target"]["ssh"]["hostKeyFingerprint"] = json!(SHA);
+    save_test_profile(directory, serde_json::from_value::<Draft>(draft).unwrap().validate().unwrap());
+    let file = directory.join("connections.json");
+    let original = fs::read(&file).unwrap();
+
+    let mut wrong_pin: Value = serde_json::from_slice(&original).unwrap();
+    wrong_pin["targets"][0]["profile"]["ssh"]["hostKeyFingerprint"] =
+        json!("SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    fs::write(&file, serde_json::to_vec(&wrong_pin).unwrap()).unwrap();
+    assert_eq!(approve_remote_editor(directory, ID, |_| panic!("PIN 불일치 상태에서 승인 창을 열었습니다"),
+        |_| -> Result<(), String> { panic!("PIN 불일치 상태에서 세션을 등록했습니다") },
+    ).unwrap_err(), "등록된 SSH 호스트 키의 지문이 다릅니다");
+
+    for (change, expected) in [
+        ("cancel", Some("SSH nano 연동 승인이 취소되었습니다")),
+        ("revision", Some("저장된 SSH 연결이 바뀌었습니다")),
+        ("host", Some("저장된 SSH 연결이 바뀌었습니다")),
+        ("port", Some("저장된 SSH 연결이 바뀌었습니다")),
+        ("account", Some("저장된 SSH 연결이 바뀌었습니다")),
+        ("hostKeyFingerprint", Some("저장된 SSH 연결이 바뀌었습니다")),
+        ("auth", Some("저장된 SSH 연결이 바뀌었습니다")),
+        ("navigate", Some("open: 문서가 바뀌었습니다")),
+        ("close", Some("open: 창이 닫혔습니다")),
+        ("approve", None),
+    ] {
+        fs::write(&file, &original).unwrap();
+        let sessions = super::super::Sessions::default();
+        let document = sessions.document("main");
+        let confirmations = Cell::new(0);
+        let launch_admissions = Cell::new(0);
+        let result = approve_remote_editor(directory, ID, |message| {
+            confirmations.set(confirmations.get() + 1);
+            for field in ["프로필: ssh-server", "리비전: 1", "서버: dev.example.test", "포트: 2222", "계정: deploy", SHA,
+                "관리자가 SSH 셸과 SFTP에서 같은 경로가 같은 파일을 가리킨다고 확인했습니까?"] {
+                assert!(message.contains(field), "{message}");
+            }
+            let mut current: Value = serde_json::from_slice(&original).unwrap();
+            let entry = &mut current["targets"][0];
+            match change {
+                "cancel" => return Ok(false),
+                "navigate" => sessions.navigate("main"),
+                "close" => assert!(sessions.close_ssh_probes(Some("main"))),
+                "approve" => {
+                    // 준비가 이미 끝났으므로 승인 뒤에는 Agent 공개 키를 다시 읽지 않는다.
+                    fs::remove_file(&public_key).unwrap();
+                }
+                "revision" => entry["revision"] = json!(2),
+                field => entry["profile"]["ssh"][field] = match field {
+                    "host" => json!("other.example.test"),
+                    "port" => json!(2022),
+                    "account" => json!("other"),
+                    "hostKeyFingerprint" => json!("SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+                    "auth" => json!({"kind": "manualPassword"}),
+                    _ => unreachable!(),
+                },
+            }
+            fs::write(&file, serde_json::to_vec(&current).unwrap()).unwrap();
+            Ok(true)
+        }, |launch| {
+            let command = Launch::Ssh(launch);
+            let (id, session) = sessions.register_document("main", document, &command, true)?;
+            let registered = sessions.registry.lock().unwrap().sessions.remove(&id).unwrap();
+            assert!(std::sync::Arc::ptr_eq(&registered, &session));
+            launch_admissions.set(launch_admissions.get() + 1);
+            let Launch::Ssh(launch) = command else { unreachable!() };
+            let (_, plan) = launch.into_parts();
+            let shell = plan.invocation(Client::Ssh);
+            let sftp = plan.invocation(Client::Sftp);
+            assert_eq!(shell.args[1], sftp.args[4]);
+            let config = fs::read_to_string(Path::new(shell.args[1])).unwrap();
+            assert!(config.contains("HostName dev.example.test\nPort 2222\nUser deploy\n"));
+            Ok(())
+        });
+        assert_eq!(result.err().as_deref(), expected, "{change}");
+        assert_eq!(confirmations.get(), 1, "{change}");
+        assert_eq!(launch_admissions.get(), u8::from(expected.is_none()), "{change}");
+        assert!(sessions.registry.lock().unwrap().sessions.is_empty(), "{change}");
+    }
 }
 
 #[cfg(test)]

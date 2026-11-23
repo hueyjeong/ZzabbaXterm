@@ -11,7 +11,7 @@ export type Dimensions = { rows: number; cols: number };
 type Message = ArrayBuffer | End | { kind: "connecting" | "ready" };
 
 export interface LocalTerminalIpc {
-  open(size: Dimensions, receive: (message: Message) => void, targetId?: string): Promise<string>;
+  open(size: Dimensions, receive: (message: Message) => void, targetId?: string, remoteEditor?: true): Promise<string>;
   start(id: string): Promise<void>;
   input(id: string, bytes: Uint8Array): Promise<void>;
   resize(id: string, size: Dimensions): Promise<void>;
@@ -20,8 +20,9 @@ export interface LocalTerminalIpc {
 }
 
 const tauriIpc: LocalTerminalIpc = {
-  open: (size, receive, targetId) => invoke("terminal_open", {
+  open: (size, receive, targetId, remoteEditor) => invoke("terminal_open", {
     ...size, output: new Channel(receive), ...(targetId === undefined ? {} : { targetId }),
+    ...(remoteEditor === true ? { remoteEditor } : {}),
   }),
   start: (id) => invoke("terminal_start", { id }),
   input: (id, bytes) => invoke("terminal_input", { id, bytes: Array.from(bytes) }),
@@ -53,6 +54,7 @@ export function connectLocalTerminal(
   targetId?: string,
   remote = false,
   confirmExit = remote,
+  remoteEditor?: true,
 ): LocalTerminal {
   let id: string | undefined;
   let stopped = false;
@@ -131,7 +133,7 @@ export function connectLocalTerminal(
   // React StrictMode에서 첫 마운트가 해제되면 네이티브 세션을 열지 않는다.
   const opened = Promise.resolve().then(async () => {
     if (stopped) return;
-    id = await ipc.open(initialSize, receive, targetId);
+    id = await (remoteEditor === true ? ipc.open(initialSize, receive, targetId, remoteEditor) : ipc.open(initialSize, receive, targetId));
     return id;
   });
   void (async () => {
