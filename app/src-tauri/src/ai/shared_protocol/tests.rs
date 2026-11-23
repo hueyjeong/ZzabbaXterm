@@ -129,7 +129,12 @@ fn ssm_shell_profile_echo_after_the_banner_is_skipped_once() {
     // 실제 StartSession(ZzabbaAiSharedControl) 출력: 배너 뒤 프로필 에코 한 줄, 프롬프트는 에코 앞이나 Ready 앞.
     let banner = b"\nStarting session with SessionId: zzabba-demo-qxk634b92i3hb53lsdfs22ab64\r\n";
     let echo = b"exec /usr/local/libexec/zzabba-ai-control --shared-control\r\n";
-    for (before_echo, before_ready) in [(&b"$ "[..], &b""[..]), (b"# ", b""), (b"", b"$ "), (b"", b"# "), (b"", b"")] {
+    let cases: [(&[u8], &[u8]); 8] = [
+        (b"$ ", b""), (b"# ", b""), (b"", b"$ "), (b"", b"# "), (b"", b""),
+        // Amazon Linux·RHEL처럼 bash가 `sh`로 실행되는 노드의 기본 프롬프트
+        (b"sh-5.2$ ", b""), (b"", b"sh-5.2$ "), (b"sh-4.2# ", b""),
+    ];
+    for (before_echo, before_ready) in cases {
         let raw = with_ready(&[&banner[..], before_echo, echo].concat(), before_ready);
         assert!(matches!(startup(&raw), Ok(Some(Event::Ready))), "{:?}", String::from_utf8_lossy(&raw));
     }
@@ -162,6 +167,12 @@ fn shell_profile_echo_is_rejected_out_of_order_or_altered() {
         with_ready(banner, b"$ "),
         with_ready(&[banner, b"$ exec /usr/local/libexec/zzabba-ai-control --shared-control; id\n"].concat(), b""),
         with_ready(&[banner, b"exec /usr/local/libexec/zzabba-ai-control --shared-pair\n"].concat(), b""),
+        with_ready(&[banner, b"sh-$ ", echo].concat(), b""),
+        with_ready(&[banner, b"sh-5$ ", echo].concat(), b""),
+        with_ready(&[banner, b"sh-5.$ ", echo].concat(), b""),
+        with_ready(&[banner, b"sh-123.2$ ", echo].concat(), b""),
+        with_ready(&[banner, b"bash-5.2$ ", echo].concat(), b""),
+        with_ready(&[banner, echo].concat(), b"sh-5.2$ sh-5.2$ "),
     ];
     for output in cases {
         assert!(matches!(startup(&output), Err(ProtocolError::StartupOutput)), "{:?}", String::from_utf8_lossy(&output));

@@ -15,6 +15,21 @@ const HISTORY_WARNING: &[u8] = b"Warning: Unable to record CLI history. Check fi
 // SSM 에이전트는 셸 프로필을 `sh`의 PTY에 입력하므로 배너 뒤에 프로필 명령이 한 번 에코된다.
 const PROFILE_COMMAND: &[u8] = b"exec /usr/local/libexec/zzabba-ai-control --shared-control";
 const PROFILE_PROMPTS: [&[u8]; 2] = [b"$ ", b"# "];
+
+/// `/bin/sh`의 기본 프롬프트 한 개만 벗긴다. dash는 `$ `·`# `, bash가 `sh`로 실행되면 `sh-5.2$ ` 꼴이다.
+fn strip_profile_prompt(line: &[u8]) -> Option<&[u8]> {
+    if let Some(rest) = PROFILE_PROMPTS.iter().find_map(|prompt| line.strip_prefix(*prompt)) {
+        return Some(rest);
+    }
+    let rest = line.strip_prefix(b"sh-")?;
+    let major = rest.iter().take_while(|byte| byte.is_ascii_digit()).count();
+    let rest = rest[major..].strip_prefix(b".").filter(|_| (1..=2).contains(&major))?;
+    let minor = rest.iter().take_while(|byte| byte.is_ascii_digit()).count();
+    if !(1..=2).contains(&minor) {
+        return None;
+    }
+    PROFILE_PROMPTS.iter().find_map(|prompt| rest[minor..].strip_prefix(*prompt))
+}
 const MAX_OUTPUT_BYTES: usize = 1024;
 const MAX_PAIR_MS: u64 = 60_000;
 
@@ -175,7 +190,7 @@ impl SharedProtocol {
         let line = match self.profile_echo {
             ProfileEcho::AwaitingPrompt if awaiting_ready => {
                 self.profile_echo = ProfileEcho::Done;
-                PROFILE_PROMPTS.iter().find_map(|prompt| line.strip_prefix(*prompt)).unwrap_or(line)
+                strip_profile_prompt(line).unwrap_or(line)
             }
             _ => line,
         };
@@ -198,7 +213,7 @@ impl SharedProtocol {
                 self.profile_echo = ProfileEcho::AwaitingPrompt;
                 return Ok(None);
             }
-            if PROFILE_PROMPTS.iter().any(|prompt| line.strip_prefix(*prompt) == Some(PROFILE_COMMAND)) {
+            if strip_profile_prompt(line) == Some(PROFILE_COMMAND) {
                 self.profile_echo = ProfileEcho::Done;
                 return Ok(None);
             }
