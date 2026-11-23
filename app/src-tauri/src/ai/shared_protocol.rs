@@ -12,6 +12,9 @@ use super::{
 
 const START_BANNER: &[u8] = b"Starting session with SessionId: ";
 const HISTORY_WARNING: &[u8] = b"Warning: Unable to record CLI history. Check file permissions for ./.";
+// SSM 에이전트는 셸 프로필을 `sh`의 PTY에 입력하므로 배너 뒤에 프로필 명령이 한 번 에코된다.
+const PROFILE_COMMAND: &[u8] = b"exec /usr/local/libexec/zzabba-ai-control --shared-control";
+const PROFILE_PROMPTS: [&[u8]; 2] = [b"$ ", b"# "];
 const MAX_OUTPUT_BYTES: usize = 1024;
 const MAX_PAIR_MS: u64 = 60_000;
 
@@ -53,6 +56,15 @@ enum Phase {
     Failed,
 }
 
+// 셸 프로필 에코는 배너 뒤 한 번이다. 프롬프트는 에코 앞이나 바로 다음 줄 앞에 한 번 온다.
+#[derive(Default, Clone, Copy)]
+enum ProfileEcho {
+    #[default]
+    None,
+    AwaitingPrompt,
+    Done,
+}
+
 #[derive(Default, Clone, Copy)]
 enum Work {
     #[default]
@@ -71,6 +83,7 @@ pub(crate) struct SharedProtocol {
     saw_blank: bool,
     saw_history_warning: bool,
     saw_banner: bool,
+    profile_echo: ProfileEcho,
     partial: Zeroizing<Vec<u8>>,
     channel: String,
     incoming: u64,
@@ -158,6 +171,14 @@ impl SharedProtocol {
         } else {
             line
         };
+        // 프롬프트가 에코보다 늦으면 `exec` 직후의 Ready 프레임 앞에 붙는다.
+        let line = match self.profile_echo {
+            ProfileEcho::AwaitingPrompt if awaiting_ready => {
+                self.profile_echo = ProfileEcho::Done;
+                PROFILE_PROMPTS.iter().find_map(|prompt| line.strip_prefix(*prompt)).unwrap_or(line)
+            }
+            _ => line,
+        };
         if awaiting_ready && !line.starts_with(b"{") {
             return self.preamble(line);
         }
@@ -172,6 +193,16 @@ impl SharedProtocol {
     }
 
     fn preamble(&mut self, line: &[u8]) -> Result<Option<Event>, ProtocolError> {
+        if self.saw_banner && matches!(self.profile_echo, ProfileEcho::None) {
+            if line == PROFILE_COMMAND {
+                self.profile_echo = ProfileEcho::AwaitingPrompt;
+                return Ok(None);
+            }
+            if PROFILE_PROMPTS.iter().any(|prompt| line.strip_prefix(*prompt) == Some(PROFILE_COMMAND)) {
+                self.profile_echo = ProfileEcho::Done;
+                return Ok(None);
+            }
+        }
         if !self.saw_banner {
             if line == HISTORY_WARNING && !self.saw_history_warning {
                 self.saw_history_warning = true;
