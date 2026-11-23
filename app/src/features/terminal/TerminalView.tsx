@@ -52,9 +52,18 @@ export function TerminalView({ active, focusRequested, label, targetId, ipc, rem
     if (!element) return;
     const term = new Terminal({
       allowProposedApi: false,
-      fontFamily: '"Cascadia Mono", "DejaVu Sans Mono", monospace',
+      fontFamily: '"Cascadia Mono", "D2Coding", "DejaVu Sans Mono", "Malgun Gothic", monospace',
       fontSize: 14,
-      theme: { background: "#12171b", foreground: "#e3e9e6", cursor: "#9cd9bf" },
+      lineHeight: 1.15,
+      // ui/tokens.css의 --bg-app·--text·--accent와 같은 색이다.
+      theme: {
+        background: "#0f1417", foreground: "#dbe4e0", cursor: "#5fd1a8", cursorAccent: "#0f1417",
+        selectionBackground: "#2f4a44",
+        black: "#1b2226", red: "#f07a6e", green: "#7fcf8f", yellow: "#e8b85c",
+        blue: "#6cb6ff", magenta: "#c792ea", cyan: "#5fd1c8", white: "#c9d3cf",
+        brightBlack: "#5d6b67", brightRed: "#ff9b90", brightGreen: "#a3e6b0", brightYellow: "#f5d08a",
+        brightBlue: "#94caff", brightMagenta: "#dcb1f5", brightCyan: "#8ce6df", brightWhite: "#f2f6f4",
+      },
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
