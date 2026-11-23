@@ -136,7 +136,8 @@ mod stored {
         ssh::{ApprovedHost, Endpoint, TRUST_DIRECTORY, TrustStore},
     };
 
-    use super::super::{APPROVAL_TTL, prepare_stored_bounded, prepare_stored_with, saved};
+    use super::super::{APPROVAL_TTL, DirectLaunch, SavedLaunch, prepare_stored_bounded, prepare_stored_with, saved};
+    use tokio_util::sync::CancellationToken;
 
     const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti";
     const SHA: &str = "SHA256:UCUiLr7Pjs9wFFJMDByLgc3NrtdU344OgUM45wZPcIQ";
@@ -159,6 +160,13 @@ mod stored {
         }))
         .unwrap();
         (directory, ssh, endpoint)
+    }
+
+    fn ready(launch: SavedLaunch) -> DirectLaunch {
+        match launch {
+            SavedLaunch::Ready(launch) => launch,
+            SavedLaunch::Forward(_) => panic!("직접 SSH 저장 암호는 바로 실행을 준비합니다"),
+        }
     }
 
     fn vault(directory: &Path) -> Bitwarden {
@@ -188,6 +196,43 @@ mod stored {
         assert!(shown.contains(ITEM), "{shown}");
         assert!(shown.contains("deploy") && shown.contains(SHA), "{shown}");
         assert!(shown.contains("[dev.example.invalid]:2222"), "{shown}");
+        assert!(!shown.contains("전송:"), "{shown}");
+    }
+
+    #[test]
+    fn stored_password_over_ssm_confirms_before_opening_the_forward() {
+        let (directory, mut ssh, endpoint) = target();
+        ssh.transport = serde_json::from_value(json!({
+            "kind": "ssm", "profile": "dev-sso", "region": "ap-northeast-2", "instanceId": "i-0123456789abcdef0",
+        })).unwrap();
+        for approve in [false, true] {
+            let vault = vault(directory.path());
+            let mut shown = String::new();
+            let result = prepare_stored_with(directory.path(), &ssh, &endpoint, ITEM, "main", 1, Ok(vault), |message| {
+                shown = message;
+                Ok(approve)
+            });
+            for field in [ITEM, "deploy", SHA, "[dev.example.invalid]:2222", "\n전송: SSM · dev-sso · ap-northeast-2 · i-0123456789abcdef0\n"] {
+                assert!(shown.contains(field), "{shown}");
+            }
+            // 승인 전에는 전달을 열지 않고, 승인 뒤에도 탭이 토큰으로 준비하도록 미룬다.
+            match result {
+                Err(error) => assert!(!approve && error == "저장된 SSH 암호 승인이 취소되었습니다", "{error}"),
+                Ok(launch) => assert!(approve && matches!(launch, SavedLaunch::Forward(_))),
+            }
+        }
+    }
+
+    #[test]
+    fn manual_fallback_over_ssm_defers_the_forward() {
+        let (directory, mut ssh, endpoint) = target();
+        ssh.transport = serde_json::from_value(json!({
+            "kind": "ssm", "profile": "dev-sso", "region": "ap-northeast-2", "instanceId": "i-0123456789abcdef0",
+        })).unwrap();
+        let launch = prepare_stored_with(directory.path(), &ssh, &endpoint, ITEM, "main", 1, Err(Error::VaultUnavailable), |_| {
+            panic!("금고 없이 승인 창을 열었습니다")
+        });
+        assert!(matches!(launch, Ok(SavedLaunch::Forward(_))));
     }
 
     #[test]
@@ -195,11 +240,11 @@ mod stored {
         let (directory, ssh, endpoint) = target();
         let vault = vault(directory.path());
         std::fs::write(directory.path().join("mode"), "locked").unwrap();
-        let launch = prepare_stored_with(directory.path(), &ssh, &endpoint, ITEM, "main", 1, Ok(vault), |_| {
+        let launch = ready(prepare_stored_with(directory.path(), &ssh, &endpoint, ITEM, "main", 1, Ok(vault), |_| {
             panic!("잠긴 금고에서 승인 창을 열었습니다")
         })
         .ok()
-        .unwrap();
+        .unwrap());
         assert!(launch.plan.stored().is_none());
         assert!(launch.notice().unwrap().contains("Bitwarden 금고가 잠겨 있습니다"));
         assert_eq!(launch.command.get_env("SSH_ASKPASS"), None);
@@ -208,11 +253,11 @@ mod stored {
     #[test]
     fn missing_vault_falls_back_with_reason() {
         let (directory, ssh, endpoint) = target();
-        let launch = prepare_stored_with(directory.path(), &ssh, &endpoint, ITEM, "main", 1, Err(Error::VaultUnavailable), |_| {
+        let launch = ready(prepare_stored_with(directory.path(), &ssh, &endpoint, ITEM, "main", 1, Err(Error::VaultUnavailable), |_| {
             panic!("금고 없이 승인 창을 열었습니다")
         })
         .ok()
-        .unwrap();
+        .unwrap());
         assert!(launch.notice().unwrap().contains("Bitwarden CLI를 찾을 수 없습니다"));
     }
 
@@ -220,9 +265,9 @@ mod stored {
     fn stored_approval_is_consumed_once() {
         let (directory, ssh, endpoint) = target();
         let vault = vault(directory.path());
-        let mut launch = prepare_stored_with(directory.path(), &ssh, &endpoint, ITEM, "main", 1, Ok(vault), |_| Ok(true))
+        let mut launch = ready(prepare_stored_with(directory.path(), &ssh, &endpoint, ITEM, "main", 1, Ok(vault), |_| Ok(true))
             .ok()
-            .unwrap();
+            .unwrap());
         assert!(launch.stored.take().is_some());
         assert!(launch.stored.take().is_none());
     }
@@ -230,7 +275,7 @@ mod stored {
     #[test]
     fn noninteractive_paths_still_refuse_stored_password() {
         let (directory, ssh, _) = target();
-        assert_eq!(saved(directory.path(), &ssh).err().unwrap(), "저장된 SSH 암호를 사용할 수 없습니다");
+        assert_eq!(saved(directory.path(), &ssh, &CancellationToken::new()).err().unwrap(), "저장된 SSH 암호를 사용할 수 없습니다");
     }
 
     #[test]
@@ -246,7 +291,7 @@ mod stored {
                 Ok(true)
             },
         ).ok().unwrap();
-        let mut launch = launch;
+        let mut launch = ready(launch);
         assert!(launch.stored.take().is_some());
     }
 

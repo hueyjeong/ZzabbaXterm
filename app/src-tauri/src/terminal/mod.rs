@@ -421,7 +421,7 @@ impl Sessions {
 
     fn register_document(&self, owner: &str, document: u64, command: &Launch, remote_editor: bool) -> Result<(String, Arc<Session>), String> {
         let id = self.next_id();
-        let mut session = Session::new(owner, command.defers_start());
+        let mut session = Session::for_launch(owner, command);
         session.document = Some(document);
         let session = Arc::new(session);
         {
@@ -449,7 +449,7 @@ impl Sessions {
         let result = session.launch(size, command, send, move |session| {
             let mut registry = registry.lock().unwrap();
             let result = session.close_result();
-            if (session.is_ssm() || ssh && result.local != LocalClose::NotStarted) && !registry.shutdown
+            if (session.defers_start() || ssh && result.local != LocalClose::NotStarted) && !registry.shutdown
                 && registry.documents.get(&session.owner).copied().unwrap_or(0) == document
             {
                 let retired = if result.warning().is_some() {

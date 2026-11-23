@@ -132,9 +132,15 @@ fn f01_ssm_transport_connects_to_the_forward_port_under_the_original_host_key_al
         assert!(forwarded.lines().any(|line| line == *option), "{option}");
     }
     assert!(!forwarded.lines().any(|line| line == "HostName dev.example.invalid" || line == "Port 2222"));
-    // 접속 주소만 바뀌고 나머지 설정과 PIN 기록은 직접 전송과 같다.
+    // SSM 유휴 제한을 넘기도록 SSM 전송에만 keepalive를 둔다.
+    for option in ["ServerAliveInterval 60", "ServerAliveCountMax 3"] {
+        assert!(forwarded.lines().any(|line| line == option), "{option}");
+    }
+    assert!(!direct_config.contains("ServerAlive"));
+    // 접속 주소와 keepalive만 바뀌고 나머지 설정과 PIN 기록은 직접 전송과 같다.
     let normalize = |text: &str| text.lines().filter(|line| !line.starts_with("HostName ") && !line.starts_with("Port ")
-        && !line.starts_with("UserKnownHostsFile ") && !line.starts_with("IdentityFile ") && !line.starts_with("CertificateFile "))
+        && !line.starts_with("UserKnownHostsFile ") && !line.starts_with("IdentityFile ") && !line.starts_with("CertificateFile ")
+        && !line.starts_with("ServerAlive"))
         .collect::<Vec<_>>().join("\n");
     assert_eq!(normalize(&forwarded), normalize(&direct_config));
     let pin = forwarded.lines().find_map(|line| line.strip_prefix("UserKnownHostsFile ")).unwrap();

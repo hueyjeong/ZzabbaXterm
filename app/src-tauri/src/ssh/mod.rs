@@ -207,6 +207,10 @@ impl ConnectionPlan {
         if let Some(agent) = agent {
             writeln!(output, "IdentityAgent {agent}")?;
         }
+        // SSM 세션은 입력이 없으면 유휴 제한으로 끊기므로 ssh 수준 keepalive를 보낸다.
+        if forward.is_some() {
+            writeln!(output, "ServerAliveInterval 60\nServerAliveCountMax 3")?;
+        }
         if stored_item.is_some() {
             writeln!(output, "NumberOfPasswordPrompts 1")?;
         }

@@ -298,6 +298,15 @@ fn ssh_forward_retries_a_new_free_port_only_after_a_bind_conflict() {
     }).err().unwrap();
     assert_eq!(attempts, BIND_ATTEMPTS);
     assert!(error.starts_with("로컬 수신 주소 사용 중: 127.0.0.1:"), "{error}");
+
+    // 재시도는 자식이 기록한 bind 충돌로만 정한다. 다른 실패가 같은 문구여도 다시 시도하지 않는다.
+    let mut attempts = 0;
+    let error = ready_on_free_port(&cancel, || Ok(free_port()), |listen| {
+        attempts += 1;
+        fixture_child("cli", listen, None, Err(&OutputFault::BindConflict.message(listen)), None)
+    }).err().unwrap();
+    assert_eq!(attempts, 1);
+    assert!(error.starts_with("로컬 수신 주소 사용 중: 127.0.0.1:"), "{error}");
 }
 
 #[test]

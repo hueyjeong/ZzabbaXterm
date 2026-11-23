@@ -166,18 +166,23 @@ fn ready_on_free_port(
     let mut conflict = None;
     for _ in 0..BIND_ATTEMPTS {
         let listen = pick().map_err(|error| format!("SSM 수신 포트 선택: {error}"))?;
-        let ready = start(listen).and_then(|mut child| loop {
-            if cancel.is_cancelled() { return Err("SSM 포트 전달이 취소되었습니다".into()); }
-            match child.observe() {
-                Observation::Listening => return Ok(child),
-                Observation::Pending => thread::sleep(Duration::from_millis(50)),
-                Observation::Ended(reason) => return Err(reason),
-            }
-        });
+        // 재시도는 실패 사유 문자열이 아니라 bind 충돌 여부로 정한다.
+        let ready = match start(listen) {
+            // 자식을 띄우기 전 실패는 그 포트를 다른 프로그램이 잡았을 때만 충돌로 본다.
+            Err(error) => Err((error, super::ssh::local_conflict(Listener::Local(listen)))),
+            Ok(mut child) => loop {
+                if cancel.is_cancelled() { break Err(("SSM 포트 전달이 취소되었습니다".into(), false)); }
+                match child.observe() {
+                    Observation::Listening => break Ok(child),
+                    Observation::Pending => thread::sleep(Duration::from_millis(50)),
+                    Observation::Ended(reason) => break Err((reason, child.bind_conflicted())),
+                }
+            },
+        };
         match ready {
             Ok(child) => return Ok((listen.port(), child)),
-            Err(error) if error == OutputFault::BindConflict.message(listen) => conflict = Some(error),
-            Err(error) => return Err(error),
+            Err((error, true)) => conflict = Some(error),
+            Err((error, false)) => return Err(error),
         }
     }
     Err(conflict.unwrap_or_default())
@@ -191,6 +196,8 @@ struct Progress {
     bound: Option<(u16, String)>,
     verified: Option<String>,
     failure: Option<String>,
+    // `failure`가 수신 주소 bind 충돌이다.
+    bind_conflict: bool,
     stdout_closed: bool,
     stderr_closed: bool,
     stderr: Vec<u8>,
@@ -312,8 +319,13 @@ impl SsmChild {
         }
     }
 
+    /// 기록된 실패가 수신 주소 bind 충돌이면 참이다.
+    fn bind_conflicted(&self) -> bool {
+        self.progress.lock().unwrap().bind_conflict
+    }
+
     fn start_failure(&self, status: &str) -> String {
-        let progress = self.progress.lock().unwrap();
+        let mut progress = self.progress.lock().unwrap();
         if let Some(failure) = &progress.failure {
             return failure.clone();
         }
@@ -321,7 +333,8 @@ impl SsmChild {
             return reason;
         }
         if bind_conflict(&String::from_utf8_lossy(&progress.stderr)) || super::ssh::local_conflict(Listener::Local(self.listen)) {
-            return ended(observe_ssm(self.listen, Event::Ended(Failure::BindConflict), None));
+            progress.bind_conflict = true;
+            return OutputFault::BindConflict.message(self.listen);
         }
         format!("SSM 포트 전달 시작 실패: {status}")
     }
@@ -437,6 +450,9 @@ fn read_stdout(stdout: impl Read, listen: SocketAddr, progress: &Arc<Mutex<Progr
                 }
             }
             Err(fault) => {
+                if state.failure.is_none() {
+                    state.bind_conflict = fault == OutputFault::BindConflict;
+                }
                 state.failure.get_or_insert(fault.message(listen));
                 // 실패를 기록한 뒤에도 자식이 쓰기에서 막히지 않도록 끝까지 비운다.
                 drop(state);

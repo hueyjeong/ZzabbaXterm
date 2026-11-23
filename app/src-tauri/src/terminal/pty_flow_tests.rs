@@ -427,18 +427,51 @@ fn f01_ssm_ssh_forward_finished_after_close_never_starts_ssh() {
 
 #[test]
 fn f01_ssm_ssh_forward_failure_reaches_the_tab() {
-    let config = tempfile::tempdir().unwrap();
-    let marker = config.path().join("ssh started");
-    let expected = super::remote::start_error(crate::ssm::CliError::SsoLoginRequired);
-    assert_eq!(expected, "SSM: SSO 재로그인 필요");
-    let failure = expected.clone();
-    let launch = forward_launch(config.path(), &marker, move |_| Err(failure));
-    let sessions = Sessions::default();
-    let mut pty = open_forward(&sessions, launch);
-    assert_eq!(sessions.start("main", &pty.id), Err(expected));
-    assert!(matches!(pty.next(Instant::now() + TIMEOUT), Event::Connecting));
-    assert!(!marker.exists());
-    assert!(sessions.close("main", &pty.id).unwrap().warning().is_none());
+    bounded(|| {
+        let config = tempfile::tempdir().unwrap();
+        let marker = config.path().join("ssh started");
+        let expected = super::remote::start_error(crate::ssm::CliError::SsoLoginRequired);
+        assert_eq!(expected, "SSM: SSO 재로그인 필요");
+        let failure = expected.clone();
+        let launch = forward_launch(config.path(), &marker, move |_| Err(failure));
+        let sessions = Sessions::default();
+        let mut pty = open_forward(&sessions, launch);
+        assert_eq!(sessions.start("main", &pty.id), Err(expected));
+        assert!(matches!(pty.next(Instant::now() + TIMEOUT), Event::Connecting));
+        assert!(!marker.exists());
+        assert!(sessions.close("main", &pty.id).unwrap().warning().is_none());
+    });
+}
+
+#[test]
+fn f01_ssm_ssh_editor_start_requested_first_is_sent_after_the_tab_attaches() {
+    use crate::ssh::tests::FakeForward;
+
+    bounded(|| {
+        let config = tempfile::tempdir().unwrap();
+        let marker = config.path().join("ssh started");
+        let (transport, _, _dropped) = FakeForward::transport(40022);
+        let (session_tx, session_rx) = mpsc::channel::<std::sync::Arc<super::process::Session>>();
+        let (started_tx, mut started_rx) = tokio::sync::oneshot::channel();
+        // 시작 요청이 먼저 오고, 전달 준비 뒤에 편집기 시작 신호 자리가 생긴다.
+        let launch = forward_launch(config.path(), &marker, move |_| {
+            session_rx.recv().unwrap().arm_editor_start(started_tx);
+            Ok(transport)
+        });
+        let sessions = Sessions::default();
+        let mut pty = open_forward(&sessions, launch);
+        session_tx.send(sessions.get("main", &pty.id).unwrap()).unwrap();
+        sessions.start("main", &pty.id).unwrap();
+        assert!(matches!(pty.next(Instant::now() + TIMEOUT), Event::Connecting));
+        assert_eq!(started_rx.try_recv(), Ok(()), "연결 뒤 편집기 시작 신호를 보내지 않았습니다");
+        #[cfg(windows)]
+        {
+            pty.until_bytes(b"\x1b[6n", 0, false);
+            pty.input(b"\x1b[1;1R");
+        }
+        pty.until_bytes(b"SSM-FIXTURE-READY", 0, true);
+        assert!(sessions.close("main", &pty.id).unwrap().warning().is_none());
+    });
 }
 
 fn load(sessions: &Sessions) -> Pty<'_> {
