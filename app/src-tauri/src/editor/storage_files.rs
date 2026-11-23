@@ -58,6 +58,7 @@ pub(crate) fn open_upload(path: &Path) -> io::Result<File> {
 
 fn upload_at(location: &Location) -> io::Result<File> {
     let file = location.open_file()?.ok_or(io::ErrorKind::NotFound)?;
+    check_local_data(&file)?;
     location.check_file(&os::file_id(&file)?)?;
     Ok(file)
 }
@@ -74,6 +75,7 @@ impl DownloadTarget {
 
     fn at(location: Location) -> io::Result<Self> {
         let original = if let Some(mut file) = location.open_file()? {
+            check_local_data(&file)?;
             let version = version(&mut file)?;
             location.check_file(&version.id)?;
             Some((file, version))
@@ -110,14 +112,19 @@ impl DownloadStage<'_> {
         }
         self.temp.file().sync_all()?;
         if version(self.temp.file())?.digest != digest { return Err(changed().into()); }
-        // 내려받은 파일은 인터넷 영역으로 표시한다. 표시 실패는 다운로드 실패로 만들지 않는다.
+        // 내려받은 파일은 인터넷 영역으로 표시한다. 표시 실패는 다운로드 실패로 만들지 않지만,
+        // 교체할 원본에 표시가 있었으면(또는 확인할 수 없으면) 표시 없는 파일로 바꾸지 않는다.
         #[cfg(windows)]
         if let Err(error) = self.temp.mark_internet() {
+            if self.target.original.as_ref().is_some_and(|(original, _)| !matches!(os::read_zone(original), Ok(None))) {
+                return Err(error.into());
+            }
             eprintln!("S3 다운로드 영역 표시 실패: {error}");
         }
         target.check_parent()?;
         let replacement = if let Some((original, selected)) = &self.target.original {
             let mut current = target.open_file()?.ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+            check_local_data(&current)?;
             let access = os::Access::read(original)?;
             if !access.matches(self.temp.file())? { return Err(changed().into()); }
             let verify = move |file: &mut File| {
@@ -251,10 +258,18 @@ fn offline(metadata: &fs::Metadata) -> bool {
     }
 }
 
+fn cloud_only() -> io::Error { io::Error::new(io::ErrorKind::Unsupported, CloudOnly) }
+
+/// 연 핸들의 속성(GetFileInformationByHandle)으로 데이터가 로컬에 있는지 다시 확인한다. 데이터를 읽기 전에 부른다.
+pub(crate) fn check_local_data(file: &File) -> io::Result<()> {
+    if offline(&file.metadata()?) { return Err(cloud_only()); }
+    Ok(())
+}
+
 /// 이름이 클라우드 전용 파일이면 거부한다. 없거나 읽을 수 없으면 이후 열기 검사에 맡긴다.
 fn reject_offline(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_file() && offline(&metadata) => Err(io::Error::new(io::ErrorKind::Unsupported, CloudOnly)),
+        Ok(metadata) if metadata.is_file() && offline(&metadata) => Err(cloud_only()),
         _ => Ok(()),
     }
 }
@@ -399,6 +414,44 @@ fn changed() -> io::Error { io::Error::new(io::ErrorKind::AlreadyExists, "select
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[cfg(windows)]
+    #[test]
+    fn editor_save_keeps_zone_identifier_and_rejects_other_streams() {
+        let stream = |path: &Path, name: &str| {
+            let mut stream = path.as_os_str().to_owned();
+            stream.push(name);
+            PathBuf::from(stream)
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let zone = b"[ZoneTransfer]\r\nZoneId=3\r\nReferrerUrl=about:internet\r\n";
+
+        // 내려받은 파일을 편집기로 저장해도 같은 영역 표시가 남는다.
+        let path = dir.path().join("받은 파일.txt");
+        fs::write(&path, b"old").unwrap();
+        fs::write(stream(&path, ":Zone.Identifier"), zone).unwrap();
+        let (mut editor, _) = super::super::LocalFile::open(&path).unwrap();
+        editor.save("new").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        assert_eq!(fs::read(stream(&path, ":Zone.Identifier")).unwrap(), zone);
+        editor.save("again").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"again");
+        assert_eq!(fs::read(stream(&path, ":Zone.Identifier")).unwrap(), zone);
+
+        // 다른 스트림이 있거나 영역 표시가 상한을 넘으면 저장하지 않는다.
+        for (name, extra) in [("other.txt", ":other"), ("large.txt", ":Zone.Identifier")] {
+            let path = dir.path().join(name);
+            fs::write(&path, b"old").unwrap();
+            fs::write(stream(&path, ":Zone.Identifier"), zone).unwrap();
+            let content = if extra == ":other" { b"other".to_vec() } else { vec![b'z'; 4097] };
+            fs::write(stream(&path, extra), &content).unwrap();
+            if let Ok((mut editor, _)) = super::super::LocalFile::open(&path) {
+                assert!(editor.save("new").is_err(), "{name}");
+            }
+            assert_eq!(fs::read(&path).unwrap(), b"old", "{name}");
+            assert_eq!(fs::read(stream(&path, extra)).unwrap(), content, "{name}");
+        }
+    }
 
     #[cfg(windows)]
     #[test]

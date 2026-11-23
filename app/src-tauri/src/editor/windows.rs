@@ -229,12 +229,10 @@ impl Directory {
         };
         let metadata = file.metadata()?;
         let attributes = metadata.file_attributes();
-        // 클라우드 자리 표시자는 데이터가 로컬에 있을 때만(회수 표시 없음) 일반 파일로 쓴다.
-        let local_cloud = self.cloud
-            && attributes & (FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_RECALL_ON_OPEN) == 0
-            && is_cloud_tag(reparse_tag(&file)?);
+        // 스토리지는 클라우드 자리 표시자 파일 핸들을 받아 데이터를 읽기 전에 회수 표시를 직접 확인한다.
+        let cloud = self.cloud && is_cloud_tag(reparse_tag(&file)?);
         Ok(
-            (metadata.is_file() && (attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 || local_cloud))
+            (metadata.is_file() && (attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 || cloud))
                 .then_some(file),
         )
     }
@@ -386,22 +384,15 @@ impl Access {
         Ok(access)
     }
 
+    /// 기본 스트림 외에는 `Zone.Identifier` 스트림 하나만 허용한다. 편집기 저장은 그 내용을 새 파일에 옮기고,
+    /// 다운로드 교체는 새 파일에 인터넷 영역 표시를 새로 기록한다.
     pub(super) fn read_editor(file: &File) -> io::Result<Self> {
-        Self::read_preserved(file, false)
-    }
-
-    pub(super) fn matches_editor(&self, file: &File) -> io::Result<bool> {
-        self.matches_preserved(file, false)
-    }
-
-    /// zone이면 다운로드 교체에서 원본의 `Zone.Identifier` 스트림 하나는 버려도 된다.
-    fn read_preserved(file: &File, zone: bool) -> io::Result<Self> {
-        check_auxiliary_data(file, zone)?;
+        check_auxiliary_data(file, true)?;
         Self::read(file)
     }
 
-    fn matches_preserved(&self, file: &File, zone: bool) -> io::Result<bool> {
-        check_auxiliary_data(file, zone)?;
+    pub(super) fn matches_editor(&self, file: &File) -> io::Result<bool> {
+        check_auxiliary_data(file, true)?;
         self.matches(file)
     }
 
@@ -578,6 +569,26 @@ fn reopen(file: &File, access: u32, share: u32) -> io::Result<File> {
 }
 
 /// 인터넷 영역(ZoneId=3)이다. HostUrl은 S3 주소를 남기지 않도록 `about:internet`으로 둔다.
+const ZONE_STREAM: &str = ":Zone.Identifier";
+/// 편집기 저장이 옮기는 `Zone.Identifier` 스트림의 최대 크기다.
+pub(super) const ZONE_LIMIT: usize = 4096;
+
+/// 파일의 `Zone.Identifier` 스트림을 읽는다. 없으면 None, 상한을 넘으면 오류다.
+pub(super) fn read_zone(file: &File) -> io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034_u32 as i32;
+    let stream = match Directory::open_at(file, OsStr::new(ZONE_STREAM), FILE_OPEN, GENERIC_READ, null(), false) {
+        Err(STATUS_OBJECT_NAME_NOT_FOUND) => return Ok(None),
+        result => result.map_err(nt_error)?,
+    };
+    let mut content = Vec::new();
+    stream.take(ZONE_LIMIT as u64 + 1).read_to_end(&mut content)?;
+    if content.len() > ZONE_LIMIT {
+        return Err(io::Error::new(io::ErrorKind::Unsupported, "zone identifier stream is too large"));
+    }
+    Ok(Some(content))
+}
+
 pub(super) const ZONE_IDENTIFIER: &[u8] = b"[ZoneTransfer]\r\nZoneId=3\r\nHostUrl=about:internet\r\n";
 
 pub(super) struct Temporary<'a> {
@@ -597,13 +608,17 @@ struct Rename {
 impl Temporary<'_> {
     /// 게시 전 임시 파일에 인터넷 영역 표시(Mark of the Web)를 기록한다. 이름을 바꿔도 스트림은 파일과 함께 간다.
     pub(super) fn mark_internet(&mut self) -> io::Result<()> {
+        self.write_zone(ZONE_IDENTIFIER)
+    }
+
+    /// 임시 파일의 `Zone.Identifier` 스트림을 content로 기록하고 디스크에 반영한다.
+    pub(super) fn write_zone(&mut self, content: &[u8]) -> io::Result<()> {
         use std::io::Write;
-        let stream = Directory::open_at(
-            self.file(), OsStr::new(":Zone.Identifier"), FILE_OVERWRITE_IF, GENERIC_WRITE, null(), false,
+        let mut stream = Directory::open_at(
+            self.file(), OsStr::new(ZONE_STREAM), FILE_OVERWRITE_IF, GENERIC_WRITE, null(), false,
         ).map_err(nt_error)?;
-        let mut stream = stream;
-        stream.write_all(ZONE_IDENTIFIER)?;
-        stream.flush()
+        stream.write_all(content)?;
+        stream.sync_all()
     }
 
     pub(super) fn file(&mut self) -> &mut File {
@@ -634,7 +649,6 @@ impl Temporary<'_> {
         self.publish_existing(
             name,
             expected,
-            false,
             |file| verify(file),
             after_backup,
             |published| {
@@ -661,14 +675,13 @@ impl Temporary<'_> {
         verify: impl FnOnce(&mut File) -> io::Result<()>,
         after_backup: impl FnOnce(),
     ) -> Result<(), PublicationError> {
-        self.publish_existing(name, current, true, verify, after_backup, Ok).map(drop)
+        self.publish_existing(name, current, verify, after_backup, Ok).map(drop)
     }
 
     fn publish_existing(
         mut self,
         name: &OsStr,
         current: &File,
-        zone: bool,
         verify: impl FnOnce(&mut File) -> io::Result<()>,
         after_backup: impl FnOnce(),
         retain: impl FnOnce(File) -> io::Result<File>,
@@ -681,14 +694,14 @@ impl Temporary<'_> {
         if file_id(&original)? != original_id {
             return Err(io::Error::from(io::ErrorKind::AlreadyExists).into());
         }
-        let access = Access::read_preserved(&original, zone)?;
+        let access = Access::read_editor(&original)?;
         let staged_id = file_id(self.file())?;
         verify(&mut original)?;
         if directory.entry_id(name)? != Some(original_id) {
             return Err(io::Error::from(io::ErrorKind::AlreadyExists).into());
         }
         access.finish_staging(self.file())?;
-        if !directory.still_at_path()? || !access.matches_preserved(&original, zone)? {
+        if !directory.still_at_path()? || !access.matches_editor(&original)? {
             return Err(io::Error::from(io::ErrorKind::AlreadyExists).into());
         }
 
@@ -706,7 +719,7 @@ impl Temporary<'_> {
         };
         after_backup();
         if directory.entry_id(&backup).ok() != Some(Some(original_id))
-            || !matches!(access.matches_preserved(&original, zone), Ok(true))
+            || !matches!(access.matches_editor(&original), Ok(true))
             || !matches!(directory.still_at_path(), Ok(true))
         {
             return Err(unconfirmed());
@@ -717,7 +730,7 @@ impl Temporary<'_> {
         let published = retain(published).map_err(|_| unconfirmed())?;
         if access.finish_staging(&published).is_err()
             || file_id(&published).ok() != Some(staged_id)
-            || !matches!(access.matches_preserved(&original, zone), Ok(true))
+            || !matches!(access.matches_editor(&original), Ok(true))
             || directory.entry_id(name).ok() != Some(Some(staged_id))
             || directory.entry_id(&backup).ok() != Some(Some(original_id))
             || !matches!(directory.still_at_path(), Ok(true))
@@ -835,6 +848,52 @@ mod tests {
     use windows_sys::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
     };
+
+    #[test]
+    fn auxiliary_data_allows_only_the_zone_identifier_stream() {
+        use std::fs;
+
+        let sandbox = tempfile::tempdir().unwrap();
+        let path = sandbox.path().join("target.txt");
+        let stream = |name: &str| {
+            let mut stream = path.as_os_str().to_owned();
+            stream.push(name);
+            PathBuf::from(stream)
+        };
+        fs::write(&path, b"original").unwrap();
+        let open = || File::open(&path).unwrap();
+        check_auxiliary_data(&open(), true).unwrap();
+        fs::write(stream(":Zone.Identifier"), ZONE_IDENTIFIER).unwrap();
+        check_auxiliary_data(&open(), true).unwrap();
+        assert_eq!(read_zone(&open()).unwrap().as_deref(), Some(ZONE_IDENTIFIER));
+        fs::write(stream(":other"), b"other").unwrap();
+        assert!(check_auxiliary_data(&open(), true).is_err());
+        fs::remove_file(stream(":Zone.Identifier")).unwrap();
+        assert!(check_auxiliary_data(&open(), true).is_err());
+        fs::remove_file(stream(":other")).unwrap();
+        check_auxiliary_data(&open(), true).unwrap();
+        assert_eq!(read_zone(&open()).unwrap(), None);
+
+        #[repr(align(4))]
+        struct EaRecord([u8; 17]);
+        // FILE_FULL_EA_INFORMATION: 다음 항목 없음, 이름 X, 값 outside.
+        let ea = EaRecord(*b"\0\0\0\0\0\x01\x07\0X\0outside");
+        let file = reopen(&open(), FILE_WRITE_EA, SHARE).unwrap();
+        // SAFETY: 동기 파일 핸들과 EA 레코드가 호출 동안 유효하다.
+        let status = unsafe {
+            NtSetEaFile(file.as_raw_handle(), &mut IO_STATUS_BLOCK::default(), ea.0.as_ptr().cast(), ea.0.len() as u32)
+        };
+        assert_eq!(status, 0, "{}", nt_error(status));
+        fs::write(stream(":Zone.Identifier"), ZONE_IDENTIFIER).unwrap();
+        assert!(check_auxiliary_data(&open(), true).is_err());
+
+        let large = sandbox.path().join("large.txt");
+        fs::write(&large, b"a").unwrap();
+        let mut large_stream = large.as_os_str().to_owned();
+        large_stream.push(":Zone.Identifier");
+        fs::write(large_stream, vec![b'z'; ZONE_LIMIT + 1]).unwrap();
+        assert!(read_zone(&File::open(&large).unwrap()).is_err());
+    }
 
     #[test]
     fn cli_rejects_directory_reparse_points_in_the_parent_path() {

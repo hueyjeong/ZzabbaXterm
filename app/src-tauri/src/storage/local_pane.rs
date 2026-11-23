@@ -126,6 +126,13 @@ impl From<LocalFileApproval> for SelectResult {
     }
 }
 
+/// HeadObject 결과다. Unverifiable은 AWS 탭의 403이다.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Head {
+    Known(ObjectHead),
+    Unverifiable,
+}
+
 /// Windows의 `\\?\` 접두어를 뺀 표시용 경로다.
 fn label(root: &LocalRoot) -> String {
     let path = root.path().to_string_lossy();
@@ -250,7 +257,8 @@ impl StorageIpc {
     }
 
     /// 업로드 전에 같은 키의 객체와 ETag를 확인한다. 확인할 수 없으면 오류를 그대로 돌려준다.
-    pub(super) async fn object_head(&self, document: &Document, target: &Target) -> Result<ObjectHead, Error> {
+    /// AWS 탭의 403만 확인 불가로 돌려준다. 호환 서비스는 조건 헤더를 무시할 수 있어 403이면 업로드하지 않는다.
+    pub(super) async fn object_head(&self, document: &Document, target: &Target) -> Result<Head, Error> {
         let stage = Stage::HeadObject;
         let (client, closed) = {
             let mut registry = self.0.lock().unwrap();
@@ -260,8 +268,12 @@ impl StorageIpc {
         };
         let result = until_closed(&closed, stage, async {
             match &client {
-                TabClient::AwsSso(client) => client.in_region(&target.region, stage)?.object_head(&target.bucket, &target.key).await,
-                TabClient::Compatible(client) => client.object_head(&target.bucket, &target.key).await.map_err(|error| error.operation),
+                TabClient::AwsSso(client) => match client.in_region(&target.region, stage)?.object_head(&target.bucket, &target.key).await {
+                    Err(error) if matches!(error.failure, Failure::Service { status: 403, .. }) => Ok(Head::Unverifiable),
+                    result => result.map(Head::Known),
+                },
+                TabClient::Compatible(client) => client.object_head(&target.bucket, &target.key).await
+                    .map(Head::Known).map_err(|error| error.operation),
             }
         }).await;
         self.record_expiration(document, &target.session_id, &closed, &result);
@@ -332,18 +344,18 @@ impl StorageIpc {
         let mut condition = UploadCondition::None;
         let confirm_with = match &file {
             ApprovedFile::Upload(_) => match self.object_head(document, &checked).await {
-                Ok(ObjectHead::Absent) => {
+                Ok(Head::Known(ObjectHead::Absent)) => {
                     condition = UploadCondition::Absent;
                     None
                 }
-                Ok(ObjectHead::Present { etag }) => {
+                Ok(Head::Known(ObjectHead::Present { etag })) => {
                     condition = UploadCondition::Matches(etag);
                     Some(("S3 객체 교체", format!("{title}\n\n같은 키의 객체를 교체하시겠습니까?")))
                 }
-                // 업로드 전용 역할은 HeadObject가 거부될 수 있다. 확인하면 같은 키가 없을 때만 쓴다.
-                Err(error) if matches!(error.failure, Failure::Service { status: 403, .. }) => {
+                // AWS 업로드 전용 역할은 HeadObject가 거부될 수 있다. 확인하면 같은 키가 없을 때만 쓴다.
+                Ok(Head::Unverifiable) => {
                     condition = UploadCondition::Absent;
-                    Some(("S3 객체 확인 불가", title.clone()))
+                    Some(("S3 객체 확인 불가", format!("{title}\n\n같은 키가 없을 때만 업로드하시겠습니까?")))
                 }
                 Err(error) => {
                     self.finish_selection(document, &session_id, id, None);
@@ -368,15 +380,7 @@ impl StorageIpc {
         if let Some((dialog, prompt)) = confirm_with && !confirm(dialog, prompt, closed).await {
             return self.finish_selection(document, &session_id, id, None).into();
         }
-        self.set_upload_condition(document, &session_id, &id, condition);
-        self.finish_selection(document, &session_id, id, Some(Ok(file))).into()
-    }
-
-    fn set_upload_condition(&self, document: &Document, session_id: &str, id: &str, condition: UploadCondition) {
-        let mut registry = self.0.lock().unwrap();
-        if let Some(selection) = registry.tab(document, session_id).and_then(|tab| tab.selection.as_mut()).filter(|selection| selection.id == id) {
-            selection.condition = condition;
-        }
+        self.finish_selection_with(document, &session_id, id, Some(Ok(file)), condition).into()
     }
 }
 

@@ -102,6 +102,8 @@ pub(crate) enum Failure {
     Length { expected: Option<u64> },
     /// 조건부 PUT의 412(또는 동시 조건부 쓰기 409)다. 승인한 뒤 다른 곳에서 객체가 바뀌었다.
     PreconditionFailed,
+    /// `If-None-Match: *`로 보낸 PUT의 412다. 같은 키의 객체가 이미 있다.
+    AlreadyExists,
 }
 
 /// 업로드 PUT에 붙이는 조건이다. 대화상자 업로드는 조건 없이 보낸다.
@@ -424,13 +426,15 @@ impl<C: std::borrow::Borrow<Client>> S3Operations<C> {
             .send()
             .await
             .map_err(|err| {
-                let conflict = err.raw_response().map(|response| response.status().as_u16()).is_some_and(|status| {
-                    status == 412 || (status == 409 && err.as_service_error().and_then(ProvideErrorMetadata::code) == Some("ConditionalRequestConflict"))
-                });
-                if conflict && *condition != UploadCondition::None {
-                    Error::at(Stage::PutObject, Failure::PreconditionFailed)
-                } else {
-                    self.sdk_error(Stage::PutObject, err)
+                let status = err.raw_response().map(|response| response.status().as_u16());
+                let code = err.as_service_error().and_then(ProvideErrorMetadata::code);
+                match (condition, status) {
+                    (UploadCondition::Absent, Some(412)) => Error::at(Stage::PutObject, Failure::AlreadyExists),
+                    // 확인한 객체가 바뀌었거나(412) 지워졌거나(404) 동시 조건부 쓰기와 겹쳤다(409).
+                    (UploadCondition::Matches(_), Some(412 | 404)) => Error::at(Stage::PutObject, Failure::PreconditionFailed),
+                    (UploadCondition::Absent | UploadCondition::Matches(_), Some(409)) if code == Some("ConditionalRequestConflict") =>
+                        Error::at(Stage::PutObject, Failure::PreconditionFailed),
+                    _ => self.sdk_error(Stage::PutObject, err),
                 }
             })?;
         Ok(bytes)
@@ -454,7 +458,8 @@ impl<C: std::borrow::Borrow<Client>> S3Operations<C> {
         match self.client.borrow().head_object().bucket(bucket).key(key)
             .customize().config_override(single_attempt()).send().await
         {
-            Ok(output) => output.e_tag.filter(|etag| !etag.is_empty())
+            // If-Match는 강한 ETag만 비교하므로 없거나 약한 ETag는 응답 오류로 본다.
+            Ok(output) => output.e_tag.filter(|etag| !etag.is_empty() && !etag.starts_with("W/"))
                 .map(|etag| ObjectHead::Present { etag })
                 .ok_or_else(|| Error::at(stage, Failure::InvalidResponse)),
             Err(error) if error.raw_response().is_some_and(|response| response.status().as_u16() == 404) => Ok(ObjectHead::Absent),

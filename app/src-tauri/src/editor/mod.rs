@@ -188,10 +188,17 @@ impl LocalFile {
             .map_err(lookup_error).map_err(save_read_error)?
             .ok_or(SaveError::Conflict(LocalConflict::NotRegular))?;
         let access = os::Access::read_editor(&initial).map_err(at(PreservePermissions))?;
+        // 내려받은 파일의 인터넷 영역 표시(Zone.Identifier)는 저장 뒤에도 같은 내용으로 남긴다.
+        #[cfg(windows)]
+        let zone = os::read_zone(&initial).map_err(at(PreservePermissions))?;
         drop(initial);
         let mut temp = self.parent.stage(Some(&access)).map_err(at(CreateTemporary))?;
         let bytes = buffer.as_bytes();
         temp.file().write_all(bytes).map_err(at(WriteTemporary))?;
+        #[cfg(windows)]
+        if let Some(zone) = &zone {
+            temp.write_zone(zone).map_err(at(PreservePermissions))?;
+        }
         access
             .finish_staging(temp.file())
             .map_err(at(PreservePermissions))?;
@@ -246,6 +253,10 @@ impl LocalFile {
                 || !access.matches_editor(original)?
             {
                 return Err(io::Error::other("original changed at publication"));
+            }
+            #[cfg(windows)]
+            if os::read_zone(original)? != zone {
+                return Err(io::Error::other("original zone identifier changed at publication"));
             }
             check_open_parent(&self.selected_parent, &self.parent, self.cli_path)
                 .map_err(|error| match error {

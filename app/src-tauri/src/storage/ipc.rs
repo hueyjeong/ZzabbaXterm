@@ -396,6 +396,18 @@ impl StorageIpc {
         id: String,
         selected: Option<Result<ApprovedFile, std::io::Error>>,
     ) -> LocalFileApproval {
+        self.finish_selection_with(document, session_id, id, selected, UploadCondition::None)
+    }
+
+    /// 승인한 파일과 업로드 PUT 조건을 같은 잠금 안에서 기록한다.
+    fn finish_selection_with(
+        &self,
+        document: &Document,
+        session_id: &str,
+        id: String,
+        selected: Option<Result<ApprovedFile, std::io::Error>>,
+        condition: UploadCondition,
+    ) -> LocalFileApproval {
         let mut registry = self.0.lock().unwrap();
         let Some(tab) = registry.tab(document, session_id) else {
             return LocalFileApproval::Denied;
@@ -410,6 +422,7 @@ impl StorageIpc {
         match selected {
             Some(Ok(file)) => {
                 selection.file = Some(file);
+                selection.condition = condition;
                 LocalFileApproval::Approved { approval_id: id }
             }
             Some(_) => {

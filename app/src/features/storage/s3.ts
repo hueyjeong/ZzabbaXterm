@@ -30,7 +30,7 @@ type Failure =
   | Readonly<{
     kind: "invalidSsoProfile" | "retestRequired" | "accountMismatch" | "invalidRegion" | "invalidBucket" | "invalidResponse" |
     "credentials" | "ssoLoginRequired" | "loginFailed" | "request" | "timedOut" | "bodyRead" | "checksum" | "destination" | "tls" |
-    "preconditionFailed"
+    "preconditionFailed" | "alreadyExists"
   }>
   | Readonly<{ kind: "bucketRegionMismatch"; region: string }>
   | Readonly<{ kind: "service"; status: number; code: string | null }>

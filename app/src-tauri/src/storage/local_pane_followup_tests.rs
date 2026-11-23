@@ -48,8 +48,8 @@ async fn storage_local_upload_puts_with_conditions_from_head_object() {
     // 승인 뒤 다른 곳에서 바뀌면 412를 덮어쓰지 않은 실제 오류로 돌려준다.
     let changed = || Error::at(Stage::PutObject, Failure::PreconditionFailed);
     assert_eq!(upload(state.select_local(&document, select(), answer(&prompts, true)).await).await, Err(changed()));
-    // 403: 확인할 수 없음을 묻고, 승인하면 If-None-Match로 보낸다. 412는 이미 있다는 뜻이다.
-    assert_eq!(upload(state.select_local(&document, select(), answer(&prompts, true)).await).await, Err(changed()));
+    // 403: 확인할 수 없음을 묻고, 승인하면 If-None-Match로 보낸다. 412는 같은 키의 객체가 이미 있다는 뜻이다.
+    assert_eq!(upload(state.select_local(&document, select(), answer(&prompts, true)).await).await, Err(Error::at(Stage::PutObject, Failure::AlreadyExists)));
     assert_eq!(state.select_local(&document, select(), answer(&prompts, false)).await, SelectResult::Cancelled);
     // 조건을 지원하지 않는 응답은 조건 없이 다시 보내지 않는다.
     let unsupported = upload(state.select_local(&document, select(), no_prompt).await).await.unwrap_err();

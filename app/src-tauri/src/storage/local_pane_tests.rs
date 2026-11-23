@@ -253,3 +253,6 @@ mod review;
 
 #[path = "local_pane_followup_tests.rs"]
 mod followup;
+
+#[path = "local_pane_review2_tests.rs"]
+mod review2;

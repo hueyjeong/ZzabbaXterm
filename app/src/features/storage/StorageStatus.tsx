@@ -40,7 +40,7 @@ const failures = {
   invalidResponse: "잘못된 서비스 응답", credentials: "SSO 자격 증명 오류", ssoLoginRequired: "같은 SSO 프로필로 다시 로그인 필요",
   request: "요청 실패", timedOut: "응답 시간 초과", loginFailed: "SSO 재로그인 실패", bodyRead: "본문 읽기 실패", checksum: "체크섬 검증 실패",
   destination: "승인한 HTTPS 주소 방식과 요청 주소가 다릅니다", tls: "HTTPS 인증서 검증 실패",
-  preconditionFailed: "다른 곳에서 객체가 바뀜",
+  preconditionFailed: "다른 곳에서 객체가 바뀜", alreadyExists: "같은 키의 객체 있음",
 };
 
 function describe(problem: Problem, compatible: boolean) {

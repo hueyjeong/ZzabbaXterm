@@ -260,6 +260,7 @@ export function FileBrowser({
       "aria-selected": isSelected,
       "aria-keyshortcuts": "Shift+F10",
       "data-kind": entry.kind,
+      "aria-description": entry.link ? "링크" : entry.offline ? "클라우드 전용" : undefined,
       "data-menu": menu?.entry === entry ? "" : undefined,
       title: entry.title ?? name,
       onClick: () => onSelect(entry),
