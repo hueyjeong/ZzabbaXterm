@@ -24,35 +24,36 @@ pub(crate) enum Relogin {
     LoggedIn,
 }
 
-/// 대상 ID별 진행 중인 로그인이다. 값은 요청 ID와 취소 토큰이다.
+/// 요청 ID별 진행 중인 로그인이다. 값은 잠금 키와 취소 토큰이다.
+/// 같은 AWS 프로필이나 같은 SSO 세션을 쓰는 대상은 한 번에 하나만 로그인한다.
 #[derive(Default)]
-pub(crate) struct TargetLogins(Mutex<HashMap<String, (String, CancellationToken)>>);
+pub(crate) struct TargetLogins(Mutex<HashMap<String, ([String; 2], CancellationToken)>>);
+
+/// 잠금 키는 AWS 프로필과 SSO 세션(없으면 시작 URL)이다.
+fn login_keys(scope: &Scope, config: &DirectSsoConfig) -> [String; 2] {
+    let sso = config.session.as_deref().map_or_else(|| format!("url:{}", config.start_url), |session| format!("session:{session}"));
+    [format!("profile:{}", scope.profile()), format!("sso:{sso}")]
+}
 
 impl TargetLogins {
-    fn begin(&self, target_id: &str, request_id: &str) -> Result<CancellationToken, String> {
+    fn begin(&self, keys: [String; 2], request_id: &str) -> Result<CancellationToken, String> {
         let mut logins = self.0.lock().unwrap();
-        if logins.contains_key(target_id) {
+        if logins.contains_key(request_id) || logins.values().any(|(held, _)| held.iter().any(|key| keys.contains(key))) {
             return Err(IN_PROGRESS.into());
         }
         let cancel = CancellationToken::new();
-        logins.insert(target_id.to_owned(), (request_id.to_owned(), cancel.clone()));
+        logins.insert(request_id.to_owned(), (keys, cancel.clone()));
         Ok(cancel)
     }
 
-    fn finish(&self, target_id: &str, request_id: &str) {
-        let mut logins = self.0.lock().unwrap();
-        if logins.get(target_id).is_some_and(|(id, _)| id == request_id) {
-            logins.remove(target_id);
-        }
+    fn finish(&self, request_id: &str) {
+        self.0.lock().unwrap().remove(request_id);
     }
 
     fn cancel(&self, request_id: &str) {
-        let mut logins = self.0.lock().unwrap();
-        logins.retain(|_, (id, cancel)| {
-            if id != request_id { return true; }
+        if let Some((_, cancel)) = self.0.lock().unwrap().remove(request_id) {
             cancel.cancel();
-            false
-        });
+        }
     }
 
     /// 기본 창의 문서가 바뀌거나 앱이 끝나면 모든 로그인을 취소한다.
@@ -114,13 +115,24 @@ impl Sso for Cli<'_> {
     }
 }
 
-async fn relogin_target(directory: &Path, target_id: &str, sso: &impl Sso) -> Result<Relogin, String> {
+/// 저장 대상에서 범위와 SSO 설정을 읽는다. 잠금 키도 이 값으로 정한다.
+fn resolve(directory: &Path, target_id: &str, sso: &impl Sso) -> Result<(Scope, DirectSsoConfig), String> {
     let scope = saved_scope(directory, target_id)?;
     let config = sso.config(&scope).map_err(message)?;
+    Ok((scope, config))
+}
+
+#[cfg(test)]
+async fn relogin_target(directory: &Path, target_id: &str, sso: &impl Sso) -> Result<Relogin, String> {
+    let (scope, config) = resolve(directory, target_id, sso)?;
+    relogin(&scope, &config, sso).await
+}
+
+async fn relogin(scope: &Scope, config: &DirectSsoConfig, sso: &impl Sso) -> Result<Relogin, String> {
     // 로그인 권한은 프런트의 오류 문자열이 아니라 이 확인 결과에서 발급한다.
-    match sso.check(&scope, &config).await {
+    match sso.check(scope, config).await {
         Ok(()) => Ok(Relogin::Valid),
-        Err(CliError::SsoLoginRequired) => sso.login(&scope, &config).await.map(|()| Relogin::LoggedIn).map_err(message),
+        Err(CliError::SsoLoginRequired) => sso.login(scope, config).await.map(|()| Relogin::LoggedIn).map_err(message),
         Err(error) => Err(message(error)),
     }
 }
@@ -144,14 +156,16 @@ pub(crate) async fn ssm_target_relogin(webview: Webview, target_id: String, requ
     }
     let directory = webview.path().app_config_dir().map_err(|error| format!("앱 설정 디렉터리: {error}"))?;
     let logins = webview.state::<TargetLogins>();
-    let cancel = logins.begin(&target_id, &request_id)?;
+    // 설정 읽기는 취소 토큰을 쓰지 않는다.
+    let (scope, config) = resolve(&directory, &target_id, &Cli(&CancellationToken::new()))?;
+    let cancel = logins.begin(login_keys(&scope, &config), &request_id)?;
     let cli = Cli(&cancel);
     let result = tokio::select! {
         biased;
         () = cancel.cancelled() => Err(CANCELLED.into()),
-        result = relogin_target(&directory, &target_id, &cli) => result,
+        result = relogin(&scope, &config, &cli) => result,
     };
-    logins.finish(&target_id, &request_id);
+    logins.finish(&request_id);
     result
 }
 
@@ -292,21 +306,33 @@ mod tests {
     }
 
     #[test]
-    fn one_login_per_target_and_cancel_by_request_id() {
+    fn one_login_per_profile_or_sso_session_and_cancel_by_request_id() {
+        let scope = |profile: &str| Scope::new(profile.into(), "us-west-2".into()).unwrap();
+        let session = |name: Option<&str>, url: &str| DirectSsoConfig {
+            session: name.map(Into::into), start_url: url.into(), ..config()
+        };
+        let a = "https://a.awsapps.com/start";
+        let b = "https://b.awsapps.com/start";
+        // 서로 다른 대상이라도 같은 프로필이면 같은 키다.
+        let shared = login_keys(&scope("dev"), &session(None, a));
         let logins = TargetLogins::default();
-        let first = logins.begin("ssm-node", "a").unwrap();
-        assert_eq!(logins.begin("ssm-node", "b").unwrap_err(), IN_PROGRESS);
-        let other = logins.begin("rdp-desktop", "c").unwrap();
+        let first = logins.begin(shared.clone(), "a").unwrap();
+        assert_eq!(logins.begin(shared.clone(), "b").unwrap_err(), IN_PROGRESS);
+        // 프로필이 달라도 같은 SSO 시작 URL이나 SSO 세션이면 기다린다.
+        assert_eq!(logins.begin(login_keys(&scope("ops"), &session(None, a)), "b").unwrap_err(), IN_PROGRESS);
+        assert_eq!(logins.begin(shared.clone(), "a").unwrap_err(), IN_PROGRESS);
+        let other = logins.begin(login_keys(&scope("ops"), &session(Some("corp"), b)), "c").unwrap();
+        assert_eq!(logins.begin(login_keys(&scope("qa"), &session(Some("corp"), a)), "x").unwrap_err(), IN_PROGRESS);
         logins.cancel("b");
         assert!(!first.is_cancelled());
-        logins.finish("ssm-node", "b");
-        assert_eq!(logins.begin("ssm-node", "d").unwrap_err(), IN_PROGRESS);
+        logins.finish("b");
+        assert_eq!(logins.begin(shared.clone(), "d").unwrap_err(), IN_PROGRESS);
         logins.cancel("a");
         assert!(first.is_cancelled() && !other.is_cancelled());
-        let again = logins.begin("ssm-node", "e").unwrap();
+        let again = logins.begin(shared.clone(), "e").unwrap();
         logins.cancel_all();
         assert!(again.is_cancelled() && other.is_cancelled());
-        assert!(logins.begin("rdp-desktop", "f").is_ok());
+        assert!(logins.begin(shared, "f").is_ok());
         assert!(valid_request_id("0b7c-41") && !valid_request_id("") && !valid_request_id("a b") && !valid_request_id(&"a".repeat(65)));
     }
 
