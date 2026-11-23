@@ -11,7 +11,7 @@ fn listed_row(state: &StorageIpc, document: &Document, session_id: &str) -> Stri
     let mut registry = state.0.lock().unwrap();
     let tab = registry.tab(document, session_id).unwrap();
     let page = tab.edits.listed(Page {
-        rows: vec![ObjectRow::Prefix { prefix: "실험/".into() }, ObjectRow::Object { key: KEY.into(), bytes: Some(4) }],
+        rows: vec![ObjectRow::Prefix { prefix: "실험/".into() }, ObjectRow::Object { key: KEY.into(), bytes: Some(4), last_modified: None, storage_class: None }],
         next_token: None,
     }, BUCKET, OBJECT_REGION);
     assert_eq!(page.rows[0], ListedRow::Prefix { prefix: "실험/".into() });

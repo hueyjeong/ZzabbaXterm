@@ -4,6 +4,7 @@ import { createRoot } from "react-dom/client";
 import { expect, it, vi } from "vitest";
 import type { S3Location, StorageEditorOpen } from "./s3";
 import { StorageTab } from "./StorageTab";
+import { contextMenu, fileRow, findControl, menuItem } from "../files/testing";
 
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
@@ -36,7 +37,7 @@ it("고정된 저장 ID를 한 번 열고 Rust가 반환한 위치를 숨김 전
       ["storage_open", { request: { targetId, id: sessionId } }],
     ]);
     expect(invoke).toHaveBeenCalledWith("storage_list_objects", { request: { sessionId, ...location, token: null } });
-    expect(host.querySelector<HTMLInputElement>("label:nth-child(2) input")?.value).toBe(location.prefix);
+    expect(host.querySelector<HTMLElement>('[aria-label="위치"] [aria-current="location"]')?.title).toBe(location.prefix);
     await render(false);
     await render(true);
     expect(invoke.mock.calls.filter(([command]) => command === "storage_open" || command === "storage_list_objects")).toHaveLength(2);
@@ -86,7 +87,7 @@ it.each(["활성 세션", "개설 중", "닫기 중"] as const)("%s 재로그인
   const root = createRoot(host);
   const closeRef = createRef<{ confirmClose(): Promise<void> }>();
   const onEditFile = vi.fn<(opened: StorageEditorOpen) => void>();
-  const button = (label: string) => [...host.querySelectorAll("button")].find(node => node.textContent === label);
+  const button = (label: string) => findControl(host, label);
   async function press(label: string) {
     const node = button(label);
     if (!node) throw new Error(`버튼 없음: ${label}`);
@@ -96,9 +97,9 @@ it.each(["활성 세션", "개설 중", "닫기 중"] as const)("%s 재로그인
     await act(async () => root.render(<StorageTab targetId={targetId} closing={false} closeRef={closeRef} onRetest={vi.fn()} onEditFile={onEditFile} />));
     const sessionId = invoke.mock.calls[0]?.[1].request.id;
     if (mode === "활성 세션") {
-      await act(async () => button("기존 편집.txt")?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, button: 2 })));
-      await press("편집");
-      await press("버킷 열기");
+      await contextMenu(fileRow(host, "기존 편집.txt"));
+      await act(async () => menuItem(host, "편집").click());
+      await press("새로고침");
     }
     await press("SSO 재로그인");
     if (mode === "닫기 중") {
@@ -133,8 +134,8 @@ it.each(["활성 세션", "개설 중", "닫기 중"] as const)("%s 재로그인
       expect(opened?.file.label).toBe("기존 편집.txt");
       expect(await opened?.transport.save(opened.file.handle, "편집 내용")).toEqual({ kind: "saved" });
       expect(invoke).toHaveBeenCalledWith("storage_edit_save", { request: { sessionId, handle: "editor-handle", text: "편집 내용" } });
-      await act(async () => button("새 목록.txt")?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, button: 2 })));
-      await press("편집");
+      await contextMenu(fileRow(host, "새 목록.txt"));
+      await act(async () => menuItem(host, "편집").click());
       expect(invoke).toHaveBeenCalledWith("storage_edit_open", { request: { sessionId, rowId: "new-row" } });
     }
     expect(host.textContent).toContain("새 목록.txt");

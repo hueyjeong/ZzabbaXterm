@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useImperativeHandle, useLayoutEffect, useRef, useState, type Ref } from "react";
+import { LogIn, Plug } from "lucide-react";
 import type { SavedConnections } from "../connections/connectionIpc";
+import { ProtocolIcon } from "../ui/controls";
 import { S3StoragePanel } from "./S3StoragePanel";
 import { StorageProblem, type Problem } from "./StorageStatus";
 import { closeStorage, openStorage, reloginStorage, storageActions } from "./storageIpc";
@@ -91,22 +93,22 @@ export function StorageTab({ profiles, targetId: pinnedId, active = true, closin
     }
   }
 
-  const reloginStatus = loggingIn && <p role="status">SSO 재로그인 중</p>;
-  if (session) return <>
-    <div inert={loggingIn}><S3StoragePanel session={session} actions={storageActions} refresh={refresh} onRelogin={() => void relogin()}
+  const reloginStatus = loggingIn && <p role="status" className="storage-notice">SSO 재로그인 중</p>;
+  if (session) return <div className="storage-host">
+    {reloginStatus}
+    {problem && <StorageProblem problem={problem} session={session} />}
+    <div className="storage-host-body" inert={loggingIn}><S3StoragePanel session={session} actions={storageActions} refresh={refresh} onRelogin={() => void relogin()}
       editEnabled={active && !closing && !loggingIn} onEditFile={onEditFile && (opened => {
         const current = attempt.current;
         if (!current || current.id !== session.sessionId || current.closing) return false;
         onEditFile(opened);
       })} /></div>
-    {reloginStatus}
-    {problem && <StorageProblem problem={problem} session={session} />}
-  </>;
+  </div>;
 
-  return <section className="s3-storage" aria-label="AWS S3">
-    <header className="storage-heading"><h2>AWS S3</h2></header>
-    <form className="storage-controls" onSubmit={event => { event.preventDefault(); if (selectedId) void open(selectedId); }}>
-      {!pinnedId && <label>SSO 프로필<select value={selectedId ?? ""} disabled={closing || opening || loggingIn} onChange={event => {
+  return <section className="storage-connect" aria-label="AWS S3">
+    <form className="storage-card" onSubmit={event => { event.preventDefault(); if (selectedId) void open(selectedId); }}>
+      <header className="storage-card-head"><ProtocolIcon kind="s3" /><h2>AWS S3</h2></header>
+      {!pinnedId && <label className="ui-label">SSO 프로필<select className="ui-field" value={selectedId ?? ""} disabled={closing || opening || loggingIn} onChange={event => {
         setTargetId(event.target.value);
         setProblem(undefined);
       }}>
@@ -118,15 +120,18 @@ export function StorageTab({ profiles, targetId: pinnedId, active = true, closin
           </option>;
         })}
       </select></label>}
-      {(!pinnedId || (booted.current && !opening && !loggingIn)) && <button type="submit" disabled={!selectedId || closing || opening || loggingIn}>스토리지 연결</button>}
+      {opening && <p role="status" className="storage-busy">SSO 프로필 확인 중</p>}
+      {loggingIn && <p role="status" className="storage-busy">SSO 재로그인 중</p>}
+      {problem && <StorageProblem problem={problem} />}
+      <div className="storage-actions">
+        {selectedId && problem && problem !== "unavailable" &&
+          (problem.failure.kind === "retestRequired" || problem.failure.kind === "accountMismatch") &&
+          <button type="button" className="ui-button" onClick={() => onRetest(selectedId)}>연결 재시험</button>}
+        {selectedId && attempt.current?.targetId === selectedId && attempt.current.needsLogin && !opening &&
+          <button type="button" className="ui-button" disabled={closing || opening || loggingIn} onClick={() => void relogin()}><LogIn aria-hidden="true" />SSO 재로그인</button>}
+        {(!pinnedId || (booted.current && !opening && !loggingIn)) &&
+          <button type="submit" className="ui-button primary" disabled={!selectedId || closing || opening || loggingIn}><Plug aria-hidden="true" />스토리지 연결</button>}
+      </div>
     </form>
-    {opening && <p role="status">SSO 프로필 확인 중</p>}
-    {reloginStatus}
-    {problem && <StorageProblem problem={problem} />}
-    {selectedId && attempt.current?.targetId === selectedId && attempt.current.needsLogin && !opening &&
-      <button type="button" disabled={closing || opening || loggingIn} onClick={() => void relogin()}>SSO 재로그인</button>}
-    {selectedId && problem && problem !== "unavailable" &&
-      (problem.failure.kind === "retestRequired" || problem.failure.kind === "accountMismatch") &&
-      <button type="button" onClick={() => onRetest(selectedId)}>연결 재시험</button>}
   </section>;
 }

@@ -1,27 +1,73 @@
+/* 좁은 왼쪽 사이드바에 들어가는 SFTP 목록 */
 .sftp-panel {
+  display: flex;
   flex: 1;
+  flex-direction: column;
   min-width: 0;
-  overflow: auto;
-  padding: 8px;
+  min-height: 0;
+  height: 100%;
+  background: var(--bg-panel);
 }
 
-.sftp-location {
+.sftp-bar {
   display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: 8px;
+  flex: none;
+  align-items: center;
+  gap: 4px;
+  height: 32px;
+  padding: 0 4px 0 6px;
+  border-block-end: 1px solid var(--border);
+  background: var(--bg-chrome);
+}
+.sftp-path {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  min-width: 0;
+  height: 24px;
+  padding-inline-end: 2px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.sftp-crumb-item { display: flex; flex: none; align-items: center; }
+.sftp-crumb-sep { color: var(--text-faint); font: 11.5px var(--font-mono); }
+.sftp-crumb {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  height: 22px;
+  max-width: 160px;
+  padding: 0 4px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  font: 11.5px var(--font-mono);
+  white-space: pre;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+.sftp-crumb.home { padding-inline: 5px; color: var(--proto-ssh); }
+.sftp-crumb.home svg { width: 13px; height: 13px; stroke-width: 2; }
+.sftp-crumb[aria-current="location"] { color: var(--text); }
+.sftp-crumb:hover:not(:disabled) { background: var(--bg-hover); color: var(--text); }
+.sftp-crumb:disabled { cursor: default; }
+.sftp-crumb:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.sftp-actions { display: flex; flex: none; }
+
+.sftp-line {
+  flex: none;
+  margin: 0;
+  padding: 3px 8px;
+  border-block-end: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 11.5px;
   overflow-wrap: anywhere;
 }
+.sftp-line.error { background: var(--danger-soft); color: var(--text); box-shadow: inset 2px 0 0 var(--danger); }
 
-.sftp-location button {
-  padding: 4px 8px;
-  border: 1px solid var(--border, #36454b);
-  border-radius: 3px;
-  background: transparent;
-  color: inherit;
-  font: inherit;
-}
-
-.sftp-location button:focus-visible {
-  outline: 2px solid var(--accent, #9cd9bf);
-}
+.sftp-files { display: flex; flex: 1; flex-direction: column; min-height: 0; }

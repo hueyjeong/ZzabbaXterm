@@ -7,6 +7,7 @@ import { CompatibleStorageTab } from "./CompatibleStorageTab";
 import { S3StoragePanel } from "./S3StoragePanel";
 import { storageActions } from "./storageIpc";
 import type { CompatibleSession, CompatibleSettingsView } from "./compatible-settings";
+import { control, dblclick, fileRow, findControl } from "../files/testing";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
@@ -30,9 +31,7 @@ const fill = (index: number, value: string) => act(async () => {
   field.dispatchEvent(new Event("input", { bubbles: true }));
 });
 const click = (label: string) => act(async () => {
-  const button = Array.from(host.querySelectorAll("button")).find(button => button.textContent === label);
-  if (!button) throw new Error(`버튼 없음: ${label}`);
-  button.click();
+  control(host, label).click();
 });
 const chooseScope = (kind: "service_browse" | "bucket") => act(async () => {
   const select = Array.from(host.querySelectorAll("label")).find(label => label.firstChild?.textContent === "연결 범위")?.querySelector("select");
@@ -269,12 +268,13 @@ it("저장된 설정은 키링 참조 없이 열고 동일 세션으로 버킷 �
   });
   expect(host.textContent).toContain("fixture-bucket");
   expect(ipc).toHaveBeenCalledTimes(2);
-  await click("다음 페이지");
+  await click("버킷 더 불러오기");
   expect(host.textContent).toContain("second-bucket");
   await click("fixture-bucket");
-  await act(async () => host.querySelector<HTMLButtonElement>('button[title="한글.txt"]')?.click());
+  await act(async () => fileRow(host, "한글.txt").click());
   await click("다운로드");
-  expect(host.textContent).toContain("다운로드 완료: 3 바이트");
+  expect(host.querySelector(".transfer-table tbody tr")?.textContent).toContain("완료");
+  expect(host.querySelector(".transfer-table tbody tr")?.textContent).toContain("3 바이트");
   const target = { sessionId, bucket: "fixture-bucket", region: settings.region, key: "한글.txt" };
   expect(ipc).toHaveBeenNthCalledWith(3, "storage_list_buckets", { request: { sessionId, token: "page-2" } });
   expect(ipc).toHaveBeenNthCalledWith(4, "storage_list_objects", { request: { sessionId, token: null, bucket: target.bucket, region: target.region, prefix: "" } });
@@ -316,28 +316,37 @@ it("버킷 전용 연결은 첫 객체 페이지를 재사용하고 같은 버�
     request: { sessionId, target: { kind: "select", settings: input, itemId: "bucket-key" },
       scope: { kind: "bucket", bucket: location.bucket, prefix: location.prefix } },
   });
-  expect(host.querySelector('[aria-label="객체 목록"]')?.textContent).toContain(key);
+  expect(fileRow(host, key).closest('[aria-label="객체 목록"]')).not.toBeNull();
+  expect(fileRow(host, key).querySelector(".file-name")?.textContent).toBe("한글.txt");
   expect(host.querySelector('[aria-label="버킷 목록"]')).toBeNull();
-  expect([...host.querySelectorAll("button")].map(button => button.textContent)).not.toContain("버킷 목록");
-  expect(host.querySelector(".storage-location strong")?.textContent).toBe(location.bucket);
+  expect(findControl(host, "버킷 목록")).toBeUndefined();
+  expect(findControl(host, "버킷 목록 불러오기")).toBeUndefined();
+  expect(host.querySelector('[aria-label="위치"] button')?.textContent).toBe(location.bucket);
+  expect(Array.from(host.querySelectorAll('[role="treeitem"]')).map(node => node.getAttribute("aria-label"))).toEqual([location.bucket, "실험", "/", " ", "하위"]);
+  await click("주소 편집");
   expect([...host.querySelectorAll("label")].filter(label => label.querySelector("input")).map(label => label.textContent))
-    .toEqual(["접두어", "업로드 전체 키"]);
+    .toEqual(["접두어"]);
+  await click("편집 취소");
 
-  await click(key);
+  await act(async () => fileRow(host, key).click());
   await click("다운로드");
   const target = { sessionId, bucket: location.bucket, region: location.region, key };
   expect(ipc).toHaveBeenCalledWith("storage_select_local_file", { request: { ...target, direction: "download" } });
   expect(ipc).toHaveBeenCalledWith("storage_download", { request: { ...target, approvalId: "fixture-approval" } });
-  expect(host.textContent).toContain("다운로드 완료: 3 바이트");
+  expect(host.querySelector(".transfer-table tbody tr")?.textContent).toContain("완료");
   const uploadTarget = { ...target, key: `${location.prefix}새 파일.txt` };
-  await fill(1, uploadTarget.key);
   await click("업로드");
+  expect(fields()[0].value).toBe(location.prefix);
+  await fill(0, uploadTarget.key);
+  await click("파일 선택");
   expect(ipc).toHaveBeenCalledWith("storage_select_local_file", { request: { ...uploadTarget, direction: "upload" } });
   expect(ipc).toHaveBeenCalledWith("storage_upload", { request: { ...uploadTarget, approvalId: "fixture-approval" } });
-  expect(host.textContent).toContain("업로드 완료: 3 바이트");
+  expect(host.querySelector(".transfer-table tbody tr")?.textContent).toContain("3 바이트");
+  expect(host.querySelectorAll(".transfer-table tbody tr")).toHaveLength(2);
 
-  await click("다음 페이지");
-  await click(nextPrefix);
+  await click("더 불러오기");
+  await dblclick(fileRow(host, nextPrefix));
+  await click("주소 편집");
   await fill(0, "");
   await click("접두어 열기");
   expect(ipc.mock.calls.filter(([command]) => command === "storage_list_buckets")).toHaveLength(0);
@@ -362,10 +371,13 @@ it("기존 AWS 패널은 초기 위치를 조회하고 버킷 목록에서 다�
     sessionId, profile: "aws-sso", region: location.region, endpoint: "https://s3.ap-northeast-2.amazonaws.com", location,
   }} />));
   expect(host.querySelector('[aria-label="AWS S3"]')).not.toBeNull();
-  expect(fields().slice(0, 3).map(field => field.value)).toEqual([location.bucket, location.prefix, location.region]);
+  expect(host.querySelector<HTMLElement>('[aria-label="위치"] [aria-current="location"]')?.title).toBe(location.prefix);
+  expect(host.querySelector('[aria-label="위치"] button')?.textContent).toBe(location.bucket);
+  expect(host.querySelector(".s3-address .s3-chip")?.textContent).toBe(location.region);
   await click("버킷 목록");
   await click(other.bucket);
-  expect(host.querySelector(".storage-location strong")?.textContent).toBe(other.bucket);
+  expect(host.querySelector('[aria-label="위치"] button')?.textContent).toBe(other.bucket);
+  expect(host.querySelector(".s3-address .s3-chip")?.textContent).toBe(other.region);
   expect(ipc.mock.calls.filter(([command]) => command === "storage_list_buckets" || command === "storage_list_objects")).toEqual([
     ["storage_list_objects", { request: { sessionId, ...location, token: null } }],
     ["storage_list_buckets", { request: { sessionId, token: null } }],

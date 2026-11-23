@@ -1,87 +1,147 @@
+/* S3와 SFTP가 함께 쓰는 파일 목록. 색은 tokens.css 변수만 참조한다. */
 .file-browser {
-  --file-border: var(--border, #36454b);
-  --file-focus: var(--accent, #9cd9bf);
-  --file-surface: #1c252a;
-  --file-selected: #34413f;
-  --file-selected-text: #c4f0de;
-  --file-muted: #b4c4be;
-  --file-space: 4px;
-  --file-radius: 3px;
-  min-width: 0;
-}
-
-.file-browser-toolbar {
+  --file-row: 26px;
+  --file-folder: var(--warning);
+  --file-code: var(--info);
+  --file-image: var(--proto-vnc);
+  --file-archive: var(--proto-ssm);
+  --file-media: var(--proto-rdp);
+  --file-sheet: var(--proto-s3);
+  --file-key: var(--proto-tunnel);
+  position: relative;
   display: flex;
-  align-items: baseline;
-  flex-wrap: wrap;
-  gap: var(--file-space) calc(2 * var(--file-space));
-  margin-block: calc(2 * var(--file-space));
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  font-size: 12.5px;
 }
-.file-browser-toolbar [role="group"] { display: flex; flex-wrap: wrap; gap: var(--file-space); }
-.file-browser-history {
-  max-width: 100%;
-  margin-inline-start: auto;
-  color: var(--file-muted);
-  font-variant-numeric: tabular-nums;
-  overflow-wrap: anywhere;
-  text-align: end;
+.file-browser[data-compact] { --file-row: 26px; font-size: 12px; }
+
+.file-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  outline: none;
 }
 
-.file-browser-toolbar button, .file-browser .file-browser-entry, .file-browser-menu button {
-  border: 1px solid var(--file-border);
-  border-radius: var(--file-radius);
-  padding: var(--file-space) calc(2 * var(--file-space));
+.file-row {
+  display: grid;
+  grid-template-columns: var(--file-columns, minmax(0, 1fr));
+  align-items: center;
+  height: var(--file-row);
+  padding-inline: 4px;
+  cursor: default;
+  user-select: none;
+}
+.file-cell {
+  min-width: 0;
+  padding-inline: 6px;
+  overflow: hidden;
+  white-space: pre;
+  text-overflow: ellipsis;
+}
+.file-cell:is([data-column="size"], [data-column="modified"]) {
+  color: var(--text-muted);
+  font: 11.5px var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+.file-cell[data-column="size"] { text-align: end; }
+.file-cell[data-column="class"] { color: var(--text-faint); font: 11px var(--font-mono); letter-spacing: .02em; }
+.file-name-cell { display: flex; align-items: center; gap: 7px; }
+.file-name { min-width: 0; overflow: hidden; white-space: pre; text-overflow: ellipsis; }
+
+/* 열 머리: 목록과 함께 스크롤되지 않도록 고정한다. */
+.file-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--bg-chrome);
+  box-shadow: inset 0 -1px 0 var(--border);
+}
+.file-head .file-row { height: 24px; }
+.file-head .file-cell { padding: 0; }
+.file-sort {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  height: 24px;
+  padding: 0 6px;
+  border: 0;
   background: transparent;
-  color: inherit;
-  font: inherit;
+  color: var(--text-faint);
+  font-size: 11.5px;
+  font-weight: 600;
   cursor: pointer;
 }
-.file-browser :is(.file-browser-toolbar, .file-browser-menu) button:hover, .file-browser .file-browser-entry:hover { background: var(--file-selected); }
-.file-browser button[aria-pressed="true"] { background: var(--file-selected); color: var(--file-selected-text); }
-.file-browser :focus-visible { outline: 2px solid var(--file-focus); outline-offset: -2px; }
+.file-sort:hover { color: var(--text); }
+.file-sort:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.file-sort svg { flex: none; width: 12px; height: 12px; color: var(--accent); }
+.file-head [data-column="size"] .file-sort { flex-direction: row-reverse; }
+[aria-sort="ascending"] .file-sort, [aria-sort="descending"] .file-sort { color: var(--text-muted); }
 
-.file-browser-list { width: 100%; table-layout: fixed; border-collapse: collapse; text-align: start; }
-.file-browser-list th, .file-browser-list td {
-  padding: var(--file-space);
-  border-block-end: 1px solid var(--file-border);
-  overflow-wrap: anywhere;
+/* 행 상태 */
+.file-grid [role="row"][aria-selected]:hover, .file-tile:hover { background: var(--bg-hover); }
+.file-grid [role="row"][aria-selected="true"], .file-tile[aria-selected="true"] { background: var(--bg-active); }
+.file-browser:focus-within :is([role="row"], [role="option"])[aria-selected="true"] {
+  background: var(--accent-soft);
+  box-shadow: inset 2px 0 0 var(--accent);
 }
-.file-browser-list th:first-child { width: min(4em, 20%); }
-.file-browser-list th:last-child { width: min(8em, 30%); }
-.file-browser-list td:last-child { text-align: end; font-variant-numeric: tabular-nums; }
-.file-browser .file-browser-entry { box-sizing: border-box; width: 100%; border-color: transparent; }
-.file-browser-list .file-browser-entry { text-align: start; white-space: break-spaces; overflow-wrap: anywhere; }
+.file-browser :is([role="row"], [role="option"]):focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+.file-browser :is([role="row"], [role="option"]):focus { outline-color: var(--accent); }
+.file-browser :is([role="row"], [role="option"])[data-menu] { box-shadow: inset 0 0 0 1px var(--border-strong); }
+.file-browser[aria-busy="true"] .file-grid [role="rowgroup"]:last-child { opacity: .6; }
 
-.file-browser-icons {
+/* 형식별 아이콘 */
+.file-icon { flex: none; width: 15px; height: 15px; stroke-width: 1.75; color: var(--text-faint); }
+.file-icon[data-type="folder"] { color: var(--file-folder); fill: color-mix(in srgb, var(--file-folder) 22%, transparent); }
+.file-icon[data-type="text"] { color: var(--text-muted); }
+.file-icon[data-type="code"] { color: var(--file-code); }
+.file-icon[data-type="image"] { color: var(--file-image); }
+.file-icon[data-type="archive"] { color: var(--file-archive); }
+.file-icon:is([data-type="video"], [data-type="audio"]) { color: var(--file-media); }
+.file-icon[data-type="sheet"] { color: var(--file-sheet); }
+.file-icon[data-type="key"] { color: var(--file-key); }
+
+.file-more { height: auto; padding-block: 4px; }
+.file-more .file-cell { grid-column: 1 / -1; }
+
+.file-empty {
+  position: absolute;
+  inset: 32px 0 0;
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(min(100%, 8rem), 1fr));
-  gap: var(--file-space);
-  list-style: none;
+  place-items: center;
   margin: 0;
-  padding: 0;
+  color: var(--text-faint);
+  pointer-events: none;
 }
-.file-browser-icons .file-browser-entry {
+
+/* 아이콘 보기 */
+.file-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(104px, 1fr));
+  gap: 2px;
+  padding: 8px;
+}
+.file-tile {
   display: grid;
   justify-items: center;
-  grid-template-columns: minmax(0, 1fr);
-  gap: var(--file-space);
-  padding: calc(2 * var(--file-space));
+  gap: 6px;
+  padding: 10px 6px 8px;
+  border-radius: var(--radius);
+  outline: none;
+  cursor: default;
+  user-select: none;
 }
-.file-browser-icons svg { width: 2rem; height: 2rem; color: var(--file-muted); }
-.file-browser-icons .file-browser-entry[aria-pressed="true"] svg { color: var(--file-focus); }
-.file-browser-icons span { max-width: 100%; white-space: pre; overflow: hidden; text-overflow: ellipsis; }
+.file-tile .file-icon { width: 30px; height: 30px; stroke-width: 1.25; }
+.file-tile .file-name { max-width: 100%; text-align: center; }
 
-.file-browser-menu {
-  position: fixed;
-  z-index: 2;
-  top: 0;
-  left: 0;
-  display: grid;
-  min-width: min(6rem, 100vw);
-  max-width: 100vw;
-  box-sizing: border-box;
-  border: 1px solid var(--file-border);
-  border-radius: var(--file-radius);
-  background: var(--file-surface);
-}
-.file-browser .file-browser-menu button { border-color: transparent; text-align: start; }
+.file-versioned { color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.file-versioned[data-kind="loading"] { color: var(--text-faint); }
+.file-versioned[data-kind="denied"], .file-versioned[data-kind="unavailable"] { color: var(--warning); }
+
+/* 진행 중인 새로고침 단추 */
+.icon-button.spinning svg { animation: file-spin .9s linear infinite; }
+@keyframes file-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .icon-button.spinning svg, .file-browser * { animation: none !important; } }

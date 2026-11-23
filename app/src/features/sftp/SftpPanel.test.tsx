@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { act, createRef, StrictMode, type ComponentProps } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { control, dblclick, fileRow, keyDown, menuItem } from "../files/testing";
 import { SftpPanel, type SftpPanelActions } from "./SftpPanel";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -25,37 +26,32 @@ afterEach(async () => {
   vi.unstubAllGlobals();
 });
 
-function button(name: string) {
-  const found = Array.from(host.querySelectorAll("button")).find(item => item.textContent === name);
-  if (!found) throw new Error(`버튼 없음: ${name}`);
-  return found;
-}
 
 it("SSH 세션에 한 번 붙고 불투명 ID로 이동하며 편집 메뉴에서만 파일을 연다", async () => {
   ipc.mockResolvedValueOnce({ entries: [folder], parentEntryId: null });
   const onEditFile = vi.fn<ComponentProps<typeof SftpPanel>["onEditFile"]>();
   await act(async () => root.render(<StrictMode><SftpPanel sshSessionId="ssh-1" onEditFile={onEditFile} /></StrictMode>));
   expect(ipc.mock.calls).toEqual([["editor_sftp_attach", { sessionId: "ssh-1" }]]);
-  expect(host.textContent).toContain("지원 안 함");
-  expect(host.textContent).not.toContain(folder.entryId);
+  expect(fileRow(host, folder.name).dataset.kind).toBe("folder");
+  expect(host.innerHTML).not.toContain(folder.entryId);
+  expect(control(host, "상위 폴더").hasAttribute("disabled")).toBe(true);
 
   ipc.mockResolvedValueOnce({ entries: [file], parentEntryId: null });
-  await act(async () => button(folder.name).click());
+  await dblclick(fileRow(host, folder.name));
   expect(ipc).toHaveBeenLastCalledWith("editor_sftp_list", { sessionId: "ssh-1", entryId: folder.entryId });
-  await act(async () => button(file.name).click());
+  expect(host.querySelector('[aria-label="SFTP 경로"] [aria-current="location"]')?.textContent).toBe(folder.name);
+  await act(async () => fileRow(host, file.name).click());
   expect(onEditFile).not.toHaveBeenCalled();
-  expect(button(file.name).getAttribute("aria-pressed")).toBe("true");
+  expect(fileRow(host, file.name).getAttribute("aria-selected")).toBe("true");
 
   ipc.mockResolvedValueOnce({ handle: "approved", name: file.name, text: "본문" });
-  await act(async () => {
-    button(file.name).dispatchEvent(new KeyboardEvent("keydown", { key: "F10", shiftKey: true, bubbles: true, cancelable: true }));
-  });
-  await act(async () => button("편집").click());
+  await keyDown(fileRow(host, file.name), "F10", { shiftKey: true });
+  await act(async () => menuItem(host, "편집").click());
   expect(ipc).toHaveBeenLastCalledWith("editor_sftp_open", { sessionId: "ssh-1", entryId: file.entryId });
   expect(onEditFile).toHaveBeenCalledExactlyOnceWith({ handle: "approved", label: file.name, text: "본문" }, expect.any(Object), expect.any(Function));
 
   ipc.mockResolvedValueOnce({ entries: [folder], parentEntryId: null });
-  await act(async () => button("상위 폴더").click());
+  await act(async () => control(host, "상위 폴더").click());
   expect(ipc).toHaveBeenLastCalledWith("editor_sftp_list", { sessionId: "ssh-1", entryId: null });
   expect(onEditFile).toHaveBeenCalledTimes(1);
 
@@ -84,7 +80,7 @@ it("SSH ID 교체와 종료 확인 뒤에 도착한 목록 응답을 무시한�
   const render = (sshSessionId: string) => act(async () => root.render(<SftpPanel {...{ sshSessionId, closeRef, onEditFile }} />));
   await render("ssh-1");
   ipc.mockReturnValueOnce(late.promise);
-  await act(async () => button(folder.name).click());
+  await dblclick(fileRow(host, folder.name));
   ipc.mockImplementation(async (command) => command === "editor_sftp_attach" ? { entries: [], parentEntryId: null } : undefined);
   await render("ssh-2");
   await act(async () => { await closeRef.current?.confirmClose(); });
@@ -117,7 +113,7 @@ it("진행 중인 폴더 응답을 종료 시작 때 무효화하고 종료 오�
   const closeRef = createRef<SftpPanelActions>();
   await act(async () => root.render(<SftpPanel sshSessionId="ssh-1" closeRef={closeRef} onEditFile={vi.fn()} />));
   ipc.mockReturnValueOnce(listing.promise);
-  await act(async () => button(folder.name).click());
+  await dblclick(fileRow(host, folder.name));
   ipc.mockRejectedValueOnce({ kind: "timedOut" });
   await act(async () => {
     const actions = closeRef.current;
@@ -127,4 +123,44 @@ it("진행 중인 폴더 응답을 종료 시작 때 무효화하고 종료 오�
   await act(async () => listing.resolve({ entries: [file], parentEntryId: null }));
   expect(host.textContent).not.toContain(file.name);
   expect(ipc).toHaveBeenLastCalledWith("editor_sftp_detach", { sessionId: "ssh-1" });
+});
+
+it("두 번 눌러 파일을 열고 경로 조각·새로고침·Backspace·시작 폴더로 이동한다", async () => {
+  const sub = { entryId: "sub-opaque", name: "하위", isDirectory: true };
+  ipc.mockResolvedValueOnce({ entries: [folder], parentEntryId: null });
+  const onEditFile = vi.fn<ComponentProps<typeof SftpPanel>["onEditFile"]>();
+  await act(async () => root.render(<SftpPanel sshSessionId="ssh-1" onEditFile={onEditFile} />));
+  const crumbs = () => Array.from(host.querySelectorAll('[aria-label="SFTP 경로"] button')).map(node => node.getAttribute("aria-label") ?? node.textContent);
+
+  ipc.mockResolvedValueOnce({ entries: [sub, file], parentEntryId: null });
+  await dblclick(fileRow(host, folder.name));
+  ipc.mockResolvedValueOnce({ entries: [file], parentEntryId: folder.entryId });
+  await dblclick(fileRow(host, sub.name));
+  expect(crumbs()).toEqual(["시작 폴더", folder.name, sub.name]);
+
+  ipc.mockResolvedValueOnce({ entries: [sub, file], parentEntryId: null });
+  await act(async () => control(host, folder.name, '[aria-label="SFTP 경로"] button').click());
+  expect(ipc).toHaveBeenLastCalledWith("editor_sftp_list", { sessionId: "ssh-1", entryId: folder.entryId });
+  expect(crumbs()).toEqual(["시작 폴더", folder.name]);
+
+  ipc.mockResolvedValueOnce({ entries: [sub, file], parentEntryId: null });
+  await act(async () => control(host, "새로고침").click());
+  expect(ipc).toHaveBeenLastCalledWith("editor_sftp_list", { sessionId: "ssh-1", entryId: folder.entryId });
+
+  ipc.mockResolvedValueOnce({ handle: "approved", name: file.name, text: "본문" });
+  await dblclick(fileRow(host, file.name));
+  expect(ipc).toHaveBeenLastCalledWith("editor_sftp_open", { sessionId: "ssh-1", entryId: file.entryId });
+  expect(onEditFile).toHaveBeenCalledTimes(1);
+
+  ipc.mockResolvedValueOnce({ entries: [folder], parentEntryId: null });
+  await keyDown(fileRow(host, file.name), "Backspace");
+  expect(ipc).toHaveBeenLastCalledWith("editor_sftp_list", { sessionId: "ssh-1", entryId: null });
+  expect(crumbs()).toEqual(["시작 폴더"]);
+  expect(control(host, "시작 폴더").hasAttribute("disabled")).toBe(true);
+
+  ipc.mockResolvedValueOnce({ entries: [file], parentEntryId: null });
+  await dblclick(fileRow(host, folder.name));
+  ipc.mockResolvedValueOnce({ entries: [folder], parentEntryId: null });
+  await act(async () => control(host, "시작 폴더").click());
+  expect(ipc).toHaveBeenLastCalledWith("editor_sftp_list", { sessionId: "ssh-1", entryId: null });
 });

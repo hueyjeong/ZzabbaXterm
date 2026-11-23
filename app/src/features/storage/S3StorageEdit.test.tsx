@@ -5,6 +5,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { ApprovedEditorFile } from "../editor/contract";
 import { S3StoragePanel } from "./S3StoragePanel";
 import type { S3Actions, StorageEditorOpen } from "./s3";
+import { control, dblclick, fileRow, menuItem } from "../files/testing";
 
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
@@ -51,9 +52,7 @@ function render(editEnabled = true, currentSession = session) {
 }
 
 function button(text: string) {
-  const node = Array.from(host.querySelectorAll("button")).find(node => node.textContent === text);
-  if (!node) throw new Error(`버튼 없음: ${text}`);
-  return node;
+  return control(host, text);
 }
 
 async function list() {
@@ -69,7 +68,7 @@ async function list() {
 
 function menu(name: string, keyboard = false) {
   return act(async () => {
-    button(name).dispatchEvent(keyboard
+    fileRow(host, name).dispatchEvent(keyboard
       ? new KeyboardEvent("keydown", { key: "F10", shiftKey: true, bubbles: true, cancelable: true })
       : new MouseEvent("contextmenu", { bubbles: true, cancelable: true, button: 2 }));
   });
@@ -78,13 +77,13 @@ function menu(name: string, keyboard = false) {
 it("우클릭은 메뉴만 열고 편집을 고르면 정확한 원문 키의 승인 행을 연다", async () => {
   invoke.mockResolvedValueOnce(file).mockResolvedValueOnce(true);
   await list();
-  await act(async () => button(key.trim()).click());
+  await act(async () => fileRow(host, key.trim()).click());
   await menu("이전 목록 행", true);
-  expect(host.querySelector('[role="menu"]')?.textContent).toBe("선택");
+  expect(host.querySelector('[role="menu"]')?.textContent).toBe("다운로드전체 키 복사");
   await menu(key);
   expect(invoke).not.toHaveBeenCalled();
   expect(onEditFile).not.toHaveBeenCalled();
-  await act(async () => button("편집").click());
+  await act(async () => menuItem(host, "편집").click());
   expect(invoke).toHaveBeenCalledExactlyOnceWith("storage_edit_open", { request: { sessionId: "first", rowId: "approved-row" } });
   expect(onEditFile).toHaveBeenCalledExactlyOnceWith({ file, transport: expect.objectContaining({ save: expect.any(Function) }), close: expect.any(Function) });
   await onEditFile.mock.calls[0][0].close();
@@ -96,13 +95,13 @@ it.each(["이동", "탭 전환", "세션 교체", "로그인 만료", "닫기"] 
   invoke.mockReturnValueOnce(pending.promise).mockResolvedValueOnce(true);
   await list();
   await menu(key, true);
-  await act(async () => button("편집").click());
+  await act(async () => menuItem(host, "편집").click());
   if (reason === "이동") {
     buckets.mockResolvedValueOnce({ ok: true, value: { rows: [], nextToken: null } });
     await act(async () => button("버킷 목록").click());
   } else if (reason === "로그인 만료") {
     download.mockResolvedValueOnce({ ok: false, error: { stage: "getObject", bytes: 0, failure: { kind: "ssoLoginRequired" } } });
-    await act(async () => button(key).click());
+    await act(async () => fileRow(host, key).click());
     await act(async () => button("다운로드").click());
   } else if (reason === "탭 전환") {
     await render(false);
@@ -124,8 +123,23 @@ it("열기 실패를 객체 목록과 함께 표시한다", async () => {
   invoke.mockResolvedValueOnce({ kind: "denied", message: "편집 승인 만료" });
   await list();
   await menu(key);
-  await act(async () => button("편집").click());
+  await act(async () => menuItem(host, "편집").click());
   expect(host.querySelector('[role="alert"]')?.textContent).toBe("파일 열기 실패: 편집 승인 만료");
-  expect(button(key)).toBeTruthy();
+  expect(fileRow(host, key)).toBeTruthy();
   expect(onEditFile).not.toHaveBeenCalled();
+});
+
+it("두 번 누르거나 도구줄 편집을 누르면 승인 행만 열고 승인 없는 행은 열지 않는다", async () => {
+  invoke.mockResolvedValueOnce(file).mockResolvedValueOnce(file);
+  await list();
+  await dblclick(fileRow(host, "이전 목록 행"));
+  await act(async () => fileRow(host, "이전 목록 행").click());
+  expect((button("편집") as HTMLButtonElement).disabled).toBe(true);
+  expect(invoke).not.toHaveBeenCalled();
+  await dblclick(fileRow(host, key));
+  expect(invoke).toHaveBeenCalledExactlyOnceWith("storage_edit_open", { request: { sessionId: "first", rowId: "approved-row" } });
+  await act(async () => fileRow(host, key.trim()).click());
+  await act(async () => button("편집").click());
+  expect(invoke).toHaveBeenLastCalledWith("storage_edit_open", { request: { sessionId: "first", rowId: "different-row" } });
+  expect(onEditFile).toHaveBeenCalledTimes(2);
 });

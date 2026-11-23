@@ -33,7 +33,15 @@ struct Editor {
 #[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub(super) enum ListedRow {
     Prefix { prefix: String },
-    Object { key: String, bytes: Option<u64>, row_id: String },
+    Object {
+        key: String,
+        bytes: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_modified: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        storage_class: Option<String>,
+        row_id: String,
+    },
 }
 
 impl Edits {
@@ -47,10 +55,10 @@ impl Edits {
             next_token: page.next_token,
             rows: page.rows.into_iter().map(|row| match row {
                 ObjectRow::Prefix { prefix } => ListedRow::Prefix { prefix },
-                ObjectRow::Object { key, bytes } => {
+                ObjectRow::Object { key, bytes, last_modified, storage_class } => {
                     let row_id = Uuid::new_v4().to_string();
                     self.rows.insert(row_id.clone(), Arc::new(ListedObject { scope: scope.clone(), key: key.clone() }));
-                    ListedRow::Object { key, bytes, row_id }
+                    ListedRow::Object { key, bytes, last_modified, storage_class, row_id }
                 }
             }).collect(),
         }

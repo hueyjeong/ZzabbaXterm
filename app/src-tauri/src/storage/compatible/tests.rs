@@ -333,7 +333,9 @@ async fn both_styles_sign_and_transfer_only_to_the_selected_bucket() {
             list.rows,
             [ObjectRow::Object {
                 key: "prefix/object".into(),
-                bytes: Some(19)
+                bytes: Some(19),
+                last_modified: None,
+                storage_class: None,
             }]
         );
         assert_eq!(
