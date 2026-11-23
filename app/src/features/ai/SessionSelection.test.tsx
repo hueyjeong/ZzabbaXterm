@@ -35,35 +35,47 @@ function actions() {
 const render = (actions: SessionSelectionProps["actions"], candidates = [alpha, beta], visible = true) =>
   act(async () => root.render(<><textarea aria-label="중앙 터미널 입력" />
     <SessionSelection actions={actions} candidates={candidates} visible={visible} /></>));
-const field = () => host.querySelector("select")!;
+const field = () => host.querySelector<HTMLButtonElement>('button[aria-haspopup="menu"]')!;
+const value = () => field().dataset.value;
 const click = (name: string) => act(async () => {
-  [...host.querySelectorAll("button")].find((item) => item.textContent === name)!.click();
+  [...host.querySelectorAll("button")].find((item) => item.textContent === name || item.getAttribute("aria-label") === name)!.click();
 });
-const choose = (id: string) => act(async () => {
-  field().value = id;
-  field().dispatchEvent(new Event("change", { bubbles: true }));
-});
+const menuItems = () => [...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')];
+async function choose(id: string) {
+  await act(async () => { field().click(); });
+  const item = menuItems().find((element) => element.textContent?.endsWith(`(세션 ${id})`));
+  expect(item, id).toBeDefined();
+  await act(async () => { item!.click(); });
+}
 
 it("구분된 실제 ID를 표시하고 연결 확인을 별도 입력으로 받는다", async () => {
   const port = actions();
   await render(port);
-  expect([...field().options].map((option) => option.textContent)).toEqual([
-    "세션 선택", "개발 서버 (세션 41)", "개발 서버 (세션 42)",
-  ]);
-  expect(field().value).toBe("");
-  const terminal = host.querySelector("textarea")!;
-  terminal.focus();
+  expect(field().textContent).toBe("세션 선택");
+  expect(field().getAttribute("aria-label")).toBe("AI 작업 세션: 선택 안 함");
+  await act(async () => { field().click(); });
+  expect(menuItems().map((item) => item.textContent)).toEqual(["개발 서버 (세션 41)", "개발 서버 (세션 42)"]);
+  await act(async () => {
+    host.querySelector('[role="menu"]')!.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  });
+  expect(host.querySelector('[role="menu"]')).toBeNull();
+  expect(document.activeElement).toBe(field());
+  expect(value()).toBe("");
   await choose(beta.id);
   expect(port.select).toHaveBeenCalledExactlyOnceWith(beta.id);
   expect(port.confirm).not.toHaveBeenCalled();
-  expect(host.textContent).toContain("ap-northeast-2 / i-001");
+  expect(field().getAttribute("aria-label")).toBe("AI 작업 세션: 개발 서버 (세션 42)");
+  expect(field().title).toBe("ap-northeast-2 / i-001");
+  expect(host.querySelector('[role="status"]')?.textContent).toBe("연결 확인 전");
+  const terminal = host.querySelector("textarea")!;
+  terminal.focus();
   await click("연결 확인");
   expect(port.confirm).toHaveBeenCalledExactlyOnceWith(beta.id, snapshot(beta).selectionId);
   expect(host.querySelector('[role="status"]')?.textContent).toBe("연결 확인됨");
   expect(document.activeElement).toBe(terminal);
   await render(port, [beta, alpha], false);
   await render(port, [beta, alpha]);
-  expect(field().value).toBe(beta.id);
+  expect(value()).toBe(beta.id);
   expect(host.querySelector('[role="status"]')?.textContent).toBe("연결 확인됨");
   expect(port.select).toHaveBeenCalledTimes(1);
   expect(port.confirm).toHaveBeenCalledTimes(1);
@@ -82,7 +94,7 @@ it("다른 세션을 거쳐 같은 ID를 다시 선택해도 이전 확인 응�
   await choose(beta.id);
   await choose(alpha.id);
   await act(async () => late.resolve({ ...snapshot(alpha, "1"), confirmed: true }));
-  expect(field().value).toBe(alpha.id);
+  expect(value()).toBe(alpha.id);
   expect(host.textContent).not.toContain("연결 확인됨");
   await click("연결 확인");
   expect(port.confirm.mock.calls).toEqual([[alpha.id, "1"], [alpha.id, "3"]]);
@@ -101,7 +113,7 @@ it("숨겨지기 전에 끝나지 않은 확인을 해제하고 새 선택 ID로
   await render(port, [alpha, beta], false);
   expect(port.clear).toHaveBeenCalledExactlyOnceWith("1");
   await render(port);
-  expect(field().value).toBe("");
+  expect(value()).toBe("");
   expect(field().disabled).toBe(true);
   expect(host.textContent).not.toContain("연결 확인됨");
 
@@ -109,7 +121,7 @@ it("숨겨지기 전에 끝나지 않은 확인을 해제하고 새 선택 ID로
   expect(field().disabled).toBe(false);
   await choose(alpha.id);
   await act(async () => late.resolve({ ...snapshot(alpha, "1"), confirmed: true }));
-  expect(field().value).toBe(alpha.id);
+  expect(value()).toBe(alpha.id);
   expect(host.textContent).not.toContain("연결 확인됨");
   await click("연결 확인");
   expect(port.confirm.mock.calls).toEqual([[alpha.id, "1"], [alpha.id, "2"]]);
@@ -128,7 +140,7 @@ it("선택했던 세션이 닫히면 숨겨진 상태에서도 정확한 선택�
   await act(async () => late.resolve({ ...snapshot(alpha), confirmed: true }));
   await render(port);
   expect(port.clear).toHaveBeenCalledExactlyOnceWith(snapshot(alpha).selectionId);
-  expect(field().value).toBe("");
+  expect(value()).toBe("");
   expect(host.textContent).not.toContain("연결 확인됨");
 });
 
@@ -143,7 +155,7 @@ it("선택 응답 전에 세션이 닫혀도 도착한 선택을 해제한다", 
   await render(port, []);
   expect(field()).toBeNull();
   expect([...host.querySelectorAll('[role="status"]')].map((status) => status.textContent)).toEqual([
-    "선택할 SSM 세션 없음", "세션 선택 중",
+    "SSM 세션 없음", "세션 선택 중",
   ]);
   await act(async () => { late.resolve(snapshot(alpha)); });
   expect(port.clear).toHaveBeenCalledExactlyOnceWith(snapshot(alpha).selectionId);
@@ -165,7 +177,7 @@ it("선택 해제 후 이전 연결 확인이 도착해도 세션을 되살리�
   await click("선택 해제");
   await act(async () => late.resolve({ ...snapshot(alpha), confirmed: true }));
   expect(port.clear).toHaveBeenCalledExactlyOnceWith(snapshot(alpha).selectionId);
-  expect(field().value).toBe("");
+  expect(value()).toBe("");
   expect(host.textContent).not.toContain("연결 확인됨");
 });
 
@@ -175,7 +187,7 @@ it("확인 응답의 선택 ID가 다르면 연결 확인 실패를 표시한다
   await render(port);
   await choose(alpha.id);
   await click("연결 확인");
-  expect(field().value).toBe(alpha.id);
+  expect(value()).toBe(alpha.id);
   expect(host.querySelector('[role="alert"]')?.textContent).toBe("세션 연결 확인 실패");
   expect(host.textContent).not.toContain("연결 확인됨");
 });

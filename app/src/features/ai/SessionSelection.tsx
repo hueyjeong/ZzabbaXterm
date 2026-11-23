@@ -1,4 +1,7 @@
 import { useLayoutEffect, useRef, useState } from "react";
+import { Check, ChevronDown, Cloud, PlugZap, X } from "lucide-react";
+import { IconButton, type MenuItem } from "../ui/controls";
+import { AnchoredMenu, useAnchoredMenu } from "./AnchoredMenu";
 
 export type SessionSelectionCandidate = Readonly<{ id: string; label: string; region: string; node: string }>;
 export type SessionSelectionSnapshot = Readonly<Omit<SessionSelectionCandidate, "label"> & {
@@ -22,12 +25,17 @@ type State =
   | { kind: "confirming"; selection: SessionSelectionSnapshot }
   | { kind: "clearing" };
 
+function safeLabel(label: string) {
+  return label.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, "�");
+}
+
 function sameSession(a: Omit<SessionSelectionCandidate, "label">, b: Omit<SessionSelectionCandidate, "label">) {
   return a.id === b.id && a.region === b.region && a.node === b.node;
 }
 
 export function SessionSelection({ candidates, visible = true, actions }: SessionSelectionProps) {
   const [state, setState] = useState<State>({ kind: "empty" });
+  const menu = useAnchoredMenu<HTMLButtonElement>();
   const live = useRef<State>(state);
   const mounted = useRef(false);
   const identity = state.kind === "selecting" ? state.candidate : "selection" in state ? state.selection : undefined;
@@ -115,30 +123,56 @@ export function SessionSelection({ candidates, visible = true, actions }: Sessio
     if (mounted.current && live.current === request) update({ kind: "selected", selection, error: "세션 연결 확인 실패" });
   }
 
-  return <div hidden={!visible}>
-    {candidates.length > 0 && <label className="a01-field">AI 작업 세션
-      <select value={candidate && !(state.kind === "selecting" && state.closed) ? candidate.id : ""}
-        disabled={state.kind === "selecting" || state.kind === "clearing"}
-        onChange={(event) => void select(event.currentTarget.value)}>
-        <option value="">세션 선택</option>
-        {candidates.map(({ id, label }) => <option key={id} value={id}>
-          {label.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, "�")} (세션 {id})
-        </option>)}
-      </select>
-    </label>}
-    {!candidates.length && <p role="status">선택할 SSM 세션 없음</p>}
-    {state.kind === "selecting" && <p role="status">세션 선택 중</p>}
-    {state.kind === "clearing" && <p role="status">세션 선택 해제 중</p>}
-    {selected && <>
-      <p>{selected.region} / {selected.node}</p>
-      <div className="a01-actions">
-        {!selected.confirmed && <button type="button" disabled={state.kind === "confirming"}
-          onClick={() => void confirm()}>연결 확인</button>}
-        <button type="button" onClick={() => void select("")}>선택 해제</button>
-      </div>
-      {state.kind === "confirming" && <p role="status">연결 확인 중</p>}
-      {selected.confirmed && <p role="status">연결 확인됨</p>}
-    </>}
-    {"error" in state && state.error && <p role="alert">{state.error}</p>}
+  const shown = candidate && !(state.kind === "selecting" && state.closed) ? candidate : undefined;
+  const busy = state.kind === "selecting" || state.kind === "clearing";
+  const status = state.kind === "selecting" ? "세션 선택 중"
+    : state.kind === "clearing" ? "세션 선택 해제 중"
+      : !selected ? ""
+        : state.kind === "confirming" ? "연결 확인 중"
+          : selected.confirmed ? "연결 확인됨" : "연결 확인 전";
+  const error = "error" in state ? state.error : undefined;
+  const dot = busy || state.kind === "confirming" ? "busy" : error ? "error" : selected?.confirmed ? "running" : undefined;
+  const name = shown ? `${safeLabel(shown.label)} (세션 ${shown.id})` : "선택 안 함";
+  const items: MenuItem[] = [
+    ...(selected ? [{ kind: "label" as const, label: `${selected.region} / ${selected.node}` }] : []),
+    ...candidates.map(({ id, label }) => ({
+      label: `${safeLabel(label)} (세션 ${id})`,
+      icon: id === shown?.id ? Check : undefined,
+      onSelect: () => {
+        menu.anchor.current?.focus();
+        if (id !== shown?.id) void select(id);
+      },
+    })),
+  ];
+
+  return <div className="a01-session" hidden={!visible}>
+    {candidates.length > 0
+      ? <span className="a01-chip-group">
+        <button type="button" ref={menu.anchor} className="a01-chip" data-value={shown?.id ?? ""}
+          aria-label={`AI 작업 세션: ${name}`} title={selected ? `${selected.region} / ${selected.node}` : undefined}
+          aria-haspopup="menu" aria-expanded={menu.open} disabled={busy} onClick={menu.toggle}
+          onKeyDown={(event) => {
+            if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+              event.preventDefault();
+              menu.show();
+            }
+          }}>
+          <Cloud aria-hidden="true" />
+          <span className="a01-chip-text">{shown ? safeLabel(shown.label) : "세션 선택"}</span>
+          {shown && <span className="status-dot" data-state={dot} aria-hidden="true" />}
+          <ChevronDown className="a01-chip-caret" aria-hidden="true" />
+        </button>
+        {selected && <IconButton small icon={X} label="선택 해제" className="a01-chip-clear"
+          onClick={() => void select("")} />}
+      </span>
+      : <span className="a01-chip muted" role="status"><Cloud aria-hidden="true" />SSM 세션 없음</span>}
+    {selected && !selected.confirmed && <button type="button" className="a01-chip action"
+      disabled={state.kind === "confirming"} onClick={() => void confirm()}>
+      <PlugZap aria-hidden="true" />연결 확인
+    </button>}
+    {status && <span className="a01-sr-only" role="status">{status}</span>}
+    {error && <p className="a01-inline-alert" role="alert">{error}</p>}
+    {menu.open && visible && candidates.length > 0 && <AnchoredMenu anchor={menu.anchor} placement="above"
+      items={items} label="AI 작업 세션" onClose={menu.close} />}
   </div>;
 }
