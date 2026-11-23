@@ -37,7 +37,7 @@ export function SshAuthFields({ ssh: { auth }, edit }: Props) {
       }
     }}>
       <option value="">인증 방식 선택</option>
-      {Object.entries(authLabels).map(([value, label]) => <option key={value} value={value} disabled={value === "storedPassword"}>{label}</option>)}
+      {Object.entries(authLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
     </select></label></div>
     {auth?.kind === "agent" && <div><label>Agent 공개 키 파일 경로 <input value={auth.publicKeyPath}
       onChange={event => edit({ auth: { kind: "agent", publicKeyPath: event.target.value } })} /></label></div>}

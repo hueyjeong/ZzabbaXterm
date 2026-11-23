@@ -2,13 +2,13 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import type { ConnectionTestRun } from "../connections/profiles";
 
 export type TerminalStatus =
-  | { kind: "opening" | "connecting" | "running" }
+  | { kind: "opening" | "connecting" | "running"; notice?: string }
   | { kind: "exited"; value: number }
   | { kind: "disconnected" | "failed"; value: string };
 
 type End = Extract<TerminalStatus, { kind: "exited" }> | { kind: "disconnected"; value: string };
 export type Dimensions = { rows: number; cols: number };
-type Message = ArrayBuffer | End | { kind: "connecting" | "ready" };
+type Message = ArrayBuffer | End | { kind: "connecting" | "ready" } | { kind: "notice"; value: string };
 
 export interface LocalTerminalIpc {
   open(size: Dimensions, receive: (message: Message) => void, targetId?: string, remoteEditor?: true): Promise<string>;
@@ -61,6 +61,7 @@ export function connectLocalTerminal(
   let started = false;
   let receiving = false;
   let ready = false;
+  let notice: string | undefined;
   let closing: Promise<void> | undefined;
   // Rust limits unacknowledged output, including bytes received before the start reply.
   const earlyOutput: Message[] = [];
@@ -108,10 +109,15 @@ export function connectLocalTerminal(
       }
       return;
     }
+    if (message.kind === "notice") {
+      notice = message.value;
+      status({ kind: ready ? "running" : "opening", notice }, id);
+      return;
+    }
     if (message.kind === "connecting" || message.kind === "ready") {
       if (!remote || ready) return;
       ready = message.kind === "ready";
-      status({ kind: ready ? "running" : "connecting" }, id);
+      status({ kind: ready ? "running" : "connecting", notice }, id);
       return;
     }
     if (message.kind !== "exited" && message.kind !== "disconnected") return;
@@ -159,7 +165,7 @@ export function connectLocalTerminal(
       for (const message of earlyOutput) receive(message);
       earlyOutput.length = 0;
       if (stopped) return;
-      status({ kind: "running" }, sessionId);
+      status({ kind: "running", notice }, sessionId);
     }
     if (latestSize !== initialSize) flushSize(latestSize);
   })().catch(fail);

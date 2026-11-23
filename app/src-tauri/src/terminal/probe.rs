@@ -278,6 +278,7 @@ impl Probe {
                     Ok(())
                 }
                 Event::Connecting => Ok(()),
+                Event::Notice(_) => Ok(()),
                 Event::Ready { account_id } => {
                     account.replace(Some(account_id));
                     session.upgrade().ok_or(super::CLOSED.to_owned())?.input(SSM_CHECK)

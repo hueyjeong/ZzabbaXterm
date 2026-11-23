@@ -53,8 +53,9 @@ function Wizard(props: LocalConnectionWizardProps) {
 
   if (status.kind === "closed") return null;
   const locked = status.kind === "saving" || status.kind === "closing" || status.kind === "closeFailed";
-  const canSave = status.kind === "passed" || status.kind === "saveFailed";
   const ssh = target.defaultMethod === "ssh" ? target.ssh : null;
+  const canSave = status.kind === "passed" || status.kind === "saveFailed"
+    || (ssh?.auth?.kind === "storedPassword" && sshPin.kind === "verified");
   const s3 = target.defaultMethod === "s3" ? target.s3 : null;
   const retestingS3 = props.initialDraft.targetRevision !== null && props.initialDraft.target.defaultMethod === "s3";
 

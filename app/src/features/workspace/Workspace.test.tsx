@@ -1642,7 +1642,7 @@ describe("F01 직접 SSH", () => {
     await changeInput("호스트 키 SHA256 지문", fingerprint);
     await press("다음");
     const auth = await select("SSH 인증 방식", "manualPassword");
-    expect(auth.querySelector<HTMLOptionElement>('option[value="storedPassword"]')?.disabled).toBe(true);
+    expect(auth.querySelector<HTMLOptionElement>('option[value="storedPassword"]')?.disabled).toBe(false);
     await press("다음");
     expect(find('[aria-label="SSH 연결 대상"]').textContent).toContain("deploy");
     await press("호스트 키 선택 및 등록");

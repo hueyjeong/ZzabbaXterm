@@ -206,6 +206,11 @@ pub(crate) fn confirm_remote_editor(window: &tauri::Window, description: String)
         .map_err(|_| "SSH nano 연동 승인 창을 열 수 없습니다".into())
 }
 
+pub(crate) fn confirm_stored_auth(window: &tauri::Window, description: String) -> Result<bool, String> {
+    dialogs::confirm(window, "SSH 저장 암호 승인", description)
+        .map_err(|_| "SSH 저장 암호 승인 창을 열 수 없습니다".into())
+}
+
 fn confirmation_message(endpoint: &Endpoint, fingerprint: &Fingerprint) -> String {
     format!("서버: {}\n포트: {}\nSHA256 지문: {fingerprint}", endpoint.host, endpoint.port)
 }

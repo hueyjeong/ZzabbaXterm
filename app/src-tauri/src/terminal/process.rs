@@ -37,6 +37,8 @@ struct Flow {
     editor_cancel: Option<CancellationToken>,
     editor_start: Option<tokio::sync::oneshot::Sender<()>>,
     editor_startup: Option<Startup>,
+    #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+    stored: Option<crate::local_auth::Exchange>,
     sent: u64,
     acked: u64,
     ack_deadline: Option<std::time::Instant>,
@@ -329,10 +331,18 @@ impl Session {
                     return Err(self.after_failed_spawn(stage("reader worker", error), remote.take()));
                 }
             };
+            enum Prepared {
+                Remote,
+                Command(CommandBuilder),
+                Saved(crate::ssh::terminal::DirectLaunch),
+            }
+            #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+            let mut stored_exchange = None;
+            let mut notice = None;
             let mut editor = None;
-            let command = match command {
-                Launch::Ssm(_) | Launch::AiControl(..) => None,
-                Launch::Local(command) => Some(command),
+            let prepared = match command {
+                Launch::Ssm(_) | Launch::AiControl(..) => Prepared::Remote,
+                Launch::Local(command) => Prepared::Command(command),
                 Launch::Ssh(mut launch) => {
                     if launch.editor_requested() {
                         let cancel = CancellationToken::new();
@@ -349,14 +359,13 @@ impl Session {
                             editor = Some(running);
                         }
                     }
-                    let (command, plan) = launch.into_parts();
-                    ssh_plan = Some(plan);
-                    Some(command)
+                    notice = launch.notice().map(str::to_owned);
+                    Prepared::Saved(launch)
                 }
             };
-            let mut child = match command {
-                None => remote_child.take().unwrap(),
-                Some(command) => {
+            let mut child = match prepared {
+                Prepared::Remote => remote_child.take().unwrap(),
+                Prepared::Command(command) => {
                     if self.flow.lock().unwrap().stop.is_some() {
                         self.teardown(pair, writer, event_tx, drain);
                         return Err(stage("open", CLOSED));
@@ -366,6 +375,26 @@ impl Session {
                         Err(error) => {
                             self.teardown(pair, writer, event_tx, drain);
                             return Err(stage("spawn", format_args!("{error:#}")));
+                        }
+                    }
+                }
+                Prepared::Saved(launch) => {
+                    if self.flow.lock().unwrap().stop.is_some() {
+                        self.teardown(pair, writer, event_tx, drain);
+                        return Err(stage("open", CLOSED));
+                    }
+                    match launch.spawn(&*pair.slave) {
+                        Ok(spawn) => {
+                            ssh_plan = Some(spawn.plan);
+                            #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+                            {
+                                stored_exchange = spawn.stored;
+                            }
+                            spawn.child
+                        }
+                        Err(error) => {
+                            self.teardown(pair, writer, event_tx, drain);
+                            return Err(stage("SSH", error));
                         }
                     }
                 }
@@ -383,11 +412,20 @@ impl Session {
                         cancel: CancellationToken::new(),
                         workers: None,
                     });
+                    #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+                    {
+                        flow.stored = stored_exchange.take();
+                    }
                 }
                 if !ssm { flow.start_deadline = Some(std::time::Instant::now() + START_TIMEOUT); }
                 self.wake.notify_all();
             }
             if !ssm { let _ = ready.send(Ok(())); }
+            if let Some(notice) = notice
+                && let Err(error) = send_event(Event::Notice(notice))
+            {
+                self.stop(Stop::Disconnected(stage("channel", error)));
+            }
 
             let mut connected = false;
             let event = thread::scope(|scope| {
@@ -877,6 +915,8 @@ impl Session {
         if let Some(cancel) = &self.cancel { cancel.cancel(); }
         if let Some(sftp) = &flow.sftp { sftp.cancel.cancel(); }
         if let Some(cancel) = &flow.editor_cancel { cancel.cancel(); }
+        #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+        if let Some(exchange) = flow.stored.take() { exchange.cancel(); }
         if flow.stop.is_none() || matches!(reason, Stop::Closed) {
             flow.stop = Some(reason);
         }
@@ -1085,4 +1125,21 @@ fn control_input_is_dedicated_and_checks_deadline_before_writing() {
     assert!(control.connected());
     assert_eq!(control.control_input(&binding, b"frame", Instant::now(), true), Err(WRITE_TIMED_OUT.into()));
     assert!(!control.connected());
+}
+
+#[cfg(all(test, feature = "stored-auth", any(windows, target_os = "linux")))]
+#[test]
+fn switching_tabs_cancels_stored_exchange() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let session = Session::new("main", false);
+    session.flow.lock().unwrap().stored =
+        Some(crate::local_auth::Exchange::dormant(Arc::clone(&cancelled)));
+    session.stop(Stop::Closed);
+    assert!(session.flow.lock().unwrap().stored.is_none());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !cancelled.load(Ordering::Relaxed) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(cancelled.load(Ordering::Relaxed));
 }

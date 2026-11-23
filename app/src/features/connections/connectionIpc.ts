@@ -103,13 +103,17 @@ export function createLocalConnectionIpc(): Omit<LocalConnectionActions, "onClos
     },
     async save(request: ConnectionRequest) {
       const success = tested.get(request.run);
-      if (!success || success.execution.cancelled || success.attempt.draft !== request.draft ||
-        attempts.get(success.attempt) !== success.execution) {
+      // 저장 암호는 연결 시험이 승인 경로를 열 수 없어 호스트 키 확인 뒤 참조만 저장한다.
+      const stored = request.draft.target.defaultMethod === "ssh" && request.draft.target.ssh.auth?.kind === "storedPassword";
+      if (!stored && (!success || success.execution.cancelled || success.attempt.draft !== request.draft ||
+        attempts.get(success.attempt) !== success.execution)) {
         throw new Error("현재 초안의 연결 테스트 성공이 필요합니다");
       }
       await invoke<null>("connection_save", { request });
-      tested.delete(request.run);
-      attempts.delete(success.attempt);
+      if (success) {
+        tested.delete(request.run);
+        attempts.delete(success.attempt);
+      }
     },
   };
 }

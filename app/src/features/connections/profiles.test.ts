@@ -268,6 +268,43 @@ describe("F01 SSH 마법사", () => {
     }]]);
     expect(wizard.getSnapshot().status).toEqual({ kind: "testFailed", error: "SSH 연결 시험을 실행할 수 없습니다" });
   });
+
+  it("확인한 저장 암호 대상은 연결 시험 없이 참조만 저장한다", async () => {
+    const verifySshHost = vi.fn().mockResolvedValue(undefined);
+    const peer = { ...nativePeer(), verifySshHost };
+    const host = {
+      host: "ssh.actual.test", port: "2222", account: "deploy",
+      hostKeyFingerprint: `SHA256:${"A".repeat(43)}`,
+    };
+    const itemId = "21eb36c3-234d-439d-9e1f-1d3cc5ba8125";
+    const wizard = createLocalConnectionWizard("stored-draft", draft);
+    wizard.go(1);
+    wizard.selectMethod("ssh");
+    wizard.editSsh(host);
+    wizard.go(1);
+    wizard.editSsh({ auth: { kind: "storedPassword", itemId } });
+    wizard.go(1, null);
+    expect(wizard.getSnapshot().step).toBe("verify");
+    await wizard.save(peer);
+    expect(ipc).not.toHaveBeenCalled();
+    await wizard.verifySshHost(peer);
+    expect(wizard.getSnapshot().sshPin).toEqual({ kind: "verified" });
+    await wizard.save(peer);
+    expect(ipc).toHaveBeenCalledTimes(1);
+    expect(ipc).toHaveBeenCalledWith("connection_save", { request: {
+      run: { draftId: "stored-draft", draftVersion: expect.any(Number), runId: "stored-draft" },
+      draft: {
+        ...draft, group: { id: "work", displayName: "회사 개발" }, target: {
+          id: draft.target.id, groupId: draft.target.groupId, displayName: draft.target.displayName,
+          defaultMethod: "ssh", ssh: {
+            host: host.host, port: 2222, account: host.account, hostKeyFingerprint: host.hostKeyFingerprint,
+            transport: { kind: "direct" }, auth: { kind: "storedPassword", itemId },
+          },
+        },
+      },
+    } });
+    expect(wizard.getSnapshot().status).toEqual({ kind: "closed" });
+  });
 });
 
 describe("저장 S3 연결", () => {

@@ -1,4 +1,4 @@
-use portable_pty::CommandBuilder;
+use portable_pty::{Child, CommandBuilder, SlavePty};
 use std::path::Path;
 use std::sync::Arc;
 use crate::connections::profile::{Ssh, SshAuth, SshTransport};
@@ -9,6 +9,25 @@ pub(crate) struct DirectLaunch {
     command: CommandBuilder,
     plan: Arc<ConnectionPlan>,
     editor: Option<(super::nano::Binding, tokio::sync::oneshot::Sender<()>)>,
+    notice: Option<String>,
+    #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+    stored: Option<StoredLaunch>,
+}
+
+/// 승인 한 건과 그 Exchange는 실행 자식과 탭 수명에 함께 묶인다.
+#[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+struct StoredLaunch {
+    document: crate::local_auth::Document,
+    approval: crate::local_auth::Approval,
+    vault: crate::local_auth::Bitwarden,
+}
+
+/// PTY 감독자가 넘겨받는 실행 자식과 수명 동안 보관할 교환이다.
+pub(crate) struct SshSpawn {
+    pub(crate) child: Box<dyn Child + Send + Sync>,
+    pub(crate) plan: Arc<ConnectionPlan>,
+    #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+    pub(crate) stored: Option<crate::local_auth::Exchange>,
 }
 
 impl DirectLaunch {
@@ -27,7 +46,42 @@ impl DirectLaunch {
         }
         let plan = Arc::new(ConnectionPlan::prepare(store, approved_host, account, Transport::Direct, auth)?);
         let command = command(plan.invocation(Client::Ssh)?);
-        Ok(Self { command, plan, editor: None })
+        Ok(Self {
+            command,
+            plan,
+            editor: None,
+            notice: None,
+            #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+            stored: None,
+        })
+    }
+
+    /// 저장 암호 대상은 승인된 Exchange를 자식과 함께 넘긴다. 그 밖에는 평소 명령을 실행한다.
+    #[allow(unused_mut, reason = "stored-auth 빌드에서만 승인을 꺼낸다")]
+    pub(crate) fn spawn(mut self, slave: &dyn SlavePty) -> Result<SshSpawn, String> {
+        #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+        if let Some(stored) = self.stored.take() {
+            let (child, exchange) = tauri::async_runtime::block_on(async {
+                stored
+                    .approval
+                    .spawn_ssh(&stored.document, &self.plan, slave, stored.vault)
+            })
+            .map_err(stored_error)?;
+            return Ok(SshSpawn { child, plan: self.plan, stored: Some(exchange) });
+        }
+        let child = slave
+            .spawn_command(self.command)
+            .map_err(|error| format!("spawn: {error:#}"))?;
+        Ok(SshSpawn {
+            child,
+            plan: self.plan,
+            #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+            stored: None,
+        })
+    }
+
+    pub(crate) fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
     }
 
     pub(crate) fn enable_editor(&mut self, app: tauri::AppHandle, owner: String, document: u64) -> tokio::sync::oneshot::Sender<String> {
@@ -81,6 +135,143 @@ pub(crate) fn saved(config: &Path, ssh: &Ssh) -> Result<DirectLaunch, String> {
     }
     let endpoint = super::Endpoint::new(&ssh.host, ssh.port).map_err(pin_error)?;
     prepare_saved(config, ssh, &endpoint)
+}
+
+/// 터미널 탭에서만 쓴다. 저장 암호 대상은 로컬 확인 창을 거친 한 번의 승인으로 실행한다.
+pub(crate) fn saved_interactive(
+    config: &Path,
+    ssh: &Ssh,
+    owner: &str,
+    document: u64,
+    confirm: impl FnOnce(String) -> Result<bool, String>,
+) -> Result<DirectLaunch, String> {
+    #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+    if let SshAuth::StoredPassword { item_id } = &ssh.auth {
+        if !matches!(ssh.transport, SshTransport::Direct {}) {
+            return Err("SSH-over-SSM을 사용할 수 없습니다".into());
+        }
+        let endpoint = super::Endpoint::new(&ssh.host, ssh.port).map_err(pin_error)?;
+        return prepare_stored(config, ssh, &endpoint, item_id, owner, document, confirm);
+    }
+    let _ = (owner, document, confirm);
+    saved(config, ssh)
+}
+
+#[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+fn prepare_stored(
+    config: &Path,
+    ssh: &Ssh,
+    endpoint: &super::Endpoint,
+    item: &str,
+    owner: &str,
+    document: u64,
+    confirm: impl FnOnce(String) -> Result<bool, String>,
+) -> Result<DirectLaunch, String> {
+    let vault = crate::local_auth::Bitwarden::discover();
+    prepare_stored_with(config, ssh, endpoint, item, owner, document, vault, confirm)
+}
+
+#[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+fn prepare_stored_with(
+    config: &Path,
+    ssh: &Ssh,
+    endpoint: &super::Endpoint,
+    item: &str,
+    owner: &str,
+    document: u64,
+    vault: Result<crate::local_auth::Bitwarden, crate::local_auth::Error>,
+    confirm: impl FnOnce(String) -> Result<bool, String>,
+) -> Result<DirectLaunch, String> {
+    let vault = match vault {
+        Ok(vault) => vault,
+        Err(error) => return manual(config, ssh, endpoint, fallback_reason(&error)),
+    };
+    if !vault.has_session() {
+        return manual(config, ssh, endpoint, "Bitwarden CLI 세션 키가 없습니다");
+    }
+    if let Err(error) = tauri::async_runtime::block_on(vault.ready()) {
+        return manual(config, ssh, endpoint, fallback_reason(&error));
+    }
+    let approved = ApprovedHost::confirm(endpoint, endpoint, &ssh.host_key_fingerprint).map_err(pin_error)?;
+    let plan = Arc::new(
+        ConnectionPlan::prepare(
+            &trust_store(config)?,
+            &approved,
+            &ssh.account,
+            Transport::Direct,
+            Authentication::StoredPassword { item },
+        )
+        .map_err(pin_error)?,
+    );
+    let current = crate::local_auth::Document {
+        owner: owner.into(),
+        document,
+        tab: uuid::Uuid::new_v4().to_string(),
+    };
+    let pending = crate::local_auth::Pending::request(current.clone(), Arc::clone(&plan)).map_err(stored_error)?;
+    let details = pending.details();
+    let message = format!(
+        "서버: {}\n계정: {}\n호스트 키 SHA256 지문: {}\n금고 항목 ID: {}\n\n저장된 SSH 암호로 로그인하시겠습니까?",
+        details.target, details.user, details.fingerprint, details.item,
+    );
+    if !confirm(message)? {
+        return Err("저장된 SSH 암호 승인이 취소되었습니다".into());
+    }
+    let approval = pending.approve(&current, &plan).map_err(stored_error)?;
+    let command = command(plan.stored_ssh_invocation().map_err(pin_error)?);
+    Ok(DirectLaunch {
+        command,
+        plan,
+        editor: None,
+        notice: None,
+        stored: Some(StoredLaunch { document: current, approval, vault }),
+    })
+}
+
+/// 금고를 쓸 수 없으면 같은 대상·계정·지문의 직접 입력으로 돌린다. 다른 자격 증명으로 재시도하지 않는다.
+#[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+fn manual(config: &Path, ssh: &Ssh, endpoint: &super::Endpoint, reason: &str) -> Result<DirectLaunch, String> {
+    let approved = ApprovedHost::confirm(endpoint, endpoint, &ssh.host_key_fingerprint).map_err(pin_error)?;
+    let mut launch = DirectLaunch::prepare(
+        &trust_store(config)?,
+        &approved,
+        &ssh.account,
+        &ssh.account,
+        Authentication::ManualPassword,
+    )
+    .map_err(pin_error)?;
+    launch.notice = Some(format!("저장된 인증을 사용할 수 없어 직접 입력으로 전환했습니다: {reason}"));
+    Ok(launch)
+}
+
+#[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+fn fallback_reason(error: &crate::local_auth::Error) -> &'static str {
+    use crate::local_auth::Error as E;
+    match error {
+        E::VaultUnavailable => "Bitwarden CLI를 찾을 수 없습니다",
+        E::VaultLocked => "Bitwarden 금고가 잠겨 있습니다",
+        E::VaultUnauthenticated => "Bitwarden에 로그인되어 있지 않습니다",
+        E::UntrustedExecutable => "신뢰할 수 있는 위치의 Bitwarden CLI가 아닙니다",
+        _ => "Bitwarden 상태를 확인할 수 없습니다",
+    }
+}
+
+#[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+fn stored_error(error: crate::local_auth::Error) -> String {
+    use crate::local_auth::Error as E;
+    match error {
+        E::Expired => "저장된 SSH 암호 승인이 만료되었습니다".into(),
+        E::Cancelled => "저장된 SSH 암호 승인이 취소되었습니다".into(),
+        E::InvalidApproval => "저장된 SSH 암호 승인 대상이 바뀌었습니다".into(),
+        E::UntrustedExecutable => "저장된 인증 실행기 또는 Bitwarden 경로를 신뢰할 수 없습니다".into(),
+        E::ChildUnavailable => "저장된 인증용 SSH 자식을 시작할 수 없습니다".into(),
+        E::ChannelUnavailable => "저장된 인증 채널을 열 수 없습니다".into(),
+        E::VaultUnavailable => "Bitwarden CLI를 찾을 수 없습니다".into(),
+        E::VaultLocked => "Bitwarden 금고가 잠겨 있습니다".into(),
+        E::VaultUnauthenticated => "Bitwarden에 로그인되어 있지 않습니다".into(),
+        E::ItemMissing => "Bitwarden 항목을 찾을 수 없습니다".into(),
+        other => format!("저장된 인증: {other:?}"),
+    }
 }
 
 pub(crate) fn prepare_remote_editor(config: &Path, id: &str, revision: std::num::NonZeroU64, ssh: &Ssh)

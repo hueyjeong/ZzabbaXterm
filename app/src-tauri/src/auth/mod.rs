@@ -196,7 +196,7 @@ impl Approval {
 pub struct Exchange {
     cancel: CancellationToken,
     task: JoinHandle<Result<(), Error>>,
-    _plan: Arc<ConnectionPlan>,
+    _plan: Option<Arc<ConnectionPlan>>,
 }
 
 impl Exchange {
@@ -228,7 +228,26 @@ impl Exchange {
         Self {
             cancel,
             task,
-            _plan: plan,
+            _plan: Some(plan),
+        }
+    }
+
+    /// 탭/창 전환이 진행 중인 교환을 실제로 취소하는지 시험할 때 쓴다.
+    #[cfg(test)]
+    pub(crate) fn dormant(cancelled: Arc<AtomicBool>) -> Self {
+        let cancel = CancellationToken::new();
+        let watched = cancel.clone();
+        let task = tauri::async_runtime::block_on(async move {
+            tokio::spawn(async move {
+                watched.cancelled().await;
+                cancelled.store(true, Ordering::Relaxed);
+                Ok(())
+            })
+        });
+        Self {
+            cancel,
+            task,
+            _plan: None,
         }
     }
 

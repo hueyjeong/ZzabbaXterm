@@ -298,15 +298,19 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Initi
     }
   }
 
-  async function test(actions: LocalConnectionActions) {
-    if (locked() || state.step !== "verify" || state.status.kind === "testing" || state.remoteCleanup) return;
-    const { draft } = state;
-    const { target } = draft;
+  function completedDraft() {
+    const { target } = state.draft;
     const ssh = target.defaultMethod === "ssh" && state.sshPin.kind === "verified" ? completeSsh(target.ssh) : null;
-    const complete = target.defaultMethod === "local" ? target
+    return target.defaultMethod === "local" ? target
       : target.defaultMethod === "ssm" ? target.ssm && { ...target, ssm: target.ssm }
         : target.defaultMethod === "s3" ? completeS3(target.s3) && target
           : ssh && { ...target, ssh };
+  }
+
+  async function test(actions: LocalConnectionActions) {
+    if (locked() || state.step !== "verify" || state.status.kind === "testing" || state.remoteCleanup) return;
+    const { draft } = state;
+    const complete = completedDraft();
     if (!complete) return;
     const attempt: ConnectionTestDraft = { draftId, draftVersion, draft: { ...draft, target: complete } };
     void cancelPending();
@@ -335,8 +339,21 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Initi
 
   async function save(actions: LocalConnectionActions) {
     const { status } = state;
-    if (state.step !== "verify" || (status.kind !== "passed" && status.kind !== "saveFailed")) return;
-    const { request, attempt } = status;
+    const stored = state.draft.target.defaultMethod === "ssh" && state.draft.target.ssh.auth?.kind === "storedPassword";
+    const passed = status.kind === "passed" || status.kind === "saveFailed";
+    // 저장 암호는 승인 기반 로그인이라 연결 시험 대신 호스트 키 확인 뒤 참조만 저장한다.
+    if (state.step !== "verify" || (!passed && !(stored && state.sshPin.kind === "verified"))) return;
+    let attempt: ConnectionTestDraft;
+    let request: ConnectionRequest;
+    if (passed) {
+      attempt = status.attempt;
+      request = status.request;
+    } else {
+      const complete = completedDraft();
+      if (!complete) return;
+      attempt = { draftId, draftVersion, draft: { ...state.draft, target: complete } };
+      request = { run: { draftId, draftVersion, runId: draftId }, draft: attempt.draft };
+    }
     const saving = { kind: "saving", request, attempt } as const;
     update({ status: saving });
     try {

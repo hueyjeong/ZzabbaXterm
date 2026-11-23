@@ -119,3 +119,116 @@ fn direct_ssh_fixture_receives_exact_plan_and_pty_input() {
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1, "영구 핀만 남아야 합니다");
     }
 }
+
+#[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+mod stored {
+    use std::{
+        path::Path,
+        process::Command,
+    };
+
+    use serde_json::json;
+
+    use crate::{
+        connections::profile::Ssh,
+        local_auth::{Bitwarden, Error},
+        ssh::{ApprovedHost, Endpoint, TRUST_DIRECTORY, TrustStore},
+    };
+
+    use super::super::{prepare_stored_with, saved};
+
+    const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti";
+    const SHA: &str = "SHA256:UCUiLr7Pjs9wFFJMDByLgc3NrtdU344OgUM45wZPcIQ";
+    const ITEM: &str = "21eb36c3-234d-439d-9e1f-1d3cc5ba8125";
+
+    fn target() -> (tempfile::TempDir, Ssh, Endpoint) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = TrustStore::create(&directory.path().join(TRUST_DIRECTORY)).unwrap();
+        let endpoint = Endpoint::new("dev.example.invalid", 2222).unwrap();
+        store
+            .register(&ApprovedHost::confirm(&endpoint, &endpoint, SHA).unwrap(), KEY)
+            .unwrap();
+        let ssh = serde_json::from_value::<Ssh>(json!({
+            "host": "dev.example.invalid",
+            "port": 2222,
+            "account": "deploy",
+            "hostKeyFingerprint": SHA,
+            "transport": {"kind": "direct"},
+            "auth": {"kind": "storedPassword", "itemId": ITEM},
+        }))
+        .unwrap();
+        (directory, ssh, endpoint)
+    }
+
+    fn vault(directory: &Path) -> Bitwarden {
+        let path = directory.join(if cfg!(windows) { "bw.exe" } else { "bw" });
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/auth/tests/bw_fixture.rs");
+        let built = Command::new(option_env!("RUSTC").unwrap_or("rustc"))
+            .arg(source)
+            .arg("-o")
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+        Bitwarden::fixture_at(&path, "isolated-fixture-session")
+    }
+
+    #[test]
+    fn stored_password_needs_confirmation_and_shows_target() {
+        let (directory, ssh, endpoint) = target();
+        let vault = vault(directory.path());
+        let mut shown = String::new();
+        let result = prepare_stored_with(directory.path(), &ssh, &endpoint, ITEM, "main", 1, Ok(vault), |message| {
+            shown = message;
+            Ok(false)
+        });
+        assert!(result.is_err());
+        assert_eq!(result.err().unwrap(), "저장된 SSH 암호 승인이 취소되었습니다");
+        assert!(shown.contains(ITEM), "{shown}");
+        assert!(shown.contains("deploy") && shown.contains(SHA), "{shown}");
+        assert!(shown.contains("[dev.example.invalid]:2222"), "{shown}");
+    }
+
+    #[test]
+    fn locked_vault_falls_back_to_manual_input() {
+        let (directory, ssh, endpoint) = target();
+        let vault = vault(directory.path());
+        std::fs::write(directory.path().join("mode"), "locked").unwrap();
+        let launch = prepare_stored_with(directory.path(), &ssh, &endpoint, ITEM, "main", 1, Ok(vault), |_| {
+            panic!("잠긴 금고에서 승인 창을 열었습니다")
+        })
+        .ok()
+        .unwrap();
+        assert!(launch.plan.stored().is_none());
+        assert!(launch.notice().unwrap().contains("Bitwarden 금고가 잠겨 있습니다"));
+        assert_eq!(launch.command.get_env("SSH_ASKPASS"), None);
+    }
+
+    #[test]
+    fn missing_vault_falls_back_with_reason() {
+        let (directory, ssh, endpoint) = target();
+        let launch = prepare_stored_with(directory.path(), &ssh, &endpoint, ITEM, "main", 1, Err(Error::VaultUnavailable), |_| {
+            panic!("금고 없이 승인 창을 열었습니다")
+        })
+        .ok()
+        .unwrap();
+        assert!(launch.notice().unwrap().contains("Bitwarden CLI를 찾을 수 없습니다"));
+    }
+
+    #[test]
+    fn stored_approval_is_consumed_once() {
+        let (directory, ssh, endpoint) = target();
+        let vault = vault(directory.path());
+        let mut launch = prepare_stored_with(directory.path(), &ssh, &endpoint, ITEM, "main", 1, Ok(vault), |_| Ok(true))
+            .ok()
+            .unwrap();
+        assert!(launch.stored.take().is_some());
+        assert!(launch.stored.take().is_none());
+    }
+
+    #[test]
+    fn noninteractive_paths_still_refuse_stored_password() {
+        let (directory, ssh, _) = target();
+        assert_eq!(saved(directory.path(), &ssh).err().unwrap(), "저장된 SSH 암호를 사용할 수 없습니다");
+    }
+}

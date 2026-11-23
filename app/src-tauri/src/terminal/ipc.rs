@@ -36,7 +36,7 @@ pub(crate) fn terminal_open(invoke: Invoke) {
         resolver.reject("nano 연동에는 저장된 SSH 연결이 필요합니다");
         return;
     }
-    let window = remote_editor.then(|| caller.window());
+    let window = target_id.is_some().then(|| caller.window());
     resolver.respond_async(async move {
         blocking(move || {
             let sessions = webview.state::<Sessions>();
@@ -50,6 +50,12 @@ pub(crate) fn terminal_open(invoke: Invoke) {
             let Some(window) = window else {
                 return sessions.open_document(owner, document, size, saved::launch(&directory, &id)?, send);
             };
+            if !remote_editor {
+                let launch = saved::launch_interactive(&directory, &id, owner, document, |message| {
+                    crate::ssh::registration::confirm_stored_auth(&window, message)
+                })?;
+                return sessions.open_document(owner, document, size, launch, send);
+            }
             validate_size(size)?;
             let (registration, command, parent) = saved::approve_remote_editor(&directory, &id, |message| {
                 sessions.with_probe_access(owner, document, true, |_| Ok(()))?;
