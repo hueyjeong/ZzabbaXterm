@@ -1,8 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState } from "react";
 import { AiPanel, type AiTopTabs } from "./AiPanel";
-import type { AiPanelProps, ChatReply, DecisionRecord, Proposal, ProposalTarget, RecordedDecision, TargetRef } from "./contracts";
-import type { SessionSelectionProps } from "./SessionSelection";
+import { executionActive, type AiPanelProps, type ChatReply, type DecisionRecord, type ExecutionApproval, type ExecutionStatus, type Proposal, type ProposalTarget, type RecordedDecision, type TargetRef } from "./contracts";
+import type { SessionSelectionProps, SessionSelectionSnapshot } from "./SessionSelection";
 
 const sendChat: AiPanelProps["onSendChat"] = async (request) => {
   try {
@@ -39,6 +39,7 @@ export function LocalAiPanel({ profilesVersion, topTabs, sessionCandidates, focu
   const [policyError, setPolicyError] = useState("");
   const policyPending = useRef(false);
   const [cliCard, setCliCard] = useState<Proposal>();
+  const [execution, setExecution] = useState<ExecutionStatus>();
   const opening = useRef(false);
   const selection = useRef<Promise<boolean>>(Promise.resolve(false));
 
@@ -91,6 +92,18 @@ export function LocalAiPanel({ profilesVersion, topTabs, sessionCandidates, focu
     void readHistory().catch(console.error);
     return () => { historyRequest.current++; };
   }, []);
+
+  const activePhase = execution?.phase;
+  useEffect(() => {
+    if (!activePhase || !executionActive(activePhase)) return;
+    let current = true;
+    const timer = window.setInterval(() => {
+      void invoke<ExecutionStatus | null>("ai_exec_status", {}).then((next) => {
+        if (current && next) setExecution(next);
+      }, () => {});
+    }, 500);
+    return () => { current = false; window.clearInterval(timer); };
+  }, [activePhase]);
 
   async function readDecision(proposalId: string) {
     const records = await readHistory();
@@ -176,6 +189,29 @@ export function LocalAiPanel({ profilesVersion, topTabs, sessionCandidates, focu
     }
   }
 
+  async function executeProposal(proposalId: string, taskId: "uptime") {
+    try {
+      const snapshot = await invoke<SessionSelectionSnapshot | null>("ai_session_selection", {});
+      if (!snapshot?.confirmed) throw new Error("AI 작업 세션을 선택하고 연결을 확인하세요");
+      const approval = await invoke<ExecutionApproval>("ai_exec_approve", {
+        proposalId, taskId, sessionId: snapshot.id, selectionId: snapshot.selectionId,
+      });
+      setExecution(await invoke<ExecutionStatus>("ai_exec_start", {
+        sessionId: snapshot.id, generation: snapshot.selectionId, approvalId: approval.approvalId, taskId,
+      }));
+    } catch (error) {
+      setExecution({ proposalId, phase: "failed", output: "", error: String(error) });
+    }
+  }
+
+  async function stopExecution(approvalId: string) {
+    try {
+      setExecution(await invoke<ExecutionStatus>("ai_exec_stop", { approvalId }));
+    } catch (error) {
+      setExecution((current) => current && { ...current, error: String(error) });
+    }
+  }
+
   return <AiPanel models={models} targets={targets} proposals={cliCard ? [cliCard] : []} onSelectTarget={select}
     history={history} policyVersion={policyVersion} onReadDecision={readDecision}
     onOpenCliReview={openCliReview} topTabs={topTabs}
@@ -184,5 +220,6 @@ export function LocalAiPanel({ profilesVersion, topTabs, sessionCandidates, focu
       onChange={(event) => void updatePolicy(event.currentTarget.checked)} /> 조회 승인 차단</label>}
     policyStatus={policyError ? <p role="alert">{policyError}</p> : savingPolicy ? <p role="status">설정 저장 중</p> : undefined}
     modelError={modelError} targetError={targetError} onRefresh={() => setRetry((value) => value + 1)}
+    execution={execution} onExecuteProposal={executeProposal} onStopExecution={stopExecution}
     onSendChat={sendChat} onRequestProposal={propose} onDecideProposal={decide} />;
 }

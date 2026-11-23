@@ -17,6 +17,48 @@ export type ProposalDecision = Readonly<{ proposalId: string; decision: "approve
 export type RecordedDecision = "approved" | "rejected" | "cancelled";
 export type DecisionRecord = Readonly<{ proposal: Proposal; decision: RecordedDecision }>;
 
+export type ExecutionPhase =
+  | "starting" | "pairing" | "waitingClaim" | "awaitingStart" | "running"
+  | "stopRequested" | "exited" | "unconfirmed" | "failed";
+
+export type ExecutionApproval = Readonly<{
+  approvalId: string;
+  proposalId: string;
+  taskId: "uptime";
+  sessionId: string;
+  selectionId: string;
+  node: string;
+  account: string;
+  program: string;
+  args: readonly string[];
+  policy: "allowed";
+  expiresInMs: number;
+}>;
+
+export function executionActive(phase: ExecutionPhase) {
+  return phase === "starting" || phase === "pairing" || phase === "waitingClaim"
+    || phase === "awaitingStart" || phase === "running" || phase === "stopRequested";
+}
+
+export type ExecutionStatus = Readonly<{
+  proposalId: string;
+  approvalId?: string;
+  jobId?: string;
+  taskId?: "uptime";
+  sessionId?: string;
+  selectionId?: string;
+  node?: string;
+  account?: string;
+  program?: string;
+  args?: readonly string[];
+  policy?: "allowed";
+  phase: ExecutionPhase;
+  output: string;
+  pairingCode?: string;
+  code?: number;
+  error?: string;
+}>;
+
 // Rust resolves targets and revalidates the recorded proposal by ID; a decision is not an execution request.
 export type AiPanelProps = Readonly<{
   models: readonly string[];
@@ -34,4 +76,7 @@ export type AiPanelProps = Readonly<{
   onSendChat: (request: ChatRequest) => Promise<ChatReply>;
   onRequestProposal: (request: ProposalRequest, signal: AbortSignal) => Promise<Proposal>;
   onDecideProposal: (decision: ProposalDecision) => Promise<RecordedDecision>;
+  execution?: ExecutionStatus;
+  onExecuteProposal?: (proposalId: string, taskId: "uptime") => Promise<void>;
+  onStopExecution?: (approvalId: string) => Promise<void>;
 }>;

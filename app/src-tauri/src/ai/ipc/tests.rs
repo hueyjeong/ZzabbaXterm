@@ -221,3 +221,105 @@ fn policy_change_frees_all_slots_and_retains_only_local_read_only_history() {
     state.select(2, Some(target)).unwrap();
     assert!(state.decide(2, &local, &targets, decision()).is_err());
 }
+
+fn ssm_target() -> SelectedTarget {
+    SelectedTarget {
+        profile_id: "dev".into(),
+        ssm_profile: Some("ops".into()),
+        region: "ap-northeast-2".into(),
+        node_id: "i-0123456789abcdef0".into(),
+        display_name: "개발 노드".into(),
+        generation: NonZeroU64::MIN,
+    }
+}
+
+fn live_session() -> crate::ai::execution::LiveSession {
+    crate::ai::execution::LiveSession {
+        id: "7".into(),
+        selection_id: NonZeroU64::new(2).unwrap(),
+        identity: crate::terminal::LiveSsmIdentity {
+            id: "7".into(),
+            document: 4,
+            account_id: "123456789012".into(),
+            role: Some(crate::ssm::AssumedRole::fixture("123456789012")),
+            profile: "ops".into(),
+            region: "ap-northeast-2".into(),
+            instance_id: "i-0123456789abcdef0".into(),
+        },
+    }
+}
+
+fn approved_execution(state: &mut ReviewState, target: &SelectedTarget, local: &LocalReview, exec: &crate::ai::execution::State, now: Instant) -> String {
+    let id = state.reviews.propose(
+        Candidate::Chat(review_proposal(r#"{"operation":"uptime","arguments":{}}"#, target.clone()).unwrap()),
+        Some(target), state.policy,
+    ).unwrap();
+    state.reviews.open(local, id, Some(target), state.policy, None).unwrap();
+    let targets = [target.clone()];
+    assert_eq!(state.decide(4, local, &targets, Decision { proposal_id: id.to_string(), decision: PanelChoice::Approve }), Ok(RecordedDecision::Approved));
+    let request = ExecApproveRequest {
+        proposal_id: id.to_string(), task_id: "uptime".into(), session_id: "7".into(), selection_id: "2".into(),
+    };
+    let card = state.approve_execution(local, &targets, &request, &live_session(), 4, exec, now).unwrap();
+    let wire = serde_json::to_value(card).unwrap();
+    assert_eq!(wire["program"], "/usr/bin/uptime");
+    assert_eq!(wire["args"], json!([]));
+    assert_eq!(wire["account"], "zzabba-ai-control");
+    assert_eq!(wire["policy"], "allowed");
+    assert_eq!(wire["sessionId"], "7");
+    assert_eq!(wire["selectionId"], "2");
+    wire["approvalId"].as_str().unwrap().to_owned()
+}
+
+fn start_request(approval_id: &str) -> ExecStartRequest {
+    ExecStartRequest {
+        session_id: "7".into(), generation: "2".into(), task_id: "uptime".into(),
+        approval_id: approval_id.into(),
+    }
+}
+
+#[test]
+fn execution_binds_the_recorded_decision_and_consumes_its_approval_once() {
+    let target = ssm_target();
+    let targets = [target.clone()];
+    let local = LocalReview::check("main", "main", true, 4).unwrap();
+    let mut state = ReviewState::default();
+    state.select(4, Some(target.clone())).unwrap();
+    let exec = crate::ai::execution::State::default();
+    let now = Instant::now();
+    let approval_id = approved_execution(&mut state, &target, &local, &exec, now);
+    let start = start_request(&approval_id);
+    assert!(state.start_execution(&local, &targets, &start, &live_session(), 4, &exec, now).is_ok());
+    assert!(state.start_execution(&local, &targets, &start, &live_session(), 4, &exec, now).is_err());
+}
+
+#[test]
+fn other_session_submission_is_refused_without_consuming_the_approval() {
+    let target = ssm_target();
+    let targets = [target.clone()];
+    let local = LocalReview::check("main", "main", true, 4).unwrap();
+    let mut state = ReviewState::default();
+    state.select(4, Some(target.clone())).unwrap();
+    let exec = crate::ai::execution::State::default();
+    let now = Instant::now();
+    let approval_id = approved_execution(&mut state, &target, &local, &exec, now);
+    let start = start_request(&approval_id);
+    let other = crate::ai::execution::LiveSession { id: "8".into(), ..live_session() };
+    assert!(state.start_execution(&local, &targets, &start, &other, 4, &exec, now).is_err());
+    assert!(state.start_execution(&local, &targets, &start, &live_session(), 4, &exec, now).is_ok());
+}
+
+#[test]
+fn policy_change_refuses_the_issued_execution_approval() {
+    let target = ssm_target();
+    let targets = [target.clone()];
+    let local = LocalReview::check("main", "main", true, 4).unwrap();
+    let mut state = ReviewState::default();
+    state.select(4, Some(target.clone())).unwrap();
+    let exec = crate::ai::execution::State::default();
+    let now = Instant::now();
+    let approval_id = approved_execution(&mut state, &target, &local, &exec, now);
+    state.set_policy(true).unwrap();
+    let start = start_request(&approval_id);
+    assert!(state.start_execution(&local, &targets, &start, &live_session(), 4, &exec, now).is_err());
+}

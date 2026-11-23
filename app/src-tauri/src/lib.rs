@@ -35,6 +35,7 @@ pub fn run() {
         .manage(editor::nano_bridge::NanoBridge::default())
         .manage(StorageIpc::default())
         .manage(ai::ipc::State::default())
+        .manage(ai::execution::State::default())
         .manage(ai::session_selection::State::default())
         .manage(tunnels::ipc::TunnelTabs::default())
         .manage(rdp::ipc::Sessions::default())
@@ -64,6 +65,7 @@ pub fn run() {
                 if main {
                     webview.state::<rdp::ipc::Sessions>().retire();
                     webview.state::<vnc::ipc::Sessions>().retire(false);
+                    webview.state::<ai::execution::State>().cancel_all();
                 }
                 if let Some(registration) = webview.try_state::<ssh::registration::Registration>() {
                     registration.document_changed(webview.label());

@@ -297,6 +297,44 @@ impl Reviews {
         Ok(&pending.card)
     }
 
+    /// 실행 승인 후보는 승인된 기록만 참조한다. 대상·정책 대조는 호출자가 이어서 한다.
+    pub(super) fn recorded(&self, local: &LocalReview, proposal_id: u32) -> Result<Card, ReviewError> {
+        let (record, decision, replayable) = self.decisions.iter()
+            .find(|(record, _, _)| record.card.proposal_id == proposal_id)
+            .ok_or(ReviewError::Missing)?;
+        if !*replayable || record.opened_in != Some(local.0) {
+            return Err(ReviewError::Stale);
+        }
+        if Instant::now() >= record.expires_at {
+            return Err(ReviewError::Expired);
+        }
+        if *decision != Decision::Approved {
+            return Err(ReviewError::NotApprovable);
+        }
+        Ok(record.card.clone())
+    }
+
+    /// 실행 직전에 원본 결정·대상·정책을 다시 대조한다.
+    pub(super) fn approved_for(
+        &self,
+        local: &LocalReview,
+        proposal_id: u32,
+        selected: Option<&SelectedTarget>,
+        policy: Policy,
+    ) -> Result<&Card, ReviewError> {
+        let (record, decision, replayable) = self.decisions.iter()
+            .find(|(record, _, _)| record.card.proposal_id == proposal_id)
+            .ok_or(ReviewError::Missing)?;
+        if !*replayable {
+            return Err(ReviewError::Stale);
+        }
+        record.check(local, selected, policy)?;
+        if *decision != Decision::Approved {
+            return Err(ReviewError::NotApprovable);
+        }
+        Ok(&record.card)
+    }
+
     pub fn decide(
         &mut self,
         local: &LocalReview,

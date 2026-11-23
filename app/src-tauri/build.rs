@@ -40,6 +40,7 @@ fn main() {
         "storage_edit_close",
         "ai_cli_review",
         "ai_policy", "ai_set_policy",
+        "ai_exec_approve", "ai_exec_start", "ai_exec_status", "ai_exec_stop",
         "ai_session_selection", "ai_session_select", "ai_session_confirm", "ai_session_clear",
     ]);
     let mut attributes = tauri_build::Attributes::new().app_manifest(app);

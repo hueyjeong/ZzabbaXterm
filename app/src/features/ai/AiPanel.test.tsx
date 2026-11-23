@@ -3,7 +3,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AiPanel, type AiTopTabs } from "./AiPanel";
-import type { AiPanelProps, ChatReply, Proposal } from "./contracts";
+import type { AiPanelProps, ChatReply, ExecutionStatus, Proposal } from "./contracts";
 
 const alpha = { targetId: "a", generation: "1", label: "개발" };
 const beta = { targetId: "b", generation: "1", label: "개발" };
@@ -346,5 +346,45 @@ describe("제안 검토", () => {
     await act(async () => { response.resolve("rejected"); });
     expect(status?.textContent).toBe("거절 기록됨");
     expect(document.activeElement).toBe(move ? terminal : status);
+  });
+});
+
+describe("승인된 작업 실행", () => {
+  const history = [{ proposal: card, decision: "approved" as const }];
+
+  it("승인된 카드에 대상·절대 경로·인자·정책을 표시하고 중지와 종료 상태를 구분한다", async () => {
+    const props = setup();
+    const execute = vi.fn<NonNullable<AiPanelProps["onExecuteProposal"]>>().mockImplementation(async () => {});
+    const stop = vi.fn<NonNullable<AiPanelProps["onStopExecution"]>>().mockImplementation(async () => {});
+    await render({ ...props, history, onExecuteProposal: execute, onStopExecution: stop });
+    await select("조회 대상", "개발 (a)");
+    expect(button("실행 승인")).toBeDefined();
+    await click("실행 승인");
+    expect(execute.mock.calls).toEqual([["p1", "uptime"]]);
+
+    const status: ExecutionStatus = {
+      proposalId: "p1", approvalId: "3", jobId: "3", taskId: "uptime", sessionId: "7", selectionId: "2",
+      node: "dev-01", account: "zzabba-ai-control", program: "/usr/bin/uptime", args: [], policy: "allowed",
+      phase: "running", output: " 10:32 up 2 days\n",
+    };
+    const rerender = async (next: ExecutionStatus) => act(async () => {
+      root.render(<><textarea aria-label="터미널 입력" /><AiPanel {...props} history={history}
+        execution={next} onExecuteProposal={execute} onStopExecution={stop} /></>);
+    });
+    await rerender(status);
+    const panel = host.querySelector(".a01-execution");
+    expect(panel?.textContent).toContain("dev-01");
+    expect(panel?.textContent).toContain("/usr/bin/uptime");
+    expect(panel?.textContent).toContain("(없음)");
+    expect(panel?.textContent).toContain("허용된 조회 작업");
+    expect(panel?.textContent).toContain("실행 중");
+    expect(panel?.textContent).toContain("10:32 up 2 days");
+    await click("중지");
+    expect(stop.mock.calls).toEqual([["3"]]);
+
+    await rerender({ ...status, phase: "unconfirmed", error: "제어 채널이 끊겼습니다" });
+    expect(host.querySelector(".a01-execution")?.textContent).toContain("종료 확인 불가");
+    await rerender({ ...status, phase: "exited", code: 0 });
+    expect(host.querySelector(".a01-execution")?.textContent).toContain("종료됨");
   });
 });
