@@ -138,6 +138,7 @@ impl ControlTransport {
                     return Ok(Output::CliExited(code));
                 }
                 Event::Disconnected(error) => return Err(error),
+                Event::Notice(_) => continue,
             }
         }
     }

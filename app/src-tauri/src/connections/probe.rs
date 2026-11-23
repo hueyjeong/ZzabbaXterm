@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc, thread};
 use serde::{Deserialize, Serialize};
 
 use crate::terminal::{Sessions, probe::Probe};
-use super::{profile::{Draft, Method, MethodRef, ValidatedDraft}, store::{SaveStatus, Store, StoreError}};
+use super::{profile::{Draft, Method, MethodRef, SshAuth, ValidatedDraft}, store::{SaveStatus, Store, StoreError}};
 
 const UNTESTED: &str = "이 초안의 현재 시험이 없습니다";
 
@@ -209,6 +209,12 @@ fn remove_run(runs: &mut Runs, owner: &str, document: u64, key: &RunKey) -> Resu
 pub(super) fn save_confirmed(sessions: &Sessions, owner: &str, document: u64, request: SaveRequest, store: &Store) -> Result<(), String> {
     let SaveRequest { run: key, draft } = request;
     let draft = draft.validate().map_err(|error| format!("초안 검증: {error:?}"))?;
+    // 저장 암호 대상은 승인 창을 열 수 있는 빌드에서만 연결 시험 없이 참조를 저장한다.
+    if cfg!(all(feature = "stored-auth", any(windows, target_os = "linux")))
+        && matches!(draft.method(), MethodRef::Ssh { ssh } if matches!(ssh.auth, SshAuth::StoredPassword { .. }))
+    {
+        return saved(store.save_authorized(draft, None, || Ok(()), || {}));
+    }
     let expected = sessions.with_probes(owner, document, |runs| {
         let run = runs.get(owner, &key)?;
         if !run.confirmed || !run.draft.matches(&draft) {
@@ -234,7 +240,11 @@ pub(super) fn save_confirmed(sessions: &Sessions, owner: &str, document: u64, re
             Ok(())
         });
     };
-    match store.save_authorized(draft, tested_account_id, authorize, committed).map_err(|error| match error {
+    saved(store.save_authorized(draft, tested_account_id, authorize, committed))
+}
+
+fn saved(result: Result<SaveStatus, StoreError>) -> Result<(), String> {
+    match result.map_err(|error| match error {
         StoreError::Authorization(reason) => reason,
         other => format!("프로필 저장: {other:?}"),
     })? {
@@ -481,5 +491,24 @@ mod tests {
             assert!(retired);
             assert!(cancel(&sessions, "other", 0, &key).is_ok());
         });
+    }
+
+    #[test]
+    fn stored_password_profile_saves_without_a_probe_run() {
+        use serde_json::json;
+        let dir = TestDir::new();
+        let sessions = Sessions::default();
+        let store = Store::new(dir.path());
+        let mut input = crate::connections::tests::ssh_draft(dir.path());
+        input["target"]["ssh"]["auth"] = json!({
+            "kind": "storedPassword",
+            "itemId": "21eb36c3-234d-439d-9e1f-1d3cc5ba8125",
+        });
+        let request = SaveRequest {
+            run: RunKey { draft_id: "stored".into(), draft_version: 1, run_id: "unused".into() },
+            draft: serde_json::from_value(input).unwrap(),
+        };
+        save_confirmed(&sessions, "main", 0, request, &store).unwrap();
+        assert_eq!(store.load().unwrap().targets.len(), 1);
     }
 }

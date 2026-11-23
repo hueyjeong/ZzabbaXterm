@@ -2,6 +2,7 @@ import type { LocalConnectionWizardState, SshAuth, SshInput } from "./profiles";
 
 type Edit = LocalConnectionWizardState["editSsh"];
 type Props = Readonly<{ ssh: SshInput; edit: Edit }>;
+type AuthProps = Props & Readonly<{ storedAuth: boolean }>;
 
 const authLabels = {
   agent: "SSH Agent",
@@ -25,7 +26,7 @@ export function SshMethodFields({ ssh, edit }: Props) {
   </>;
 }
 
-export function SshAuthFields({ ssh: { auth }, edit }: Props) {
+export function SshAuthFields({ ssh: { auth }, edit, storedAuth }: AuthProps) {
   return <>
     <div><label>SSH 인증 방식 <select value={auth?.kind ?? ""} onChange={event => {
       switch (event.currentTarget.value) {
@@ -37,7 +38,7 @@ export function SshAuthFields({ ssh: { auth }, edit }: Props) {
       }
     }}>
       <option value="">인증 방식 선택</option>
-      {Object.entries(authLabels).map(([value, label]) => <option key={value} value={value} disabled={value === "storedPassword"}>{label}</option>)}
+      {Object.entries(authLabels).map(([value, label]) => <option key={value} value={value} disabled={value === "storedPassword" && !storedAuth}>{label}</option>)}
     </select></label></div>
     {auth?.kind === "agent" && <div><label>Agent 공개 키 파일 경로 <input value={auth.publicKeyPath}
       onChange={event => edit({ auth: { kind: "agent", publicKeyPath: event.target.value } })} /></label></div>}

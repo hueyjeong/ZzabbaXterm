@@ -15,6 +15,22 @@ pub(super) fn launch(config: &Path, id: &str) -> Result<Launch, String> {
     })
 }
 
+/// 터미널 탭에는 저장 암호 승인 경로를 연다. 연결 시험·터널은 계속 `launch`를 쓴다.
+pub(super) fn launch_interactive(
+    config: &Path,
+    id: &str,
+    owner: &str,
+    document: u64,
+    confirm: impl FnOnce(String) -> Result<bool, String>,
+) -> Result<Launch, String> {
+    with_saved_method(config, id, |method, _| match method {
+        MethodRef::Local { shell, start_directory } => local(shell, start_directory).map(Launch::Local),
+        MethodRef::Ssm { profile, region, instance_id } => remote::Target::new(profile, region, instance_id).map(Launch::Ssm),
+        MethodRef::Ssh { ssh } => crate::ssh::terminal::saved_interactive(config, ssh, owner, document, confirm).map(Launch::Ssh),
+        MethodRef::S3 { .. } => Err("S3 연결은 스토리지 탭에서 열 수 있습니다".into()),
+    })
+}
+
 pub(super) fn approve_remote_editor<T>(config: &Path, id: &str,
     confirm: impl FnOnce(String) -> Result<bool, String>,
     register: impl FnOnce(DirectLaunch) -> Result<T, String>,

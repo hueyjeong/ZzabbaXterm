@@ -56,7 +56,7 @@ function terminalStatus(status: TerminalStatus) {
   switch (status.kind) {
     case "opening": return "여는 중";
     case "connecting": return "연결 중";
-    case "running": return "연결됨";
+    case "running": return status.notice ?? "연결됨";
     case "exited": return `종료 코드 ${status.value}`;
     case "disconnected": return `단절: ${status.value}`;
     case "failed": return `열기 실패: ${status.value}`;
@@ -828,6 +828,7 @@ export function Workspace() {
         {hostRegistration && <span role={hostRegistration.kind}>{hostRegistration.message}</span>}
       </footer>
       {wizard && <LocalConnectionWizard {...wizard} groups={profileLoad.profiles?.groups ?? []}
+        capabilities={connections.capabilities}
         verifySshHost={connections.verifySshHost}
         test={connections.test} cancelTest={connections.cancelTest} save={connections.save} onClose={closeWizard} />}
     </main>

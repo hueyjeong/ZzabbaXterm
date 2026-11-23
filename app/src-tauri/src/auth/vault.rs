@@ -37,7 +37,25 @@ impl Bitwarden {
         })
     }
 
-    pub(super) async fn password(&self, item: &str) -> Result<Zeroizing<Vec<u8>>, Error> {
+    /// 관리자·소유자가 보호한 고정 경로에서만 찾는다. 세션 키는 앱 프로세스 환경에서만
+    /// 읽고 자식 환경·argv·로그로 내보내지 않는다.
+    pub fn discover() -> Result<Self, Error> {
+        let session = std::env::var("BW_SESSION").ok().map(Zeroizing::new);
+        let mut installed = candidates().into_iter().filter(|path| path.symlink_metadata().is_ok());
+        let path = installed.next().ok_or(Error::VaultUnavailable)?;
+        Self::new(&path, session)
+    }
+
+    /// 승인 창을 열기 전에 금고 상태를 확인한다. 실패하면 직접 입력으로 되돌린다.
+    pub(crate) async fn ready(&self) -> Result<(), Error> {
+        self.status().await
+    }
+
+    pub(crate) fn has_session(&self) -> bool {
+        self.session.is_some()
+    }
+
+    async fn status(&self) -> Result<(), Error> {
         let (ok, status, _) = self.run(&["status"], 8192).await?;
         if !ok {
             return Err(Error::VaultFailed);
@@ -51,11 +69,15 @@ impl Bitwarden {
             .map_err(|_| Error::VaultFailed)?
             .status
         {
-            "locked" => return Err(Error::VaultLocked),
-            "unauthenticated" => return Err(Error::VaultUnauthenticated),
-            "unlocked" => (),
-            _ => return Err(Error::VaultFailed),
+            "locked" => Err(Error::VaultLocked),
+            "unauthenticated" => Err(Error::VaultUnauthenticated),
+            "unlocked" => Ok(()),
+            _ => Err(Error::VaultFailed),
         }
+    }
+
+    pub(super) async fn password(&self, item: &str) -> Result<Zeroizing<Vec<u8>>, Error> {
+        self.status().await?;
         let (ok, password, error) = self.run(&["get", "password", item], MAX_PASSWORD).await?;
         if !ok {
             return Err(match error.trim_ascii() {
@@ -124,6 +146,31 @@ impl Bitwarden {
             session: Some(session),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_at(path: &Path, session: &str) -> Self {
+        Self {
+            program: TrustedFile::fixture(path),
+            session: Some(Zeroizing::new(session.into())),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn candidates() -> Vec<std::path::PathBuf> {
+    ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(|root| std::path::PathBuf::from(root).join("Bitwarden CLI").join(BW))
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn candidates() -> Vec<std::path::PathBuf> {
+    ["/usr/bin", "/usr/local/bin"]
+        .into_iter()
+        .map(|root| std::path::Path::new(root).join(BW))
+        .collect()
 }
 
 type Secret = Zeroizing<Vec<u8>>;

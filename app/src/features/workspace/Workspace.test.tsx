@@ -1619,7 +1619,10 @@ describe("F01 직접 SSH", () => {
   const fingerprint = `SHA256:${"A".repeat(43)}`;
 
   it("네이티브 PIN 등록을 취소하면 연결 시험과 저장을 차단한다", async () => {
-    runConnectionCommand = async () => { throw "cancelled"; };
+    runConnectionCommand = async (command) => {
+      if (command === "connection_capabilities") return { storedAuth: true };
+      throw "cancelled";
+    };
     const select = async (label: string, value: string) => {
       const control = [...find("dialog").querySelectorAll("label")]
         .find(item => item.firstChild?.textContent?.trim() === label)?.querySelector("select");
@@ -1642,7 +1645,7 @@ describe("F01 직접 SSH", () => {
     await changeInput("호스트 키 SHA256 지문", fingerprint);
     await press("다음");
     const auth = await select("SSH 인증 방식", "manualPassword");
-    expect(auth.querySelector<HTMLOptionElement>('option[value="storedPassword"]')?.disabled).toBe(true);
+    expect(auth.querySelector<HTMLOptionElement>('option[value="storedPassword"]')?.disabled).toBe(false);
     await press("다음");
     expect(find('[aria-label="SSH 연결 대상"]').textContent).toContain("deploy");
     await press("호스트 키 선택 및 등록");

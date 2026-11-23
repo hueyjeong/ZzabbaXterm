@@ -774,6 +774,7 @@ enum End {
     Disconnected(String),
     Connecting,
     Ready,
+    Notice(String),
 }
 
 impl Event {
@@ -785,6 +786,7 @@ impl Event {
             Self::Disconnected(reason) => End::Disconnected(reason).body()?,
             Self::Connecting => End::Connecting.body()?,
             Self::Ready { .. } => End::Ready.body()?,
+            Self::Notice(notice) => End::Notice(notice).body()?,
         })
     }
 }
@@ -796,6 +798,7 @@ pub(crate) enum Event {
     Disconnected(String),
     Connecting,
     Ready { account_id: String },
+    Notice(String),
 }
 
 fn validate_working_directory(directory: &std::path::Path) -> Result<(), String> {

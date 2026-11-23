@@ -130,6 +130,37 @@ fn an_unacknowledged_response_is_not_cancelled() {
 }
 
 #[test]
+fn cancelling_exchange_drops_inflight_lookup() {
+    struct Guard(Arc<AtomicBool>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let plan = plan(&root.path().join("trust"), 2222, "fixture-user", KEY, ITEM);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = Guard(Arc::clone(&dropped));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let notify = Arc::clone(&started);
+        let mut exchange = Exchange::start(Instant::now() + TTL, plan, move |_, _| async move {
+            let _guard = guard;
+            notify.notify_one();
+            std::future::pending::<Result<(), Error>>().await
+        });
+        started.notified().await;
+        exchange.cancel();
+        assert_eq!(exchange.result().await, Err(Error::Cancelled));
+        assert!(dropped.load(Ordering::Relaxed));
+    });
+}
+
+#[test]
 fn writable_install_and_missing_cli_are_distinct() {
     let temp = tempfile::tempdir().unwrap();
     let name = if cfg!(windows) { "bw.exe" } else { "bw" };

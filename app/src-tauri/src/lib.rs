@@ -21,6 +21,7 @@ pub mod local_auth {
     #[path = "mod.rs"]
     mod implementation;
     pub use self::implementation::run_askpass;
+    pub(crate) use self::implementation::{Approval, Bitwarden, Document, Error, Exchange, Pending};
 }
 
 use editor::registry::LocalEditors;

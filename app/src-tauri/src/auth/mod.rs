@@ -93,6 +93,7 @@ impl Pending {
     }
 
     /// 로컬 확인 창은 별도 입력값 대신 이 계획의 직접 SSH 대상, 계정, 지문, 금고 항목을 표시한다.
+    #[cfg(test)]
     pub(crate) fn details(&self) -> &crate::ssh::Stored {
         self.plan.stored().expect("stored SSH plan required")
     }
@@ -196,7 +197,7 @@ impl Approval {
 pub struct Exchange {
     cancel: CancellationToken,
     task: JoinHandle<Result<(), Error>>,
-    _plan: Arc<ConnectionPlan>,
+    _plan: Option<Arc<ConnectionPlan>>,
 }
 
 impl Exchange {
@@ -228,7 +229,21 @@ impl Exchange {
         Self {
             cancel,
             task,
-            _plan: plan,
+            _plan: Some(plan),
+        }
+    }
+
+    /// 교환 결과 관찰을 시험할 때 고정 결과를 돌려준다.
+    #[cfg(test)]
+    pub(crate) fn fixture_result(result: Result<(), Error>) -> Self {
+        let cancel = CancellationToken::new();
+        let task = tauri::async_runtime::block_on(async move {
+            tokio::spawn(async move { result })
+        });
+        Self {
+            cancel,
+            task,
+            _plan: None,
         }
     }
 
