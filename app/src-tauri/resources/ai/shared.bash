@@ -2,8 +2,17 @@
 [[ $- == *i* && ${BASH_VERSION-} && $BASH_SUBSHELL == 0 ]] || return 0
 
 __zzabba_shared_pair() {
-    local code locator
-    IFS= read -r -s -t 60 -p 'Zzabba pairing code: ' code </dev/tty || return 0
+    local code= char locator end=$((SECONDS + 60))
+    # bind -x 처리기 안에서는 readline 터미널 설정이 유지된다. Enter는 클라이언트에 따라 CR 또는 LF로 온다.
+    printf 'Zzabba pairing code: ' >/dev/tty
+    while (( SECONDS < end )) && IFS= read -r -s -n 1 -t "$((end - SECONDS))" char </dev/tty; do
+        [[ -z $char || $char == $'\r' ]] && break
+        code+=$char
+        (( ${#code} <= 96 )) || return 1
+    done
+    printf '\n' >/dev/tty
+    code=${code#$'\e[200~'}
+    code=${code%$'\e[201~'}
     [[ $code =~ ^[0-9a-f]{64}$ ]] || return 1
     locator=$(exec -c /usr/local/libexec/zzabba-ai-control --shared-pair <<<"$BASHPID_FOR_ZZABBA"$'\n'"$code") || return
     __zzabba_shared_locator=$locator

@@ -79,8 +79,10 @@ class Terminal:
 
 
 class Control(Terminal):
-    def __init__(self):
+    # Windows ConPTY와 SSM 플러그인은 앱이 보낸 프레임 끝 LF를 CR로 전달한다.
+    def __init__(self, eol=b'\n'):
         super().__init__([BIN, '--shared-control'])
+        self.eol = eol
         self.channel = secrets.token_hex(16)
         ready = self.event('ready')
         self.frame('hello', version=1, nonce=ready['nonce'])
@@ -102,12 +104,13 @@ class Control(Terminal):
         return msg
 
     def frame(self, kind, **fields):
-        self.send(json.dumps(dict(type=kind, channel=self.channel, **fields)).encode() + b'\n')
+        self.send(json.dumps(dict(type=kind, channel=self.channel, **fields)).encode() + self.eol)
 
-    def pair(self, tab):
+    def pair(self, tab, enter=b'\r'):
         tab.send(KEY_PAIR)
         tab.read(rb'Zzabba pairing code: ')
-        tab.send(self.code + b'\n')
+        # bind -x 처리기 안에서는 Enter가 클라이언트에 따라 CR 또는 LF로 그대로 온다.
+        tab.send(self.code + enter)
         tab.read(rb'zzabba\$ ')
 
     def ticket(self, job):
@@ -232,7 +235,7 @@ def main():
     with ExitStack() as stack:
         tab = bash(stack)
         control = stack.enter_context(Control())
-        control.pair(tab)
+        control.pair(tab, b'\n')
         control.generation = control.event('paired', 2)['shell_generation']
         control.approval('reserve', control.ticket(1))
         os.kill(control.pid, signal.SIGKILL)
@@ -246,7 +249,7 @@ def main():
 
     with ExitStack() as stack:
         tab = bash(stack)
-        control = stack.enter_context(Control())
+        control = stack.enter_context(Control(b'\r'))
         control.pair(tab)
         control.generation = control.event('paired', 2)['shell_generation']
         ticket = control.ticket(1)
