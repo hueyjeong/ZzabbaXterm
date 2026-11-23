@@ -37,6 +37,15 @@
 
 Agent 공개 키는 열린 파일의 핸들로 링크 여부, 정규 파일 여부, 16 KiB 상한을 검사한 뒤 읽는다. SSH-over-SSM과 저장 암호는 이 후보에서 사용 불가다.
 
+**저장 인증 기반의 현재 상태(비기본 기능).** `stored-auth` 기능으로 빌드할 때만 다음이 포함된다: Bitwarden CLI 호출(`auth/vault.rs`), 로컬 승인 전송(Windows named pipe / Linux Unix 소켓, 상대 프로세스·이미지·자식 관계 확인), `zzabba-askpass` helper, 승인 1회 소비(`auth/mod.rs`). 그러나 제품 경로에는 아직 연결되지 않았다. `DirectLaunch::prepare`와 저장 대상 실행이 `StoredAuthenticationUnavailable`로 거부하므로, `stored-auth`를 켜도 동작은 같다. F01 완료로 기록하지 않는다.
+
+경계와 전제:
+- Windows는 named pipe DACL을 소유자 전용으로 만들고 `reject_remote_clients`를 켠 뒤, 연결 피어가 승인한 `ssh` 자식이고 이미지가 신뢰된 경로인지 확인한다. askpass 파이프 검사는 helper의 stdout 핸들을 복제해 `GetFileType == FILE_TYPE_PIPE`와 `GetNamedPipeServerProcessId`/`GetNamedPipeClientProcessId`가 모두 파이프를 만든 `ssh` PID를 가리키는지 본다. 2026-11-23 Windows 11 측정에서 `CreatePipe`의 쓰기 끝(client) 핸들에서도 두 API가 성공하고 생성 프로세스 PID를 돌려주는 것을 확인했다.
+- Linux는 `SO_PEERPIDFD`(커널 6.5 이상)로 상대 프로세스를 고정한다. Ubuntu 24.04(6.8)는 통과하고, Debian 12(6.1) 같은 환경에서는 채널을 열지 못한다. 미지원을 별도 상태로 안내하는 처리는 아직 없다.
+- 배포 전제: helper(`zzabba-askpass`)는 앱 옆에, `bw`는 관리자·소유자가 검증한 경로에 있어야 한다. 현재 per-user 설치(`%LOCALAPPDATA%`, `bundle.active=false`, `externalBin` 없음)로는 두 검사를 통과하지 못하며, 패키징 정책을 정해야 한다.
+- 같은 사용자 권한의 악성 코드가 승인 창을 사칭하거나 IPC에 주입하는 경우는 이 경계 밖이다.
+- OpenSSH가 askpass를 지원하지 않는 환경을 탐지해 `저장 인증 불가`로 표시하는 처리는 아직 없다.
+
 저장 대상은 `terminal_open` → `terminal::saved::launch` → `ssh::terminal::DirectLaunch`를 거친다. Rust는 각 PTY ID에 독립 계획을 만들고 직접 실행한 자식의 종료를 확인한 뒤 임시 파일을 해제한다. 닫기에서 종료 요청이나 상태 확인이 실패하면 같은 탭에 `종료 확인 불가`가 표시되며 다시 확인할 수 있다. Windows의 확인 범위는 소유한 프로세스 핸들 하나다.
 
 SSH 연결 시험은 별도 터미널에서 비밀번호나 키 암호를 입력받는다. Rust는 현재 문서와 초안의 시험 ID에만 입력을 연결하고, 고정 원격 명령의 시도별 출력과 정상 종료가 모두 확인된 뒤 저장을 승인한다.

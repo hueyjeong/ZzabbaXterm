@@ -9,7 +9,7 @@ fn f01_probe_retry_reaps_only_the_original_child_and_releases_its_plan() {
     let approved = ApprovedHost::confirm(&endpoint, &endpoint, "SHA256:UCUiLr7Pjs9wFFJMDByLgc3NrtdU344OgUM45wZPcIQ").unwrap();
     store.register(&approved, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti").unwrap();
     let plan = ConnectionPlan::prepare(&store, &approved, "fixture", Transport::Direct, Authentication::ManualPassword).unwrap();
-    let config = std::path::PathBuf::from(plan.invocation(crate::ssh::Client::Ssh).args[1]);
+    let config = std::path::PathBuf::from(plan.invocation(crate::ssh::Client::Ssh).unwrap().args[1]);
     let child = Isolated::waiting();
     let mut peer = Isolated::waiting();
     let mut child = Restricted {

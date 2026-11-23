@@ -120,8 +120,8 @@ fn nano_approval_admits_only_the_confirmed_saved_ssh_and_document() {
             launch_admissions.set(launch_admissions.get() + 1);
             let Launch::Ssh(launch) = command else { unreachable!() };
             let (_, plan) = launch.into_parts();
-            let shell = plan.invocation(Client::Ssh);
-            let sftp = plan.invocation(Client::Sftp);
+            let shell = plan.invocation(Client::Ssh).unwrap();
+            let sftp = plan.invocation(Client::Sftp).unwrap();
             assert_eq!(shell.args[1], sftp.args[4]);
             let config = fs::read_to_string(Path::new(shell.args[1])).unwrap();
             assert!(config.contains("HostName dev.example.test\nPort 2222\nUser deploy\n"));

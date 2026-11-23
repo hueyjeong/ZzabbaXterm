@@ -61,6 +61,9 @@ impl<'a> ApprovedHost<'a> {
         }
         Ok(Self { endpoint: actual, fingerprint })
     }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    pub(super) fn fingerprint(&self) -> String { self.fingerprint.to_string() }
 }
 
 fn valid_label(label: &str) -> bool {

@@ -133,7 +133,7 @@ fn create_dir(path: &Path, descriptor: &Local) -> io::Result<()> {
     Ok(())
 }
 
-fn user_sid_text() -> io::Result<String> {
+pub(crate) fn user_sid_text() -> io::Result<String> {
     let mut buffer = MaybeUninit::uninit();
     let mut ptr = null_mut();
     // SID 문자열은 LocalFree 전까지 유효하다.
@@ -158,7 +158,15 @@ pub(super) fn private_dir(path: &Path) -> io::Result<()> {
 }
 
 pub(super) fn trusted_chain(path: &Path, file: bool) -> io::Result<()> {
-    with_install_validator(|check| {
+    install_chain(path, file, true)
+}
+
+pub(crate) fn protected_executable(path: &Path) -> io::Result<()> {
+    install_chain(path, true, false)
+}
+
+fn install_chain(path: &Path, file: bool, allow_current_user: bool) -> io::Result<()> {
+    install_validator(allow_current_user, |check| {
         let defining_dir = if file {
             path.parent().ok_or_else(denied)?
         } else {
@@ -178,8 +186,19 @@ pub(super) fn trusted_chain(path: &Path, file: bool) -> io::Result<()> {
 pub(super) fn with_install_validator<T>(
     validate: impl FnOnce(&dyn Fn(&Path, bool, bool) -> io::Result<()>) -> io::Result<T>,
 ) -> io::Result<T> {
+    install_validator(true, validate)
+}
+
+fn install_validator<T>(
+    allow_current_user: bool,
+    validate: impl FnOnce(&dyn Fn(&Path, bool, bool) -> io::Result<()>) -> io::Result<T>,
+) -> io::Result<T> {
     let mut buffer = MaybeUninit::uninit();
-    let current = user(&mut buffer)?;
+    let current = if allow_current_user {
+        user(&mut buffer)?
+    } else {
+        null_mut()
+    };
     // Windows Resource Protection의 TrustedInstaller 서비스 SID다.
     let mut installer = null_mut();
     let sid = wide("S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464".as_ref());
@@ -239,7 +258,7 @@ fn check_writers(file: &File, current: PSID, installer: PSID, mask: u32) -> io::
         }
         let _descriptor = Local(raw);
         let trusted = |sid| {
-            EqualSid(sid, current) != 0
+            (!current.is_null() && EqualSid(sid, current) != 0)
                 || EqualSid(sid, installer) != 0
                 || IsWellKnownSid(sid, WinLocalSystemSid) != 0
                 || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
@@ -381,5 +400,31 @@ pub(super) mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn protected_executable_rejects_current_user_writable_install() {
+        let temp = tempfile::tempdir().unwrap();
+        let install = temp.path().join("install");
+        private_dir(&install).unwrap();
+        let executable = install.join("zzabba-askpass.exe");
+        std::fs::write(&executable, b"fixture").unwrap();
+
+        with_install_validator(|check| {
+            check(&install, true, true)?;
+            check(&executable, false, true)
+        })
+        .unwrap();
+        // 임시 디렉터리의 조상과 무관하게 실행 파일 자체의 DACL도 검사한다.
+        assert_eq!(
+            install_validator(false, |check| check(&executable, false, true))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            protected_executable(&executable).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
     }
 }
