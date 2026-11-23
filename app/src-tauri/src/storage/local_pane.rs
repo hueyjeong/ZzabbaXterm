@@ -136,11 +136,17 @@ fn normalized(path: &Path) -> PathBuf {
     PathBuf::from(if cfg!(windows) { text.to_lowercase() } else { text.to_owned() })
 }
 
-/// 드라이브 루트, 홈 자체와 그 상위, 보호 폴더와 그 상위·하위면 참이다. 홈의 다른 하위 폴더는 허용한다.
+/// 드라이브 루트, 홈 자체와 그 상위, 홈 바로 아래 숨김 폴더와 그 하위, 보호 폴더와 그 상위·하위면 참이다.
+/// 홈의 다른 하위 폴더는 허용한다.
 pub(super) fn restricted(root: &Path, home: Option<&Path>, protected: &[PathBuf]) -> bool {
     let root = normalized(root);
     if root.parent().is_none() { return true; }
-    if home.filter(|home| home.is_absolute()).is_some_and(|home| normalized(home).starts_with(&root)) { return true; }
+    if let Some(home) = home.filter(|home| home.is_absolute()).map(normalized) {
+        if home.starts_with(&root) { return true; }
+        // 홈 바로 아래 숨김 폴더(`.ssh`, `.kube`, `.docker` 등)와 그 하위는 자격 증명·설정 위치라 막는다.
+        if root.strip_prefix(&home).ok().and_then(|rest| rest.components().next())
+            .is_some_and(|first| first.as_os_str().to_string_lossy().starts_with('.')) { return true; }
+    }
     protected.iter().filter(|path| path.is_absolute()).map(|path| normalized(path))
         .any(|path| path.starts_with(&root) || root.starts_with(&path))
 }
@@ -158,6 +164,8 @@ pub(super) fn restricted_root(root: &Path) -> bool {
     ].map(PathBuf::from).to_vec());
     if let Some(home) = &home {
         protected.extend([".ssh", ".config", ".local", ".aws", ".gnupg"].map(|name| home.join(name)));
+        #[cfg(target_os = "macos")]
+        protected.push(home.join("Library"));
     }
     restricted(root, home.as_deref(), &protected)
 }
@@ -167,7 +175,8 @@ pub(super) fn executable_name(name: &str) -> bool {
     const EXTENSIONS: &[&str] = &[
         "exe", "com", "cmd", "bat", "lnk", "pif", "scr", "cpl", "msc", "msi", "msp", "msix", "appx", "appinstaller", "application",
         "ps1", "psm1", "psd1", "vbs", "vbe", "js", "jse", "wsf", "wsh", "ws", "hta", "reg", "url", "scf", "inf", "jar", "dll",
-        "sh", "bash", "zsh", "csh", "command", "desktop", "appimage", "run",
+        "sh", "bash", "zsh", "csh", "command", "desktop", "appimage", "run", "py", "pyw", "chm", "xll", "docm", "xlsm", "pptm",
+        "wsc", "sct", "settingcontent-ms", "library-ms", "iso", "img", "vhd", "vhdx", "ps1xml",
     ];
     name.rsplit_once('.').is_some_and(|(_, extension)| EXTENSIONS.iter().any(|known| known.eq_ignore_ascii_case(extension.trim_end())))
 }

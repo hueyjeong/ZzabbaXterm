@@ -70,6 +70,10 @@ fn storage_local_root_restriction_covers_system_credentials_home_and_drive_roots
     for path in [home.clone(), base.to_owned(), home.join(".ssh"), system.clone(), system.join("sub"), home.join(".ssh").join("없는 하위")] {
         assert!(check(&path), "{path:?}");
     }
+    fs::create_dir_all(home.join(".kube").join("cache")).unwrap();
+    for path in [home.join(".kube"), home.join(".kube").join("cache")] {
+        assert!(check(&path), "{path:?}");
+    }
     for path in [home.join("문서"), base.join("other")] {
         assert!(!check(&path), "{path:?}");
     }
@@ -95,7 +99,8 @@ fn storage_local_root_restriction_covers_system_credentials_home_and_drive_roots
             assert!(restricted_root(&path), "{name}");
             assert!(restricted_root(&path.join("하위")), "{name}");
         }
-        assert!(restricted_root(base), "임시 폴더는 LOCALAPPDATA 아래다");
+        let local = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap());
+        assert!(restricted_root(&local.join("Temp").join("zzabba")), "LOCALAPPDATA 하위");
     }
     #[cfg(unix)]
     for path in ["/", "/etc", "/etc/ssh", "/usr", "/usr/bin"] {
