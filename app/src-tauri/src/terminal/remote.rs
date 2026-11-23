@@ -1,7 +1,8 @@
 use portable_pty::{Child, PtyPair, PtySize};
+use std::sync::Arc;
 
-use crate::ssm::{AwsCli, CancellationToken, CliError, Scope, SessionDocument, StartRequest};
-use super::LiveSsmIdentity;
+use crate::ssm::{AwsCli, CancellationToken, CliError, Scope, SessionDocument, StartPermit, StartRequest};
+use super::{ControlBinding, LiveSsmIdentity};
 
 const START_DIAGNOSTIC_LIMIT: usize = 8 * 1024;
 
@@ -53,11 +54,18 @@ impl Target {
         })
     }
 
+    pub(super) async fn prepare_control(&self, binding: &Arc<ControlBinding>) -> Result<Remote, String> {
+        let mut remote = self.prepare(Some(binding.identity()), binding.cancel_token()).await?;
+        remote.control = Some(Arc::clone(binding));
+        Ok(remote)
+    }
+
     pub(super) async fn prepare(&self, central: Option<&LiveSsmIdentity>, cancel: &CancellationToken) -> Result<Remote, String> {
         let document = match central {
             Some(identity) if self.scope.profile() == identity.profile && self.scope.region() == identity.region
                 && self.instance_id == identity.instance_id => SessionDocument::AiSharedControl {
-                    account_id: &identity.account_id, target: &identity.instance_id,
+                    role: identity.role.as_deref().ok_or_else(|| start_error(CliError::CallerChanged))?,
+                    target: &identity.instance_id,
                 },
             Some(_) => return Err(start_error(CliError::InvalidTarget)),
             None => SessionDocument::DefaultShell,
@@ -65,8 +73,7 @@ impl Target {
         #[cfg(test)]
         if let Some(program) = &self.fixture {
             if central.is_some() { return Err(start_error(CliError::InvalidTarget)); }
-            let (cli, scope, request, permit) = crate::ssm::fixture_start(program);
-            return Ok(Remote { cli, scope, request, spawned: false, fixture: Some(permit), is_fixture: true });
+            return Ok(Remote::fixture(program));
         }
         let cli = AwsCli::probe(cancel).await.map_err(start_error)?;
         let node = cli.online_nodes(&self.scope, cancel).await.map_err(start_error)?
@@ -76,6 +83,7 @@ impl Target {
         let request = cli.prepare_document_start(&self.scope, &node, document, cancel).map_err(start_error)?;
         Ok(Remote {
             cli, scope: self.scope.clone(), request, spawned: false,
+            control: None,
             #[cfg(test)]
             fixture: None,
             #[cfg(test)]
@@ -90,6 +98,7 @@ fn shared_control_rejects_mismatched_target_and_default_shell_fixture() {
     let mut target = Target::new("fixture", "us-west-2", "i-01234567").unwrap();
     let identity = LiveSsmIdentity {
         id: "0".into(), document: 0, account_id: "123456789012".into(),
+        role: Some(crate::ssm::AssumedRole::fixture("123456789012")),
         profile: "fixture".into(), region: "us-west-2".into(), instance_id: "i-01234567".into(),
     };
     let invalid = start_error(CliError::InvalidTarget);
@@ -105,6 +114,9 @@ fn shared_control_rejects_mismatched_target_and_default_shell_fixture() {
     ] {
         check(&target, &change);
     }
+    let no_role = LiveSsmIdentity { role: None, ..identity.clone() };
+    assert_eq!(tauri::async_runtime::block_on(target.prepare(Some(&no_role), &cancel)).err(),
+        Some(start_error(CliError::CallerChanged)));
     target.fixture = Some(std::path::PathBuf::new());
     check(&target, &identity);
 }
@@ -114,14 +126,16 @@ pub(super) struct Remote {
     scope: Scope,
     request: StartRequest,
     spawned: bool,
+    control: Option<Arc<ControlBinding>>,
     #[cfg(test)]
-    fixture: Option<crate::ssm::StartPermit>,
+    fixture: Option<StartPermit>,
     #[cfg(test)]
     is_fixture: bool,
 }
 
 pub(super) struct SsmIdentity {
     pub(super) account_id: String,
+    pub(super) role: Option<std::sync::Arc<crate::ssm::AssumedRole>>,
     pub(super) profile: String,
     pub(super) region: String,
     pub(super) instance_id: String,
@@ -132,21 +146,40 @@ impl Remote {
         self.request.account_id()
     }
 
+    #[cfg(test)]
+    fn fixture(program: &std::path::Path) -> Self {
+        let (cli, scope, request, permit) = crate::ssm::fixture_start(program);
+        Self { cli, scope, request, spawned: false, control: None, fixture: Some(permit), is_fixture: true }
+    }
+
     pub(super) fn spawn(&mut self, size: PtySize, cancel: &CancellationToken) -> Result<(PtyPair, Box<dyn Child + Send + Sync>), String> {
-        #[cfg(test)]
-        if let Some(permit) = self.fixture.take() {
-            return self.record_spawn(permit.spawn_fixture(size));
-        }
-        let permit = tauri::async_runtime::block_on(self.cli.authorize_start(&mut self.request, &self.scope, cancel))
-            .map_err(start_error)?.ok_or_else(|| start_error(CliError::Cancelled))?;
-        if cancel.is_cancelled() { return Err(start_error(CliError::Cancelled)); }
-        self.record_spawn(permit.spawn(size))
+        let control = self.control.take();
+        let cancel = control.as_deref().map_or(cancel, ControlBinding::cancel_token);
+        let permit = self.authorize(cancel)?;
+        let child = {
+            #[cfg(test)]
+            if self.is_fixture {
+                return self.record_spawn(permit.spawn_fixture(size, cancel, control.as_deref(), || {}, || {}));
+            }
+            permit.spawn_cancellable(size, cancel, control.as_deref())
+        };
+        self.record_spawn(child)
     }
 
     fn record_spawn(&mut self, child: std::io::Result<(PtyPair, Box<dyn Child + Send + Sync>)>) -> Result<(PtyPair, Box<dyn Child + Send + Sync>), String> {
-        let child = child.map_err(|_| "SSM PTY: 시작 실패".to_owned())?;
+        let child = child.map_err(|error| match error.kind() {
+            std::io::ErrorKind::Interrupted => error.to_string(),
+            _ => "SSM PTY: 시작 실패".to_owned(),
+        })?;
         self.spawned = true;
         Ok(child)
+    }
+
+    fn authorize(&mut self, cancel: &CancellationToken) -> Result<StartPermit, String> {
+        #[cfg(test)]
+        if let Some(permit) = self.fixture.take() { return Ok(permit); }
+        tauri::async_runtime::block_on(self.cli.authorize_start(&mut self.request, &self.scope, cancel))
+            .map_err(start_error)?.ok_or_else(|| start_error(CliError::Cancelled))
     }
 
     pub(super) fn wait_connected(&self, cancel: &CancellationToken, work_tab: bool) -> Result<Option<SsmIdentity>, String> {
@@ -157,6 +190,7 @@ impl Remote {
         if self.is_fixture { return Ok(None); }
         Ok(Some(SsmIdentity {
             account_id: self.account_id().into(),
+            role: self.request.assumed_role().cloned(),
             profile: self.scope.profile().into(),
             region: self.scope.region().into(),
             instance_id: self.request.target().into(),
@@ -176,6 +210,189 @@ impl Remote {
     pub(super) fn recheck_closed(&self) -> bool {
         tauri::async_runtime::block_on(self.cli.recheck_closed(&self.request, &self.scope)).is_ok()
     }
+}
+
+#[cfg(all(test, any(windows, unix)))]
+#[test]
+fn submitted_control_start_is_reaped_and_checks_exact_ssm_cleanup_after_revocation() {
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+    let (done, finished) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let root = tempfile::tempdir().unwrap();
+        let program = root.path().join(format!("ssm fixture{}", std::env::consts::EXE_SUFFIX));
+        let compiled = std::process::Command::new(option_env!("RUSTC").unwrap_or("rustc"))
+            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/src/terminal/ssm_fixture.rs"))
+            .arg("-o").arg(&program).output().unwrap();
+        assert!(compiled.status.success(), "{}", String::from_utf8_lossy(&compiled.stderr));
+        std::fs::write(root.path().join("mode"), "unknown").unwrap();
+        submitted_control_start_shutdown_case(&program, false);
+        std::fs::remove_file(root.path().join("History")).unwrap();
+        submitted_control_start_shutdown_case(&program, true);
+        let _ = done.send(());
+    });
+    match finished.recv_timeout(WAIT) {
+        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => worker.join().unwrap(),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("제어 SSM 종료 확인 대기 시간 초과"),
+    }
+}
+
+#[cfg(all(test, any(windows, unix)))]
+fn submitted_control_start_shutdown_case(program: &std::path::Path, exit_started: bool) {
+    use crate::terminal::{CENTRAL_UNAVAILABLE, ControlExitReport, LocalClose, Sessions, process::Session};
+    use std::{sync::mpsc, thread, time::Duration};
+
+    const WAIT: Duration = Duration::from_secs(10);
+    const OWNER: &str = "main";
+    const DOCUMENT: u64 = 0;
+    let sessions = Sessions::default();
+    let central = sessions.insert_live_ssm_fixture("main", 0, "123456789012", "us-west-2", "i-01234567");
+    let binding = sessions.bind_ssm_control("main", &central.identity, &CancellationToken::new()).unwrap();
+    let cancel = binding.cancel_token();
+    let mut remote = Remote::fixture(program);
+    let selected = sessions.get("main", &central.identity.id).unwrap();
+    let permit = remote.authorize(cancel).unwrap();
+    let session = Arc::new(Session::dedicated(&binding));
+    let tracked = sessions.track_control(&binding, &session).unwrap();
+    let id = tracked.id;
+    let transport = crate::ai::control::ControlTransport::from_tracked_fixture(id, Arc::clone(&binding), Arc::clone(&session));
+    let destroy_count = std::cell::Cell::new(0);
+    let destroy = || { destroy_count.set(destroy_count.get() + 1); Ok(()) };
+    assert!(sessions.get("main", &id.to_string()).is_err());
+
+    let (pair, mut child) = thread::scope(|scope| {
+        let (submit, submitted) = mpsc::channel();
+        let (close, closed) = mpsc::channel();
+        let closer = scope.spawn(move || {
+            submitted.recv_timeout(WAIT).unwrap();
+            central.stop();
+            close.send(()).unwrap();
+        });
+        let spawn = permit.spawn_fixture(PtySize::default(), cancel, Some(&binding), || {}, || {
+            assert!(binding.registry_unlocked_fixture());
+            if exit_started {
+                assert!(sessions.begin_control_exit(OWNER, DOCUMENT, "first"));
+                assert!(matches!(sessions.bind_ssm_control(OWNER, binding.identity(), &CancellationToken::new()), Err(error) if error == CENTRAL_UNAVAILABLE));
+                thread::scope(|drains| {
+                    let old = drains.spawn(|| sessions.drain_controls_for_close(OWNER, DOCUMENT, "first", WAIT));
+                    tauri::async_runtime::block_on(async {
+                        tokio::time::timeout(WAIT, cancel.cancelled()).await.unwrap();
+                    });
+                    assert_eq!(sessions.drain_controls_for_close(OWNER, DOCUMENT, "first", Duration::ZERO), Some(ControlExitReport {
+                        pending: 1, ..ControlExitReport::default()
+                    }));
+                    assert!(matches!(selected.control_submit.try_lock(), Err(std::sync::TryLockError::WouldBlock)));
+                    assert!(sessions.queue_control_exit(OWNER, DOCUMENT, "first", Some(41), &destroy).is_err());
+                    assert_eq!(destroy_count.get(), 0);
+                    assert!(!sessions.close_ssh_probes(None));
+                    assert!(!sessions.consume_control_exit_approval(Some(41)));
+                    assert_eq!(sessions.check_control_exit_ssh(OWNER, DOCUMENT, "first", |_| unreachable!()), Some(false));
+                    assert_eq!(binding.admit(|| unreachable!()), Err::<(), _>(CENTRAL_UNAVAILABLE.into()));
+                    sessions.release_control_exit(OWNER, DOCUMENT, "first");
+                    let fresh = sessions.bind_ssm_control(OWNER, binding.identity(), &CancellationToken::new()).unwrap();
+                    assert_eq!(fresh.admit(|| Ok(())), Ok(()));
+                    assert!(sessions.begin_control_exit(OWNER, DOCUMENT, "retry"));
+                    assert_eq!(old.join().unwrap(), None);
+                    sessions.release_control_exit(OWNER, DOCUMENT, "retry");
+                });
+            }
+            submit.send(()).unwrap();
+            tauri::async_runtime::block_on(async {
+                tokio::time::timeout(WAIT, cancel.cancelled()).await.unwrap();
+            });
+            assert!(matches!(selected.control_submit.try_lock(), Err(std::sync::TryLockError::WouldBlock)));
+            assert!(matches!(closed.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        });
+        let child = remote.record_spawn(spawn).unwrap();
+        closed.recv_timeout(WAIT).unwrap();
+        closer.join().unwrap();
+        child
+    });
+    assert!(cancel.is_cancelled());
+    if exit_started {
+        assert_eq!(sessions.drain_controls_for_close(OWNER, DOCUMENT, "first", Duration::ZERO), None);
+    }
+    session.terminate_fixture(child.as_mut(), pair.master.as_ref());
+    drop(pair);
+    session.cleanup(Some(remote));
+    drop(tracked);
+    let result = transport.close();
+    assert_eq!((result.local, result.remote, result.target.as_deref()),
+        (LocalClose::CliReaped, RemoteClose::Unconfirmed, Some("i-01234567")));
+    assert!(sessions.begin_control_exit(OWNER, DOCUMENT, "closing"));
+    sessions.release_control_exit(OWNER, DOCUMENT, "first");
+    assert_eq!(sessions.drain_controls_for_close(OWNER, DOCUMENT, "closing", WAIT), Some(ControlExitReport {
+        remote_unconfirmed: usize::from(exit_started), ..ControlExitReport::default()
+    }));
+    assert_eq!(sessions.close_ssh_probes_for_exit(OWNER, DOCUMENT, "closing"), Some(true));
+    sessions.queue_control_exit(OWNER, DOCUMENT, "closing", None, &destroy).unwrap();
+    assert_eq!(destroy_count.get(), 1);
+    assert!(!sessions.consume_control_exit_approval(None));
+    assert_eq!(sessions.destroy(OWNER), None);
+    assert!(!sessions.consume_control_exit_approval(Some(41)));
+    assert!(sessions.consume_control_exit_approval(None));
+    assert!(!sessions.consume_control_exit_approval(None));
+    assert!(program.with_file_name("History").is_file());
+}
+
+#[cfg(test)]
+#[test]
+fn close_attempt_release_only_affects_the_current_unsealed_document() {
+    use crate::terminal::{CENTRAL_UNAVAILABLE, Sessions};
+    use std::time::Duration;
+
+    const OWNER: &str = "main";
+    let sessions = Sessions::default();
+    let old = sessions.document(OWNER);
+    assert!(sessions.begin_control_exit(OWNER, old, "first"));
+    assert_eq!(sessions.check_control_exit_ssh(OWNER, old, "first", |_| false), Some(false));
+    assert!(sessions.begin_control_exit(OWNER, old, "navigation"));
+
+    // 첫 SSH 확인이 반환되기 전에 문서가 바뀌고 새 확인이 시작되는 순서를 고정한다.
+    assert_eq!(sessions.check_control_exit_ssh(OWNER, old, "navigation", |_| {
+        sessions.navigate(OWNER);
+        let document = sessions.document(OWNER);
+        assert!(!sessions.begin_control_exit(OWNER, old, "stale"));
+        assert!(sessions.begin_control_exit(OWNER, document, "retry"));
+        assert!(!sessions.begin_control_exit(OWNER, document, "other"));
+        assert_eq!(sessions.check_control_exit_ssh(OWNER, document, "retry", |_| {
+            sessions.release_control_exit(OWNER, old, "navigation");
+            sessions.release_control_exit(OWNER, old, "retry");
+            sessions.release_control_exit(OWNER, document, "other");
+            true
+        }), Some(true));
+        false
+    }), None);
+
+    let document = sessions.document(OWNER);
+    assert_eq!(sessions.drain_controls_for_close(OWNER, old, "navigation", Duration::ZERO), None);
+    let expired = sessions.queue_control_exit(OWNER, old, "navigation", Some(41), || unreachable!());
+    assert_eq!(expired, Err("창 닫기 요청이 만료되었습니다".into()));
+    assert_eq!(sessions.queue_control_exit(OWNER, document, "other", Some(41), || unreachable!()),
+        Err("창 닫기 요청이 만료되었습니다".into()));
+    let failed = sessions.queue_control_exit(OWNER, document, "retry", Some(42), || Err("폐기 예약 실패".into()));
+    assert_eq!(failed, Err("폐기 예약 실패".into()));
+
+    let central = sessions.insert_live_ssm_fixture(OWNER, document, "123456789012", "us-west-2", "i-01234567");
+    let binding = sessions.bind_ssm_control(OWNER, &central.identity, &CancellationToken::new()).unwrap();
+    assert_eq!(binding.admit(|| Ok(())), Ok(()));
+    assert!(sessions.begin_control_exit(OWNER, document, "success"));
+    assert_eq!(sessions.close_ssh_probes_for_exit(OWNER, document, "success"), Some(true));
+    sessions.queue_control_exit(OWNER, document, "success", Some(43), || Ok(())).unwrap();
+    sessions.release_control_exit(OWNER, document, "success");
+    assert_eq!(binding.admit(|| unreachable!()), Err::<(), _>(CENTRAL_UNAVAILABLE.into()));
+    sessions.navigate(OWNER);
+    assert!(!sessions.begin_control_exit(OWNER, sessions.document(OWNER), "after-queue"));
+    assert_eq!(sessions.destroy("other"), None);
+    assert!(!sessions.consume_control_exit_approval(Some(43)));
+    assert_eq!(sessions.destroy(OWNER), Some(43));
+    assert_eq!(sessions.destroy(OWNER), None);
+    assert!(!sessions.consume_control_exit_approval(None));
+    assert!(!sessions.consume_control_exit_approval(Some(41)));
+    assert!(!sessions.consume_control_exit_approval(Some(42)));
+    assert!(!sessions.close_ssh_probes(None));
+    assert!(sessions.consume_control_exit_approval(Some(43)));
+    assert!(!sessions.consume_control_exit_approval(Some(43)));
+    assert!(Sessions::default().close_ssh_probes(None));
 }
 
 fn start_error(error: CliError) -> String {
