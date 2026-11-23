@@ -71,17 +71,61 @@ pub(super) fn valid_name(name: &OsStr) -> bool {
             .all(|ch| ch != 0 && ch != b':' as u16 && ch != b'/' as u16 && ch != b'\\' as u16)
 }
 
+/// 클라우드 동기화 자리 표시자(OneDrive Files On-Demand 등)의 재분석 태그다. 이름 대리(링크)가 아니다.
+pub(super) fn is_cloud_tag(tag: u32) -> bool {
+    const IO_REPARSE_TAG_CLOUD: u32 = 0x9000_001A;
+    const IO_REPARSE_TAG_CLOUD_MASK: u32 = 0x0000_F000;
+    tag & !IO_REPARSE_TAG_CLOUD_MASK == IO_REPARSE_TAG_CLOUD
+}
+
+fn reparse_tag(file: &File) -> io::Result<u32> {
+    let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
+    // SAFETY: the file handle and correctly sized output live through the call.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileAttributeTagInfo,
+            (&mut info as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+            size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 { 0 } else { info.ReparseTag })
+}
+
+/// 경로의 항목 자체(재분석 지점을 따라가지 않음)가 클라우드 자리 표시자인지 확인한다.
+pub(super) fn cloud_placeholder(path: &Path) -> io::Result<bool> {
+    let file = File::options()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(SHARE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    Ok(is_cloud_tag(reparse_tag(&file)?))
+}
+
 pub(super) struct Directory {
     pub(super) path: PathBuf,
     file: File,
     id: FileId,
+    /// 스토리지 로컬 창은 클라우드 자리 표시자 폴더와 데이터가 로컬에 있는 자리 표시자 파일을 허용한다.
+    cloud: bool,
 }
 
 impl Directory {
     pub(super) fn open(path: PathBuf) -> io::Result<Self> {
-        let file = Self::open_path(&path)?;
+        Self::open_with(path, false)
+    }
+
+    pub(super) fn open_storage(path: PathBuf) -> io::Result<Self> {
+        Self::open_with(path, true)
+    }
+
+    fn open_with(path: PathBuf, cloud: bool) -> io::Result<Self> {
+        let file = Self::open_path(&path, cloud)?;
         let id = file_id(&file)?;
-        Ok(Self { path, file, id })
+        Ok(Self { path, file, id, cloud })
     }
 
     pub(super) fn open_cli(path: &Path) -> io::Result<Self> {
@@ -109,7 +153,7 @@ impl Directory {
         {
             return Err(io::ErrorKind::InvalidInput.into());
         }
-        let root = Self::open_path(Path::new(&OsString::from_wide(&drive[..3])))?;
+        let root = Self::open_path(Path::new(&OsString::from_wide(&drive[..3])), false)?;
         let relative = components.as_path();
         // 전체 하위 경로를 한 번에 열어 검사와 열기 사이의 경로 바꿔치기를 피한다.
         let file = if relative.as_os_str().is_empty() {
@@ -124,14 +168,14 @@ impl Directory {
                 true,
             )
             .map_err(nt_error)?;
-            Self::check_directory(&file)?;
+            Self::check_directory(&file, false)?;
             file
         };
         let path = final_path(&file)
             .filter(|path| valid_path(path))
             .ok_or(io::ErrorKind::InvalidInput)?;
         let id = file_id(&file)?;
-        Ok(Self { path, file, id })
+        Ok(Self { path, file, id, cloud: false })
     }
 
     pub(super) fn still_at_cli_path(&self, path: &Path) -> io::Result<bool> {
@@ -139,26 +183,27 @@ impl Directory {
         Ok(current.id == self.id && current.path == self.path)
     }
 
-    fn open_path(path: &Path) -> io::Result<File> {
+    fn open_path(path: &Path, cloud: bool) -> io::Result<File> {
         let file = File::options()
             .access_mode(FILE_READ_ATTRIBUTES | FILE_TRAVERSE)
             .share_mode(SHARE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)?;
-        Self::check_directory(&file)?;
+        Self::check_directory(&file, cloud)?;
         Ok(file)
     }
 
-    fn check_directory(file: &File) -> io::Result<()> {
+    fn check_directory(file: &File, cloud: bool) -> io::Result<()> {
         let metadata = file.metadata()?;
-        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        let reparse = metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+        if !metadata.is_dir() || (reparse && !(cloud && is_cloud_tag(reparse_tag(file)?))) {
             return Err(io::ErrorKind::NotADirectory.into());
         }
         Ok(())
     }
 
     pub(super) fn still_at_path(&self) -> io::Result<bool> {
-        Ok(file_id(&Self::open_path(&self.path)?)? == self.id)
+        Ok(file_id(&Self::open_path(&self.path, self.cloud)?)? == self.id)
     }
 
     pub(super) fn open_file(&self, name: &OsStr) -> io::Result<Option<File>> {
@@ -183,8 +228,13 @@ impl Directory {
             result => result.map_err(nt_error)?,
         };
         let metadata = file.metadata()?;
+        let attributes = metadata.file_attributes();
+        // 클라우드 자리 표시자는 데이터가 로컬에 있을 때만(회수 표시 없음) 일반 파일로 쓴다.
+        let local_cloud = self.cloud
+            && attributes & (FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_RECALL_ON_OPEN) == 0
+            && is_cloud_tag(reparse_tag(&file)?);
         Ok(
-            (metadata.is_file() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0)
+            (metadata.is_file() && (attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 || local_cloud))
                 .then_some(file),
         )
     }

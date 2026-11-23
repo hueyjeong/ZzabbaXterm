@@ -162,7 +162,7 @@ it("로컬 파일을 현재 S3 접두어로 올리고 완료 뒤 S3 목록을 �
   expect(actions.listObjects).toHaveBeenCalledTimes(2);
   const row = host.querySelector(".transfer-table tbody tr")!;
   expect(row.textContent).toContain("완료");
-  expect(row.querySelector(".transfer-key")?.getAttribute("title")).toBe("local-bucket · ap-northeast-2 · C:\\작업 폴더/올릴 파일.txt");
+  expect(row.querySelector(".transfer-key")?.getAttribute("title")).toBe("local-bucket · ap-northeast-2 · C:\\작업 폴더\\올릴 파일.txt");
 });
 
 it("S3 객체를 현재 로컬 폴더로 내려받고 완료 뒤 로컬 목록을 새로 읽는다", async () => {
@@ -256,5 +256,85 @@ it("760px보다 좁으면 두 창을 위아래로 쌓고 구분선을 숨긴다"
   expect(host.querySelector('[aria-label="로컬 창 크기"]')).toBeNull();
   await act(async () => notify?.(1200));
   expect(split.hasAttribute("data-stacked")).toBe(false);
-  expect(host.querySelector('[aria-label="로컬 창 크기"]')).not.toBeNull();
+  const separator = host.querySelector('[aria-label="로컬 창 크기"]')!;
+  expect(separator.getAttribute("aria-valuemax")).toBe("720");
+  expect(separator.getAttribute("aria-valuenow")).toBe("360");
+  await act(async () => notify?.(500 / 0.6));
+  expect(split.hasAttribute("data-stacked")).toBe(false);
+  expect(separator.getAttribute("aria-valuemax")).toBe("500");
+  expect(separator.getAttribute("aria-valuenow")).toBe("360");
+  await act(async () => notify?.(780));
+  expect(separator.getAttribute("aria-valuemax")).toBe("468");
+});
+
+it("시스템·자격 증명 폴더는 루트로 쓰지 않고 상태만 표시한다", async () => {
+  const local = localActions({ openRoot: vi.fn<LocalFileActions["openRoot"]>().mockResolvedValue({ kind: "restricted" }) });
+  await render(s3Actions(), local);
+  await click("로컬 폴더 열기", localPane());
+  expect(localPane().querySelector('[role="alert"]')?.textContent).toBe("로컬 폴더: 이 폴더는 쓸 수 없음");
+  expect(local.list).not.toHaveBeenCalled();
+  expect(Array.from(localPane().querySelectorAll(".s3-local-tools button")).map(button => button.getAttribute("aria-label")))
+    .toEqual(["로컬 폴더 열기"]);
+});
+
+it("로컬 전송 거부 원인과 S3 존재 확인 오류를 전송 행에 표시한다", async () => {
+  const select = vi.fn<LocalFileActions["select"]>()
+    .mockResolvedValueOnce({ kind: "rejected", reason: { kind: "invalidPath" } })
+    .mockResolvedValueOnce({ kind: "failed", error: { stage: "headObject", failure: { kind: "service", status: 403, code: "AccessDenied" }, bytes: 0 } });
+  const actions = s3Actions();
+  await render(actions, localActions({ select }));
+  await openBucket();
+  await click("로컬 폴더 열기", localPane());
+  await act(async () => fileRow(host, objectKey).click());
+  await click("로컬 폴더로 다운로드");
+  await act(async () => fileRow(host, "올릴 파일.txt").click());
+  await click("S3로 업로드", localPane());
+  const rows = Array.from(host.querySelectorAll(".transfer-table tbody tr"));
+  expect(rows.map(row => row.getAttribute("data-state"))).toEqual(["failed", "rejected"]);
+  expect(rows[0].querySelector(".transfer-result")?.textContent).toBe("객체 확인: 권한 거부 (403 AccessDenied) · 0 바이트");
+  expect(rows[1].querySelector(".transfer-state")?.textContent).toBe("거부");
+  expect(rows[1].querySelector(".transfer-result")?.textContent).toBe("잘못된 경로");
+  expect(actions.upload).not.toHaveBeenCalled();
+  expect(actions.download).not.toHaveBeenCalled();
+});
+
+it("루트가 옮겨지면 목록과 전송 모두 루트를 해제한다", async () => {
+  const list = vi.fn<LocalFileActions["list"]>().mockResolvedValueOnce({ ok: true, value: rootListing })
+    .mockResolvedValueOnce({ ok: false, error: { kind: "rootChanged" } })
+    .mockResolvedValue({ ok: true, value: rootListing });
+  const select = vi.fn<LocalFileActions["select"]>().mockResolvedValue({ kind: "rejected", reason: { kind: "rootChanged" } });
+  const actions = s3Actions();
+  await render(actions, localActions({ list, select }));
+  await click("로컬 폴더 열기", localPane());
+  await click("로컬 새로고침", localPane());
+  expect(localPane().querySelector('[role="alert"]')?.textContent).toBe("로컬 폴더: 로컬 폴더 이동됨");
+  expect(localPane().querySelector('[role="grid"]')).toBeNull();
+
+  await click("로컬 폴더 열기", localPane());
+  await openBucket();
+  await act(async () => fileRow(host, objectKey).click());
+  await click("로컬 폴더로 다운로드");
+  expect(host.querySelector(".transfer-table tbody tr .transfer-result")?.textContent).toBe("로컬 폴더 이동됨");
+  expect(localPane().querySelector('[role="grid"]')).toBeNull();
+  expect((control(host, "로컬 폴더로 다운로드") as HTMLButtonElement).disabled).toBe(true);
+});
+
+it("전송 중에는 루트를 바꾸지 않고 로컬 목록을 읽는 동안 업로드하지 않는다", async () => {
+  const pending = Promise.withResolvers<Awaited<ReturnType<LocalFileActions["select"]>>>();
+  const refresh = Promise.withResolvers<Awaited<ReturnType<LocalFileActions["list"]>>>();
+  const list = vi.fn<LocalFileActions["list"]>().mockResolvedValueOnce({ ok: true, value: rootListing }).mockReturnValueOnce(refresh.promise);
+  const local = localActions({ list, select: vi.fn<LocalFileActions["select"]>(() => pending.promise) });
+  await render(s3Actions(), local);
+  await openBucket();
+  await click("로컬 폴더 열기", localPane());
+  await act(async () => fileRow(host, "올릴 파일.txt").click());
+  await click("로컬 새로고침", localPane());
+  expect((control(localPane(), "S3로 업로드") as HTMLButtonElement).disabled).toBe(true);
+  await act(async () => refresh.resolve({ ok: true, value: rootListing }));
+  expect((control(localPane(), "S3로 업로드") as HTMLButtonElement).disabled).toBe(false);
+  await click("S3로 업로드", localPane());
+  expect((control(localPane(), "로컬 폴더 열기") as HTMLButtonElement).disabled).toBe(true);
+  await act(async () => pending.resolve({ kind: "cancelled" }));
+  expect((control(localPane(), "로컬 폴더 열기") as HTMLButtonElement).disabled).toBe(false);
+  expect(local.openRoot).toHaveBeenCalledTimes(1);
 });

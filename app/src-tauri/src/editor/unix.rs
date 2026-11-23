@@ -40,6 +40,10 @@ pub(super) struct Directory {
 }
 
 impl Directory {
+    pub(super) fn open_storage(path: PathBuf) -> io::Result<Self> {
+        Self::open(path)
+    }
+
     pub(super) fn open(path: PathBuf) -> io::Result<Self> {
         let file = File::options()
             .read(true)

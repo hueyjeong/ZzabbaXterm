@@ -111,13 +111,17 @@ export function S3StoragePanel({
   const [treeWidth, setTreeWidth] = useState(240);
   const [localWidth, setLocalWidth] = useState(360);
   const [dropping, setDropping] = useState(false);
-  const [stacked, setStacked] = useState(false);
+  const [splitWidth, setSplitWidth] = useState(0);
+  const stacked = splitWidth > 0 && splitWidth < 760;
+  // 로컬 창은 CSS에서 두 창 영역의 60%를 넘지 않는다. 크기를 모르면 960px을 상한으로 쓴다.
+  const localMax = splitWidth > 0 ? Math.max(220, Math.floor(splitWidth * 0.6)) : 960;
+  const localShown = Math.min(localWidth, localMax);
   const split = useRef<HTMLDivElement>(null);
   // 좁은 폭에서는 두 창을 위아래로 쌓는다. 고정 위치 메뉴가 어긋나지 않게 컨테이너 쿼리 대신 크기를 관찰한다.
   useLayoutEffect(() => {
     const node = split.current;
     if (!node || typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(([entry]) => setStacked(entry.contentRect.width < 760));
+    const observer = new ResizeObserver(([entry]) => setSplitWidth(entry.contentRect.width));
     observer.observe(node);
     return () => observer.disconnect();
   }, []);
@@ -316,6 +320,20 @@ export function S3StoragePanel({
       const selection = local
         ? await localActions.select({ ...target, rootId: local.rootId, path: local.path, direction })
         : await actions.selectLocalFile({ ...target, direction });
+      if (selection.kind === "rejected") {
+        set({ ...display, state: "rejected", reason: selection.reason });
+        // 루트가 옮겨졌으면 Rust가 승인을 폐기했으므로 로컬 창도 루트를 해제한다.
+        if (local && selection.reason.kind === "rootChanged") {
+          updateLocal(current => current.root?.rootId === local.rootId
+            ? { root: undefined, listing: undefined, path: "", selected: null, problem: selection.reason } : {});
+        }
+        return;
+      }
+      if (selection.kind === "failed") {
+        const loginRequired = selection.error.failure.kind === "ssoLoginRequired";
+        set({ ...display, state: "failed", problem: selection.error }, loginRequired ? { expired: true } : {});
+        return;
+      }
       if (selection.kind !== "approved") {
         set({ ...display, state: selection.kind });
         return;
@@ -442,16 +460,16 @@ export function S3StoragePanel({
   const acceptsLocal = (event: ReactDragEvent) => canLocalTransfer && !!location && event.dataTransfer.types.includes(LOCAL_DRAG_TYPE);
 
   return <section className="s3-explorer" aria-label={title} onKeyDown={shortcuts}>
-    <div className="s3-split" ref={split} data-stacked={stacked ? "" : undefined} style={{ ["--local-width" as string]: `${localWidth}px` }}>
+    <div className="s3-split" ref={split} data-stacked={stacked ? "" : undefined} style={{ ["--local-width" as string]: `${localShown}px` }}>
       <LocalPane sessionId={sessionId} view={view.local} actions={localActions} update={updateLocal} fileView={fileView}
-        canTransfer={canTransfer && !!location} onUpload={uploadLocal} onDropObject={downloadLocal} />
+        canTransfer={canLocalTransfer && !!location} transferring={transferring} onUpload={uploadLocal} onDropObject={downloadLocal} />
       {!stacked && <div className="s3-resizer s3-split-resizer" role="separator" aria-orientation="vertical" aria-label="로컬 창 크기" tabIndex={0}
-        aria-valuemin={220} aria-valuemax={960} aria-valuenow={localWidth} onPointerDown={event => resize(event, localWidth, setLocalWidth, 220, 960)}
+        aria-valuemin={220} aria-valuemax={localMax} aria-valuenow={localShown} onPointerDown={event => resize(event, localShown, setLocalWidth, 220, localMax)}
         onKeyDown={event => {
           const delta = event.key === "ArrowLeft" ? -16 : event.key === "ArrowRight" ? 16 : 0;
           if (!delta) return;
           event.preventDefault();
-          setLocalWidth(width => Math.max(220, Math.min(960, width + delta)));
+          setLocalWidth(width => Math.max(220, Math.min(localMax, Math.min(width, localMax) + delta)));
         }} />}
       <div className="s3-remote">
         <div className="s3-toolbar" role="toolbar" aria-label="탐색 도구">

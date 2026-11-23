@@ -1,20 +1,32 @@
 import { Ban, ChevronDown, CircleCheck, CircleX, Download, Hourglass, LoaderCircle, ShieldX, Upload, type LucideIcon } from "lucide-react";
 import { exactBytes, formatBytes } from "../files/FileBrowser";
 import { IconButton } from "../ui/controls";
-import type { Downloaded, S3Error, S3Session } from "./s3";
+import type { Downloaded, LocalFailure, S3Error, S3Session } from "./s3";
 
 export type Problem = S3Error | "unavailable";
+
+const localFailures = {
+  denied: "승인 거부", invalidPath: "잘못된 경로", link: "링크 또는 루트 밖 경로", notFound: "항목 없음", rootChanged: "로컬 폴더 이동됨",
+  restricted: "이 폴더는 쓸 수 없음",
+};
+
+/** 로컬 창 오류 한 줄이다. */
+export function localFailureText(failure: LocalFailure | Readonly<{ kind: "restricted" }>) {
+  return failure.kind === "localIo" ? `로컬 파일 오류 (${failure.errorKind})` : localFailures[failure.kind];
+}
 export type Transfer = Readonly<{
   id: string; direction: "upload" | "download"; bucket: string; region: string; key: string; size: number | null; local?: string;
 }> & (
   | Readonly<{ state: "selecting" | "running" | "cancelled" | "denied" }>
   | Readonly<{ state: "failed"; problem: Problem }>
+  | Readonly<{ state: "rejected"; reason: LocalFailure }>
   | Readonly<{ state: "uploaded"; bytes: number }>
   | Readonly<{ state: "downloaded"; result: Downloaded }>
 );
 
 const stages = {
   profile: "SSO 프로필", listBuckets: "버킷 목록", headBucket: "버킷 확인", listObjects: "객체 목록", uploadSource: "업로드 원본",
+  headObject: "객체 확인",
   identity: "AWS 신원 확인",
   putObject: "객체 업로드", getObject: "객체 받기", downloadBody: "다운로드 본문",
   downloadWrite: "다운로드 파일 쓰기", downloadCommit: "다운로드 파일 확정",
@@ -72,6 +84,7 @@ const states: Record<Transfer["state"], { label: string; icon: LucideIcon }> = {
   cancelled: { label: "취소", icon: Ban },
   denied: { label: "승인 거부", icon: ShieldX },
   failed: { label: "실패", icon: CircleX },
+  rejected: { label: "거부", icon: ShieldX },
   uploaded: { label: "완료", icon: CircleCheck },
   downloaded: { label: "완료", icon: CircleCheck },
 };
@@ -82,6 +95,7 @@ function result(transfer: Transfer, session: S3Session) {
     case "downloaded":
       return `${transfer.result.bytes} 바이트 · ${transfer.result.integrity === "sdkChecksumVerified" ? "SDK 체크섬 검증됨" : "길이만 확인"}`;
     case "failed": return <StorageProblem inline problem={transfer.problem} compatible={!!session.compatible} />;
+    case "rejected": return <span className="storage-problem">{localFailureText(transfer.reason)}</span>;
     default: return "";
   }
 }
@@ -93,7 +107,7 @@ export function TransferQueue({ transfers, session, open, onToggle }: {
   onToggle(): void;
 }) {
   const active = transfers.filter(({ state }) => state === "selecting" || state === "running").length;
-  const failed = transfers.filter(({ state }) => state === "failed").length;
+  const failed = transfers.filter(({ state }) => state === "failed" || state === "rejected").length;
   return <section className="transfer-queue" aria-label="전송 대기열" data-open={open ? "" : undefined}>
     <header className="transfer-queue-bar">
       <IconButton small icon={ChevronDown} label={open ? "전송 대기열 접기" : "전송 대기열 펼치기"} aria-expanded={open} onClick={onToggle} />

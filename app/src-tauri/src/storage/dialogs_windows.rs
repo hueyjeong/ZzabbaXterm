@@ -124,6 +124,7 @@ fn show_folder(parent: HWND, title: &str, closed: watch::Receiver<bool>) -> Opti
 
     let lifetime = Lifetime { closed, start: std::time::Instant::now() };
     if lifetime.ended() { return None; }
+    let _com = Apartment::enter()?;
     let title: Vec<_> = title.encode_utf16().chain([0]).collect();
     let request = BROWSEINFOW {
         hwndOwner: parent,
@@ -142,6 +143,25 @@ fn show_folder(parent: HWND, title: &str, closed: watch::Receiver<bool>) -> Opti
     if !found || lifetime.ended() { return None; }
     let len = path.iter().position(|unit| *unit == 0)?;
     Some(OsString::from_wide(&path[..len]).into())
+}
+
+/// `SHBrowseForFolderW`의 새 대화상자는 단일 스레드 아파트를 요구한다. 초기화에 성공한 경우에만 짝을 맞춰 해제한다.
+struct Apartment;
+
+impl Apartment {
+    fn enter() -> Option<Self> {
+        use windows_sys::Win32::{Foundation::{S_FALSE, S_OK}, System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx}};
+        // SAFETY: 예약 인자는 null이며 같은 스레드에서 Drop이 CoUninitialize로 짝을 맞춘다.
+        // RPC_E_CHANGED_MODE 등 다른 결과는 이 스레드에 대화상자를 띄울 수 없으므로 취소로 처리한다.
+        matches!(unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) }, S_OK | S_FALSE).then_some(Self)
+    }
+}
+
+impl Drop for Apartment {
+    fn drop(&mut self) {
+        // SAFETY: enter가 S_OK 또는 S_FALSE를 받은 같은 스레드에서만 만들어진다.
+        unsafe { windows_sys::Win32::System::Com::CoUninitialize() };
+    }
 }
 
 unsafe extern "system" fn folder_event(hwnd: HWND, message: u32, _: isize, context: isize) -> i32 {

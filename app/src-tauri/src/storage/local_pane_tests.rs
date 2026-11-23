@@ -247,3 +247,6 @@ fn storage_local_list_ipc_returns_root_relative_entries() {
     // 알 수 없는 필드(예: 절대 경로)는 요청 단계에서 거부한다.
     assert!(list(json!({ "sessionId": session.session_id, "rootId": root_id, "path": "", "absolute": "C:\\" })).is_err());
 }
+
+#[path = "local_pane_review_tests.rs"]
+mod review;

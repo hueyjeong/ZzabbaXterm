@@ -3,6 +3,7 @@ import { ArrowUp, FolderOpen, HardDrive, HardDriveUpload, RefreshCw, X } from "l
 import { FileBrowser, sameEntry, type EntryRef, type FileEntry, type FileView } from "../files/FileBrowser";
 import { IconButton, type MenuItem } from "../ui/controls";
 import type { LocalFailure, LocalFileActions, LocalListing, LocalRoot } from "./s3";
+import { localFailureText } from "./StorageStatus";
 
 /** 로컬 창에서 S3 창으로 끄는 파일. 탭 끌기(TAB_DRAG_TYPE)와 OS 파일 놓기("Files")와 겹치지 않는다. */
 export const LOCAL_DRAG_TYPE = "application/x-zzabba-local-file";
@@ -19,7 +20,7 @@ export type LocalView = Readonly<{
   listing?: LocalListing;
   loading: boolean;
   picking: boolean;
-  problem?: LocalFailure | "unavailable";
+  problem?: LocalFailure | Readonly<{ kind: "restricted" }> | "unavailable";
   selected: EntryRef | null;
   stale: boolean;
 }>;
@@ -30,8 +31,10 @@ export function joinLocal(path: string, name: string) {
   return path ? `${path}/${name}` : name;
 }
 
+/** 루트 label과 같은 구분자로 상대 경로를 붙인다. */
 export function localDisplay(root: LocalRoot, path: string) {
-  return path ? `${root.label.replace(/[\\/]+$/, "")}/${path}` : root.label;
+  const separator = root.label.includes("\\") ? "\\" : "/";
+  return path ? `${root.label.replace(/[\\/]+$/, "")}${separator}${path.split("/").join(separator)}` : root.label;
 }
 
 /** 끌어 온 항목의 JSON 값을 읽는다. 형식이 다르면 null이다. */
@@ -45,11 +48,8 @@ export function readDrag<T>(event: DragEvent, type: string): Partial<T> | null {
   }
 }
 
-const failures = { denied: "승인 거부", invalidPath: "잘못된 경로", link: "링크 또는 루트 밖 경로", notFound: "폴더 없음" };
-
 function describe(problem: NonNullable<LocalView["problem"]>) {
-  if (problem === "unavailable") return "네이티브 요청 결과 수신 실패";
-  return problem.kind === "localIo" ? `로컬 파일 오류 (${problem.errorKind})` : failures[problem.kind];
+  return problem === "unavailable" ? "네이티브 요청 결과 수신 실패" : localFailureText(problem);
 }
 
 type Props = Readonly<{
@@ -60,11 +60,13 @@ type Props = Readonly<{
   fileView: FileView;
   /** S3 위치가 확인됐고 다른 전송이 없을 때만 참이다. */
   canTransfer: boolean;
+  /** 전송 승인·전송 중에는 루트를 바꾸지 않는다. */
+  transferring: boolean;
   onUpload(path: string, name: string, bytes: number | null): void;
   onDropObject(key: string): void;
 }>;
 
-export function LocalPane({ sessionId, view, actions, update, fileView, canTransfer, onUpload, onDropObject }: Props) {
+export function LocalPane({ sessionId, view, actions, update, fileView, canTransfer, transferring, onUpload, onDropObject }: Props) {
   const [dropping, setDropping] = useState(false);
   const { root, listing, path } = view;
   const navigable = !!root && !view.loading;
@@ -77,8 +79,8 @@ export function LocalPane({ sessionId, view, actions, update, fileView, canTrans
       update(current => {
         if (!same(current)) return {};
         if (result.ok) return { loading: false, path: next, listing: result.value, ...(next !== current.path ? { selected: null } : {}) };
-        // 승인이 폐기됐으면 루트를 다시 골라야 한다.
-        return result.error.kind === "denied"
+        // 승인이 폐기됐거나 루트가 옮겨졌으면 루트를 다시 골라야 한다.
+        return result.error.kind === "denied" || result.error.kind === "rootChanged"
           ? { loading: false, problem: result.error, root: undefined, listing: undefined, path: "", selected: null }
           : { loading: false, problem: result.error };
       });
@@ -93,7 +95,7 @@ export function LocalPane({ sessionId, view, actions, update, fileView, canTrans
     try {
       const approval = await actions.openRoot({ sessionId });
       if (approval.kind !== "approved") {
-        update(() => ({ picking: false, ...(approval.kind === "denied" ? { problem: { kind: "denied" } as const } : {}) }));
+        update(() => ({ picking: false, ...(approval.kind === "cancelled" ? {} : { problem: { kind: approval.kind } }) }));
         return;
       }
       const next: LocalRoot = { rootId: approval.rootId, label: approval.label };
@@ -178,7 +180,7 @@ export function LocalPane({ sessionId, view, actions, update, fileView, canTrans
         </ol>
       </nav>}
       <div className="s3-local-tools" role="toolbar" aria-label="로컬 도구">
-        <IconButton icon={FolderOpen} label="로컬 폴더 열기" disabled={view.picking} onClick={() => void openRoot()} />
+        <IconButton icon={FolderOpen} label="로컬 폴더 열기" disabled={view.picking || transferring} onClick={() => void openRoot()} />
         {root && <>
           <IconButton icon={ArrowUp} label="로컬 상위 폴더" disabled={parent === null || !navigable} onClick={goUp} />
           <IconButton icon={RefreshCw} label="로컬 새로고침" className={view.loading ? "spinning" : undefined} disabled={!navigable}

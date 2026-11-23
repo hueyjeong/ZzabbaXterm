@@ -784,7 +784,7 @@ fn verified_selection(directory: &std::path::Path, target_id: &str) -> Result<Ve
     Ok(VerifiedStorageSelection { sso: VerifiedSsoSelection { scope, config }, location })
 }
 
-#[derive(Deserialize, PartialEq, Eq)]
+#[derive(Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct Target {
     session_id: String,

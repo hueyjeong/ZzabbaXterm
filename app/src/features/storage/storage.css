@@ -278,11 +278,11 @@
 tr[data-state="running"] .transfer-state { color: var(--accent); }
 tr[data-state="running"] .transfer-state svg { animation: file-spin .9s linear infinite; }
 tr:is([data-state="uploaded"], [data-state="downloaded"]) .transfer-state { color: var(--accent); }
-tr[data-state="failed"] .transfer-state, tr[data-state="failed"] .transfer-result { color: var(--danger); }
+tr:is([data-state="failed"], [data-state="rejected"]) :is(.transfer-state, .transfer-result) { color: var(--danger); }
 tr:is([data-state="cancelled"], [data-state="denied"]) .transfer-state { color: var(--text-faint); }
 tr[data-state="selecting"] .transfer-state { color: var(--warning); }
 .transfer-result { font-size: 11.5px; }
-tr[data-state="failed"] .transfer-result { white-space: normal; }
+tr:is([data-state="failed"], [data-state="rejected"]) .transfer-result { white-space: normal; }
 
 /* 상태 줄 */
 .s3-status {
