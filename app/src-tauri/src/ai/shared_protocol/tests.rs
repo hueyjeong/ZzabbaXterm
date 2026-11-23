@@ -105,6 +105,87 @@ fn official_connection_and_fragmented_startup_are_both_required() {
     assert!(protocol.hello(CHANNEL).is_ok());
 }
 
+fn startup(output: &[u8]) -> Result<Option<Event>, ProtocolError> {
+    let mut protocol = SharedProtocol::default();
+    let mut input = output;
+    loop {
+        match protocol.feed(&mut input) {
+            Ok(None) if !input.is_empty() => continue,
+            Ok(None) => return protocol.ssm_connected(),
+            other => return other,
+        }
+    }
+}
+
+fn with_ready(prefix: &[u8], prompt_before_ready: &[u8]) -> Vec<u8> {
+    let mut raw = prefix.to_vec();
+    raw.extend_from_slice(prompt_before_ready);
+    raw.extend_from_slice(&encode(NodeFrame::Ready { version: VERSION, nonce: NONCE }).unwrap());
+    raw
+}
+
+#[test]
+fn ssm_shell_profile_echo_after_the_banner_is_skipped_once() {
+    // 실제 StartSession(ZzabbaAiSharedControl) 출력: 배너 뒤 프로필 에코 한 줄, 프롬프트는 에코 앞이나 Ready 앞.
+    let banner = b"\nStarting session with SessionId: zzabba-demo-qxk634b92i3hb53lsdfs22ab64\r\n";
+    let echo = b"exec /usr/local/libexec/zzabba-ai-control --shared-control\r\n";
+    let cases: [(&[u8], &[u8]); 8] = [
+        (b"$ ", b""), (b"# ", b""), (b"", b"$ "), (b"", b"# "), (b"", b""),
+        // Amazon Linux·RHEL처럼 bash가 `sh`로 실행되는 노드의 기본 프롬프트
+        (b"sh-5.2$ ", b""), (b"", b"sh-5.2$ "), (b"sh-4.2# ", b""),
+    ];
+    for (before_echo, before_ready) in cases {
+        let raw = with_ready(&[&banner[..], before_echo, echo].concat(), before_ready);
+        assert!(matches!(startup(&raw), Ok(Some(Event::Ready))), "{:?}", String::from_utf8_lossy(&raw));
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn conpty_profile_echo_with_the_prompt_before_ready_is_accepted() {
+    // Windows 앱에서 관찰한 ConPTY 출력 순서.
+    let prefix = [
+        &b"\x1b[6n\x1b[?9001h\x1b[?1004h\x1b[m\x1b]0;C:\\Program Files\\Amazon\\AWSCLIV2\\aws.exe\x07\x1b[?25h\r\n"[..],
+        b"Starting session with SessionId: zzabba-demo-v34xzel7qn25ut4eba2fnyn8vi\r\n",
+        b"exec /usr/local/libexec/zzabba-ai-control --shared-control\r\n",
+    ]
+    .concat();
+    assert!(matches!(startup(&with_ready(&prefix, b"$ ")), Ok(Some(Event::Ready))));
+}
+
+#[test]
+fn shell_profile_echo_is_rejected_out_of_order_or_altered() {
+    let banner: &[u8] = b"Starting session with SessionId: abc\n";
+    let echo: &[u8] = b"exec /usr/local/libexec/zzabba-ai-control --shared-control\n";
+    let cases = [
+        with_ready(echo, b""),
+        with_ready(&[banner, echo, echo].concat(), b""),
+        with_ready(&[banner, b"$ ", echo].concat(), b"$ "),
+        with_ready(&[banner, echo].concat(), b"$ $ "),
+        with_ready(&[banner, echo, b"$ \n"].concat(), b""),
+        with_ready(&[banner, b"% ", echo].concat(), b""),
+        with_ready(banner, b"$ "),
+        with_ready(&[banner, b"$ exec /usr/local/libexec/zzabba-ai-control --shared-control; id\n"].concat(), b""),
+        with_ready(&[banner, b"exec /usr/local/libexec/zzabba-ai-control --shared-pair\n"].concat(), b""),
+        with_ready(&[banner, b"sh-$ ", echo].concat(), b""),
+        with_ready(&[banner, b"sh-5$ ", echo].concat(), b""),
+        with_ready(&[banner, b"sh-5.$ ", echo].concat(), b""),
+        with_ready(&[banner, b"sh-123.2$ ", echo].concat(), b""),
+        with_ready(&[banner, b"bash-5.2$ ", echo].concat(), b""),
+        with_ready(&[banner, echo].concat(), b"sh-5.2$ sh-5.2$ "),
+    ];
+    for output in cases {
+        assert!(matches!(startup(&output), Err(ProtocolError::StartupOutput)), "{:?}", String::from_utf8_lossy(&output));
+    }
+}
+
+#[test]
+fn skipped_profile_echo_matches_the_bundled_ssm_document() {
+    let document: serde_json::Value =
+        serde_json::from_str(include_str!("../../../resources/ai/ZzabbaAiSharedControl.json")).unwrap();
+    assert_eq!(document["inputs"]["shellProfile"]["linux"].as_str().unwrap().as_bytes(), PROFILE_COMMAND);
+}
+
 #[cfg(windows)]
 #[test]
 fn only_known_conpty_start_sequences_are_skipped() {

@@ -79,8 +79,10 @@ class Terminal:
 
 
 class Control(Terminal):
-    def __init__(self):
+    # Windows ConPTY와 SSM 플러그인은 앱이 보낸 프레임 끝 LF를 CR로 전달한다.
+    def __init__(self, eol=b'\n'):
         super().__init__([BIN, '--shared-control'])
+        self.eol = eol
         self.channel = secrets.token_hex(16)
         ready = self.event('ready')
         self.frame('hello', version=1, nonce=ready['nonce'])
@@ -102,12 +104,13 @@ class Control(Terminal):
         return msg
 
     def frame(self, kind, **fields):
-        self.send(json.dumps(dict(type=kind, channel=self.channel, **fields)).encode() + b'\n')
+        self.send(json.dumps(dict(type=kind, channel=self.channel, **fields)).encode() + self.eol)
 
-    def pair(self, tab):
+    def pair(self, tab, enter=b'\r'):
         tab.send(KEY_PAIR)
         tab.read(rb'Zzabba pairing code: ')
-        tab.send(self.code + b'\n')
+        # bind -x 처리기 안에서는 Enter가 클라이언트에 따라 CR 또는 LF로 그대로 온다.
+        tab.send(self.code + enter)
         tab.read(rb'zzabba\$ ')
 
     def ticket(self, job):
@@ -232,7 +235,7 @@ def main():
     with ExitStack() as stack:
         tab = bash(stack)
         control = stack.enter_context(Control())
-        control.pair(tab)
+        control.pair(tab, b'\n')
         control.generation = control.event('paired', 2)['shell_generation']
         control.approval('reserve', control.ticket(1))
         os.kill(control.pid, signal.SIGKILL)
@@ -246,7 +249,7 @@ def main():
 
     with ExitStack() as stack:
         tab = bash(stack)
-        control = stack.enter_context(Control())
+        control = stack.enter_context(Control(b'\r'))
         control.pair(tab)
         control.generation = control.event('paired', 2)['shell_generation']
         ticket = control.ticket(1)
@@ -271,6 +274,40 @@ def main():
         tab.send(KEY_CLAIM)
         tab.read(rb'zzabba\$ ')
         assert b'/usr/bin/uptime' not in tab.transcript
+
+    with ExitStack() as stack:
+        tab = bash(stack)
+        control = stack.enter_context(Control())
+        # 거부된 입력의 나머지는 readline에 도달하지 않는다: 괄호 붙여넣기 안 줄바꿈, 일반 여러 줄, 길이 초과.
+        for attempt in (b'\x1b[200~' + control.code[:8] + b'\recho PASTE-RAN\r\x1b[201~',
+                        control.code[:8] + b'\recho RAW-RAN\r',
+                        control.code + control.code[:40] + b'echo LONG-RAN\r'):
+            tab.send(KEY_PAIR)
+            tab.read(rb'Zzabba pairing code: ')
+            tab.send(attempt)
+            tab.read(rb'zzabba\$ ')
+            control.quiet()
+        # 붙여넣기가 나뉘어 도착해도 끝 표지까지 읽어 버린다.
+        tab.send(KEY_PAIR)
+        tab.read(rb'Zzabba pairing code: ')
+        tab.send(b'\x1b[200~' + control.code[:8] + b'\r')
+        time.sleep(0.3)
+        tab.send(b'echo SPLIT-RAN\r\x1b[201~')
+        tab.read(rb'zzabba\$ ')
+        control.quiet()
+        tab.send(b'echo paste-safe\n')
+        tab.read(rb'\rpaste-safe\r\n')
+        assert b'-RAN' not in tab.transcript
+        # 괄호 붙여넣기는 끝 표지에서 입력을 마치고, 줄 단위 복사의 끝 줄바꿈 한 개는 허용한다.
+        tab.send(KEY_PAIR)
+        tab.read(rb'Zzabba pairing code: ')
+        tab.send(b'\x1b[200~' + control.code + b'\r\x1b[201~')
+        tab.read(rb'zzabba\$ ')
+        assert control.event('paired', 2)['uid'] == UID
+        tab.send(b'exit\n')
+        tab.wait()
+        absent(control.path)
+        control.wait()
 
     assert COUNT.read_bytes() == b'x'
     print('PASS: one approved uptime; no default/direct start, invalid operation, denial, wrong UID/tab/generation, editing, replay or disconnect; input preserved')

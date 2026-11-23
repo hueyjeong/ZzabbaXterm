@@ -2,8 +2,36 @@
 [[ $- == *i* && ${BASH_VERSION-} && $BASH_SUBSHELL == 0 ]] || return 0
 
 __zzabba_shared_pair() {
-    local code locator
-    IFS= read -r -s -t 60 -p 'Zzabba pairing code: ' code </dev/tty || return 0
+    local code= char locator now end paste=0 reject=0 entered=0
+    printf -v end '%(%s)T' -1
+    end=$((end + 60))
+    # Enter는 수신 시점의 터미널 설정에 따라 CR 또는 LF(빈 문자)로 온다.
+    # 괄호 붙여넣기는 끝 표지까지 읽는다. 안쪽 줄바꿈이나 길이 초과는 거부하되 끝 표지까지 계속 읽어 버린다.
+    printf 'Zzabba pairing code: ' >/dev/tty
+    while printf -v now '%(%s)T' -1 && (( now < end )) &&
+        IFS= read -r -s -n 1 -t "$((end - now))" char </dev/tty; do
+        [[ -z $char ]] && char=$'\n'
+        if (( paste )); then
+            code+=$char
+            if [[ $code == *$'\e[201~' ]]; then entered=1; break; fi
+            if (( ${#code} > 96 )); then reject=1; code=${code: -5}; fi
+            continue
+        fi
+        if [[ $char == $'\n' || $char == $'\r' ]]; then entered=1; break; fi
+        code+=$char
+        [[ $code == $'\e[200~' ]] && paste=1
+        (( ${#code} <= 96 )) || { reject=1; break; }
+    done
+    # 남은 입력이 readline에 넘어가 명령으로 실행되지 않도록 버린다.
+    while IFS= read -r -s -n 1 -t 0.05 char </dev/tty; do :; done
+    printf '\n' >/dev/tty
+    (( entered && !reject )) || return 1
+    if (( paste )); then
+        code=${code#$'\e[200~'}
+        code=${code%$'\e[201~'}
+        # 줄 단위 복사로 붙은 끝 줄바꿈 한 개만 허용한다.
+        [[ $code == *$'\r' || $code == *$'\n' ]] && code=${code:0:${#code}-1}
+    fi
     [[ $code =~ ^[0-9a-f]{64}$ ]] || return 1
     locator=$(exec -c /usr/local/libexec/zzabba-ai-control --shared-pair <<<"$BASHPID_FOR_ZZABBA"$'\n'"$code") || return
     __zzabba_shared_locator=$locator
