@@ -1,7 +1,9 @@
 import { useImperativeHandle, useLayoutEffect, useRef, useState, type Ref } from "react";
 import type { ApprovedEditorFile, ConfirmEditorDiscard, EditorFileHandle, EditorTransport } from "./contract";
 import { connectEditor, type EditorCloseState, type EditorConnection, type EditorState } from "./editor";
-import { createFileModel, editor } from "./monaco";
+import { createFileModel, defineEditorTheme, editor, EDITOR_THEME } from "./monaco";
+import { FileCode2, GitCompare, RotateCcw, Save, X } from "lucide-react";
+import { IconButton } from "../ui/controls";
 import "./editor.css";
 
 export interface EditorTabActions {
@@ -45,7 +47,7 @@ const options = {
   fontFamily: '"Cascadia Mono", "DejaVu Sans Mono", monospace',
   fontSize: 14,
   scrollBeyondLastLine: false,
-  theme: "vs-dark",
+  theme: EDITOR_THEME,
 };
 
 /** 파일 핸들로 키를 지정하고, 같은 핸들은 기존 탭을 선택한다. */
@@ -73,6 +75,7 @@ function EditorTabContent({ ref, file, active, readOnly = false, focusRequested,
   useLayoutEffect(() => {
     if (!host.current) return;
     const model = createFileModel(binding.file);
+    defineEditorTheme();
     const view = editor.create(host.current, { ...options, model, ariaLabel: binding.file.label });
     const buffer = connectEditor(binding.file, model, binding.transport, setState, false);
     mono.current = view;
@@ -130,14 +133,18 @@ function EditorTabContent({ ref, file, active, readOnly = false, focusRequested,
       if (!readOnly) void connection.current?.save();
     }}>
       <header className="editor-toolbar">
-        <button type="button" disabled={readOnly || !active || state.saving || Boolean(state.busy) || !state.dirty || state.needsReload} onClick={() => void connection.current?.save()}>저장</button>
-        <button type="button" disabled={readOnly || !active || Boolean(state.busy)} onClick={() => void connection.current?.compare()}>원본과 비교</button>
-        <button type="button" disabled={readOnly || !active || state.saving || Boolean(state.busy)} onClick={() => void connection.current?.reload(confirmDiscard)}>다시 읽기</button>
-        {comparison !== undefined && <button type="button" onClick={() => connection.current?.dismissComparison()}>비교 닫기</button>}
+        <span className="editor-file" title={file.label}><FileCode2 aria-hidden="true" /><span>{file.label}</span>
+          {state.dirty && <span className="editor-dirty" aria-hidden="true" />}</span>
         <output role="status">
           {[statusText(state), state.saving && state.busy !== "save" && "저장 응답 대기",
           !state.busy && state.needsReload && "다시 읽기 필요"].filter(Boolean).join(" · ")}
         </output>
+        <span className="editor-actions" role="toolbar" aria-label="편집기">
+          <IconButton icon={Save} label="저장" disabled={readOnly || !active || state.saving || Boolean(state.busy) || !state.dirty || state.needsReload} onClick={() => void connection.current?.save()} />
+          <IconButton icon={GitCompare} label="원본과 비교" disabled={readOnly || !active || Boolean(state.busy)} onClick={() => void connection.current?.compare()} />
+          <IconButton icon={RotateCcw} label="다시 읽기" disabled={readOnly || !active || state.saving || Boolean(state.busy)} onClick={() => void connection.current?.reload(confirmDiscard)} />
+          {comparison !== undefined && <IconButton icon={X} label="비교 닫기" onClick={() => connection.current?.dismissComparison()} />}
+        </span>
       </header>
       <div className="editor-surface" ref={host} hidden={showingDiff} />
       {showingDiff && <>

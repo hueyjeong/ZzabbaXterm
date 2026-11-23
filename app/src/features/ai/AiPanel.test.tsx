@@ -2,7 +2,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { AiPanel, type AiTopTabs } from "./AiPanel";
+import { AiPanel } from "./AiPanel";
 import type { AiPanelProps, ChatReply, ExecutionStatus, Proposal } from "./contracts";
 
 const alpha = { targetId: "a", generation: "1", label: "개발" };
@@ -24,12 +24,13 @@ function setup() {
   };
 }
 
-async function render(props: AiPanelProps & { topTabs?: AiTopTabs }) {
+async function render(props: AiPanelProps) {
   await act(async () => { root.render(<><textarea aria-label="터미널 입력" /><AiPanel {...props} /></>); });
 }
 
 function button(label: string) {
-  return [...host.querySelectorAll("button")].find((element) => element.textContent === label);
+  return [...host.querySelectorAll("button")].find((element) =>
+    element.textContent === label || element.getAttribute("aria-label") === label);
 }
 
 async function click(label: string) {
@@ -38,15 +39,21 @@ async function click(label: string) {
   await act(async () => { element!.click(); });
 }
 
+const chip = (label: string) => [...host.querySelectorAll<HTMLButtonElement>('button[aria-haspopup="menu"]')]
+  .find((element) => element.getAttribute("aria-label")?.startsWith(`${label}: `));
+
 async function select(label: string, option: string) {
-  const field = [...host.querySelectorAll("label")].find((element) => element.firstChild?.textContent === label)!
-    .querySelector("select")!;
-  await act(async () => {
-    field.closest("details:not([open])")?.querySelector("summary")?.click();
-    field.value = [...field.options].find((element) => element.textContent?.trim() === option)!.value;
-    field.dispatchEvent(new Event("change", { bubbles: true }));
-  });
+  const trigger = chip(label);
+  expect(trigger, label).toBeDefined();
+  await act(async () => { trigger!.click(); });
+  const item = [...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find((element) => element.textContent === option);
+  expect(item, option).toBeDefined();
+  await act(async () => { item!.click(); });
+  expect(host.querySelector('[role="menu"]')).toBeNull();
 }
+
+const fields = (article: Element | null | undefined) =>
+  [...article?.querySelectorAll("[data-field]") ?? []].map((element) => element.textContent);
 
 const input = () => host.querySelector<HTMLTextAreaElement>('textarea[aria-label="메시지 입력"]')!;
 async function type(value: string) {
@@ -77,8 +84,8 @@ describe("일반 대화", () => {
     await render(props);
     await select("조회 대상", "개발 (a)");
     await type("echo CHAT_ONLY");
-    expect(button("전송")?.disabled).toBe(true);
-    await select("Ollama 모델", "local:latest");
+    // 사용자가 고르기 전에는 첫 모델을 쓴다.
+    expect(chip("모델")?.textContent).toBe("local:latest");
     await click("전송");
     expect(document.activeElement).toBe(input());
     expect(host.querySelector('[role="log"]')?.textContent).toContain(reply);
@@ -105,7 +112,7 @@ describe("일반 대화", () => {
     const reply = Promise.withResolvers<ChatReply>();
     props.onSendChat.mockReturnValueOnce(reply.promise);
     await render(props);
-    await select("Ollama 모델", "local:latest");
+    await select("모델", "local:latest");
     await type("다시 보낼 문장");
     await click("전송");
     const terminal = host.querySelector("textarea")!;
@@ -125,7 +132,7 @@ describe("일반 대화", () => {
   it("요청 크기 오류가 나면 기존 대화와 초안을 유지한다", async () => {
     const props = setup();
     await render(props);
-    await select("Ollama 모델", "local:latest");
+    await select("모델", "local:latest");
     await type("첫 질문");
     await click("전송");
     const message = "Ollama 요청 크기 한도를 초과했습니다. 전송되지 않았습니다.";
@@ -141,80 +148,105 @@ describe("일반 대화", () => {
   });
 });
 
-it("오른쪽 탭을 전환해도 채팅 초안, SFTP 입력과 제안 검토 상태를 유지한다", async () => {
+it("채팅과 제안 카드를 하나의 대화 기록에 시간 순서로 표시하고 대상 전환 중에도 초안을 유지한다", async () => {
   const props = setup();
   await render(props);
   const chat = host.querySelector<HTMLElement>(".workspace-chat")!;
-  const review = host.querySelector<HTMLElement>(".a01-proposals")!;
-  expect(chat.contains(review)).toBe(true);
-  expect(chat.querySelector("h2")?.textContent).toBe("AI 채팅");
+  expect(chat.querySelector("h2")?.textContent).toBe("AI");
+  expect(chat.getAttribute("aria-labelledby")).toBe(chat.querySelector("h2")?.id);
   expect(host.querySelector('[role="tablist"]')).toBeNull();
-  await select("Ollama 모델", "local:latest");
+  expect(host.querySelector(".a01-empty")?.textContent).toBe("");
+  expect(button("가동 시간 확인")).toBeUndefined();
+  expect(chip("조회 대상")?.textContent).toBe("대상 선택");
+  expect(chip("모델")?.textContent).toBe("local:latest");
+
+  await select("모델", "local:latest");
   await select("조회 대상", "개발 (a)");
-  await type("채팅 초안");
+  expect(chip("조회 대상")?.getAttribute("aria-label")).toBe("조회 대상: 개발 (a)");
+  await type("첫 질문");
+  await click("전송");
+  await click("가동 시간 확인");
+  await type("두 번째 질문");
+  await click("전송");
+  const roles = () => [...host.querySelector('[role="log"]')!.children]
+    .map((element) => element.tagName === "ARTICLE" ? "카드" : element.getAttribute("data-role"));
+  expect(roles()).toEqual(["user", "assistant", "카드", "user", "assistant"]);
+  expect(host.querySelector(".a01-empty")).toBeNull();
+  expect(fields(host.querySelector("article"))).toEqual(["uptime", "dev-01\\u{1b}", card.interpretation]);
+
+  await type("보존할 초안");
   const draft = input();
-
-  const onSelect = vi.fn<AiTopTabs["onSelect"]>();
-  const item = { id: "ssh-1", label: "SFTP", content: <input aria-label="원격 경로" /> };
-  const show = (selectedId: string | null) => render({ ...props, topTabs: { item, selectedId, onSelect } });
-  await show("다른 세션");
-  const chatTab = button("AI 채팅")!;
-  const sftpTab = button("SFTP")!;
-  const sftp = document.getElementById(sftpTab.getAttribute("aria-controls")!)!;
-  const path = sftp.querySelector("input")!;
-  expect(chatTab.closest('[role="tablist"]')).toBe(sftpTab.parentElement);
-  expect(chat.getAttribute("role")).toBe("tabpanel");
-  expect(chat.id).toBe(chatTab.getAttribute("aria-controls"));
-  expect(chat.getAttribute("aria-labelledby")).toBe(chatTab.id);
-  expect(sftp.getAttribute("aria-labelledby")).toBe(sftpTab.id);
-  expect(chatTab.getAttribute("aria-selected")).toBe("true");
-  expect(chatTab.tabIndex).toBe(0);
-  expect(sftpTab.tabIndex).toBe(-1);
-  expect(sftp.hidden && sftp.hasAttribute("inert")).toBe(true);
-
-  await click("SFTP");
-  expect(onSelect).toHaveBeenLastCalledWith(item.id);
-  expect(document.activeElement).toBe(sftpTab);
-  await show(item.id);
-  expect(sftpTab.getAttribute("aria-selected")).toBe("true");
-  expect(sftpTab.tabIndex).toBe(0);
-  expect(chatTab.tabIndex).toBe(-1);
-  expect(chat.hidden && chat.hasAttribute("inert")).toBe(true);
-  expect(sftp.hidden || sftp.hasAttribute("inert")).toBe(false);
-  path.value = "/home/dev";
-
-  const key = (tab: HTMLButtonElement, name: string) => act(async () => {
-    tab.dispatchEvent(new KeyboardEvent("keydown", { key: name, bubbles: true, cancelable: true }));
-  });
-  await key(sftpTab, "ArrowRight");
-  expect(onSelect).toHaveBeenLastCalledWith(null);
-  expect(document.activeElement).toBe(chatTab);
-  await show(null);
-  expect(chat.hidden || chat.hasAttribute("inert")).toBe(false);
+  await select("조회 대상", "개발 (b)");
   expect(input()).toBe(draft);
-  expect(draft.value).toBe("채팅 초안");
-  expect(button("전송")?.disabled).toBe(false);
-  expect(chat.querySelector(".a01-proposals")).toBe(review);
-  expect(review.querySelector("select")?.selectedOptions[0].textContent?.trim()).toBe("개발 (a)");
-  const proposal = Promise.withResolvers<Proposal>();
-  props.onRequestProposal.mockReturnValueOnce(proposal.promise);
-  await click("가동 시간 조회 제안");
-  expect(review.querySelector('[role="status"]')?.textContent).toBe("제안 요청 중");
-
-  await key(chatTab, "End");
-  expect(onSelect).toHaveBeenLastCalledWith(item.id);
-  await show(item.id);
-  expect(sftp.querySelector("input")).toBe(path);
-  expect(path.value).toBe("/home/dev");
-  await act(async () => { proposal.resolve(card); });
-  expect(review.closest("[inert]")).toBe(chat);
-  expect(sftp.querySelector(".a01-proposals")).toBeNull();
-  await click("AI 채팅");
-  await show(null);
-  expect(button("승인")?.closest(".a01-proposals")).toBe(review);
-  expect(props.onSendChat).not.toHaveBeenCalled();
+  expect(draft.value).toBe("보존할 초안");
+  expect(roles()).toEqual(["user", "assistant", "user", "assistant"]);
+  await select("조회 대상", "개발 (a)");
+  expect(roles()).toEqual(["user", "assistant", "user", "assistant"]);
+  expect(draft.value).toBe("보존할 초안");
   expect(props.onRequestProposal).toHaveBeenCalledTimes(1);
   expect(props.onDecideProposal).not.toHaveBeenCalled();
+});
+
+it("새 대화는 대화 기록만 비우고 초안과 제안 카드는 유지한다", async () => {
+  const props = setup();
+  await render({ ...props, proposals: [card] });
+  expect(button("새 대화")?.disabled).toBe(true);
+  await select("모델", "local:latest");
+  await select("조회 대상", "개발 (a)");
+  await type("질문");
+  await click("전송");
+  await type("남길 초안");
+  expect(button("새 대화")?.disabled).toBe(false);
+  await click("새 대화");
+  expect(host.querySelectorAll(".a01-msg")).toHaveLength(0);
+  expect(host.querySelectorAll("article")).toHaveLength(1);
+  expect(input().value).toBe("남길 초안");
+  expect(document.activeElement).toBe(input());
+  await click("전송");
+  expect(props.onSendChat.mock.calls[1]).toEqual([{ model: "local:latest", messages: [{ role: "user", content: "남길 초안" }] }]);
+});
+
+describe("입력 키", () => {
+  async function key(init: KeyboardEventInit) {
+    const event = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true, ...init });
+    await act(async () => { input().dispatchEvent(event); });
+    return event;
+  }
+
+  it("Enter로 전송하고 Shift+Enter는 줄바꿈으로 남긴다", async () => {
+    const props = setup();
+    await render(props);
+    await select("모델", "local:latest");
+    await type("첫 줄");
+    const shifted = await key({ shiftKey: true });
+    expect(shifted.defaultPrevented).toBe(false);
+    expect(props.onSendChat).not.toHaveBeenCalled();
+    const enter = await key({});
+    expect(enter.defaultPrevented).toBe(true);
+    expect(props.onSendChat.mock.calls).toEqual([[{ model: "local:latest", messages: [{ role: "user", content: "첫 줄" }] }]]);
+    expect(input().value).toBe("");
+    expect(host.querySelector('[role="log"]')?.textContent).toBe("나첫 줄AI응답");
+  });
+
+  it.each([{ isComposing: true }, { keyCode: 229 }])("IME 조합 중 Enter는 전송하지 않는다 (%o)", async (init) => {
+    const props = setup();
+    await render(props);
+    await select("모델", "local:latest");
+    await type("한글 조합");
+    const event = await key(init);
+    expect(event.defaultPrevented).toBe(false);
+    expect(props.onSendChat).not.toHaveBeenCalled();
+    expect(input().value).toBe("한글 조합");
+  });
+
+  it("모델이 없으면 Enter로 전송하지 않는다", async () => {
+    const props = { ...setup(), models: [] };
+    await render(props);
+    await type("보낼 수 없는 문장");
+    await key({});
+    expect(props.onSendChat).not.toHaveBeenCalled();
+    expect(input().value).toBe("보낼 수 없는 문장");
+  });
 });
 
 describe("제안 검토", () => {
@@ -223,10 +255,10 @@ describe("제안 검토", () => {
     const pending = Promise.withResolvers<Proposal>();
     props.onRequestProposal.mockReturnValueOnce(pending.promise);
     await render(props);
-    await select("Ollama 모델", "local:latest");
+    await select("모델", "local:latest");
     await select("조회 대상", "개발 (a)");
     await type("채팅 초안");
-    await click("가동 시간 조회 제안");
+    await click("가동 시간 확인");
     expect(props.onRequestProposal.mock.calls[0][0]).toEqual({
       model: "local:latest", target: { targetId: "a", generation: "1" }, operation: "uptime",
     });
@@ -259,9 +291,9 @@ describe("제안 검토", () => {
     const props = setup();
     props.onRequestProposal.mockResolvedValueOnce({ ...card, target: beta });
     await render(props);
-    await select("Ollama 모델", "local:latest");
+    await select("모델", "local:latest");
     await select("조회 대상", "개발 (a)");
-    await click("가동 시간 조회 제안");
+    await click("가동 시간 확인");
     expect(host.querySelector('[role="alert"]')?.textContent).toBe("제안 요청 실패");
     expect(button("승인")).toBeUndefined();
   });
@@ -271,14 +303,12 @@ describe("제안 검토", () => {
     await render({ ...props, proposals: [card, card] });
     await select("조회 대상", "개발 (a)");
     const [article] = host.querySelectorAll("article");
-    expect([...article.querySelectorAll("dd")].map((element) => element.textContent)).toEqual([
-      "dev-01\\u{1b}", "uptime", card.interpretation,
-    ]);
+    expect(fields(article)).toEqual(["uptime", "dev-01\\u{1b}", card.interpretation]);
     expect(host.querySelectorAll("article")).toHaveLength(1);
     const approval = button("승인")!;
     await act(async () => { approval.click(); approval.click(); });
     expect(props.onDecideProposal.mock.calls).toEqual([[{ proposalId: "p1", decision: "approve" }]]);
-    expect(article.textContent).toContain("승인 기록됨");
+    expect(article.querySelector("[role=status]")?.textContent).toBe("승인됨");
     expect(props.onSendChat).not.toHaveBeenCalled();
     expect(props.onRequestProposal).not.toHaveBeenCalled();
   });
@@ -309,7 +339,7 @@ describe("제안 검토", () => {
     await click("승인");
     await select("조회 대상", "개발 (b)");
     await act(async () => { decision.resolve("approved"); });
-    expect(host.querySelector("article dd")?.textContent).toBe("dev-02");
+    expect(host.querySelector("article [data-field=node]")?.textContent).toBe("dev-02");
     expect(host.querySelector("article [role=status]")).toBeNull();
     await select("조회 대상", "개발 (a)");
     expect(host.querySelector("article [role=status]")?.textContent).toBe("검토 종료");
@@ -323,11 +353,11 @@ describe("제안 검토", () => {
       ssm: { profile: "ops-b", region: "us-west-2" }
     };
     await render({ ...setup(), proposals: [first, second] });
-    const values = () => [...host.querySelectorAll("article dd")].map((item) => item.textContent);
+    const values = () => fields(host.querySelector("article"));
     await select("조회 대상", "개발 (a)");
-    expect(values()).toEqual(["ops-a", "ap-northeast-2", "dev-01\\u{1b}", "uptime", card.interpretation]);
+    expect(values()).toEqual(["uptime", "dev-01\\u{1b}", "ops-a", "ap-northeast-2", card.interpretation]);
     await select("조회 대상", "개발 (b)");
-    expect(values()).toEqual(["ops-b", "us-west-2", "dev-01\\u{1b}"]);
+    expect(values()).toEqual(["dev-01\\u{1b}", "ops-b", "us-west-2"]);
   });
 
   it.each([false, true])("결정 활성화 후 포커스를 이어 받고 다른 탭 입력은 유지한다 (%s)", async (move) => {
@@ -339,12 +369,12 @@ describe("제안 검토", () => {
     button("승인")!.focus();
     await click("승인");
     const status = host.querySelector("article [role=status]");
-    expect(status?.textContent).toBe("결정 기록 중");
+    expect(status?.textContent).toBe("기록 중");
     expect(document.activeElement).toBe(status);
     const terminal = host.querySelector("textarea")!;
     if (move) terminal.focus();
     await act(async () => { response.resolve("rejected"); });
-    expect(status?.textContent).toBe("거절 기록됨");
+    expect(status?.textContent).toBe("거절됨");
     expect(document.activeElement).toBe(move ? terminal : status);
   });
 });
@@ -358,8 +388,8 @@ describe("승인된 작업 실행", () => {
     const stop = vi.fn<NonNullable<AiPanelProps["onStopExecution"]>>().mockImplementation(async () => {});
     await render({ ...props, history, onExecuteProposal: execute, onStopExecution: stop });
     await select("조회 대상", "개발 (a)");
-    expect(button("실행 승인")).toBeDefined();
-    await click("실행 승인");
+    expect(button("실행")).toBeDefined();
+    await click("실행");
     expect(execute.mock.calls).toEqual([["p1", "uptime"]]);
 
     const status: ExecutionStatus = {

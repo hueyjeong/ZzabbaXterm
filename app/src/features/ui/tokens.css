@@ -1,0 +1,160 @@
+/* 앱 전체가 공유하는 색·간격·글꼴 토큰과 공통 컨트롤이다. 기능 CSS는 이 변수만 참조한다. */
+:root {
+  color-scheme: dark;
+  --bg-app: #0f1417;
+  --bg-chrome: #151b1f;
+  --bg-panel: #182024;
+  --bg-elevated: #20292e;
+  --bg-input: #11171a;
+  --bg-hover: #263035;
+  --bg-active: #2c393e;
+  --border: #29343a;
+  --border-strong: #3a474e;
+  --text: #dbe4e0;
+  --text-muted: #8f9e99;
+  --text-faint: #66746f;
+  --accent: #5fd1a8;
+  --accent-strong: #7fe0bc;
+  --accent-fg: #08130f;
+  --accent-soft: rgb(95 209 168 / 14%);
+  --danger: #f07a6e;
+  --danger-soft: rgb(240 122 110 / 14%);
+  --warning: #e8b85c;
+  --info: #6cb6ff;
+  --proto-local: #a7b5b0;
+  --proto-ssh: #6cb6ff;
+  --proto-ssm: #f2a33a;
+  --proto-s3: #69c47a;
+  --proto-rdp: #8aa4ff;
+  --proto-vnc: #c792ea;
+  --proto-tunnel: #e0c36c;
+  --proto-editor: #c9b8ff;
+  --radius-sm: 4px;
+  --radius: 6px;
+  --radius-lg: 10px;
+  --shadow-popover: 0 10px 28px rgb(0 0 0 / 45%), 0 0 0 1px var(--border-strong);
+  --font-ui: "Segoe UI Variable Text", "Segoe UI", "Pretendard", "Noto Sans KR", "Malgun Gothic", system-ui, sans-serif;
+  --font-mono: "Cascadia Mono", "JetBrains Mono", "D2Coding", Consolas, ui-monospace, monospace;
+  --control-height: 28px;
+  font: 13px/1.45 var(--font-ui);
+  background: var(--bg-app);
+  color: var(--text);
+}
+
+body { margin: 0; }
+* { scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
+input, select, textarea, button { font: inherit; color: inherit; }
+code, pre, kbd { font-family: var(--font-mono); }
+
+/* 아이콘 단추: 이름은 aria-label과 title로 제공한다. */
+.icon-button {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: var(--control-height);
+  height: var(--control-height);
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.icon-button:hover:not(:disabled) { background: var(--bg-hover); color: var(--text); }
+.icon-button[aria-pressed="true"], .icon-button[aria-expanded="true"] { background: var(--bg-active); color: var(--text); }
+.icon-button:disabled { opacity: .4; cursor: default; }
+.icon-button:focus-visible, .ui-button:focus-visible, .ui-field:focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; }
+.icon-button svg { width: 16px; height: 16px; stroke-width: 1.75; }
+.icon-button.small { --control-height: 22px; }
+.icon-button.small svg { width: 14px; height: 14px; }
+.icon-button.danger:hover:not(:disabled) { background: var(--danger-soft); color: var(--danger); }
+
+/* 글자 단추 */
+.ui-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: var(--control-height);
+  padding: 0 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  color: var(--text);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ui-button:hover:not(:disabled) { background: var(--bg-hover); }
+.ui-button:disabled { opacity: .45; cursor: default; }
+.ui-button svg { width: 14px; height: 14px; stroke-width: 2; }
+.ui-button.primary { border-color: transparent; background: var(--accent); color: var(--accent-fg); font-weight: 600; }
+.ui-button.primary:hover:not(:disabled) { background: var(--accent-strong); }
+.ui-button.danger { border-color: transparent; background: var(--danger-soft); color: var(--danger); }
+.ui-button.ghost { border-color: transparent; background: transparent; }
+.ui-button.ghost:hover:not(:disabled) { background: var(--bg-hover); }
+
+/* 입력과 선택 */
+.ui-field {
+  box-sizing: border-box;
+  min-width: 0;
+  min-height: var(--control-height);
+  padding: 3px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--text);
+  outline: none;
+}
+.ui-field:focus { border-color: var(--accent); }
+.ui-field::placeholder { color: var(--text-faint); }
+select.ui-field { padding-inline-end: 4px; }
+
+/* 문맥 메뉴와 단추 메뉴 */
+.ui-menu {
+  position: fixed;
+  z-index: 50;
+  display: grid;
+  min-width: 200px;
+  max-width: min(360px, 100vw);
+  padding: 4px;
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow-popover);
+}
+.ui-menu [role="menuitem"] {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 30px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  text-align: start;
+  cursor: pointer;
+}
+.ui-menu [role="menuitem"]:is(:hover, :focus-visible):not(:disabled) { background: var(--bg-active); outline: none; }
+.ui-menu [role="menuitem"]:disabled { opacity: .45; cursor: default; }
+.ui-menu [role="menuitem"] svg { flex: none; width: 15px; height: 15px; stroke-width: 1.75; color: var(--text-muted); }
+.ui-menu [role="menuitem"] kbd { margin-inline-start: auto; padding-inline-start: 16px; color: var(--text-faint); font: 12px var(--font-ui); }
+.ui-menu [role="separator"] { height: 1px; margin: 4px 6px; background: var(--border); }
+.ui-menu-label { padding: 6px 10px 2px; color: var(--text-faint); font-size: 11px; font-weight: 600; letter-spacing: .02em; }
+
+/* 상태 점 */
+.status-dot { flex: none; width: 7px; height: 7px; border-radius: 50%; background: var(--text-faint); }
+.status-dot[data-state="running"] { background: var(--accent); }
+.status-dot[data-state="busy"] { background: var(--warning); }
+.status-dot[data-state="error"] { background: var(--danger); }
+
+/* 프로토콜 아이콘 색 */
+.proto-icon { flex: none; width: 16px; height: 16px; stroke-width: 1.75; }
+.proto-icon[data-kind="local"] { color: var(--proto-local); }
+.proto-icon[data-kind="ssh"] { color: var(--proto-ssh); }
+.proto-icon[data-kind="ssm"] { color: var(--proto-ssm); }
+.proto-icon[data-kind="s3"] { color: var(--proto-s3); }
+.proto-icon[data-kind="rdp"] { color: var(--proto-rdp); }
+.proto-icon[data-kind="vnc"] { color: var(--proto-vnc); }
+.proto-icon[data-kind="tunnel"] { color: var(--proto-tunnel); }
+.proto-icon[data-kind="editor"] { color: var(--proto-editor); }
+.proto-icon[data-kind="sudo"] { color: var(--warning); }

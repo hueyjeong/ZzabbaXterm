@@ -72,7 +72,7 @@ export type AiPanelProps = Readonly<{
   targetError?: string;
   onRefresh?: () => void;
   onOpenCliReview?: () => void;
-  policyControl?: React.ReactNode;
+  policy?: Readonly<{ blocked: boolean; saving: boolean; onChange: (blocked: boolean) => void }>;
   onSendChat: (request: ChatRequest) => Promise<ChatReply>;
   onRequestProposal: (request: ProposalRequest, signal: AbortSignal) => Promise<Proposal>;
   onDecideProposal: (decision: ProposalDecision) => Promise<RecordedDecision>;

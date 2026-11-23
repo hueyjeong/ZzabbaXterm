@@ -4,6 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { S3StoragePanel } from "./S3StoragePanel";
 import type { S3Actions, S3Result, S3Session } from "./s3";
+import { control, dblclick, fileRow } from "../files/testing";
 
 const session: S3Session = { sessionId: "first", profile: "sso", region: "ap-northeast-2", endpoint: "https://s3.ap-northeast-2.amazonaws.com" };
 const prefix = "실험//";
@@ -39,8 +40,7 @@ function render(countHistory: CountHistory, openedSession = session) {
 }
 
 function click(text: string) {
-  const button = Array.from(host.querySelectorAll("button")).find(node => node.textContent === text);
-  if (!button) throw new Error(`버튼 없음: ${text}`);
+  const button = control(host, text);
   return act(async () => button.click());
 }
 
@@ -58,7 +58,7 @@ it("객체 목록을 먼저 열고 이동·세션 변경 전에 시작한 이력
   await click(bucket);
   expect(countHistory).toHaveBeenCalledExactlyOnceWith(request);
   expect(host.textContent).toContain(`${historyLabel}확인 중`);
-  await click(prefix);
+  await dblclick(fileRow(host, prefix));
   expect(countHistory).toHaveBeenLastCalledWith({ ...request, prefix });
   await act(async () => current.resolve({ ok: true, value: 0 }));
   await act(async () => previous.resolve({ ok: true, value: 7 }));
@@ -107,7 +107,7 @@ it("이동을 시작하면 지난 수를 숨기고 SSO 재로그인 전후에 �
   await click("버킷 목록");
   await click(bucket);
   expect(host.textContent).toContain(`${historyLabel}4개`);
-  await click(prefix);
+  await dblclick(fileRow(host, prefix));
   expect(host.textContent).not.toContain("4개");
   expect(countHistory).toHaveBeenCalledTimes(1);
   await act(async () => list.resolve({ ok: false, error: { stage: "listObjects", failure: { kind: "ssoLoginRequired" }, bytes: 0 } }));

@@ -13,7 +13,11 @@ pub(crate) fn register(directory: &Path, draft: profile::ValidatedDraft) -> Resu
 
     ipc::prepare_config_parent(directory).map_err(|_| Error::StoreUnavailable)?;
     let id = draft.target_id().to_owned();
-    match store::Store::new(directory).register(draft).map_err(|_| Error::StoreUnavailable)? {
+    let store = store::Store::new(directory);
+    if !probe::desktop_route_ready(&draft, &store).map_err(|_| Error::StoreUnavailable)? {
+        return Err(Error::InvalidRequest);
+    }
+    match store.register(draft).map_err(|_| Error::StoreUnavailable)? {
         store::SaveStatus::Saved => Ok((id, profile::Revision::MIN.to_string())),
         store::SaveStatus::GroupConflict => Err(Error::GroupConflict),
         store::SaveStatus::TargetConflict => Err(Error::TargetConflict),
@@ -58,7 +62,7 @@ pub(crate) fn with_ai_targets<T>(
                 let (ssm_profile, region, node_id) = match entry.profile.method() {
                     profile::MethodRef::Local { .. } => (None, String::new(), "내 PC".into()),
                     profile::MethodRef::Ssm { profile, region, instance_id } => (Some(profile.into()), region.into(), instance_id.into()),
-                    profile::MethodRef::Ssh { .. } | profile::MethodRef::S3 { .. } => return None,
+                    profile::MethodRef::Ssh { .. } | profile::MethodRef::S3 { .. } | profile::MethodRef::Desktop { .. } => return None,
                 };
                 Some(crate::ai::SelectedTarget {
                     profile_id: entry.profile.id.as_str().to_owned(),
@@ -82,7 +86,7 @@ pub(crate) fn ai_aliases(directory: &Path) -> Result<Vec<crate::ai::cli::Alias>,
         let method = match entry.profile.method() {
             profile::MethodRef::Local { .. } => "local",
             profile::MethodRef::Ssm { .. } => "ssm",
-            profile::MethodRef::Ssh { .. } | profile::MethodRef::S3 { .. } => return None,
+            profile::MethodRef::Ssh { .. } | profile::MethodRef::S3 { .. } | profile::MethodRef::Desktop { .. } => return None,
         };
         Some(crate::ai::cli::Alias {
             id: entry.profile.id.as_str().into(),

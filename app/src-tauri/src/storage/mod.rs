@@ -24,7 +24,7 @@ use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 use percent_encoding::percent_decode_str;
 use aws_smithy_async::time::SharedTimeSource;
 use aws_smithy_runtime_api::client::http::SharedHttpClient;
-use aws_smithy_types::timeout::TimeoutConfig;
+use aws_smithy_types::{date_time::Format as DateTimeFormat, timeout::TimeoutConfig};
 
 #[derive(Debug, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct BucketRow {
@@ -40,10 +40,18 @@ pub(crate) struct Page<T> {
 }
 
 #[derive(Debug, PartialEq, Eq, serde::Serialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
+#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub(crate) enum ObjectRow {
     Prefix { prefix: String },
-    Object { key: String, bytes: Option<u64> },
+    /// 수정 시각은 RFC 3339 문자열, 스토리지 클래스는 서비스가 보낸 값 그대로다.
+    Object {
+        key: String,
+        bytes: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_modified: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        storage_class: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -350,9 +358,13 @@ impl<C: std::borrow::Borrow<Client>> S3Operations<C> {
         }
         for object in output.contents.unwrap_or_default() {
             let bytes = object.size().and_then(|n| u64::try_from(n).ok());
+            let last_modified = object.last_modified().and_then(|time| time.fmt(DateTimeFormat::DateTime).ok());
+            let storage_class = object.storage_class().map(|class| class.as_str().to_owned());
             rows.push(ObjectRow::Object {
                 key: decode(object.key)?,
                 bytes,
+                last_modified,
+                storage_class,
             });
         }
         Ok(Page {

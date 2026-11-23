@@ -15,7 +15,7 @@ export type S3Session = Readonly<{
 export type BucketRow = Readonly<{ name: string; region: string }>;
 export type ObjectRow =
   | Readonly<{ kind: "prefix"; prefix: string }>
-  | Readonly<{ kind: "object"; key: string; bytes: number | null; rowId?: string }>;
+  | Readonly<{ kind: "object"; key: string; bytes: number | null; lastModified?: string; storageClass?: string; rowId?: string }>;
 
 export type StorageEditorOpen = Readonly<{
   file: ApprovedEditorFile;

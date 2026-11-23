@@ -69,7 +69,7 @@ fn tunnels_observe_only_the_owned_transport_and_keep_terminal_state() {
         server: "test".into(), listen: local(), destination,
     }).unwrap();
     let other = tunnels.begin(outsider.clone(), Route::Ssm {
-        listen: local(), node: "test".into(), port: 456,
+        listen: local(), node: "test".into(), port: 456, host: None,
     }).unwrap();
     let mut probe = Probe::new();
     probe.close_failures = 1;

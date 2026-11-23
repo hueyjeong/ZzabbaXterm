@@ -349,7 +349,7 @@ fn parse(command: &str, input: impl Read) -> Result<Command> {
             }
             #[cfg(not(windows))]
             MethodRef::Local { .. } => {}
-            MethodRef::Ssm { .. } | MethodRef::S3 { .. } => {}
+            MethodRef::Ssm { .. } | MethodRef::S3 { .. } | MethodRef::Desktop { .. } => {}
         }
         Ok(Command::Register(draft))
     } else {

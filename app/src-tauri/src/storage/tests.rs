@@ -105,7 +105,8 @@ async fn s01_지정_버킷의_다음_페이지와_선택한_키를_그대로_요
             concat!(
                 "<ListBucketResult><EncodingType>url</EncodingType><IsTruncated>false</IsTruncated>",
                 "<Contents><Key>%EC%8B%A4%ED%97%98%2F%2F..%2F%ED%95%9C%EA%B8%80%20+%252F.txt</Key>",
-                "<Size>3</Size></Contents></ListBucketResult>"
+                "<LastModified>2026-03-04T05:06:07.000Z</LastModified>",
+                "<Size>3</Size><StorageClass>GLACIER_IR</StorageClass></Contents></ListBucketResult>"
             ),
         ),
         object_response(3, None, SdkBody::from("new")),
@@ -136,11 +137,20 @@ async fn s01_지정_버킷의_다음_페이지와_선택한_키를_그대로_요
         .await
         .unwrap();
     assert_eq!(second.next_token, None);
-    let [ObjectRow::Object { key, bytes }] = second.rows.as_slice() else {
+    let [ObjectRow::Object { key, bytes, last_modified, storage_class }] = second.rows.as_slice() else {
         panic!("객체 행 한 개 필요")
     };
     assert_eq!(key.as_bytes(), "실험//../한글 +%2F.txt".as_bytes());
     assert_eq!(*bytes, Some(3));
+    assert_eq!(last_modified.as_deref(), Some("2026-03-04T05:06:07Z"));
+    assert_eq!(storage_class.as_deref(), Some("GLACIER_IR"));
+    assert_eq!(
+        serde_json::to_value(&second.rows[0]).unwrap(),
+        serde_json::json!({
+            "kind": "object", "key": "실험//../한글 +%2F.txt", "bytes": 3,
+            "lastModified": "2026-03-04T05:06:07Z", "storageClass": "GLACIER_IR",
+        })
+    );
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("chosen.txt");
     assert_eq!(

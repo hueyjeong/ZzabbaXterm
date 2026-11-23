@@ -23,7 +23,11 @@ fn remote_route(listen: SocketAddr) -> Route {
 }
 
 fn ssm_route(listen: SocketAddr, node: &str) -> Route {
-    Route::Ssm { listen, node: node.into(), port: 3389 }
+    Route::Ssm { listen, node: node.into(), port: 3389, host: None }
+}
+
+fn ssm_remote_route(listen: SocketAddr, host: &str) -> Route {
+    Route::Ssm { listen, node: NODE.into(), port: 3389, host: Some(host.into()) }
 }
 
 #[test]
@@ -118,4 +122,36 @@ fn occupied_loopback_is_not_readiness_and_existing_listener_answers() {
     let mut answer = [0; 8];
     client.read_exact(&mut answer).unwrap();
     assert_eq!(&answer, b"existing");
+}
+
+#[test]
+fn ssm_remote_host_uses_the_remote_document_only_for_dns_or_ip_hosts() {
+    let listen = local(13389);
+    for (host, parameters) in [
+        ("rdp.internal.example", "host=rdp.internal.example,portNumber=3389,localPortNumber=13389"),
+        ("10.0.1.25", "host=10.0.1.25,portNumber=3389,localPortNumber=13389"),
+        ("fd00::25", "host=fd00::25,portNumber=3389,localPortNumber=13389"),
+    ] {
+        let route = ssm_remote_route(listen, host);
+        let plan = SsmPlan::new(&route, SCOPE, &route, SCOPE).unwrap();
+        assert_eq!(plan.document_options(SCOPE, NODE).unwrap(), [
+            "--document-name", "AWS-StartPortForwardingSessionToRemoteHost", "--parameters", parameters,
+        ]);
+        let other_region = SsmScope { region: "us-west-2", ..SCOPE };
+        assert_eq!(plan.document_options(other_region, NODE), Err(PlanError::ApprovalMismatch));
+        assert_eq!(plan.document_options(SCOPE, "i-00000000000000000"), Err(PlanError::ApprovalMismatch));
+    }
+    let approved = ssm_remote_route(listen, "rdp.internal.example");
+    for changed in [ssm_remote_route(listen, "other.internal.example"), ssm_route(listen, NODE)] {
+        assert_eq!(SsmPlan::new(&changed, SCOPE, &approved, SCOPE).err(), Some(PlanError::ApprovalMismatch));
+    }
+    let long = format!("{}.example", "a".repeat(250));
+    for host in [
+        "", " ", "host name", "a,b", "host=other", "host
+portNumber=22", "[fd00::25]", "fe80::1%eth0",
+        "-debug", "host_name", "host:3389", long.as_str(), "2852039166", "127.1", "0x7f000001", "999.1.1.1",
+    ] {
+        let route = ssm_remote_route(listen, host);
+        assert_eq!(SsmPlan::new(&route, SCOPE, &route, SCOPE).err(), Some(PlanError::InvalidDestination), "{host:?}");
+    }
 }

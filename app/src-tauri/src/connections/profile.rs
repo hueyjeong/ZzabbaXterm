@@ -49,6 +49,8 @@ pub(super) enum Method {
     Ssm { ssm: Ssm },
     Ssh { ssh: Ssh },
     S3 { s3: S3 },
+    Rdp { rdp: Rdp },
+    Vnc { vnc: Vnc },
 }
 
 pub(crate) enum MethodRef<'a> {
@@ -56,6 +58,7 @@ pub(crate) enum MethodRef<'a> {
     Ssm { profile: &'a str, region: &'a str, instance_id: &'a str },
     Ssh { ssh: &'a Ssh },
     S3 { s3: &'a S3 },
+    Desktop { route: &'a DesktopRoute },
 }
 
 impl MethodRef<'_> {
@@ -132,6 +135,71 @@ impl S3 {
             return Err(ValidationError::S3Prefix);
         }
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DesktopProtocol {
+    Rdp,
+    Vnc,
+}
+
+/// 원격 화면 프로필이다. 비밀번호는 저장하지 않고 연결할 때 서비스 인증에서 받는다.
+#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct Rdp {
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) tls_only: bool,
+    pub(crate) route: DesktopRoute,
+}
+
+#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct Vnc {
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) route: DesktopRoute,
+}
+
+#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase", deny_unknown_fields)]
+pub(crate) enum DesktopRoute {
+    Direct {},
+    /// 저장된 직접 SSH 대상의 서버 루프백(`127.0.0.1:port`)으로 전달한다.
+    Ssh { target_id: String },
+    /// host가 비면 노드 자신의 포트, 있으면 노드에서 접속하는 원격 호스트로 전달한다.
+    Ssm(Ssm),
+}
+
+fn desktop_dns(host: &str) -> bool {
+    host.parse::<IpAddr>().is_err() && !crate::tunnels::transport::numeric_tail(host) && host.len() <= 253 && host.split('.').all(|label| {
+        !label.is_empty() && label.len() <= 63 && !label.starts_with('-') && !label.ends_with('-')
+            && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    })
+}
+
+fn validate_desktop(protocol: DesktopProtocol, host: &str, port: u16, route: &DesktopRoute) -> Result<(), ValidationError> {
+    if port == 0 {
+        return Err(ValidationError::DesktopPort);
+    }
+    let address = host.parse::<IpAddr>().is_ok() || desktop_dns(host);
+    // RDP는 TLS 인증서 이름이 필요하다. 평문 RFB는 터널 끝과 같은 호스트의 서비스만 연다.
+    let valid = match (protocol, route) {
+        (DesktopProtocol::Rdp, DesktopRoute::Direct {} | DesktopRoute::Ssh { .. }) => desktop_dns(host),
+        // SSM 경로도 RDP 인증서 이름이 필요하므로 DNS 이름을 목적지로 쓴다.
+        (DesktopProtocol::Rdp, DesktopRoute::Ssm(_)) => desktop_dns(host),
+        (DesktopProtocol::Vnc, DesktopRoute::Direct {}) => address,
+        (DesktopProtocol::Vnc, DesktopRoute::Ssh { .. } | DesktopRoute::Ssm(_)) => host.is_empty(),
+    };
+    if !valid {
+        return Err(ValidationError::DesktopHost);
+    }
+    match route {
+        DesktopRoute::Direct {} => Ok(()),
+        DesktopRoute::Ssh { target_id } if valid_id(target_id) && !target_id.starts_with('-') => Ok(()),
+        DesktopRoute::Ssh { .. } => Err(ValidationError::DesktopRoute),
+        DesktopRoute::Ssm(target) => target.validate(),
     }
 }
 
@@ -237,6 +305,9 @@ pub(crate) enum ValidationError {
     S3Region,
     S3Bucket,
     S3Prefix,
+    DesktopHost,
+    DesktopPort,
+    DesktopRoute,
 }
 
 // 구조 검증과 실제 연결 시험은 별개다.
@@ -312,6 +383,7 @@ impl Target {
             Method::Ssm { ssm } => MethodRef::Ssm { profile: &ssm.profile, region: &ssm.region, instance_id: &ssm.instance_id },
             Method::Ssh { ssh } => MethodRef::Ssh { ssh },
             Method::S3 { s3 } => MethodRef::S3 { s3 },
+            Method::Rdp { rdp: Rdp { route, .. } } | Method::Vnc { vnc: Vnc { route, .. } } => MethodRef::Desktop { route },
         }
     }
 
@@ -337,6 +409,8 @@ impl Target {
             Method::Ssm { ssm } => ssm.validate(),
             Method::Ssh { ssh } => ssh.validate(),
             Method::S3 { s3 } => s3.validate(),
+            Method::Rdp { rdp } => validate_desktop(DesktopProtocol::Rdp, &rdp.host, rdp.port, &rdp.route),
+            Method::Vnc { vnc } => validate_desktop(DesktopProtocol::Vnc, &vnc.host, vnc.port, &vnc.route),
         }
     }
 }

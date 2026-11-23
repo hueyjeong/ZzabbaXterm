@@ -5,8 +5,8 @@
   height: 100%;
   min-width: 0;
   min-height: 0;
-  background: #12171b;
-  color: #e3e9e6;
+  background: var(--bg-app);
+  color: var(--text);
 }
 
 .editor-tab[hidden], .editor-tab [hidden] { display: none; }
@@ -15,15 +15,20 @@
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 4px 8px;
-  border-bottom: 1px solid var(--border, #36454b);
-  background: #253036;
+  min-height: 32px;
+  padding: 0 4px 0 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-panel);
+  color: var(--text-muted);
+  font-size: 12px;
 }
 
-.editor-toolbar { flex-wrap: wrap; }
-.editor-toolbar button { max-width: 100%; padding: 4px 6px; overflow-wrap: anywhere; }
-.editor-toolbar button:disabled { opacity: 0.5; }
-.editor-toolbar output { max-width: 100%; color: var(--accent, #9cd9bf); overflow-wrap: anywhere; }
+.editor-file { display: flex; align-items: center; gap: 6px; min-width: 0; color: var(--text); }
+.editor-file > span:first-of-type { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.editor-file svg { flex: none; width: 14px; height: 14px; color: var(--proto-editor); }
+.editor-dirty { flex: none; width: 7px; height: 7px; border-radius: 50%; background: var(--warning); }
+.editor-actions { display: flex; gap: 2px; margin-inline-start: auto; }
+.editor-toolbar output { min-width: 0; color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .editor-toolbar output:empty { position: absolute; }
 .editor-diff-labels span { flex: 1; }
 .editor-surface { flex: 1; min-height: 0; min-width: 0; overflow: hidden; }

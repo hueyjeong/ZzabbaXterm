@@ -132,9 +132,16 @@ impl SshPlan {
     }
 }
 
+/// 숫자만으로 된 최종 라벨(`2852039166`, `127.1`, `0x7f000001`)은 리졸버가 IP로 해석하므로 이름으로 받지 않는다.
+pub(crate) fn numeric_tail(name: &str) -> bool {
+    let last = name.rsplit('.').next().unwrap_or(name);
+    let hex = last.strip_prefix("0x").or_else(|| last.strip_prefix("0X"));
+    last.bytes().all(|b| b.is_ascii_digit()) || hex.is_some_and(|digits| digits.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 fn dns_name(host: &str) -> bool {
     let name = host.strip_suffix('.').unwrap_or(host);
-    name.len() <= 253 && name.split('.').all(|label| {
+    !numeric_tail(name) && name.len() <= 253 && name.split('.').all(|label| {
         !label.is_empty()
             && label.len() <= 63
             && !label.starts_with('-')
@@ -155,6 +162,7 @@ pub(crate) struct SsmPlan<'a> {
     listen: SocketAddr,
     node: String,
     scope: SsmScope<'a>,
+    document: &'static str,
     parameters: String,
 }
 
@@ -170,7 +178,7 @@ impl<'a> SsmPlan<'a> {
         if route != approved_route || scope != approved_scope {
             return Err(PlanError::ApprovalMismatch);
         }
-        let Route::Ssm { listen, node, port } = route else {
+        let Route::Ssm { listen, node, port, host } = route else {
             return Err(PlanError::WrongTransport);
         };
         // 플러그인은 주소 인자를 받지 않고 localhost에 바인드한다. 이 주소가 관찰될 때만 준비로 본다.
@@ -185,8 +193,16 @@ impl<'a> SsmPlan<'a> {
         }) {
             return Err(PlanError::InvalidDestination);
         }
-        let parameters = format!("portNumber={port},localPortNumber={}", listen.port());
-        Ok(Self { listen: *listen, node: node.clone(), scope, parameters })
+        // 원격 호스트는 문서 매개변수 구분자(`,`·`=`)와 공백·제어 문자가 없는 DNS 이름 또는 IP 리터럴만 받는다.
+        let (document, parameters) = match host {
+            None => ("AWS-StartPortForwardingSession", format!("portNumber={port},localPortNumber={}", listen.port())),
+            Some(host) if host.parse::<IpAddr>().is_ok() || dns_name(host) => (
+                "AWS-StartPortForwardingSessionToRemoteHost",
+                format!("host={host},portNumber={port},localPortNumber={}", listen.port()),
+            ),
+            Some(_) => return Err(PlanError::InvalidDestination),
+        };
+        Ok(Self { listen: *listen, node: node.clone(), scope, document, parameters })
     }
 
     /// C02의 검증된 요청과 승인 범위를 대조한 뒤 고정 문서 인자만 돌려준다.
@@ -200,7 +216,7 @@ impl<'a> SsmPlan<'a> {
         if self.scope != c02_scope || self.node != c02_node {
             return Err(PlanError::ApprovalMismatch);
         }
-        Ok(["--document-name", "AWS-StartPortForwardingSession", "--parameters", &self.parameters])
+        Ok(["--document-name", self.document, "--parameters", &self.parameters])
     }
 
     pub(crate) fn observe(&self, event: Event, verified_session_id: Option<&str>) -> Observation {

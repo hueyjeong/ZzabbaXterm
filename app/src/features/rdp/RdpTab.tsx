@@ -1,5 +1,6 @@
 import { useImperativeHandle, useLayoutEffect, useRef, useState, type Ref, type SubmitEvent } from "react";
 import { RemoteDesktopView } from "../remoteDesktop/RemoteDesktopView";
+import type { DesktopPreset } from "../remoteDesktop/desktopProfile";
 import type { DesktopTunnelSource } from "../tunnels/tunnelIpc";
 import { connect, type Capabilities, type Connection } from "./session";
 
@@ -7,11 +8,11 @@ const noChannels: Capabilities = { copy: false, paste: false, resize: false };
 
 export interface RdpTabActions { requestClose(): Promise<boolean> }
 
-export function RdpTab({ active, label, source, onSecurityMode, ref }: { readonly active: boolean; readonly label: string; readonly source?: DesktopTunnelSource; readonly onSecurityMode?: (tlsOnly: boolean) => void; readonly ref?: Ref<RdpTabActions> }) {
+export function RdpTab({ active, label, source, preset, onSecurityMode, ref }: { readonly active: boolean; readonly label: string; readonly source?: DesktopTunnelSource; readonly preset?: DesktopPreset; readonly onSecurityMode?: (tlsOnly: boolean) => void; readonly ref?: Ref<RdpTabActions> }) {
   const cancel = useRef<(() => Promise<void>) | undefined>(undefined);
-  const [host, setHost] = useState("");
-  const [port, setPort] = useState("3389");
-  const [tlsOnly, setTlsOnly] = useState(false);
+  const [host, setHost] = useState(preset?.host ?? "");
+  const [port, setPort] = useState(String(preset?.port ?? 3389));
+  const [tlsOnly, setTlsOnly] = useState(preset?.tlsOnly ?? false);
   const [opening, setOpening] = useState<{ host: string; port: number; forwardedAddress: string | undefined; tlsOnly: boolean }>();
   const [connection, setConnection] = useState<Connection>();
   const [channels, setChannels] = useState(noChannels);

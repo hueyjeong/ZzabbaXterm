@@ -1,13 +1,23 @@
-import { useId, useLayoutEffect, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode, type RefObject } from "react";
-import { executionActive, type AiPanelProps, type ChatMessage, type ExecutionStatus, type Proposal, type ProposalTarget, type RecordedDecision } from "./contracts";
+import { useEffect, useId, useLayoutEffect, useRef, useState, type KeyboardEvent, type ReactNode, type RefObject } from "react";
+import {
+  Activity, ArrowUp, Ban, Check, ChevronDown, CircleAlert, CircleCheck, CircleHelp, Cloud, Crosshair, Ellipsis, Globe, Inbox,
+  LoaderCircle, Play, RefreshCw, Server, ShieldAlert, ShieldCheck, ShieldOff, Sparkles, Square, SquarePen, SquareTerminal, X,
+} from "lucide-react";
+import { IconButton, type MenuItem } from "../ui/controls";
+import { AnchoredMenu, useAnchoredMenu } from "./AnchoredMenu";
+import {
+  executionActive, type AiPanelProps, type ChatMessage, type ExecutionPhase, type ExecutionStatus, type Proposal,
+  type ProposalTarget, type RecordedDecision,
+} from "./contracts";
 import { SessionSelection, type SessionSelectionProps } from "./SessionSelection";
 import "./ai.css";
 
-type ChatState = { kind: "idle" } | { kind: "sending" } | { kind: "failed"; message: string };
+type ChatState = { kind: "idle" } | { kind: "sending"; content: string } | { kind: "failed"; message: string };
 type ProposalState = { kind: "idle" } | { kind: "requesting" } | { kind: "failed" };
 type DecisionState = RecordedDecision | "reviewing" | "failed";
+type Entry = Readonly<{ seq: number; message: ChatMessage }>;
 
-const EXECUTION_LABEL: Record<ExecutionStatus["phase"], string> = {
+const EXECUTION_LABEL: Record<ExecutionPhase, string> = {
   starting: "채널 연결 중",
   pairing: "연결 코드 대기",
   waitingClaim: "중앙 셸 예약 키 대기",
@@ -19,17 +29,22 @@ const EXECUTION_LABEL: Record<ExecutionStatus["phase"], string> = {
   failed: "실행 실패",
 };
 
+// 채널 연결 → 연결 코드 → 예약 키 → 실행 → 종료
+const EXECUTION_STEPS = 5;
+const EXECUTION_STEP: Record<ExecutionPhase, number> = {
+  starting: 0, pairing: 1, waitingClaim: 2, awaitingStart: 3, running: 3, stopRequested: 3,
+  exited: 4, unconfirmed: 4, failed: 4,
+};
+
+const DECISION_LABEL: Record<DecisionState | "closed", string> = {
+  reviewing: "기록 중", approved: "승인됨", rejected: "거절됨", cancelled: "취소됨", failed: "기록 실패", closed: "검토 종료",
+};
+
 function blockText(value: string) {
   return value.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, (character) =>
     character === "\n" || character === "\t" ? character
       : `\\u{${character.codePointAt(0)?.toString(16)}}`);
 }
-
-export type AiTopTabs = Readonly<{
-  item: Readonly<{ id: string; label: string; content: ReactNode; hidden?: boolean }>;
-  selectedId: string | null;
-  onSelect: (id: string | null) => void;
-}>;
 
 function targetKey({ targetId, generation }: ProposalTarget | Proposal["target"]) {
   return JSON.stringify([targetId, generation]);
@@ -40,162 +55,235 @@ function visibleText(value: string) {
     `\\u{${character.codePointAt(0)?.toString(16)}}`);
 }
 
-function navigateTopTabs(event: KeyboardEvent<HTMLDivElement>) {
-  const tabs = event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]');
-  const chat = tabs[0];
-  const item = tabs[1];
-  let next: HTMLButtonElement;
-  switch (event.key) {
-    case "Home": next = chat; break;
-    case "End": next = item; break;
-    case "ArrowLeft":
-    case "ArrowRight": next = event.target === chat ? item : chat; break;
-    default: return;
-  }
-  event.preventDefault();
-  next.click();
+function menuKeys(open: () => void) {
+  return (event: KeyboardEvent<HTMLButtonElement>) => {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      open();
+    }
+  };
 }
 
-export function AiPanel(props: AiPanelProps & { topTabs?: AiTopTabs; sessionSelection?: SessionSelectionProps; policyStatus?: ReactNode }) {
+export function AiPanel(props: AiPanelProps & { sessionSelection?: SessionSelectionProps; policyStatus?: ReactNode }) {
   const [modelName, setModelName] = useState("");
   const [selected, setSelected] = useState("");
-  const model = props.models.includes(modelName) ? modelName : "";
+  const [entries, setEntries] = useState<readonly Entry[]>([]);
+  const [chat, setChat] = useState<ChatState>({ kind: "idle" });
+  // 사용자가 고르기 전에는 첫 모델을 쓴다.
+  // 고르기 전에는 첫 모델을 쓴다. 고른 모델이 목록에서 빠지면 다른 모델로 조용히 바꾸지 않고 다시 고르게 한다.
+  const model = props.models.includes(modelName) ? modelName : modelName ? "" : props.models[0] ?? "";
   const target = props.targets.find((candidate) => targetKey(candidate) === selected);
   const attempted = useRef(new Set<string>());
-  const chatTitle = useId();
-  const proposalTitle = useId();
-  const proposalSettings = useRef<HTMLDetailsElement>(null);
-  const { topTabs } = props;
-  const visibleTabs = topTabs && !topTabs.item.hidden ? topTabs : undefined;
-  const chatPanel = `${chatTitle}-panel`;
-  const itemPanel = `${chatTitle}-item`;
-  const itemSelected = !!visibleTabs && visibleTabs.selectedId === visibleTabs.item.id;
+  const order = useRef(new Map<string, number>());
+  const sequence = useRef(0);
+  const input = useRef<HTMLTextAreaElement>(null);
+  const scroller = useRef<HTMLDivElement>(null);
+  const stick = useRef(true);
+  const title = useId();
+  const more = useAnchoredMenu<HTMLButtonElement>();
+  const targetMenu = useAnchoredMenu<HTMLButtonElement>();
+  const { policy } = props;
+
+  useEffect(() => {
+    // 맨 아래를 보고 있을 때만 새 내용으로 따라 내려간다.
+    const element = scroller.current;
+    if (!element) return;
+    const follow = () => {
+      if (stick.current) element.scrollTop = element.scrollHeight;
+    };
+    const observer = new MutationObserver(follow);
+    observer.observe(element, { childList: true, subtree: true, characterData: true });
+    return () => observer.disconnect();
+  }, []);
+
+  function chooseTarget(key: string) {
+    targetMenu.anchor.current?.focus();
+    if (key === selected && target) return;
+    setSelected(key);
+    const next = props.targets.find((candidate) => targetKey(candidate) === key);
+    props.onSelectTarget?.(next ? { targetId: next.targetId, generation: next.generation } : null);
+  }
+
+  const targetName = target ? `${visibleText(target.label)} (${visibleText(target.targetId)})` : "선택 안 함";
+  const targetItems: MenuItem[] = [
+    ...props.targets.map((candidate) => ({
+      label: `${visibleText(candidate.label)} (${visibleText(candidate.targetId)})`,
+      icon: target && targetKey(candidate) === selected ? Check : undefined,
+      onSelect: () => chooseTarget(targetKey(candidate)),
+    })),
+    ...(target ? [{ kind: "separator" as const }, { label: "대상 선택 해제", icon: X, onSelect: () => chooseTarget("") }] : []),
+  ];
+  const moreItems: MenuItem[] = [
+    { kind: "label", label: "조회 승인 정책" },
+    policy?.blocked
+      ? { label: "조회 승인 차단 해제", icon: ShieldCheck, disabled: policy.saving, onSelect: () => policy.onChange(false) }
+      : { label: "조회 승인 차단", icon: ShieldOff, disabled: !policy || policy.saving, onSelect: () => policy?.onChange(true) },
+  ];
 
   return (
-    <div className={visibleTabs ? "a01-top a01-top-tabbed" : "a01-top"}>
-      {visibleTabs && <div className="a01-tabs" role="tablist" aria-label="오른쪽 패널" onKeyDown={navigateTopTabs}>
-        {[
-          { id: null, label: "AI 채팅", panel: chatPanel, selected: !itemSelected },
-          { id: visibleTabs.item.id, label: visibleTabs.item.label, panel: itemPanel, selected: itemSelected },
-        ].map(({ id, label, panel, selected }) =>
-          <button key={panel} type="button" role="tab" id={`${panel}-tab`} aria-controls={panel}
-            aria-selected={selected} tabIndex={selected ? 0 : -1} onClick={(event) => {
-              event.currentTarget.focus();
-              visibleTabs.onSelect(id);
-            }}>{label}</button>)}
-      </div>}
-      <section className="workspace-chat a01-chat" id={visibleTabs ? chatPanel : undefined}
-        role={visibleTabs ? "tabpanel" : undefined} aria-labelledby={visibleTabs ? `${chatPanel}-tab` : chatTitle}
-        hidden={itemSelected} inert={itemSelected} tabIndex={visibleTabs && !itemSelected ? 0 : undefined}>
-        {!visibleTabs && <h2 id={chatTitle}>AI 채팅</h2>}
-        {props.sessionSelection && <SessionSelection {...props.sessionSelection}
-          visible={props.sessionSelection.visible !== false && !itemSelected} />}
-        {(props.modelError || props.onRefresh) && <div className="a01-discovery">
-          {props.modelError && <p role="alert">{props.modelError}</p>}
-          {props.onRefresh && <button type="button" aria-label="모델 및 대상 새로고침" onClick={props.onRefresh}>새로고침</button>}
-        </div>}
-        <Chat models={props.models} model={model} onModelChange={setModelName} onSendChat={props.onSendChat} />
-        <div className="a01-proposals" role="region" aria-labelledby={proposalTitle}>
-          <details className="a01-disclosure" ref={proposalSettings}>
-            <summary id={proposalTitle}>작업 제안</summary>
-            <div className="a01-proposal-controls">
-              {props.policyControl}
-              {props.targets.length > 0 && <label className="a01-field">조회 대상
-                <select value={target ? selected : ""} onChange={(event) => {
-                  const key = event.target.value;
-                  setSelected(key);
-                  const next = props.targets.find((candidate) => targetKey(candidate) === key);
-                  props.onSelectTarget?.(next ? { targetId: next.targetId, generation: next.generation } : null);
-                }}>
-                  <option value="">대상 선택</option>
-                  {props.targets.map((candidate) => <option key={targetKey(candidate)} value={targetKey(candidate)}>
-                    {visibleText(candidate.label)} ({visibleText(candidate.targetId)})
-                  </option>)}
-                </select>
-              </label>}
-              {target && props.onOpenCliReview && <button type="button" onClick={props.onOpenCliReview}>CLI 제안 열기</button>}
-            </div>
-          </details>
-          {props.targetError && <p role="alert">{props.targetError}</p>}
-          {props.policyStatus}
-          <ProposalReview key={JSON.stringify([selected, !!target, target && props.policyVersion])} model={model} target={target}
-            proposals={props.proposals} history={props.history} attempted={attempted.current} settings={proposalSettings}
-            execution={props.execution} onExecuteProposal={props.onExecuteProposal} onStopExecution={props.onStopExecution}
-            onRequestProposal={props.onRequestProposal} onDecideProposal={props.onDecideProposal} onReadDecision={props.onReadDecision} />
+    <section className="workspace-chat a01-chat" aria-labelledby={title}>
+      <header className="a01-head">
+        <h2 id={title}>AI</h2>
+        {policy?.blocked && <span className="a01-head-badge"><ShieldAlert aria-hidden="true" />승인 차단</span>}
+        <div className="a01-head-actions">
+          <IconButton icon={SquarePen} label="새 대화" disabled={chat.kind === "sending" || entries.length === 0}
+            onClick={() => {
+              setEntries([]);
+              setChat({ kind: "idle" });
+              stick.current = true;
+              input.current?.focus();
+            }} />
+          {props.onOpenCliReview && <IconButton icon={Inbox} label="CLI 제안 가져오기" disabled={!target}
+            onClick={props.onOpenCliReview} />}
+          {props.onRefresh && <IconButton icon={RefreshCw} label="모델 및 대상 새로고침" onClick={props.onRefresh} />}
+          <button type="button" ref={more.anchor} className="icon-button" aria-label="더보기" title="더보기"
+            aria-haspopup="menu" aria-expanded={more.open} onClick={more.toggle} onKeyDown={menuKeys(more.show)}>
+            <Ellipsis aria-hidden="true" />
+          </button>
+          {more.open && <AnchoredMenu anchor={more.anchor} align="end" items={moreItems} label="더보기" onClose={more.close} />}
         </div>
-      </section>
-      {topTabs && <div className="a01-top-item" role={visibleTabs ? "tabpanel" : undefined}
-        id={visibleTabs ? itemPanel : undefined} aria-labelledby={visibleTabs ? `${itemPanel}-tab` : undefined}
-        hidden={!itemSelected} inert={!itemSelected} tabIndex={itemSelected ? 0 : undefined}>
-        {topTabs.item.content}
-      </div>}
-    </div>
+      </header>
+      {props.policyStatus && <div className="a01-notice">{props.policyStatus}</div>}
+      <div className="a01-scroll" ref={scroller} onScroll={(event) => {
+        const element = event.currentTarget;
+        stick.current = element.scrollHeight - element.scrollTop - element.clientHeight < 48;
+      }}>
+        <Conversation key={JSON.stringify([selected, !!target, target && props.policyVersion])} model={model} target={target}
+          entries={entries} chat={chat} order={order.current} nextSeq={() => ++sequence.current} fallbackFocus={input}
+          proposals={props.proposals} history={props.history} attempted={attempted.current}
+          execution={props.execution} onExecuteProposal={props.onExecuteProposal} onStopExecution={props.onStopExecution}
+          onRequestProposal={props.onRequestProposal} onDecideProposal={props.onDecideProposal} onReadDecision={props.onReadDecision} />
+      </div>
+      <div className="a01-bottom">
+        {props.targetError && <p className="a01-inline-alert" role="alert">{props.targetError}</p>}
+        {props.modelError && <p className="a01-inline-alert" role="alert">{props.modelError}</p>}
+        {chat.kind === "failed" && <p className="a01-inline-alert" role="alert">전송 실패: {chat.message}</p>}
+        <Composer models={props.models} model={model} onModelChange={setModelName} input={input} chat={chat}
+          onSend={async (draft) => {
+            stick.current = true;
+            setChat({ kind: "sending", content: draft });
+            const next: ChatMessage[] = [...entries.map(({ message }) => message), { role: "user", content: draft }];
+            try {
+              const reply = await props.onSendChat({ model, messages: next });
+              if (reply.kind === "reply") {
+                const user = ++sequence.current;
+                const assistant = ++sequence.current;
+                setEntries([...entries, { seq: user, message: next[next.length - 1] },
+                  { seq: assistant, message: { role: "assistant", content: reply.content } }]);
+                setChat({ kind: "idle" });
+                return true;
+              }
+              setChat({ kind: "failed", message: reply.message });
+            } catch {
+              setChat({ kind: "failed", message: "로컬 모델 연결 오류" });
+            }
+            return false;
+          }}>
+          {props.targets.length > 0 && <>
+            <button type="button" ref={targetMenu.anchor} className="a01-chip" data-active={!!target || undefined}
+              aria-label={`조회 대상: ${targetName}`} title={target ? targetName : undefined}
+              aria-haspopup="menu" aria-expanded={targetMenu.open} onClick={targetMenu.toggle} onKeyDown={menuKeys(targetMenu.show)}>
+              <Crosshair aria-hidden="true" />
+              <span className="a01-chip-text">{target ? visibleText(target.label) : "대상 선택"}</span>
+              <ChevronDown className="a01-chip-caret" aria-hidden="true" />
+            </button>
+            {targetMenu.open && <AnchoredMenu anchor={targetMenu.anchor} placement="above" items={targetItems}
+              label="조회 대상" onClose={targetMenu.close} />}
+          </>}
+          {props.sessionSelection && <SessionSelection {...props.sessionSelection}
+            visible={props.sessionSelection.visible !== false} />}
+        </Composer>
+      </div>
+    </section>
   );
 }
 
-function Chat({ models, model, onModelChange, onSendChat }: Pick<AiPanelProps, "models" | "onSendChat"> & {
+function Composer({ models, model, onModelChange, input, chat, onSend, children }: {
+  models: readonly string[];
   model: string;
   onModelChange: (model: string) => void;
+  input: RefObject<HTMLTextAreaElement | null>;
+  chat: ChatState;
+  onSend: (draft: string) => Promise<boolean>;
+  children: ReactNode;
 }) {
   const [draft, setDraft] = useState("");
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [state, setState] = useState<ChatState>({ kind: "idle" });
   const sending = useRef(false);
-  const input = useRef<HTMLTextAreaElement>(null);
+  const modelMenu = useAnchoredMenu<HTMLButtonElement>();
+  const busy = chat.kind === "sending";
 
-  async function send(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+  useLayoutEffect(() => {
+    const element = input.current;
+    if (!element) return;
+    element.style.height = "auto";
+    element.style.height = `${Math.min(element.scrollHeight, 200)}px`;
+  }, [draft, input]);
+
+  async function submit() {
     if (!model || !draft.trim() || sending.current) return;
     sending.current = true;
     input.current?.focus();
-    setState({ kind: "sending" });
-    const next: ChatMessage[] = [...messages, { role: "user", content: draft }];
+    const content = draft;
+    setDraft("");
     try {
-      const reply = await onSendChat({ model, messages: next });
-      if (reply.kind === "reply") {
-        setMessages([...next, { role: "assistant", content: reply.content }]);
-        setDraft("");
-        setState({ kind: "idle" });
-      } else {
-        setState({ kind: "failed", message: reply.message });
-      }
-    } catch {
-      setState({ kind: "failed", message: "로컬 모델 연결 오류" });
+      if (!await onSend(content)) setDraft(content);
     } finally {
       sending.current = false;
     }
   }
 
-  return <>
-    {models.length > 0 && <label className="a01-field">Ollama 모델
-      <select value={model} disabled={state.kind === "sending"} onChange={(event) => onModelChange(event.target.value)}>
-        <option value="">모델 선택</option>
-        {models.map((name) => <option key={name} value={name}>{name}</option>)}
-      </select>
-    </label>}
-    <ol className="a01-transcript" role="log" aria-label="대화 기록">
-      {messages.map(({ role, content }, index) => <li key={index}>
-        <strong>{role === "user" ? "나" : "AI"}</strong>
-        <p>{content}</p>
-      </li>)}
-    </ol>
-    {state.kind === "failed" && <p role="alert">전송 실패: {state.message}</p>}
-    <form className="a01-composer" onSubmit={send}>
-      <textarea ref={input} aria-label="메시지 입력" placeholder="메시지 입력" value={draft}
-        readOnly={state.kind === "sending"} onChange={(event) => setDraft(event.target.value)} />
-      <button type="submit" disabled={!model || !draft.trim() || state.kind === "sending"}>
-        {state.kind === "sending" ? "전송 중" : "전송"}
+  const modelItems: MenuItem[] = models.map((name) => ({
+    label: name,
+    icon: name === model ? Check : undefined,
+    onSelect: () => {
+      onModelChange(name);
+      input.current?.focus();
+    },
+  }));
+
+  return <form className="a01-composer" aria-label="메시지 작성" data-busy={busy || undefined} onSubmit={(event) => {
+    event.preventDefault();
+    void submit();
+  }}>
+    <div className="a01-context">{children}</div>
+    <textarea ref={input} aria-label="메시지 입력" placeholder="메시지 입력" rows={1} value={draft}
+      readOnly={busy} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => {
+        if (event.key !== "Enter" || event.shiftKey) return;
+        // 한글 등 IME 조합을 확정하는 Enter는 전송하지 않는다.
+        if (event.nativeEvent.isComposing || event.keyCode === 229) return;
+        event.preventDefault();
+        void submit();
+      }} />
+    <div className="a01-toolbar">
+      <button type="button" ref={modelMenu.anchor} className="a01-model" data-error={models.length === 0 || undefined}
+        aria-label={`모델: ${models.length === 0 ? "없음" : model || "선택 안 함"}`} aria-haspopup="menu"
+        aria-expanded={modelMenu.open} disabled={busy || models.length === 0}
+        onClick={modelMenu.toggle} onKeyDown={menuKeys(modelMenu.show)}>
+        {models.length === 0 ? <CircleAlert aria-hidden="true" /> : <Sparkles aria-hidden="true" />}
+        <span>{models.length === 0 ? "모델 없음" : model || "모델 선택"}</span>
+        {models.length > 0 && <ChevronDown className="a01-chip-caret" aria-hidden="true" />}
       </button>
-    </form>
-  </>;
+      {modelMenu.open && models.length > 0 && <AnchoredMenu anchor={modelMenu.anchor} placement="above"
+        items={[{ kind: "label", label: "Ollama 모델" }, ...modelItems]} label="모델" onClose={modelMenu.close} />}
+      <button type="submit" className="a01-send" aria-label="전송" aria-busy={busy || undefined}
+        disabled={!model || !draft.trim() || busy}>
+        {busy ? <LoaderCircle className="a01-spin" aria-hidden="true" /> : <ArrowUp aria-hidden="true" />}
+      </button>
+    </div>
+  </form>;
 }
 
-function ProposalReview({ model, target, proposals, history, attempted, settings, execution, onExecuteProposal, onStopExecution, onRequestProposal, onDecideProposal, onReadDecision }:
+function Conversation({ model, target, entries, chat, order, nextSeq, fallbackFocus, proposals, history, attempted, execution,
+  onExecuteProposal, onStopExecution, onRequestProposal, onDecideProposal, onReadDecision }:
   Pick<AiPanelProps, "proposals" | "history" | "execution" | "onExecuteProposal" | "onStopExecution" | "onRequestProposal" | "onDecideProposal" | "onReadDecision"> & {
     model: string;
     target: ProposalTarget | undefined;
+    entries: readonly Entry[];
+    chat: ChatState;
+    order: Map<string, number>;
+    nextSeq: () => number;
+    fallbackFocus: RefObject<HTMLTextAreaElement | null>;
     attempted: Set<string>;
-    settings: RefObject<HTMLDetailsElement | null>;
   }) {
   const [request, setRequest] = useState<ProposalState>({ kind: "idle" });
   const [created, setCreated] = useState<Proposal[]>([]);
@@ -216,11 +304,18 @@ function ProposalReview({ model, target, proposals, history, attempted, settings
     .map((proposal) => [proposal.id, proposal]));
   const recorded = new Map(history?.map(({ proposal, decision }) => [proposal.id, decision]));
   for (const { proposal } of history ?? []) cards.set(proposal.id, proposal);
+  for (const id of cards.keys()) if (!order.has(id)) order.set(id, nextSeq());
+
+  const timeline = [
+    ...entries.map((entry) => ({ seq: entry.seq, entry, proposal: undefined })),
+    ...[...cards.values()].map((proposal) => ({ seq: order.get(proposal.id)!, entry: undefined, proposal })),
+  ].sort((a, b) => a.seq - b.seq);
+  const offerProposal = !!target && (!!model || request.kind === "requesting");
 
   function keepRequestFocus() {
     const cancel = cancelButton.current;
     if (cancel && cancel.ownerDocument.activeElement === cancel) {
-      const next = settings.current?.open && model ? proposeButton.current : settings.current?.querySelector("summary");
+      const next = model ? proposeButton.current : fallbackFocus.current;
       next?.focus({ preventScroll: true });
     }
   }
@@ -282,76 +377,142 @@ function ProposalReview({ model, target, proposals, history, attempted, settings
     }
   }
 
-  return <>
-    {target && (model || request.kind === "requesting") && <div className="a01-actions a01-request">
-      <button type="button" className="a01-request-start" ref={proposeButton} disabled={!model} aria-disabled={request.kind === "requesting" || undefined}
-        onClick={propose}>가동 시간 조회 제안</button>
-      {request.kind === "requesting" && <button type="button" className="a01-request-cancel" ref={cancelButton} onClick={() => {
-        keepRequestFocus();
-        pending.current?.abort();
-        pending.current = null;
-        setRequest({ kind: "idle" });
-      }}>요청 취소</button>}
-    </div>}
-    {request.kind === "requesting" && <p role="status">제안 요청 중</p>}
-    {request.kind === "failed" && <p role="alert">제안 요청 실패</p>}
-    {[...cards.values()].map((proposal) => {
-      const decision = recorded.get(proposal.id) ?? decisions.get(proposal.id) ?? (attempted.has(proposal.id) ? "closed" : undefined);
-      const active = execution !== undefined && executionActive(execution.phase);
-      return <article key={proposal.id} className="a01-proposal" aria-label="조회 제안" tabIndex={-1}>
-        <dl>
-          {proposal.ssm && <>
-            <dt>SSM 프로필</dt><dd>{visibleText(proposal.ssm.profile)}</dd>
-            <dt>리전</dt><dd>{visibleText(proposal.ssm.region)}</dd>
-          </>}
-          <dt>대상</dt><dd>{visibleText(proposal.node)}</dd>
-          {proposal.kind === "reviewable" && <>
-            <dt>명령</dt><dd><code>{visibleText(proposal.displayCommand)}</code></dd>
-            <dt>해석</dt><dd>{visibleText(proposal.interpretation)}</dd>
-          </>}
-        </dl>
-        {proposal.kind !== "reviewable" && <p>{proposal.kind === "blocked" ? "차단된 조회" : "미등록 조회"}</p>}
-        {decision ? <p role="status" tabIndex={-1} ref={(status) => {
+  function card(proposal: Proposal) {
+    const decision = recorded.get(proposal.id) ?? decisions.get(proposal.id) ?? (attempted.has(proposal.id) ? "closed" : undefined);
+    const active = execution !== undefined && executionActive(execution.phase);
+    const KindIcon = proposal.kind === "reviewable" ? SquareTerminal : proposal.kind === "blocked" ? Ban : CircleHelp;
+    return <article key={proposal.id} className="a01-card" data-kind={proposal.kind} aria-label="조회 제안" tabIndex={-1}>
+      <header className="a01-card-head">
+        <KindIcon className="a01-card-icon" aria-hidden="true" />
+        {proposal.kind === "reviewable"
+          ? <code className="a01-card-command" data-field="command">{visibleText(proposal.displayCommand)}</code>
+          : <span className="a01-card-command">{proposal.kind === "blocked" ? "차단된 조회" : "미등록 조회"}</span>}
+        {decision && <span className="a01-badge" data-state={decision} role="status" tabIndex={-1} ref={(status) => {
           if (status && status.ownerDocument.activeElement === status.closest("article")) status.focus({ preventScroll: true });
-        }}>{{
-          reviewing: "결정 기록 중", approved: "승인 기록됨", cancelled: "취소됨",
-          rejected: "거절 기록됨", failed: "결정 기록 실패", closed: "검토 종료"
-        }[decision]}</p> : <div className="a01-actions">
-          {proposal.kind === "reviewable" && <button type="button" onClick={(event) => decide(proposal, "approve", event.currentTarget)}>승인</button>}
-          <button type="button" onClick={(event) => decide(proposal, "reject", event.currentTarget)}>거절</button>
-          <button type="button" onClick={(event) => decide(proposal, "cancel", event.currentTarget)}>취소</button>
-        </div>}
-        {decision === "failed" && onReadDecision && <button type="button" onClick={(event) => {
+        }}>{DECISION_LABEL[decision]}</span>}
+      </header>
+      <div className="a01-card-target">
+        <span className="a01-tag" title="대상"><Server aria-hidden="true" /><span data-field="node">{visibleText(proposal.node)}</span></span>
+        {proposal.ssm && <>
+          <span className="a01-tag" title="SSM 프로필"><Cloud aria-hidden="true" /><span data-field="profile">{visibleText(proposal.ssm.profile)}</span></span>
+          <span className="a01-tag" title="리전"><Globe aria-hidden="true" /><span data-field="region">{visibleText(proposal.ssm.region)}</span></span>
+        </>}
+      </div>
+      {proposal.kind === "reviewable" &&
+        <p className="a01-card-text" data-field="interpretation">{visibleText(proposal.interpretation)}</p>}
+      {!decision && <div className="a01-card-actions">
+        {proposal.kind === "reviewable" && <button type="button" className="ui-button primary"
+          onClick={(event) => decide(proposal, "approve", event.currentTarget)}><Check aria-hidden="true" />승인</button>}
+        <button type="button" className="ui-button"
+          onClick={(event) => decide(proposal, "reject", event.currentTarget)}><X aria-hidden="true" />거절</button>
+        <button type="button" className="ui-button ghost"
+          onClick={(event) => decide(proposal, "cancel", event.currentTarget)}>취소</button>
+      </div>}
+      {decision === "failed" && onReadDecision && <div className="a01-card-actions">
+        <button type="button" className="ui-button" onClick={(event) => {
           if (decisions.get(proposal.id) === "failed") {
             void recordDecision(proposal.id, event.currentTarget, () => onReadDecision(proposal.id));
           }
-        }}>결정 다시 조회</button>}
-        {decision === "approved" && proposal.kind === "reviewable" && onExecuteProposal && !active &&
-          targetKey(proposal.target) === key &&
-          <div className="a01-actions">
-            <button type="button" disabled={!!executing} onClick={() => void execute(proposal)}>
-              {executing === proposal.id ? "실행 승인 중" : "실행 승인"}
-            </button>
-          </div>}
-        {execution?.proposalId === proposal.id && <section className="a01-execution" aria-label="실행 상태">
-          <dl>
-            {execution.node && <><dt>대상</dt><dd>{visibleText(execution.node)}</dd></>}
-            {execution.sessionId && <><dt>세션</dt><dd>{visibleText(execution.sessionId)}</dd></>}
-            {execution.program && <><dt>절대 경로</dt><dd><code>{visibleText(execution.program)}</code></dd></>}
-            <dt>인자</dt><dd><code>{execution.args?.length ? execution.args.map(visibleText).join(" ") : "(없음)"}</code></dd>
-            <dt>정책</dt><dd>{execution.policy === "allowed" ? "허용된 조회 작업" : "실행 불가"}</dd>
-            <dt>상태</dt><dd role="status">{EXECUTION_LABEL[execution.phase]}</dd>
-            {execution.jobId && <><dt>작업</dt><dd>{visibleText(execution.jobId)}</dd></>}
-            {execution.pairingCode && <><dt>연결 코드</dt><dd><code>{visibleText(execution.pairingCode)}</code></dd></>}
-          </dl>
-          {execution.error && <p role="alert">{visibleText(execution.error)}</p>}
-          {execution.output && <pre className="a01-execution-output">{blockText(execution.output)}</pre>}
-          {execution.phase === "running" && execution.approvalId && onStopExecution &&
-            <div className="a01-actions">
-              <button type="button" onClick={() => void onStopExecution(execution.approvalId as string)}>중지</button>
-            </div>}
-        </section>}
-      </article>;
-    })}
+        }}><RefreshCw aria-hidden="true" />다시 조회</button>
+      </div>}
+      {decision === "approved" && proposal.kind === "reviewable" && onExecuteProposal && !active &&
+        targetKey(proposal.target) === key &&
+        <div className="a01-card-actions">
+          <button type="button" className="ui-button primary" disabled={!!executing} onClick={() => void execute(proposal)}>
+            {executing === proposal.id
+              ? <><LoaderCircle className="a01-spin" aria-hidden="true" />실행 요청 중</>
+              : <><Play aria-hidden="true" />실행</>}
+          </button>
+        </div>}
+      {execution?.proposalId === proposal.id && <Execution execution={execution} onStopExecution={onStopExecution} />}
+    </article>;
+  }
+
+  const empty = timeline.length === 0 && chat.kind !== "sending";
+  return <>
+    {empty && <div className="a01-empty">
+      <span className="a01-empty-mark" aria-hidden="true"><Sparkles /></span>
+    </div>}
+    <div className="a01-log" role="log" aria-label="대화 기록" hidden={empty}>
+      {timeline.map(({ entry, proposal }) => entry
+        ? <div key={`m${entry.seq}`} className="a01-msg" data-role={entry.message.role}>
+          {entry.message.role === "assistant" && <span className="a01-avatar" aria-hidden="true"><Sparkles /></span>}
+          <span className="a01-sr-only">{entry.message.role === "user" ? "나" : "AI"}</span>
+          <p className="a01-msg-body">{entry.message.content}</p>
+        </div>
+        : card(proposal!))}
+      {chat.kind === "sending" && <>
+        <div className="a01-msg" data-role="user" data-pending="true">
+          <p className="a01-msg-body">{chat.content}</p>
+        </div>
+        <div className="a01-msg" data-role="assistant" aria-hidden="true">
+          <span className="a01-avatar"><Sparkles /></span>
+          <span className="a01-typing"><i /><i /><i /></span>
+        </div>
+      </>}
+    </div>
+    <div className="a01-proposals">
+      {request.kind === "requesting" && <div className="a01-pending">
+        <LoaderCircle className="a01-spin" aria-hidden="true" />
+        <span role="status">제안 요청 중</span>
+        <button type="button" className="ui-button ghost" ref={cancelButton} onClick={() => {
+          keepRequestFocus();
+          pending.current?.abort();
+          pending.current = null;
+          setRequest({ kind: "idle" });
+        }}>요청 취소</button>
+      </div>}
+      {request.kind === "failed" && <p className="a01-inline-alert" role="alert">제안 요청 실패</p>}
+      {offerProposal && <div className="a01-suggestions">
+        <button type="button" className="a01-suggestion" ref={proposeButton} disabled={!model}
+          aria-disabled={request.kind === "requesting" || undefined} onClick={propose}>
+          <Activity aria-hidden="true" />가동 시간 확인
+        </button>
+      </div>}
+    </div>
   </>;
+}
+
+function Execution({ execution, onStopExecution }: Pick<AiPanelProps, "onStopExecution"> & { execution: ExecutionStatus }) {
+  const { phase } = execution;
+  const active = executionActive(phase);
+  const step = EXECUTION_STEP[phase];
+  const tone = phase === "exited" ? "done" : phase === "failed" ? "error" : phase === "unconfirmed" ? "warning" : "active";
+  const StateIcon = active ? LoaderCircle : phase === "exited" ? CircleCheck : CircleAlert;
+  return <section className="a01-execution" aria-label="실행 상태" data-tone={tone}>
+    <div className="a01-exec-head">
+      <StateIcon className={active ? "a01-exec-icon a01-spin" : "a01-exec-icon"} aria-hidden="true" />
+      <span className="a01-exec-label" role="status">{EXECUTION_LABEL[phase]}</span>
+      {phase === "running" && execution.approvalId && onStopExecution &&
+        <button type="button" className="ui-button danger a01-stop"
+          onClick={() => void onStopExecution(execution.approvalId as string)}>
+          <Square aria-hidden="true" />중지
+        </button>}
+    </div>
+    <div className="a01-steps" role="progressbar" aria-label="실행 단계" aria-valuemin={0} aria-valuemax={EXECUTION_STEPS}
+      aria-valuenow={active ? step : EXECUTION_STEPS} aria-valuetext={EXECUTION_LABEL[phase]}>
+      {Array.from({ length: EXECUTION_STEPS }, (_, index) =>
+        <span key={index} data-state={!active || index < step ? "done" : index === step ? "current" : "todo"} />)}
+    </div>
+    {execution.pairingCode && <div className="a01-pairing">
+      <span>연결 코드</span>
+      <code>{visibleText(execution.pairingCode)}</code>
+    </div>}
+    {execution.error && <p className="a01-inline-alert" role="alert">{visibleText(execution.error)}</p>}
+    {execution.output && <details className="a01-fold" open>
+      <summary>출력</summary>
+      <pre className="a01-execution-output">{blockText(execution.output)}</pre>
+    </details>}
+    <details className="a01-fold">
+      <summary>세부 정보</summary>
+      <dl className="a01-facts">
+        {execution.node && <><dt>대상</dt><dd>{visibleText(execution.node)}</dd></>}
+        {execution.sessionId && <><dt>세션</dt><dd>{visibleText(execution.sessionId)}</dd></>}
+        {execution.program && <><dt>절대 경로</dt><dd><code>{visibleText(execution.program)}</code></dd></>}
+        <dt>인자</dt><dd><code>{execution.args?.length ? execution.args.map(visibleText).join(" ") : "(없음)"}</code></dd>
+        <dt>정책</dt><dd>{execution.policy === "allowed" ? "허용된 조회 작업" : "실행 불가"}</dd>
+        {execution.jobId && <><dt>작업</dt><dd>{visibleText(execution.jobId)}</dd></>}
+      </dl>
+    </details>
+  </section>;
 }

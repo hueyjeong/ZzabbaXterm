@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState } from "react";
-import { AiPanel, type AiTopTabs } from "./AiPanel";
+import { AiPanel } from "./AiPanel";
 import { executionActive, type AiPanelProps, type ChatReply, type DecisionRecord, type ExecutionApproval, type ExecutionStatus, type Proposal, type ProposalTarget, type RecordedDecision, type TargetRef } from "./contracts";
 import type { SessionSelectionProps, SessionSelectionSnapshot } from "./SessionSelection";
 
@@ -20,9 +20,8 @@ const sessionActions: SessionSelectionProps["actions"] = {
   clear: (selectionId) => invoke("ai_session_clear", { selectionId }),
 };
 
-export function LocalAiPanel({ profilesVersion, topTabs, sessionCandidates, focused = false }: {
+export function LocalAiPanel({ profilesVersion, sessionCandidates, focused = false }: {
   profilesVersion: number;
-  topTabs?: AiTopTabs;
   sessionCandidates?: SessionSelectionProps["candidates"];
   focused?: boolean;
 }) {
@@ -214,10 +213,9 @@ export function LocalAiPanel({ profilesVersion, topTabs, sessionCandidates, focu
 
   return <AiPanel models={models} targets={targets} proposals={cliCard ? [cliCard] : []} onSelectTarget={select}
     history={history} policyVersion={policyVersion} onReadDecision={readDecision}
-    onOpenCliReview={openCliReview} topTabs={topTabs}
+    onOpenCliReview={openCliReview}
     sessionSelection={sessionCandidates && { candidates: sessionCandidates, visible: !focused, actions: sessionActions }}
-    policyControl={blocked !== undefined && <label><input type="checkbox" checked={blocked} disabled={savingPolicy}
-      onChange={(event) => void updatePolicy(event.currentTarget.checked)} /> 조회 승인 차단</label>}
+    policy={blocked === undefined ? undefined : { blocked, saving: savingPolicy, onChange: (next) => void updatePolicy(next) }}
     policyStatus={policyError ? <p role="alert">{policyError}</p> : savingPolicy ? <p role="status">설정 저장 중</p> : undefined}
     modelError={modelError} targetError={targetError} onRefresh={() => setRetry((value) => value + 1)}
     execution={execution} onExecuteProposal={executeProposal} onStopExecution={stopExecution}

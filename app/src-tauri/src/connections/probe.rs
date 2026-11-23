@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc, thread};
 use serde::{Deserialize, Serialize};
 
 use crate::terminal::{Sessions, probe::Probe};
-use super::{profile::{Draft, Method, MethodRef, SshAuth, ValidatedDraft}, store::{SaveStatus, Store, StoreError}};
+use super::{profile::{DesktopRoute, Draft, Method, MethodRef, SshAuth, SshTransport, ValidatedDraft}, store::{SaveStatus, Store, StoreError}};
 
 const UNTESTED: &str = "이 초안의 현재 시험이 없습니다";
 
@@ -109,6 +109,9 @@ pub(super) fn start(sessions: &Sessions, owner: &str, document: u64, draft_id: S
     if draft_id.is_empty() || draft_version > (1 << 53) - 1 {
         return Err("초안 ID 또는 버전이 올바르지 않습니다".into());
     }
+    if matches!(draft.target.method, Method::Rdp { .. } | Method::Vnc { .. }) {
+        return Err("원격 화면 프로필은 연결 시험 없이 저장합니다".into());
+    }
     sessions.with_probe_access(owner, document, matches!(draft.target.method, Method::Ssh { .. }), |runs| {
         let active = runs.active.entry(owner.into()).or_default();
         if active.get(&draft_id).is_some_and(|run| run.key.draft_version > draft_version) {
@@ -206,6 +209,15 @@ fn remove_run(runs: &mut Runs, owner: &str, document: u64, key: &RunKey) -> Resu
     Ok(())
 }
 
+/// 원격 화면의 SSH 경로는 Agent·키 파일 인증의 저장된 직접 SSH 대상만 가리킨다. 마법사와 CLI 등록이 같이 쓴다.
+pub(super) fn desktop_route_ready(draft: &ValidatedDraft, store: &Store) -> Result<bool, StoreError> {
+    let MethodRef::Desktop { route: DesktopRoute::Ssh { target_id } } = draft.method() else { return Ok(true) };
+    let file = store.load()?;
+    Ok(file.targets.iter().any(|entry| entry.profile.id.as_str() == target_id && entry.profile.id.as_str() != draft.target_id()
+        && matches!(&entry.profile.method, Method::Ssh { ssh } if matches!(ssh.transport, SshTransport::Direct {})
+            && matches!(ssh.auth, SshAuth::Agent { .. } | SshAuth::KeyFile { .. }))))
+}
+
 pub(super) fn save_confirmed(sessions: &Sessions, owner: &str, document: u64, request: SaveRequest, store: &Store) -> Result<(), String> {
     let SaveRequest { run: key, draft } = request;
     let draft = draft.validate().map_err(|error| format!("초안 검증: {error:?}"))?;
@@ -213,6 +225,13 @@ pub(super) fn save_confirmed(sessions: &Sessions, owner: &str, document: u64, re
     if cfg!(all(feature = "stored-auth", any(windows, target_os = "linux")))
         && matches!(draft.method(), MethodRef::Ssh { ssh } if matches!(ssh.auth, SshAuth::StoredPassword { .. }))
     {
+        return saved(store.save_authorized(draft, None, || Ok(()), || {}));
+    }
+    // 원격 화면 프로필은 비밀 없이 경로만 저장한다. 서버 신원과 터널은 열 때 다시 확인한다.
+    if !desktop_route_ready(&draft, store).map_err(|error| format!("프로필 읽기: {error:?}"))? {
+        return Err("Agent 또는 키 파일 인증의 저장된 직접 SSH 대상이 필요합니다".into());
+    }
+    if matches!(draft.method(), MethodRef::Desktop { .. }) {
         return saved(store.save_authorized(draft, None, || Ok(()), || {}));
     }
     let expected = sessions.with_probes(owner, document, |runs| {
@@ -491,6 +510,40 @@ mod tests {
             assert!(retired);
             assert!(cancel(&sessions, "other", 0, &key).is_ok());
         });
+    }
+
+    #[test]
+    fn desktop_profile_saves_without_a_probe_and_requires_a_key_based_direct_ssh_route() {
+        use crate::connections::tests::{desktop_draft, ssh_draft};
+        use serde_json::json;
+        let dir = TestDir::new();
+        let sessions = Sessions::default();
+        let store = Store::new(dir.path());
+        let request = |input: serde_json::Value| SaveRequest {
+            run: RunKey { draft_id: "desktop".into(), draft_version: 1, run_id: "unused".into() },
+            draft: serde_json::from_value(input).unwrap(),
+        };
+        let rdp = desktop_draft(dir.path(), "rdp", json!({
+            "host": "xrdp.example.test", "port": 3389, "tlsOnly": false, "route": {"kind": "ssh", "targetId": "ssh-server"},
+        }));
+        assert!(start(&sessions, "main", 0, "desktop".into(), 1, serde_json::from_value(rdp.clone()).unwrap(), dir.path().into()).is_err());
+        assert!(save_confirmed(&sessions, "main", 0, request(rdp.clone()), &store).is_err());
+        let mut ssh = ssh_draft(dir.path());
+        store.save(serde_json::from_value::<Draft>(ssh.clone()).unwrap().validate().unwrap()).unwrap();
+        assert!(save_confirmed(&sessions, "main", 0, request(rdp.clone()), &store).is_err());
+        ssh["groupRevision"] = json!(1);
+        ssh["targetRevision"] = json!(1);
+        ssh["target"]["ssh"]["auth"] = json!({"kind": "keyFile", "privateKeyPath": dir.path().join("private-key")});
+        store.save(serde_json::from_value::<Draft>(ssh).unwrap().validate().unwrap()).unwrap();
+        let mut rdp = rdp;
+        rdp["groupRevision"] = json!(1);
+        save_confirmed(&sessions, "main", 0, request(rdp), &store).unwrap();
+        let mut vnc = desktop_draft(dir.path(), "vnc", json!({"host": "vnc.example.test", "port": 5900, "route": {"kind": "direct"}}));
+        vnc["groupRevision"] = json!(1);
+        save_confirmed(&sessions, "main", 0, request(vnc), &store).unwrap();
+        let file = store.load().unwrap();
+        assert_eq!(file.targets.len(), 3);
+        assert!(file.targets.iter().all(|entry| entry.tested_account_id.is_none()));
     }
 
     #[test]

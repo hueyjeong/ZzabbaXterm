@@ -1,5 +1,7 @@
 import { useImperativeHandle, useRef, useState, type Ref } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { FolderDown, KeyRound, Plug } from "lucide-react";
+import { ProtocolIcon } from "../ui/controls";
 import { S3StoragePanel } from "./S3StoragePanel";
 import { StorageProblem } from "./StorageStatus";
 import type { S3Error } from "./s3";
@@ -185,46 +187,65 @@ export function CompatibleStorageTab({ closing, closeRef }: {
 
   if (session) {
     const { target } = session;
-    return <div inert={closing}><S3StoragePanel initialPage={session.initial} actions={storageActions} session={{
+    return <div className="storage-host" inert={closing}><S3StoragePanel initialPage={session.initial} actions={storageActions} session={{
       sessionId: session.sessionId, profile: target.alias, region: target.region, endpoint: target.origin,
       compatible: { serviceId: target.serviceId, addressing: target.addressing },
     }} /></div>;
   }
 
-  return <section className="s3-storage" aria-label="S3 호환 HTTPS">
-    <header className="storage-heading"><h2>S3 호환 HTTPS</h2></header>
-    <form onSubmit={event => { event.preventDefault(); void open(); }}>
-      <fieldset className="storage-controls" disabled={closing || busy || !!attempt.current}>
-        <label>서비스 ID<input required value={input.serviceId} onChange={event => change({ serviceId: event.target.value })} /></label>
-        <button type="button" disabled={!input.serviceId} onClick={() => void load()}>저장된 설정 불러오기</button>
-        <label>별칭<input required value={input.alias} onChange={event => change({ alias: event.target.value })} /></label>
-        <label>HTTPS 출처<input required type="url" value={input.endpoint} onChange={event => change({ endpoint: event.target.value })} /></label>
-        <label>서명 리전<input required value={input.region} onChange={event => change({ region: event.target.value })} /></label>
-        <label>주소 방식<select value={input.addressing} onChange={event => change({ addressing: event.target.value === "path" ? "path" : "virtual_hosted" })}>
-          <option value="path">경로</option><option value="virtual_hosted">가상 호스트</option>
-        </select></label>
-        {!reusable && <>
-          <label>키링 항목 ID<input required value={itemId} onChange={event => setItemId(event.target.value)} /></label>
-          <button type="button" disabled={!input.serviceId || !input.alias || !input.endpoint || !input.region} onClick={() => void enroll()}>키 등록</button>
-        </>}
-        <label>연결 범위<select required value={scopeKind} onChange={event => {
-          const kind = event.target.value;
-          if (kind === "service_browse" || kind === "bucket") setScopeKind(kind);
-        }}>
-          <option value="" disabled>범위 선택</option>
-          <option value="service_browse">전체 탐색</option>
-          <option value="bucket">버킷 직접 열기</option>
-        </select></label>
-        {scopeKind === "bucket" && <>
-          <label>버킷<input required value={bucket} onChange={event => setBucket(event.target.value)} /></label>
-          <label>접두어<input value={prefix} onChange={event => setPrefix(event.target.value)} /></label>
-        </>}
-        <button type="submit" disabled={!scopeKind || (scopeKind === "bucket" && !bucket)}>{reusable ? "호환 스토리지 연결" : "설정 저장 및 연결"}</button>
+  return <section className="storage-connect" aria-label="S3 호환 HTTPS">
+    <form className="storage-card wide" onSubmit={event => { event.preventDefault(); void open(); }}>
+      <header className="storage-card-head"><ProtocolIcon kind="s3" /><h2>S3 호환 HTTPS</h2></header>
+      <fieldset disabled={closing || busy || !!attempt.current}>
+        <div className="storage-row">
+          <label className="ui-label">서비스 ID<input className="ui-field mono" required value={input.serviceId} spellCheck={false}
+            onChange={event => change({ serviceId: event.target.value })} /></label>
+          <button type="button" className="ui-button" disabled={!input.serviceId} onClick={() => void load()}><FolderDown aria-hidden="true" />저장된 설정 불러오기</button>
+        </div>
+        <div className="storage-grid">
+          <label className="ui-label">별칭<input className="ui-field" required value={input.alias} onChange={event => change({ alias: event.target.value })} /></label>
+          <label className="ui-label">HTTPS 출처<input className="ui-field mono" required type="url" value={input.endpoint} spellCheck={false}
+            placeholder="https://" onChange={event => change({ endpoint: event.target.value })} /></label>
+          <label className="ui-label">서명 리전<input className="ui-field mono" required value={input.region} spellCheck={false}
+            onChange={event => change({ region: event.target.value })} /></label>
+          <label className="ui-label">주소 방식<select className="ui-field" value={input.addressing}
+            onChange={event => change({ addressing: event.target.value === "path" ? "path" : "virtual_hosted" })}>
+            <option value="path">경로</option><option value="virtual_hosted">가상 호스트</option>
+          </select></label>
+        </div>
+        {!reusable && <div className="storage-section">
+          <div className="storage-row">
+            <label className="ui-label">키링 항목 ID<input className="ui-field mono" required value={itemId} spellCheck={false}
+              onChange={event => setItemId(event.target.value)} /></label>
+            <button type="button" className="ui-button" disabled={!input.serviceId || !input.alias || !input.endpoint || !input.region}
+              onClick={() => void enroll()}><KeyRound aria-hidden="true" />키 등록</button>
+          </div>
+        </div>}
+        <div className="storage-section">
+          <div className="storage-grid">
+            <label className="ui-label">연결 범위<select className="ui-field" required value={scopeKind} onChange={event => {
+              const kind = event.target.value;
+              if (kind === "service_browse" || kind === "bucket") setScopeKind(kind);
+            }}>
+              <option value="" disabled>범위 선택</option>
+              <option value="service_browse">전체 탐색</option>
+              <option value="bucket">버킷 직접 열기</option>
+            </select></label>
+            {scopeKind === "bucket" && <>
+              <label className="ui-label">버킷<input className="ui-field mono" required value={bucket} spellCheck={false} onChange={event => setBucket(event.target.value)} /></label>
+              <label className="ui-label">접두어<input className="ui-field mono" value={prefix} spellCheck={false} onChange={event => setPrefix(event.target.value)} /></label>
+            </>}
+          </div>
+        </div>
+        <div className="storage-actions">
+          {busy && <p role="status" className="storage-busy">호환 스토리지 요청 중</p>}
+          <button type="submit" className="ui-button primary" disabled={!scopeKind || (scopeKind === "bucket" && !bucket)}>
+            <Plug aria-hidden="true" />{reusable ? "호환 스토리지 연결" : "설정 저장 및 연결"}</button>
+        </div>
       </fieldset>
+      {typeof error === "string" ? error && <p role="alert" className="storage-error">{error}</p> :
+        <StorageProblem problem={error.connection} session={{ sessionId: error.sessionId, profile: input.alias, region: input.region, endpoint: input.endpoint,
+          compatible: { serviceId: input.serviceId, addressing: input.addressing } }} />}
     </form>
-    {busy && <p role="status">호환 스토리지 요청 중</p>}
-    {typeof error === "string" ? error && <p role="alert">{error}</p> :
-      <StorageProblem problem={error.connection} session={{ sessionId: error.sessionId, profile: input.alias, region: input.region, endpoint: input.endpoint,
-        compatible: { serviceId: input.serviceId, addressing: input.addressing } }} />}
   </section>;
 }

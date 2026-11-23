@@ -37,7 +37,8 @@ pub(crate) enum Route {
     SshRemote { server: String, listen: SocketAddr, destination: Destination },
     SshDynamic { server: String, listen: SocketAddr },
     #[cfg(test)]
-    Ssm { listen: SocketAddr, node: String, port: u16 },
+    // host가 없으면 노드 자신의 포트, 있으면 노드에서 접속하는 원격 호스트다.
+    Ssm { listen: SocketAddr, node: String, port: u16, host: Option<String> },
 }
 
 pub(crate) enum Observation {

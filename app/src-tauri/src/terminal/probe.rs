@@ -17,6 +17,7 @@ const SSM_TIMEOUT: Duration = Duration::from_secs(60);
 const S3_TIMEOUT: Duration = Duration::from_secs(60);
 const SSH_TIMEOUT: Duration = Duration::from_secs(120);
 pub(super) const TIMED_OUT: &str = "연결 시험 시간이 초과되었습니다";
+const DESKTOP_UNTESTED: &str = "원격 화면 프로필은 연결 시험 없이 저장합니다";
 
 fn scan(needle: &[u8], matched: &mut usize, bytes: &[u8]) -> bool {
     for &byte in bytes {
@@ -57,7 +58,7 @@ impl Probe {
                 s3_cancel: Some(CancellationToken::new()),
                 ..Self::with_timeout(owner, S3_TIMEOUT, false, false)
             },
-            MethodRef::Local { .. } => Self::with_timeout(owner, TIMEOUT, false, false),
+            MethodRef::Local { .. } | MethodRef::Desktop { .. } => Self::with_timeout(owner, TIMEOUT, false, false),
         }
     }
 
@@ -103,6 +104,7 @@ impl Probe {
         let launch = match draft.method() {
             MethodRef::Local { shell, start_directory } => command(shell, start_directory).map(Launch::Local),
             MethodRef::Ssm { profile, region, instance_id } => remote::Target::new(profile, region, instance_id).map(Launch::Ssm),
+            MethodRef::Desktop { .. } => Err(DESKTOP_UNTESTED.into()),
             MethodRef::Ssh { ssh } => {
                 self.finish(self.run_ssh(config, ssh).map(|()| None));
                 return;

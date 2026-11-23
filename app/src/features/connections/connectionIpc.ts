@@ -106,7 +106,10 @@ export function createLocalConnectionIpc(): Omit<LocalConnectionActions, "onClos
     async save(request: ConnectionRequest) {
       const success = tested.get(request.run);
       // 저장 암호는 연결 시험이 승인 경로를 열 수 없어 호스트 키 확인 뒤 참조만 저장한다.
-      const stored = request.draft.target.defaultMethod === "ssh" && request.draft.target.ssh.auth?.kind === "storedPassword";
+      // 원격 화면 프로필은 비밀 없이 경로만 저장하며 Rust가 다시 검증한다.
+      const { target } = request.draft;
+      const stored = (target.defaultMethod === "ssh" && target.ssh.auth?.kind === "storedPassword")
+        || target.defaultMethod === "rdp" || target.defaultMethod === "vnc";
       if (!stored && (!success || success.execution.cancelled || success.attempt.draft !== request.draft ||
         attempts.get(success.attempt) !== success.execution)) {
         throw new Error("현재 초안의 연결 테스트 성공이 필요합니다");

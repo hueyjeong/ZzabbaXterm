@@ -16,7 +16,7 @@
 
 1. **Red.** `app/src-tauri/src/tunnels/`에서 네 전달 방식의 인자 구성, 바인드 실패, 소유 탭 마지막 해제, 생성 도중 닫기·중복 닫기를 표 기반 Rust 테스트로 작성한다. `app/src/features/tunnels/`에는 준비 중·준비됨·실패를 구분하는 Vitest를 둔다.
 2. **Green — 방향.** [OpenSSH](https://man.openbsd.org/ssh) 자식은 셸 문자열이 아닌 인자 배열로 실행한다. `-N`과 `-o ExitOnForwardFailure=yes`를 사용한다. `-L`은 로컬 루프백 수신 → SSH 서버에서 시험 서비스로 접속, `-R`은 SSH 서버 루프백 수신 → 클라이언트 쪽 시험 서비스로 접속, `-D`는 로컬 루프백 SOCKS 수신 → SSH 서버에서 클라이언트가 지정한 목적지로 접속이다. 동적 전달 화면에는 고정 목적지 대신 SOCKS를 표시한다. 기존 호스트 키·인증 경계를 사용하고 원격 수신도 승인된 인터페이스인지 확인한다.
-3. **Green — SSM.** [Session Manager 문서](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-sessions-start.html)의 `aws ssm start-session`에 선택한 프로필·리전·관리 노드 및 `AWS-StartPortForwardingSession`을 넘긴다. `localPortNumber`는 로컬 수신, `portNumber`는 노드의 서비스 포트다. 로컬 포워딩만 제공한다. CLI·플러그인 누락, 인증 만료, 문서 실행 거부, 목적지 거부를 나눠 표시한다. 서비스 로그인을 SSM 승인으로 대체하지 않는다.
+3. **Green — SSM.** [Session Manager 문서](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-sessions-start.html)의 `aws ssm start-session`에 선택한 프로필·리전·관리 노드 및 `AWS-StartPortForwardingSession`을 넘긴다. `localPortNumber`는 로컬 수신, `portNumber`는 노드의 서비스 포트다. 노드에서 다른 호스트로 전달할 때는 `AWS-StartPortForwardingSessionToRemoteHost`에 `host`를 더한다. `host`는 DNS 이름 또는 IP 리터럴만 받고 공백·쉼표·`=`·제어 문자를 거부한다. 두 문서 모두 같은 프로필·리전·노드 승인 범위를 대조한다. 로컬 포워딩만 제공한다. CLI·플러그인 누락, 인증 만료, 문서 실행 거부, 목적지 거부를 나눠 표시한다. 서비스 로그인을 SSM 승인으로 대체하지 않는다.
 4. **Green — 수명.** Rust가 발급한 ID에 생성 프로세스 핸들·SSM 세션 ID·소유 탭 집합을 묶는다. 각 요청에서 창과 탭의 소유권을 확인한다. 자식의 실제 준비 결과와 종료를 관찰한다. 사전 포트 검사만 믿지 말고 시작 중 바인드 실패도 처리한다. 수신 준비와 목적지 서비스의 실제 응답을 구분한다. 마지막 해제·창 종료 때 소유 자식과 플러그인을 정리하고 해당 SSM ID의 종료를 확인한다. 포트/PID 검색으로 다른 프로세스를 종료하지 않는다.
 5. **자동 검증.** `cargo test --manifest-path src-tauri/Cargo.toml tunnels`와 `npx vitest run src/features/tunnels`에서 실제 실행한 사례 수를 기록한다. 로컬 수신기를 먼저 열어 바인드 충돌 후에도 기존 응답이 살아 있는지 검사한다.
 6. **실기기 시연(T5 터널).** 두 OS에서 `-L`과 SSM은 로컬에서, `-R`은 원격 수신 측에서, `-D`는 SOCKS를 지정한 시험 클라이언트에서 승인된 목적지의 고유 문구를 읽는다. 같은 터널의 탭 닫기, 다른 터널의 강제 종료, 포트 충돌을 인수 조건대로 반복한다. OS·도구 버전·방향·익명화한 끝점·탭별 전후 응답·마지막 포트 해제와 SSM 종료 결과를 남긴다. 자원 부재는 `미실행(사유)`이다. 이 기록은 RDP·VNC 화면 시험과 별도다.
@@ -26,4 +26,6 @@
 - 왼쪽 트리의 저장된 직접 SSH 연결에서 **터널 열기**를 선택한다. Rust는 승인한 연결과 포트를 다시 확인하고, 마지막 소유 탭의 닫기에서만 해당 자식을 종료한다. 종료를 확인하지 못하면 같은 탭에서 다시 확인한다.
 - 직접 SSH의 `-L`과 `-D`를 지원하며, `-R`은 루프백 수신을 검증할 수 있는 Linux 경로에서 제공한다. Windows `-R`과 공식 AWS Session Manager 포트 전달은 시작 전에 차단한다. SSH 셸과 SSM 셸 기능은 이 차단과 별개다.
 - `-L`에서 RDP/VNC로 승인한 서비스가 SSH 서버의 `127.0.0.1` 또는 `::1`에 있다면 준비된 행에서 해당 원격 화면을 열 수 있다. 원본 터널 탭을 닫아도 화면 탭이 연결을 소유하면 전달은 이어지며 마지막 소유 탭에서 종료한다.
+- Rust 전달 계획(`SsmPlan`)은 노드 포트와 원격 호스트 문서 인자를 만들고 승인 범위를 대조한다. 실행 경로는 위 차단과 같이 아직 열지 않는다.
+- 저장된 RDP·VNC 프로필의 SSH 경로는 같은 `-L` 전달을 열고 준비된 전달로 원격 화면 탭을 연다(`openDesktopProfile`). 목적지는 SSH 서버의 `127.0.0.1:포트`다.
 - 격리 Ubuntu에서 OpenSSH `-L`·`-R`·`-D`의 실제 응답, 마지막 소유자 종료, 포트 충돌과 늦은 닫기를 확인했다. Windows와 네이티브 Ubuntu의 T5 전체, 실제 AWS 포트 전달은 미실행이다.

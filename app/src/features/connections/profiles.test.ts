@@ -402,3 +402,86 @@ describe("저장 S3 연결", () => {
     expect(peer.onClose).toHaveBeenCalledExactlyOnceWith({ kind: "saved", draftId: "work-draft", targetId: draft.target.id });
   });
 });
+
+describe("저장 RDP·VNC 연결", () => {
+  const node = { profile: "company-sso", region: "ap-northeast-2", instanceId: "i-0123456789abcdef0" };
+
+  it("SSH 경로 RDP는 연결 시험 없이 비밀 없는 경로만 저장한다", async () => {
+    const peer = nativePeer();
+    ipc.mockResolvedValue(null);
+    const wizard = createLocalConnectionWizard("rdp-draft", draft);
+    wizard.go(1);
+    wizard.selectMethod("rdp");
+    expect(wizard.getSnapshot().draft.target).toMatchObject({ rdp: { host: "", port: "3389", tlsOnly: false, route: { kind: "direct" } } });
+    wizard.editDesktop({ host: "xrdp.example.test", tlsOnly: true, route: { kind: "ssh", targetId: "" } });
+    wizard.go(1);
+    expect(wizard.canReviewDesktop(null)).toBe(false);
+    wizard.go(1, null);
+    expect(wizard.getSnapshot().step).toBe("auth");
+    wizard.editDesktop({ route: { kind: "ssh", targetId: "ssh-server" } });
+    expect(wizard.canReviewDesktop(null)).toBe(true);
+    wizard.go(1, null);
+    expect(wizard.getSnapshot().step).toBe("verify");
+    await wizard.test(peer);
+    expect(ipc).not.toHaveBeenCalled();
+    await wizard.save(peer);
+    expect(ipc.mock.calls).toEqual([["connection_save", { request: {
+      run: { draftId: "rdp-draft", draftVersion: expect.any(Number), runId: "rdp-draft" },
+      draft: { ...draft, target: {
+        id: draft.target.id, groupId: draft.target.groupId, displayName: draft.target.displayName, defaultMethod: "rdp",
+        rdp: { host: "xrdp.example.test", port: 3389, tlsOnly: true, route: { kind: "ssh", targetId: "ssh-server" } },
+      } },
+    } }]]);
+    expect(peer.onClose).toHaveBeenCalledWith({ kind: "saved", draftId: "rdp-draft", targetId: draft.target.id });
+  });
+
+  it("SSM 경로는 노드 선택을 경로에 넣고 VNC는 노드 자신의 서비스만 허용한다", async () => {
+    const peer = nativePeer();
+    ipc.mockResolvedValue(null);
+    const wizard = createLocalConnectionWizard("vnc-draft", draft);
+    wizard.go(1);
+    wizard.selectMethod("vnc");
+    wizard.editDesktop({ host: "vnc.internal.example", port: "5901", route: { kind: "ssm" } });
+    wizard.go(1);
+    expect(wizard.canReviewDesktop(node)).toBe(false);
+    wizard.go(1, node);
+    expect(wizard.getSnapshot().step).toBe("auth");
+    wizard.editDesktop({ host: "" });
+    expect(wizard.canReviewDesktop(null)).toBe(false);
+    expect(wizard.canReviewDesktop(node)).toBe(true);
+    wizard.go(1, node);
+    expect(wizard.getSnapshot().step).toBe("verify");
+    await wizard.save(peer);
+    expect(ipc).toHaveBeenCalledWith("connection_save", { request: expect.objectContaining({
+      draft: expect.objectContaining({ target: expect.objectContaining({
+        defaultMethod: "vnc", vnc: { host: "", port: 5901, route: { kind: "ssm", ...node } },
+      }) }),
+    }) });
+  });
+
+  it("RDP 호스트는 경로별 규칙을 따르고 기존 프로필을 편집 입력으로 연다", () => {
+    const wizard = createLocalConnectionWizard("rdp-edit", {
+      ...draft, groupRevision: 1, targetRevision: 2,
+      target: { id: "rdp", groupId: "work", displayName: "윈도", defaultMethod: "rdp",
+        rdp: { host: "", port: 3390, tlsOnly: false, route: { kind: "ssm", ...node } } },
+    });
+    expect(wizard.getSnapshot().draft.target).toMatchObject({ rdp: { host: "", port: "3390", route: { kind: "ssm", ...node } } });
+    wizard.go(1);
+    wizard.go(1);
+    // RDP는 SSM 경로에서도 인증서 이름(DNS)이 필요하다.
+    expect(wizard.canReviewDesktop(node)).toBe(false);
+    for (const [host, route, valid] of [
+      ["10.0.1.25", { kind: "direct" }, false],
+      ["win.example.test", { kind: "direct" }, true],
+      ["127.0.0.1", { kind: "ssh", targetId: "ssh-server" }, false],
+      ["host,other", { kind: "ssm", ...node }, false],
+      ["10.0.1.25", { kind: "ssm", ...node }, false],
+      ["2852039166", { kind: "ssm", ...node }, false],
+      ["127.1", { kind: "direct" }, false],
+      ["rdp.internal.example", { kind: "ssm", ...node }, true],
+    ] as const) {
+      wizard.editDesktop({ host, route });
+      expect(wizard.canReviewDesktop(node), `${host} ${route.kind}`).toBe(valid);
+    }
+  });
+});
