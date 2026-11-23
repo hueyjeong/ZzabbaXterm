@@ -47,6 +47,18 @@ describe("L01 터미널 세션", () => {
     ]));
   });
 
+  it("승격 요청은 대상 ID 유무에 따라 로컬·원격 명령으로 보낸다", async () => {
+    const ipcInvoke = vi.mocked(invoke).mockRejectedValue(new Error("시험 종료"));
+    const elevation = { program: "/usr/bin/id", args: ["-u"], item: "21eb36c3-234d-439d-9e1f-1d3cc5ba8125" };
+    connectLocalTerminal(dimensions, vi.fn(), vi.fn(), undefined, undefined, false, false, undefined, elevation);
+    connectLocalTerminal(dimensions, vi.fn(), vi.fn(), undefined, undefined, false, false, undefined,
+      { ...elevation, targetId: "saved-ssh", target: "demo@server:22", account: "demo" });
+    await vi.waitFor(() => expect(ipcInvoke.mock.calls).toEqual([
+      ["elevation_open", { ...dimensions, output: expect.any(Object), program: "/usr/bin/id", args: ["-u"], item: elevation.item }],
+      ["elevation_open_remote", { ...dimensions, output: expect.any(Object), targetId: "saved-ssh", program: "/usr/bin/id", args: ["-u"], item: elevation.item }],
+    ]));
+  });
+
   it("저장 인증 폴백 알림을 실행 상태에 표시한다", async () => {
     const peer = nativePeer();
     const starting = Promise.withResolvers<void>();

@@ -40,6 +40,11 @@ name = "zzabba-askpass"
 path = "src/bin/zzabba-askpass.rs"
 required-features = ["stored-auth"]
 
+# Linux 원격 sudo 승격 helper. 관리자가 /usr/local/libexec/zzabba-elevate에 설치한다.
+[[bin]]
+name = "zzabba-elevate"
+path = "src/bin/zzabba-elevate.rs"
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]

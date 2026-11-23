@@ -2,10 +2,12 @@ import { useLayoutEffect, useRef, useState, type KeyboardEvent } from "react";
 import type { SavedConnections } from "../connections/connectionIpc";
 
 type OpenTarget = (target?: SavedConnections["targets"][number]["profile"], options?: { readonly remoteEditor?: true }) => void;
-type MenuTarget = { method: string; open: () => void; sshTargetId?: string; s3TargetId?: string; openTunnel?: () => void; openRemoteEditor?: () => void };
+type ElevateTarget = (target?: SavedConnections["targets"][number]["profile"]) => void;
+type MenuTarget = { method: string; open: () => void; sshTargetId?: string; s3TargetId?: string; openTunnel?: () => void; openRemoteEditor?: () => void; elevate?: () => void };
 
-export function LocalTree({ profiles, onOpen, onRegisterSshHost, onRetestS3, onOpenTunnel }: {
-  profiles?: SavedConnections; onOpen: OpenTarget; onRegisterSshHost: (targetId: string) => void;
+export function LocalTree({ profiles, onOpen, onElevate, onLocalElevate, onRegisterSshHost, onRetestS3, onOpenTunnel }: {
+  profiles?: SavedConnections; onOpen: OpenTarget; onElevate?: ElevateTarget; onLocalElevate?: () => void;
+  onRegisterSshHost: (targetId: string) => void;
   onRetestS3?: (targetId: string) => void;
   onOpenTunnel: (targetId: string, name: string, method: "ssh" | "ssm") => void;
 }) {
@@ -20,7 +22,7 @@ export function LocalTree({ profiles, onOpen, onRegisterSshHost, onRetestS3, onO
   const term = query.trim().toLocaleLowerCase();
   const matches = (name: string) => name.toLocaleLowerCase().includes(term);
   const groups = [
-    { key: "local", name: "로컬", id: "", targets: [{ key: "pc", name: "내 PC", id: "", method: "로컬", open: () => onOpen() }] },
+    { key: "local", name: "로컬", id: "", targets: [{ key: "pc", name: "내 PC", id: "", method: "로컬", open: () => onOpen(), elevate: onLocalElevate }] },
     ...(profiles?.groups.map(({ profile }) => ({
       key: `group:${profile.id}`, name: profile.displayName, id: profile.id,
       targets: profiles.targets.filter(({ profile: target }) => target.groupId === profile.id).map(({ profile: target }) => ({
@@ -34,6 +36,7 @@ export function LocalTree({ profiles, onOpen, onRegisterSshHost, onRetestS3, onO
         s3TargetId: target.defaultMethod === "s3" && onRetestS3 ? target.id : undefined,
         openTunnel: target.defaultMethod === "ssm" || (target.defaultMethod === "ssh" && target.ssh.transport.kind === "direct")
           ? () => onOpenTunnel(target.id, target.displayName, target.defaultMethod) : undefined,
+        elevate: onElevate && target.defaultMethod === "ssh" ? () => onElevate(target) : undefined,
       })),
     })) ?? []),
   ].flatMap((group) => {
@@ -57,7 +60,7 @@ export function LocalTree({ profiles, onOpen, onRegisterSshHost, onRetestS3, onO
   function showMenu(row: HTMLLIElement, target: MenuTarget, x: number, y: number) {
     row.focus();
     const extraActions = Number(target.sshTargetId !== undefined) + Number(target.s3TargetId !== undefined) +
-      Number(!!target.openTunnel) + Number(!!target.openRemoteEditor);
+      Number(!!target.openTunnel) + Number(!!target.openRemoteEditor) + Number(!!target.elevate);
     const menuHeight = 44 + 36 * extraActions;
     setMenu({ row, target, x: Math.min(x, window.innerWidth - 170), y: Math.min(y, window.innerHeight - menuHeight) });
   }
@@ -150,6 +153,11 @@ export function LocalTree({ profiles, onOpen, onRegisterSshHost, onRetestS3, onO
         setMenu(undefined);
         menu.target.open();
       }}>{menu.target.method}</button>
+      {menu.target.elevate && <button type="button" role="menuitem" onClick={() => {
+        menu.row.focus();
+        setMenu(undefined);
+        menu.target.elevate?.();
+      }}>승격 실행…</button>}
       {menu.target.openRemoteEditor && <button type="button" role="menuitem" onClick={() => {
         menu.row.focus();
         setMenu(undefined);

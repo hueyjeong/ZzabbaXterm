@@ -64,3 +64,46 @@ it("직접 SSH의 Agent와 키 파일에만 네이티브 nano 연동 승인을 �
     vi.unstubAllGlobals();
   }
 });
+
+
+it("승격 메뉴는 저장 인증 기반 명령이 준비된 경우에만 표시한다", () => {
+  const profiles: SavedConnections = {
+    version: 1, groups: [{ revision: 1, profile: { id: "ssh", displayName: "서버" } }],
+    targets: [{
+      revision: 1,
+      profile: {
+        id: "agent", displayName: "Agent 서버", groupId: "ssh", defaultMethod: "ssh",
+        ssh: {
+          host: "server", port: 22, account: "developer", hostKeyFingerprint: "SHA256:host",
+          auth: { kind: "agent", publicKeyPath: "/keys/client.pub" }, transport: { kind: "direct" },
+        },
+      },
+    }],
+  };
+  const host = document.body.appendChild(document.createElement("div"));
+  const root = createRoot(host);
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  try {
+    act(() => root.render(<LocalTree profiles={profiles} onOpen={vi.fn()} onRegisterSshHost={vi.fn()} onOpenTunnel={vi.fn()} />));
+    const row = (name: string) => {
+      const match = [...host.querySelectorAll<HTMLLIElement>("li[role=treeitem]")].find(item => item.textContent === name);
+      if (!match) throw new Error(`대상 행 없음: ${name}`);
+      return match;
+    };
+    const menuItem = (name: string) => [...host.querySelectorAll<HTMLButtonElement>("button[role=menuitem]")]
+      .find(button => button.textContent === name);
+    for (const name of ["내 PC", "Agent 서버"]) {
+      act(() => { row(name).dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true })); });
+      expect(menuItem("승격 실행…")).toBeUndefined();
+    }
+    act(() => root.render(<LocalTree profiles={profiles} onOpen={vi.fn()} onLocalElevate={vi.fn()} onElevate={vi.fn()} onRegisterSshHost={vi.fn()} onOpenTunnel={vi.fn()} />));
+    for (const name of ["내 PC", "Agent 서버"]) {
+      act(() => { row(name).dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true })); });
+      expect(menuItem("승격 실행…")).toBeDefined();
+    }
+  } finally {
+    act(() => root.unmount());
+    host.remove();
+    vi.unstubAllGlobals();
+  }
+});
