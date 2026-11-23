@@ -2,6 +2,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import type { SsoLoginIpc } from "../ssm/ssoLogin";
 import { TunnelTab } from "./TunnelTab";
 import { tunnelIpc } from "./tunnelIpc";
 
@@ -139,4 +140,43 @@ it("starts a local route on the owned handle without sending saved connection se
   expect(invoke).toHaveBeenNthCalledWith(2, "tunnel_start", {
     tab: "owned", request: { direction: "local", listen: 13389, host: "127.0.0.1", port: 3389, protocol: "rdp" },
   });
+});
+
+it("SSO 만료로 실패한 SSM 터널은 로그인 뒤 같은 요청으로 다시 시작하고 로그인 실패를 표시한다", async () => {
+  vi.useFakeTimers();
+  const request = { direction: "ssm", listen: 15901, port: 5901, protocol: "vnc" };
+  let snapshot: unknown[] = [];
+  let starts = 0;
+  invoke.mockImplementation(async (command: string) => {
+    if (command === "tunnel_status") return snapshot;
+    if (command === "tunnel_start") return String(++starts);
+    throw new Error(command);
+  });
+  const sso: SsoLoginIpc = {
+    login: vi.fn().mockRejectedValueOnce("SSM: 권한 거부").mockResolvedValue("loggedIn"),
+    cancel: vi.fn().mockResolvedValue(null),
+  };
+  await act(async () => root.render(<TunnelTab {...props} targetId="vnc-ssm" method="ssm" ssoIpc={sso} />));
+  const field = (name: string) => host.querySelector<HTMLInputElement | HTMLSelectElement>(`[name="${name}"]`)!;
+  field("listen").value = "15901";
+  field("port").value = "5901";
+  field("protocol").value = "vnc";
+  await act(async () => host.querySelector<HTMLButtonElement>('button[type="submit"]')?.click());
+  const login = () => host.querySelector<HTMLButtonElement>('li button[aria-label="SSO 로그인"]');
+  snapshot = [{ ...tunnel, id: "1", state: "failed", error: "SSM: SSO 재로그인 필요" }, { ...tunnel, id: "other", state: "failed", error: "SSM: SSO 재로그인 필요" }];
+  await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+  // 이 탭에서 시작한 요청만 다시 시작할 수 있다.
+  expect(host.querySelectorAll('li button[aria-label="SSO 로그인"]')).toHaveLength(1);
+
+  await act(async () => login()?.click());
+  expect(sso.login).toHaveBeenLastCalledWith("vnc-ssm", expect.any(String));
+  expect([...host.querySelectorAll('[role="alert"]')].map(alert => alert.textContent)).toContain("SSO 로그인 실패: SSM: 권한 거부");
+  expect(invoke.mock.calls.filter(([command]) => command === "tunnel_start")).toHaveLength(1);
+
+  await act(async () => login()?.click());
+  expect(sso.login).toHaveBeenCalledTimes(2);
+  expect(invoke.mock.calls.filter(([command]) => command === "tunnel_start")).toEqual([
+    ["tunnel_start", { tab: "owned", request }], ["tunnel_start", { tab: "owned", request }],
+  ]);
+  expect(host.textContent).not.toContain("SSO 로그인 실패");
 });

@@ -18,6 +18,7 @@ import { DesktopRouteError, openDesktopProfile, type DesktopPreset, type Desktop
 import { SftpPanel, type SftpPanelActions } from "../sftp/SftpPanel";
 import { sftpError } from "../sftp/sftpIpc";
 import type { SsmTarget } from "../ssm/ssm";
+import { SsoLoginAction, ssoExpired, useSsoLogin } from "../ssm/ssoLogin";
 import { CompatibleStorageTab } from "../storage/CompatibleStorageTab";
 import { StorageTab } from "../storage/StorageTab";
 import { TerminalView } from "../terminal/TerminalView";
@@ -204,6 +205,11 @@ export function Workspace() {
   }, [layout, tabs]);
   const [focused, setFocused] = useState(false);
   const [windowError, setWindowError] = useState("");
+  // SSO 만료로 열지 못한 원격 화면 프로필이다. 로그인에 성공하면 같은 위치로 다시 연다.
+  const [desktopRetry, setDesktopRetry] = useState<{ target: DesktopProfile; split?: Placement; error: string }>();
+  const desktopLogin = useSsoLogin(desktopRetry?.target.id, () => {
+    if (desktopRetry) void openDesktopTarget(desktopRetry.target, desktopRetry.split);
+  });
   const [closeError, setCloseError] = useState("");
   const [loadVersion, setLoadVersion] = useState(0);
   const [profileLoad, setProfileLoad] = useState<ProfileLoad>({ kind: "loading" });
@@ -522,6 +528,7 @@ export function Workspace() {
   async function openDesktopTarget(target: DesktopProfile, split?: Placement) {
     if (desktopOpening?.id === target.id) return;
     setWindowError("");
+    setDesktopRetry(undefined);
     const pending = { id: target.id, label: target.displayName, controller: new AbortController() };
     desktopOpening?.controller.abort();
     setDesktopOpening(pending);
@@ -539,7 +546,10 @@ export function Workspace() {
     } catch (error) {
       if (error instanceof DesktopRouteError) keepUnclosedRoute(error.handle, error.targetId, target.displayName, error.message, error.method);
       if (!pending.controller.signal.aborted || error instanceof DesktopRouteError) {
-        setWindowError(`${target.displayName} 열기 실패: ${error instanceof Error ? error.message : String(error)}`);
+        const message = error instanceof Error ? error.message : String(error);
+        const failure = `${target.displayName} 열기 실패: ${message}`;
+        setWindowError(failure);
+        if (ssoExpired(message)) setDesktopRetry({ target, split, error: failure });
       }
     } finally {
       setDesktopOpening(current => current === pending ? undefined : current);
@@ -993,7 +1003,7 @@ export function Workspace() {
               }}>
               {tab.kind === "terminal" ? (
                 <TerminalView active={visible} focusRequested={id === focusTab} label={label} targetId={tab.targetId}
-                  elevation={tab.elevation}
+                  elevation={tab.elevation} reconnect={!tab.elevation}
                   remote={!!tab.ssm} ssh={!!tab.ssh} remoteEditor={tab.remoteEditor} closing={!!tab.closeStatus} closeRef={tab.ssm || tab.ssh ? bindClose : undefined}
                   onStatus={(status, sessionId) => updateStatus(id, status, sessionId)} />
               ) : tab.kind === "tunnel" ? (
@@ -1055,6 +1065,7 @@ export function Workspace() {
         {closeBlock && <span role="status">{closeBlock.message}</span>}
         {closeError && <span role="alert">{closeError}</span>}
         {windowError && <span role="alert">{windowError}</span>}
+        {desktopRetry?.error === windowError && <SsoLoginAction login={desktopLogin} />}
         {fileError && <span role="alert">{fileError}</span>}
         {hostRegistration && <span role={hostRegistration.kind}>{hostRegistration.message}</span>}
         {desktopOpening && <span role="status" className="workspace-status-pending">{desktopOpening.label} 경로 여는 중

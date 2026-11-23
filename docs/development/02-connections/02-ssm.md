@@ -44,6 +44,22 @@ JS는 문서에서 `window.__ZZABBA_SSM_DOCUMENT__`를 읽는다. 아직 값이 
 
 격리 시험: `cargo test --manifest-path app/src-tauri/Cargo.toml ssm::ipc::tests`.
 
+### 저장 대상의 SSO 재로그인
+
+SSM 셸, SSH-over-SSM, SSM 경로의 RDP·VNC, SSM 포트 전달을 열다가 `SSM: SSO 재로그인 필요`로 실패하면 해당 위치에 `SSO 로그인` 단추(`LogIn`)를 표시한다. 터미널 탭은 탭 아래 상태 줄에, 원격 화면 프로필은 작업 공간 상태 줄에, SSM 터널은 실패한 터널 행에 단추를 둔다. 판별 문자열은 `app/src/features/ssm/ssoLogin.tsx`의 `SSO_LOGIN_REQUIRED` 한 곳에서 정의한다. Rust의 `start_error(CliError::SsoLoginRequired)`와 같은 값인지 Rust 시험이 확인한다.
+
+호출 형식은 `invoke("ssm_target_relogin", { targetId, requestId })`이다. `requestId`는 프런트가 만든 UUID이며 성공 값은 `"valid"` 또는 `"loggedIn"`이다. Rust는 `targetId`로 연결 저장소를 읽어 SSM 대상의 범위, SSH 대상의 `transport: ssm`, RDP·VNC의 `route: ssm`에서만 프로필과 리전을 고른다. 그 밖의 대상은 확인 호출 전에 거부한다. 직접 SSO 프로필이 아니면 `SsoLoginNotApplicable`로 거부한다.
+
+1. 선택한 직접 SSO 설정을 읽는다.
+2. 그 설정으로 `aws configure export-credentials`와 `aws sts get-caller-identity`를 실행해 신원을 확인한다. 노드 조회는 하지 않는다.
+3. 확인 결과가 `SsoLoginRequired`일 때만 `relogin_saved`로 `aws sso login --profile <profile>`을 실행한다. 1단계의 설정이 바뀌었으면 로그인하지 않는다. 확인이 성공하면 로그인 없이 `"valid"`를 반환하고, 다른 오류는 그대로 반환한다.
+
+같은 대상의 로그인은 하나만 실행한다. 진행 중에 다시 요청하면 `SSO 로그인 진행 중`으로 거부한다. `invoke("ssm_target_relogin_cancel", { requestId })`는 해당 요청만 취소한다. 기본 창의 문서 전환·창 종료·앱 종료에서는 Rust가 모든 로그인을 취소한다. 두 명령은 로컬 `main` 웹뷰의 `local-ssm-login` 권한에만 등록한다.
+
+성공하면 같은 대상을 다시 연다. 터미널은 세션 세대를 올려 새 세션을 시작하고, 원격 화면은 같은 프로필의 경로를 같은 위치에 다시 열고, 터널은 그 탭에서 시작한 같은 요청을 다시 승인받아 시작한다. 진행 중에는 `SSO 로그인 중`, 실패하면 `SSO 로그인 실패: <오류>`를 표시한다. SSO 외 사유로 열기에 실패한 터미널 탭에는 `다시 연결` 단추(`RotateCcw`)를 둔다. sudo 승격 탭은 제외한다.
+
+격리 시험: `cargo test --manifest-path app/src-tauri/Cargo.toml ssm::target_login`, `npx vitest run src/features/terminal/TerminalView.sso.test.tsx src/features/tunnels/TunnelTab.test.tsx`.
+
 ### 연결 프로필과 시험 자격
 
 마법사의 `AWS Systems Manager` 방식은 SSO 프로필, 리전, 온라인 노드를 선택한다. 리전을 수정한 뒤에는 `리전 적용`을 눌러 새 범위에서 노드를 다시 선택해야 시험 단계로 넘어갈 수 있다. 프로필·리전·노드를 바꾸면 이전 시험과 저장 자격이 취소된다. 시험 실패 후에도 선택한 값은 남으며, 시험·저장 화면에는 표시명과 별도로 SSO 프로필, 리전, 인스턴스 ID가 표시된다.

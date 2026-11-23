@@ -45,6 +45,7 @@ pub fn run() {
     let other_commands: fn(tauri::ipc::Invoke) -> bool = tauri::generate_handler![
         terminal_start, terminal_input, terminal_resize, terminal_ack, terminal_close,
         workspace_window,
+        ssm::target_login::ssm_target_relogin, ssm::target_login::ssm_target_relogin_cancel,
     ];
     tauri::Builder::default()
         .manage(Sessions::default())
@@ -58,6 +59,7 @@ pub fn run() {
         .manage(tunnels::ipc::TunnelTabs::default())
         .manage(rdp::ipc::Sessions::default())
         .manage(vnc::ipc::Sessions::default())
+        .manage(ssm::target_login::TargetLogins::default())
         .register_asynchronous_uri_scheme_protocol("rdp-packet", rdp::ipc::protocol)
         .register_asynchronous_uri_scheme_protocol("vnc-packet", vnc::output::protocol)
         .plugin(ssm::ipc::lifecycle())
@@ -85,6 +87,7 @@ pub fn run() {
                     webview.state::<rdp::ipc::Sessions>().retire();
                     webview.state::<vnc::ipc::Sessions>().retire(false);
                     webview.state::<ai::execution::State>().cancel_all();
+                    webview.state::<ssm::target_login::TargetLogins>().cancel_all();
                 }
                 if let Some(registration) = webview.try_state::<ssh::registration::Registration>() {
                     registration.document_changed(webview.label());
@@ -181,6 +184,7 @@ pub fn run() {
                 if label == "main" {
                     app.state::<rdp::ipc::Sessions>().retire();
                     app.state::<vnc::ipc::Sessions>().retire(true);
+                    app.state::<ssm::target_login::TargetLogins>().cancel_all();
                 }
                 if let Some(registration) = app.try_state::<ssh::registration::Registration>() {
                     registration.document_changed(&label);
@@ -200,6 +204,7 @@ pub fn run() {
                 if let Some(code) = exit_code { app.exit(code); }
             }
             tauri::RunEvent::Exit => {
+                app.state::<ssm::target_login::TargetLogins>().cancel_all();
                 app.state::<rdp::ipc::Sessions>().retire();
                 app.state::<vnc::ipc::Sessions>().retire(true);
                 app.state::<tunnels::ipc::TunnelTabs>().navigate(true);

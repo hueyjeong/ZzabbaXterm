@@ -31,6 +31,7 @@ fn main() {
         "ai_cancel_proposal",
         "ai_decisions",
         "ssm_discovery",
+        "ssm_target_relogin", "ssm_target_relogin_cancel",
         "storage_open", "storage_list_buckets", "storage_list_objects", "storage_select_local_file",
         "storage_compatible_load", "storage_compatible_open",
         "storage_compatible_enroll",

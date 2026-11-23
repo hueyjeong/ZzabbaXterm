@@ -1,8 +1,11 @@
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
+import { RotateCcw } from "lucide-react";
 import { useImperativeHandle, useLayoutEffect, useRef, useState, type Ref } from "react";
 import type { ElevationRequest } from "../elevation/elevation";
+import { SsoLoginAction, ssoExpired, useSsoLogin, type SsoLoginIpc } from "../ssm/ssoLogin";
+import { IconButton } from "../ui/controls";
 import { connectLocalTerminal, type LocalTerminal, type LocalTerminalIpc, type TerminalStatus } from "./session";
 import "./terminal.css";
 
@@ -19,6 +22,9 @@ export interface TerminalViewProps {
   readonly closing?: boolean;
   readonly closeRef?: Ref<{ confirmClose(): Promise<void> }>;
   readonly onStatus?: (status: TerminalStatus, sessionId?: string) => void;
+  /** 열기에 실패하면 다시 연결 단추를 보인다. */
+  readonly reconnect?: boolean;
+  readonly ssoIpc?: SsoLoginIpc;
 }
 
 function text(status: TerminalStatus) {
@@ -32,7 +38,7 @@ function text(status: TerminalStatus) {
   }
 }
 
-export function TerminalView({ active, focusRequested, label, targetId, ipc, remote, ssh, remoteEditor, elevation, closing, closeRef, onStatus }: TerminalViewProps) {
+export function TerminalView({ active, focusRequested, label, targetId, ipc, remote, ssh, remoteEditor, elevation, closing, closeRef, onStatus, reconnect, ssoIpc }: TerminalViewProps) {
   const host = useRef<HTMLDivElement>(null);
   const session = useRef<LocalTerminal | undefined>(undefined);
   const stopRequested = useRef(false);
@@ -46,6 +52,15 @@ export function TerminalView({ active, focusRequested, label, targetId, ipc, rem
   const [status, setStatus] = useState<TerminalStatus>({ kind: "opening" });
   const statusListener = useRef(onStatus);
   useLayoutEffect(() => { statusListener.current = onStatus; }, [onStatus]);
+  // 세대를 올리면 기존 세션을 닫고 같은 대상으로 새 세션을 연다.
+  const [generation, setGeneration] = useState(0);
+  function reopen() {
+    const opening: TerminalStatus = { kind: "opening" };
+    setStatus(opening);
+    statusListener.current?.(opening);
+    setGeneration(value => value + 1);
+  }
+  const ssoLogin = useSsoLogin(targetId, reopen, ssoIpc);
 
   useLayoutEffect(() => {
     const element = host.current;
@@ -118,17 +133,23 @@ export function TerminalView({ active, focusRequested, label, targetId, ipc, rem
       session.current = undefined;
       term.dispose();
     };
-  }, [targetId, ipc, remote, ssh, remoteEditor, elevation]);
+  }, [targetId, ipc, remote, ssh, remoteEditor, elevation, generation]);
 
   useLayoutEffect(() => {
     refresh.current?.(active, !closing && status.kind === "running", focusRequested);
   }, [active, closing, status.kind, focusRequested]);
 
   const message = text(status);
+  const failed = status.kind === "failed" && !closing;
+  const expired = failed && !!targetId && !elevation && ssoExpired(status.value);
   return (
     <section className="terminal-view" aria-label={label} hidden={!active}>
       <div className="terminal-screen" ref={host} inert={closing || status.kind !== "running"} />
-      {message && <div className="terminal-status" role="status">{message}</div>}
+      {(message || expired || (failed && reconnect)) && <div className="terminal-status">
+        {message && <span role="status">{message}</span>}
+        {expired ? <SsoLoginAction login={ssoLogin} />
+          : failed && reconnect && <IconButton icon={RotateCcw} label="다시 연결" small onClick={reopen} />}
+      </div>}
     </section>
   );
 }

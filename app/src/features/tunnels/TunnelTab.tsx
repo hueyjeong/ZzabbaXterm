@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
+import { SsoLoginButton, SsoLoginStatus, ssoExpired, useSsoLogin, type SsoLoginIpc } from "../ssm/ssoLogin";
 import { tunnelIpc, type DesktopTunnelSource, type TunnelRequest, type TunnelStatus } from "./tunnelIpc";
 import "./tunnel.css";
 
@@ -10,13 +11,14 @@ type Props = Readonly<{
   closeState?: CloseState;
   onShare(targetId: string, tab: string, id: string): Promise<void>;
   onOpenDesktop(protocol: "rdp" | "vnc", source: DesktopTunnelSource): void;
+  ssoIpc?: SsoLoginIpc;
 }>;
 
 const states = {
   starting: "준비 중", ready: "수신 준비됨", failed: "시작 실패", disconnected: "끊김",
 } satisfies Record<TunnelStatus["state"], string>;
 
-export function TunnelTab({ tab, targetId, method, closeState, onShare, onOpenDesktop }: Props) {
+export function TunnelTab({ tab, targetId, method, closeState, onShare, onOpenDesktop, ssoIpc }: Props) {
   const windows = /Windows/.test(navigator.userAgent);
   const [direction, setDirection] = useState<Exclude<TunnelRequest["direction"], "ssm">>("local");
   const [tunnels, setTunnels] = useState<readonly TunnelStatus[]>([]);
@@ -25,6 +27,14 @@ export function TunnelTab({ tab, targetId, method, closeState, onShare, onOpenDe
   const [error, setError] = useState("");
   const [statusError, setStatusError] = useState("");
   const closing = closeState !== undefined;
+  // 이 탭에서 시작한 요청이다. SSO 로그인 뒤 같은 요청으로 다시 시작한다.
+  const requests = useRef(new Map<string, TunnelRequest>());
+  const retry = useRef<TunnelRequest | undefined>(undefined);
+  const login = useSsoLogin(targetId, () => {
+    const request = retry.current;
+    retry.current = undefined;
+    if (request) void run(() => begin(request));
+  }, ssoIpc);
 
   useEffect(() => {
     if (closing) return;
@@ -53,6 +63,11 @@ export function TunnelTab({ tab, targetId, method, closeState, onShare, onOpenDe
     finally { busy.current = false; setPending(false); }
   }
 
+  async function begin(request: TunnelRequest) {
+    const id = await tunnelIpc.start(tab, request);
+    if (id !== null) requests.current.set(id, request);
+  }
+
   function start(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (method === "ssh" && windows && direction === "remote") return;
@@ -66,7 +81,7 @@ export function TunnelTab({ tab, targetId, method, closeState, onShare, onOpenDe
       : direction === "local" ? { direction, listen, host, port, protocol }
         : direction === "remote" ? { direction, listen, host, port }
           : { direction, listen };
-    void run(() => tunnelIpc.start(tab, request));
+    void run(() => begin(request));
   }
 
   const service = <label>서비스 <select name="protocol">
@@ -109,6 +124,7 @@ export function TunnelTab({ tab, targetId, method, closeState, onShare, onOpenDe
     </>}
     {!closing && error && <div role="alert">{error}</div>}
     {!closing && statusError && <div role="alert">상태 확인 실패: {statusError}</div>}
+    {!closing && <SsoLoginStatus login={login} />}
     <ul aria-label="이 탭의 터널">
       {tunnels.map(tunnel => {
         const desktop = !closing && !statusError && tunnel.state === "ready" ? tunnel.desktop : undefined;
@@ -116,6 +132,9 @@ export function TunnelTab({ tab, targetId, method, closeState, onShare, onOpenDe
           <strong>{tunnel.route}</strong> <span role="status">{states[tunnel.state]}</span>
           <div>{tunnel.endpoint} · 소유 탭: {tunnel.owners.join(", ")}</div>
           {tunnel.error && <div role="alert">{tunnel.error}</div>}
+          {tunnel.state === "failed" && ssoExpired(tunnel.error) && requests.current.has(tunnel.id) &&
+            <SsoLoginButton login={login} disabled={closing || pending}
+              onStart={() => { retry.current = requests.current.get(tunnel.id); }} />}
           {(tunnel.state === "starting" || tunnel.state === "ready") &&
             <button type="button" disabled={closing || pending} onClick={() => void run(() => onShare(targetId, tab, tunnel.id))}>새 탭에 공유</button>}
           {(desktop?.protocol === "rdp" || desktop?.protocol === "vnc") &&

@@ -6,6 +6,7 @@ pub mod ipc;
 mod plugin;
 mod profile;
 mod session;
+pub(crate) mod target_login;
 #[cfg(windows)]
 pub(crate) mod windows_acl;
 
@@ -136,6 +137,19 @@ impl AwsCli {
         .await
     }
 
+    /// SSO 자격을 내보내고 STS 신원 확인만 한다. 노드 조회는 하지 않는다.
+    pub(crate) async fn check_identity(
+        &self,
+        scope: &Scope,
+        config: &DirectSsoConfig,
+        cancel: &CancellationToken,
+    ) -> Result<(), CliError> {
+        let home = home::CliHome::new()?;
+        home.import_sso_token(&home::user_home()?, config.cache_key())?;
+        let mut capture = |spec: CommandSpec| async move { spec.capture(cancel).await };
+        self.caller_with(scope, &config.cli_ini(), Arc::new(home), &mut capture).await.map(drop)
+    }
+
     // Tauri 작업은 캡처 클로저를 빌리지 않는 Send 퓨처를 사용한다.
     async fn online_nodes_with<F>(
         &self,
@@ -144,6 +158,25 @@ impl AwsCli {
         home: Arc<home::CliHome>,
         mut capture: impl FnMut(CommandSpec) -> F + Send,
     ) -> Result<Vec<OnlineNode>, CliError>
+    where
+        F: Future<Output = Result<Captured, CliError>> + Send,
+    {
+        let (credentials, owner, role) = self.caller_with(scope, config, home, &mut capture).await?;
+        let result = capture(
+            self.nodes_command(scope)
+                .with_credentials(scope, &credentials),
+        )
+        .await?;
+        self.parse_online_nodes(scope, owner, role, credentials, result)
+    }
+
+    async fn caller_with<F>(
+        &self,
+        scope: &Scope,
+        config: &str,
+        home: Arc<home::CliHome>,
+        capture: &mut (impl FnMut(CommandSpec) -> F + Send),
+    ) -> Result<(Arc<Credentials>, Arc<str>, Option<Arc<AssumedRole>>), CliError>
     where
         F: Future<Output = Result<Captured, CliError>> + Send,
     {
@@ -171,12 +204,7 @@ impl AwsCli {
         drop(home);
         let identity = session::identity_command(&self.0, scope, &credentials);
         let (owner, role) = session::captured_caller(capture(identity).await?)?;
-        let result = capture(
-            self.nodes_command(scope)
-                .with_credentials(scope, &credentials),
-        )
-        .await?;
-        self.parse_online_nodes(scope, owner, role, credentials, result)
+        Ok((credentials, owner, role))
     }
 
     pub fn relogin_command(&self, scope: &Scope, cause: CliError) -> Result<CommandSpec, CliError> {
