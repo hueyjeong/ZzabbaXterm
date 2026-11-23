@@ -4,7 +4,7 @@
 
 사용자 결과: 가운데 탭에 실제 원격 데스크톱이 열리고, 키 입력과 클립보드가 선택한 데스크톱에만 전달된다. xrdp를 SSM 터널로 열어도 인증 대상은 원격 xrdp 서버다.
 
-제목줄의 **RDP**는 직접 접속한다. 준비된 로컬 SSH 전달 행의 **RDP로 열기**는 Rust가 소유한 그 연결을 사용한다. 두 경로에서 원격 인증서 이름을 따로 확인하고 검증된 TLS 위에서 NLA/CredSSP NTLM을 사용한다. xrdp의 TLS 전용 로그인과 공식 SSM 전달은 현재 지원 범위 밖이다.
+제목줄의 **RDP**는 직접 접속한다. 준비된 로컬 SSH 전달 행의 **RDP로 열기**는 Rust가 소유한 그 연결을 사용한다. 두 경로에서 원격 인증서 이름을 따로 확인하고 검증된 TLS 위에서 NLA/CredSSP NTLM을 사용한다. 서버가 NLA를 지원하지 않고 `PROTOCOL_SSL`(TLS 전용)만 고르는 경우에는 연결 설정의 **NLA를 지원하지 않는 서버(TLS 전용) 허용**을 켠 사용자만 같은 대상으로 한 번 재연결해 TLS 위 Client Info로 계정을 전달한다. 공식 SSM 전달은 현재 지원 범위 밖이다.
 
 준비물: 네이티브 Windows 11·Ubuntu 24.04 GNOME Wayland 클라이언트, 승인된 비운영 Windows RDP 및 Linux xrdp 서버, 검증 가능한 원격 DNS 이름과 신뢰 CA, 시험용 원격 계정·필요한 경우 도메인, xrdp 관리 노드의 SSM 전달 권한. 정상 원격 접속 도구와 같은 계정으로 서비스·정책을 먼저 확인한다. 아래 명령은 구현 시점의 `app/` 기준이다.
 
@@ -13,6 +13,15 @@
 - Given Windows RDP 또는 Linux xrdp / When 탭을 열고 원격 편집기에 시험 문구를 입력 / Then 서버가 보낸 프레임에 그 문구가 나타난다. xrdp 직접과 SSM 경유 모두 같은 원격 이름을 검증한다.
 - Given TCP 상대가 루프백인 터널 / When 서버 인증서의 이름·유효기간·체인 중 하나가 틀림 / Then 서비스 자격 증명을 전송하기 전에 중단한다. 잘못된 비밀번호와 인증서 실패는 다른 상태다.
 - Given 다른 탭이 열린 상태 / When 사용 중인 시험 터널을 종료하고 다시 연결 / Then 해당 탭만 끊기고 재접속 후 새 원격 프레임과 입력을 확인할 수 있다. 예전 세션의 입력은 재전송되지 않는다.
+- Given NLA를 지원하지 않는 xrdp / When opt-in을 켜고 연결 / Then 첫 NLA 협상이 `SSL`을 받으면 연결을 닫고 같은 대상·같은 인증서 검증으로 TLS 전용 한 번만 재연결하며, 승인 카드와 연결 상태에 `TLS 전용(표준 RDP 보안 없음)`이 표시된다. opt-in이 꺼져 있으면 자격 증명을 보내지 않고 opt-in 이름을 포함한 오류로 끝난다.
+- Given TLS 전용 연결 / When 인증서 이름·체인·유효기간 중 하나가 틀림 / Then 자격 증명을 Client Info로 보내기 전에 중단한다.
+
+## TLS 전용 모드
+
+- **정책**: 기본은 NLA 우선이다. 첫 연결은 `enable_credssp=true, enable_tls=false`로 `HYBRID|HYBRID_EX`만 요청하므로 서버가 TLS로 다운그레이드할 수 없다. 서버가 `SSL`을 고르면 연결을 닫고, opt-in이 켜진 경우에만 `enable_credssp=false, enable_tls=true`로 같은 대상에 한 번 재연결한다. 재시도는 한 번뿐이며 opt-in은 기본 꺼짐이다.
+- **자격 증명**: TLS 전용에는 CredSSP가 없으므로 사용자·도메인·비밀번호는 검증된 TLS 위의 Client Info PDU로 전달한다. 승인 카드·금고 경로는 NLA와 같고, 비밀번호를 로그·argv·WebView에 남기지 않는다. 세션 활성화 후 `ConnectTimeAutoDetection`에서 config의 자격 증명을 비운다.
+- **인증서**: TLS 전용도 원격 DNS 이름·체인·유효기간을 검증한다. 인증서 검증을 끄는 옵션은 없다. 자체 서명 서버는 시험용 CA를 OS 현재 사용자 신뢰 저장소에 설치해 검증하고, 사용이 끝나면 제거한다.
+- **표시**: opt-in을 켜면 승인 카드와 연결 상태에 `NLA, 미지원 시 TLS 전용(표준 RDP 보안 없음)`을 표시한다. opt-in이 꺼진 채 서버가 `SSL`을 고르면 `RDP 서버가 NLA를 지원하지 않습니다. 연결 설정에서 'NLA를 지원하지 않는 서버(TLS 전용) 허용'을 켜야 합니다`로 중단한다.
 
 ## 구현 순서
 
@@ -25,6 +34,8 @@
 
 ## 실측 기록
 
-- xrdp 0.9.24(Ubuntu 24.04 패키지, `security_layer=negotiate`)는 RDP 협상 요청에 항상 `RDP_NEG_RSP selectedProtocol = 0x1`(SSL/TLS 전용)로 답한다. `HYBRID`·`HYBRID_EX`만 요청해도 같은 값이 온다. 따라서 이 패키지로는 NLA 로그인을 협상할 수 없고, 앱은 `RDP 서버와 NLA를 협상할 수 없습니다`로 중단한다. 이는 제품의 TLS+NLA 전용 정책과 xrdp 배포판 기본 빌드의 차이며, 시험에는 NLA를 지원하는 RDP 서버가 필요하다.
-- 확인 방법: 컨테이너의 `127.0.0.1:3389`에 X.224 `Connection Request` + `RDP_NEG_REQ`(`requestedProtocols`를 0x0b, 0x08, 0x02, 0x01로 각각)를 보내고 응답의 `selectedProtocol`을 읽는다. 네 경우 모두 `0x1`이었다.
-- 이 실측은 실제 원격 화면·입력 인수를 대신하지 않는다. T5는 승인된 Windows RDP 및 NLA 지원 xrdp 서버에서 따로 기록한다.
+- xrdp 0.9.24(Ubuntu 24.04 패키지, `security_layer=negotiate`)는 `HYBRID|HYBRID_EX`만 요청하면 `RDP_NEG_RSP selectedProtocol = 0x0`(RDP 표준 보안)을 돌려주고, `SSL`을 요청하면 `0x1`(TLS 전용)을 돌려준다. 즉 NLA를 모르는 서버는 SSL로 다운그레이드하지 않고 RDP 표준 보안을 고른다. 앱은 NLA가 아닌 선택을 모두 NLA 미지원으로 보고 opt-in이 켜진 경우에만 `SSL` 요청으로 한 번 재협상한다.
+- 시험 컨테이너 `zzabba-demo-remote`(xrdp 0.9.24, SSH `127.0.0.1:2299`)에 `SAN=DNS:xrdp.demo.test,DNS:localhost`인 시험 CA 서명 인증서를 설치하고, 그 CA를 Windows 현재 사용자 신뢰 저장소에 넣은 뒤 `localhost:13389`(SSH 로컬 전달 → 컨테이너 `127.0.0.1:3389`)로 앱에서 연결했다. 승인 카드와 연결 상태에 `NLA, 미지원 시 TLS 전용(표준 RDP 보안 없음)`이 표시됐고, xrdp 로그에 `requested [HYBRID|HYBRID_EX|RDP], selected [RDP]` 뒤 `requested [SSL|RDP], selected [SSL]`, `TLSv1.3`, Client Info 수신과 capability 교환이 기록됐다. 인증서 이름 불일치는 자격 증명 입력 전에 중단된다.
+- 위 실측에서 앱은 Confirm Active 직후 첫 화면 PDU를 `RDP 화면 또는 입력 범위가 올바르지 않습니다`(`Error::Bounds`)로 거부하고 연결을 닫았다. TLS 전용 협상·TLS 1.3·Client Info 자격 증명·capability 교환까지는 도달했으나 원격 화면과 키 입력은 확인하지 못했다. 같은 엔진의 NLA 경로도 xrdp에서는 이전에 시험된 적이 없으므로, 첫 fast-path 화면 PDU의 사각형/비트맵 폭 검사와 xrdp 출력의 차이를 별도 결함으로 다뤄야 한다. 실제 원격 화면·입력 인수는 이 수정 뒤 다시 기록한다.
+- 확인 방법: 컨테이너의 `127.0.0.1:3389`에 X.224 `Connection Request` + `RDP_NEG_REQ`(`requestedProtocols`를 0x0b, 0x0a, 0x08, 0x02, 0x01로 각각)를 보내고 응답의 `selectedProtocol`을 읽는다. 0x0b·0x01은 0x1, 0x0a·0x08·0x02는 0x0이었다.
+- 자동 시험: `cargo test rdp::connect::tests`의 `tls_only_retries_once_and_activates_with_client_info_credentials`, `tls_only_stops_before_credentials_when_the_certificate_name_differs`, `rejects_non_nla_selection_without_opt_in_and_legacy_modes_without_resolving_credentials`가 협상 매트릭스·자격 증명·인증서 중단을 고정한다. `cargo test rdp::ipc::tests`와 Vitest `src/features/rdp`가 승인 문구·opt-in 전달·표시를 확인한다.

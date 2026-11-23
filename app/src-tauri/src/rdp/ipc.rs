@@ -105,6 +105,8 @@ struct Identity { session_id: String, generation: u64 }
 struct Draft {
     host: String,
     port: u16,
+    #[serde(default)]
+    tls_only: bool,
     #[serde(default, deserialize_with = "read_source")]
     source: Option<Source>,
 }
@@ -124,15 +126,16 @@ fn read_source<'de, D: serde::Deserializer<'de>>(value: D) -> Result<Option<Sour
 impl Draft {
     fn approval_text(&self, dns: &str) -> Result<String, Error> {
         if !route::dns_name(dns) || self.port == 0 { return Err(Error::InvalidServerName); }
+        let login = if self.tls_only { "NLA, 미지원 시 TLS 전용(표준 RDP 보안 없음)" } else { "NLA" };
         let Some(source) = &self.source else {
-            return Ok(format!("서버: {dns}:{}\n경로: 직접\n로그인: NLA", self.port));
+            return Ok(format!("서버: {dns}:{}\n경로: 직접\n로그인: {login}", self.port));
         };
         let ForwardDestination { host, port } = &source.destination;
         if !matches!(host.as_str(), "127.0.0.1" | "::1") || *port != self.port || !valid_id(&source.target_id) {
             return Err(Error::InvalidForwardDestination);
         }
         let destination = std::net::SocketAddr::new(host.parse().map_err(|_| Error::InvalidForwardDestination)?, *port);
-        Ok(format!("경로: R01 SSH 전달\nSSH 대상 ID: {}\n포워드 목적지: {destination}\nTLS 인증 DNS: {dns}\n로그인: NLA", source.target_id))
+        Ok(format!("경로: R01 SSH 전달\nSSH 대상 ID: {}\n포워드 목적지: {destination}\nTLS 인증 DNS: {dns}\n로그인: {login}", source.target_id))
     }
 }
 
@@ -404,12 +407,12 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
         let lease = lease.insert(issued);
         if life.is_cancelled() { return Err(CLOSED.into()); }
         let loss = lease.loss();
-        let target = route::forwarded(dns, &approved_destination, size, lease).map_err(message)?;
+        let target = route::forwarded(dns, &approved_destination, size, lease, draft.tls_only).map_err(message)?;
         (target, Some(loss), target_name)
     } else {
         native::confirm(window.clone(), description, prompt.clone(), approval.clone()).await.map_err(message)?;
         let target_name = format!("{dns}:{}", draft.port);
-        (route::direct(dns, draft.port, size), None, target_name)
+        (route::direct(dns, draft.port, size, draft.tls_only), None, target_name)
     };
     let stopped = async {
         tokio::select! { biased;
@@ -518,6 +521,7 @@ pub(super) fn message(error: Error) -> &'static str {
         Error::InvalidForwardDestination => "RDP 터널 목적지가 올바르지 않습니다",
         Error::Tcp => "RDP TCP 연결 실패",
         Error::Negotiation => "RDP 서버와 NLA를 협상할 수 없습니다",
+        Error::TlsOnlyRequired => "RDP 서버가 NLA를 지원하지 않습니다. 연결 설정에서 'NLA를 지원하지 않는 서버(TLS 전용) 허용'을 켜야 합니다",
         Error::TrustStore => "RDP 신뢰 저장소를 읽을 수 없습니다",
         Error::TlsIdentity => "RDP 서버 TLS 인증서 검증 실패",
         Error::Authentication => "RDP NLA 계정 인증 실패",
@@ -568,6 +572,18 @@ mod tests {
         })).unwrap();
         assert_eq!(direct.approval_text(&direct.host).unwrap(),
             "서버: rdp.example.invalid:3389\n경로: 직접\n로그인: NLA");
+        let opt_in: Draft = serde_json::from_value(serde_json::json!({
+            "host": "rdp.example.invalid", "port": 3389, "tlsOnly": true
+        })).unwrap();
+        assert_eq!(opt_in.approval_text(&opt_in.host).unwrap(),
+            "서버: rdp.example.invalid:3389\n경로: 직접\n로그인: NLA, 미지원 시 TLS 전용(표준 RDP 보안 없음)");
+        let forwarded_opt_in: Draft = serde_json::from_value(serde_json::json!({
+            "host": "rdp.example.invalid", "port": 3390, "tlsOnly": true,
+            "source": { "tabHandle": "owned-tab", "tunnelId": "7", "targetId": "ssh-server",
+                "destination": { "host": "127.0.0.1", "port": 3390 } }
+        })).unwrap();
+        assert_eq!(forwarded_opt_in.approval_text(&forwarded_opt_in.host).unwrap(),
+            "경로: R01 SSH 전달\nSSH 대상 ID: ssh-server\n포워드 목적지: 127.0.0.1:3390\nTLS 인증 DNS: rdp.example.invalid\n로그인: NLA, 미지원 시 TLS 전용(표준 RDP 보안 없음)");
     }
 
     #[test]

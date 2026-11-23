@@ -111,9 +111,10 @@ fn listener() -> TcpListener {
     TcpListener::from_std(listener).unwrap()
 }
 
-async fn fixture_target(listener: &TcpListener, size: DesktopSize) -> Target {
+async fn fixture_target(listener: &TcpListener, size: DesktopSize, tls_only: bool, dns: &str) -> Target {
     let stream = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
-    Target { endpoint: Endpoint::Forwarded(stream), server_name: REMOTE.into(), size }
+    let listen = stream.peer_addr().unwrap();
+    Target { endpoint: Endpoint::Forwarded { stream: Some(stream), listen }, server_name: dns.into(), size, tls_only }
 }
 
 fn fixture_policy(_: &str, _: &[rustls::pki_types::CertificateDer<'_>]) -> Result<(), Error> {
@@ -189,12 +190,13 @@ async fn exercise(
     let calls = AtomicUsize::new(0);
     let size = DesktopSize { width: 800, height: 600 };
     let target = if forwarded {
-        fixture_target(listener, size).await
+        fixture_target(listener, size, false, REMOTE).await
     } else {
         Target {
             endpoint: Endpoint::Direct(listener.local_addr().unwrap().port()),
             server_name: "localhost".into(),
             size,
+            tls_only: false,
         }
     };
     let name = ServerName::try_from(target.server_name.clone()).unwrap();
@@ -300,16 +302,12 @@ async fn rejects_peer_policy_before_credentials_on_both_routes() {
 }
 
 #[tokio::test]
-async fn rejects_tls_only_and_legacy_modes_without_resolving_credentials() {
+async fn rejects_non_nla_selection_without_opt_in_and_legacy_modes_without_resolving_credentials() {
     let listener = listener();
-    for protocol in [
-        SecurityProtocol::SSL,
-        SecurityProtocol::empty(),
-        SecurityProtocol::SSL | SecurityProtocol::HYBRID,
-    ] {
+    for protocol in [SecurityProtocol::empty(), SecurityProtocol::SSL, SecurityProtocol::SSL | SecurityProtocol::HYBRID] {
         assert_eq!(
             exercise(&listener, protocol, true, REMOTE, false, true, fixture_policy).await,
-            (Error::Negotiation, 0, false)
+            (Error::TlsOnlyRequired, 0, false)
         );
         assert!(
             timeout(Duration::from_millis(25), listener.accept())
@@ -317,6 +315,196 @@ async fn rejects_tls_only_and_legacy_modes_without_resolving_credentials() {
                 .is_err()
         );
     }
+}
+
+type ClientInfo = (String, Option<String>, String);
+
+fn tls_server(key: KeyPair, cert: rustls::pki_types::CertificateDer<'static>) -> Arc<rustls::ServerConfig> {
+    Arc::new(
+        rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], PrivatePkcs8KeyDer::from(key.serialize_der()).into())
+            .unwrap(),
+    )
+}
+
+/// 첫 연결에는 NLA 우선 요청을 SSL로 거절하고, 두 번째 TLS 전용 연결에서만 Client Info를 받는다.
+async fn tls_only_server(
+    listener: &TcpListener,
+    tls_server: Arc<rustls::ServerConfig>,
+    size: DesktopSize,
+    activate: bool,
+) -> Option<ClientInfo> {
+    let (socket, _) = listener.accept().await.unwrap();
+    let mut framed = TokioFramed::new(socket);
+    let (_, bytes) = framed.read_pdu().await.unwrap();
+    assert_eq!(
+        decode::<X224<ConnectionRequest>>(&bytes).unwrap().0.protocol,
+        SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX
+    );
+    let (mut socket, leftover) = framed.into_inner();
+    assert!(leftover.is_empty());
+    socket
+        .write_all(&encode_vec(&X224(ConnectionConfirm::Response {
+            flags: ResponseFlags::empty(),
+            // xrdp는 HYBRID를 모르면 SSL이 아니라 RDP(표준 보안)를 고른다.
+            protocol: SecurityProtocol::empty(),
+        })).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(socket.read(&mut [0u8; 1]).await.unwrap(), 0);
+
+    let (socket, _) = listener.accept().await.unwrap();
+    let mut framed = TokioFramed::new(socket);
+    let (_, bytes) = framed.read_pdu().await.unwrap();
+    assert_eq!(
+        decode::<X224<ConnectionRequest>>(&bytes).unwrap().0.protocol,
+        SecurityProtocol::SSL
+    );
+    use ironrdp::pdu::rdp::capability_sets::{Bitmap, BitmapDrawingFlags, CapabilitySet};
+    let mut acceptor = Acceptor::new(
+        SecurityProtocol::SSL,
+        size,
+        vec![CapabilitySet::Bitmap(Bitmap {
+            pref_bits_per_pix: 32,
+            desktop_width: size.width,
+            desktop_height: size.height,
+            desktop_resize_flag: true,
+            drawing_flags: BitmapDrawingFlags::empty(),
+        })],
+        None,
+    );
+    let mut output = WriteBuf::new();
+    acceptor.step(&bytes, &mut output).unwrap();
+    output.clear();
+    acceptor.step(&[], &mut output).unwrap();
+    framed.write_all(output.filled()).await.unwrap();
+    assert_eq!(acceptor.reached_security_upgrade(), Some(SecurityProtocol::SSL));
+    let (socket, leftover) = framed.into_inner();
+    assert!(leftover.is_empty());
+    let Ok(tls) = TlsAcceptor::from(tls_server).accept(socket).await else {
+        return None;
+    };
+    acceptor.mark_security_upgrade_as_done();
+    if !activate {
+        return None;
+    }
+    let (mut framed, result) = accept_finalize(TokioFramed::new(tls), &mut acceptor).await.ok()?;
+    let credentials = result.credentials.map(|c| (c.username, c.domain, c.password));
+    framed
+        .write_all(&crate::rdp::frame::tests::marker_frame(false))
+        .await
+        .ok()?;
+    framed
+        .write_all(&crate::rdp::frame::tests::bitmap_frame(InclusiveRectangle {
+            left: 1,
+            top: 0,
+            right: 1,
+            bottom: 1,
+        }))
+        .await
+        .ok()?;
+    credentials
+}
+
+#[tokio::test]
+async fn tls_only_retries_once_and_activates_with_client_info_credentials() {
+    use crate::rdp::{Event, SLOTS, Session};
+
+    let size = DesktopSize { width: 800, height: 600 };
+    let ca = root();
+    let key = KeyPair::generate().unwrap();
+    let cert = CertificateParams::new(vec![REMOTE.to_owned()])
+        .unwrap()
+        .signed_by(&key, &ca)
+        .unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca.der().clone()).unwrap();
+    let listener = listener();
+    let server = tls_only_server(&listener, tls_server(key, cert.der().clone()), size, true);
+    let client = async {
+        let slot = Slot::new(1);
+        let mut session = Session::open_with_tls(
+            fixture_target(&listener, size, true, REMOTE).await,
+            REMOTE.try_into().unwrap(),
+            tls_config(roots),
+            || async {
+                Ok(Account {
+                    username: "fixture".into(),
+                    domain: Some("EXAMPLE".into()),
+                    password: zeroize::Zeroizing::new("fixture-only".into()),
+                })
+            },
+            SLOTS.try_acquire().unwrap(),
+            AuthIo::new(&slot, None),
+        )
+        .await?;
+        let frame = loop {
+            match session.next().await {
+                Some(Event::Frame(frame)) => break frame,
+                Some(_) => {}
+                None => return Err(Error::Closed),
+            }
+        };
+        assert_eq!((frame.width, frame.height), (size.width, size.height));
+        assert_eq!(&frame.rgba[4..8], &[255, 0, 0, 255]);
+        session.close().await;
+        Ok::<_, Error>(())
+    };
+    let client = TEST_PEER_POLICY.scope(fixture_policy, client);
+    let (result, credentials) = timeout(Duration::from_secs(5), async {
+        tokio::join!(client, server)
+    })
+    .await
+    .unwrap();
+    result.unwrap();
+    assert_eq!(
+        credentials,
+        Some(("fixture".into(), Some("EXAMPLE".into()), "fixture-only".into()))
+    );
+}
+
+#[tokio::test]
+async fn tls_only_stops_before_credentials_when_the_certificate_name_differs() {
+    let size = DesktopSize { width: 800, height: 600 };
+    let ca = root();
+    let key = KeyPair::generate().unwrap();
+    let cert = CertificateParams::new(vec![REMOTE.to_owned()])
+        .unwrap()
+        .signed_by(&key, &ca)
+        .unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca.der().clone()).unwrap();
+    let listener = listener();
+    let server = tls_only_server(&listener, tls_server(key, cert.der().clone()), size, false);
+    let calls = AtomicUsize::new(0);
+    let slot = Slot::new(1);
+    let client = connect(
+        fixture_target(&listener, size, true, "wrong.example.test").await,
+        "wrong.example.test".try_into().unwrap(),
+        tls_config(roots),
+        || async {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok(Account {
+                username: "fixture".into(),
+                domain: None,
+                password: zeroize::Zeroizing::new("fixture-only".into()),
+            })
+        },
+        ironrdp::displaycontrol::client::DisplayControlClient::new(|_| Ok(Vec::new())),
+        AuthIo::new(&slot, None),
+    );
+    let client = TEST_PEER_POLICY.scope(fixture_policy, client);
+    let (result, credentials) = timeout(Duration::from_secs(5), async {
+        tokio::join!(client, server)
+    })
+    .await
+    .unwrap();
+    assert!(matches!(result, Err(Error::TlsIdentity)));
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    assert_eq!(credentials, None);
 }
 
 #[cfg(any(windows, target_os = "linux"))]
@@ -509,7 +697,7 @@ async fn activates_and_delivers_pixels_and_key_input_only_for_the_authenticated_
         let client = async {
             let slot = Slot::new(1);
             let mut session = TEST_PEER_POLICY.scope(fixture_policy, Session::open_with_tls(
-                fixture_target(&listener, size).await,
+                fixture_target(&listener, size, false, REMOTE).await,
                 REMOTE.try_into().unwrap(),
                 Arc::clone(&tls),
                 || async {

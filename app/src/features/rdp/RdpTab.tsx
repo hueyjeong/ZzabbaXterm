@@ -7,11 +7,12 @@ const noChannels: Capabilities = { copy: false, paste: false, resize: false };
 
 export interface RdpTabActions { requestClose(): Promise<boolean> }
 
-export function RdpTab({ active, label, source, ref }: { readonly active: boolean; readonly label: string; readonly source?: DesktopTunnelSource; readonly ref?: Ref<RdpTabActions> }) {
+export function RdpTab({ active, label, source, onSecurityMode, ref }: { readonly active: boolean; readonly label: string; readonly source?: DesktopTunnelSource; readonly onSecurityMode?: (tlsOnly: boolean) => void; readonly ref?: Ref<RdpTabActions> }) {
   const cancel = useRef<(() => Promise<void>) | undefined>(undefined);
   const [host, setHost] = useState("");
   const [port, setPort] = useState("3389");
-  const [opening, setOpening] = useState<{ host: string; port: number; forwardedAddress: string | undefined }>();
+  const [tlsOnly, setTlsOnly] = useState(false);
+  const [opening, setOpening] = useState<{ host: string; port: number; forwardedAddress: string | undefined; tlsOnly: boolean }>();
   const [connection, setConnection] = useState<Connection>();
   const [channels, setChannels] = useState(noChannels);
   const [ready, setReady] = useState(false);
@@ -20,6 +21,7 @@ export function RdpTab({ active, label, source, ref }: { readonly active: boolea
   const [closeStatus, setCloseStatus] = useState<"closing" | "unconfirmed">();
   const destination = source?.destination;
   const forwardedAddress = destination && `${destination.host.includes(":") ? `[${destination.host}]` : destination.host}:${destination.port}`;
+  const loginMode = opening?.tlsOnly ? "NLA, 미지원 시 TLS 전용(표준 RDP 보안 없음)" : "NLA";
 
   useLayoutEffect(() => () => { void cancel.current?.().catch(() => { }); }, []);
   useImperativeHandle(ref, () => ({ requestClose }));
@@ -55,8 +57,9 @@ export function RdpTab({ active, label, source, ref }: { readonly active: boolea
     if (!event.nativeEvent.isTrusted || !active || cancel.current) return;
     setError("");
     const hostName = host.trim();
-    const draft = source ? { host: hostName, port: source.destination.port, source } : { host: hostName, port: Number(port) };
-    setOpening({ host: source ? hostName.toLowerCase() : hostName, port: draft.port, forwardedAddress });
+    const draft = source ? { host: hostName, port: source.destination.port, tlsOnly, source } : { host: hostName, port: Number(port), tlsOnly };
+    setOpening({ host: source ? hostName.toLowerCase() : hostName, port: draft.port, forwardedAddress, tlsOnly });
+    onSecurityMode?.(tlsOnly);
     cancel.current = connect(draft, setConnection,
       setChannels, setReady, setNotice, (message, closed) => {
         reset();
@@ -71,10 +74,11 @@ export function RdpTab({ active, label, source, ref }: { readonly active: boolea
       {forwardedAddress && <span>포워드 목적지: {forwardedAddress}</span>}
       <label>{source ? "TLS 인증 DNS" : "서버 DNS"} <input value={host} onChange={(event) => setHost(event.target.value)} required maxLength={253} /></label>
       {!source && <label>포트 <input type="number" value={port} min={1} max={65535} onChange={(event) => setPort(event.target.value)} required /></label>}
+      <label><input type="checkbox" checked={tlsOnly} onChange={(event) => setTlsOnly(event.target.checked)} /> NLA를 지원하지 않는 서버(TLS 전용) 허용</label>
       <button type="submit" disabled={!active}>{source ? "터널 연결" : "직접 연결"}</button>
     </form>}
     {opening && <div className="remote-desktop-toolbar">
-      <span>{opening.forwardedAddress ? <>포워드 목적지: {opening.forwardedAddress} · TLS 인증 DNS: {opening.host} · NLA</> : `${opening.host}:${opening.port} · NLA`}</span>
+      <span>{opening.forwardedAddress ? <>포워드 목적지: {opening.forwardedAddress} · TLS 인증 DNS: {opening.host} · {loginMode}</> : `${opening.host}:${opening.port} · ${loginMode}`}</span>
       {!ready && <span role="status">연결 중</span>}
       <button type="button" onClick={() => { void requestClose(); }}>연결 종료</button>
       {connection && <>

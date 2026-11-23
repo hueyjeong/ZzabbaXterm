@@ -56,6 +56,8 @@ struct Target {
     endpoint: route::Endpoint,
     server_name: String,
     size: DesktopSize,
+    /// 사용자가 승인한 경우에만 NLA 없는 서버에 TLS 전용으로 한 번 재연결한다.
+    tls_only: bool,
 }
 
 /// Local authentication data; never serialized or sent to the renderer.
@@ -77,6 +79,7 @@ pub enum Error {
     InvalidForwardDestination,
     Tcp,
     Negotiation,
+    TlsOnlyRequired,
     TrustStore,
     TlsIdentity,
     Authentication,

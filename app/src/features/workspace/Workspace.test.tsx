@@ -531,7 +531,7 @@ describe("중앙 원격 화면", () => {
     await act(async () => form.requestSubmit());
     expect(connectionCalls(`${protocol}_connect`)).toEqual([[
       `${protocol}_connect`, protocol === "rdp"
-        ? { id: identity, draft: { host: "desktop.example.invalid", port: 3389 }, output }
+        ? { id: identity, draft: { host: "desktop.example.invalid", port: 3389, tlsOnly: false }, output }
         : { owner, draft: { host: "desktop.example.invalid", port: 5900, password: true }, output },
       { headers: { [`x-zzabba-${protocol}-document`]: proof } },
     ]]);

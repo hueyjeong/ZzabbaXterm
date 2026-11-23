@@ -5,12 +5,13 @@ use ironrdp::{
         self, ClientConnector, ClientConnectorState, ConnectionResult, Credentials, DesktopSize,
         Sequence, credssp::CredsspSequence, sspi::generator::GeneratorState,
     },
-    core::WriteBuf,
+    core::{WriteBuf, decode},
     pdu::{
         PduHint,
         gcc::KeyboardType,
-        nego::SecurityProtocol,
+        nego::{ConnectionConfirm, SecurityProtocol},
         rdp::capability_sets::{BitmapCodecs, MajorPlatformType},
+        x224::X224,
     },
 };
 use ironrdp_tokio::{FramedWrite as _, TokioFramed, bytes::Bytes};
@@ -26,13 +27,14 @@ use super::{Account, Error, Target, clipboard::TextClipboard, ipc::AuthIo, route
 
 pub(super) type Transport = TokioFramed<TlsStream<TcpStream>>;
 
-fn config(size: DesktopSize) -> connector::Config {
+fn config(size: DesktopSize, tls_only: bool) -> connector::Config {
     connector::Config {
         desktop_size: size,
         desktop_scale_factor: 0,
-        // PROTOCOL_SSL is TLS-only; NLA uses TLS under HYBRID or HYBRID_EX.
-        enable_tls: false,
-        enable_credssp: true,
+        // NLA-first requests HYBRID|HYBRID_EX only, so the server cannot downgrade to TLS.
+        // TLS-only requests PROTOCOL_SSL and skips CredSSP; the caller must opt in.
+        enable_tls: tls_only,
+        enable_credssp: !tls_only,
         // Smart-card variant with no identity emits no pre-TLS username cookie.
         credentials: Credentials::SmartCard {
             pin: String::new(),
@@ -158,33 +160,72 @@ fn verify_peer_policy(
     }
 }
 
-async fn verify(
-    target: Target,
-    server_name: ServerName<'static>,
-    tls: Arc<rustls::ClientConfig>,
-) -> Result<Verified, Error> {
-    let stream = match target.endpoint {
-        Endpoint::Direct(port) => TcpStream::connect((target.server_name.as_str(), port))
-            .await
-            .map_err(|_| Error::Tcp)?,
-        Endpoint::Forwarded(stream) => stream,
-    };
+enum Negotiated {
+    Upgraded(TokioFramed<TcpStream>, ClientConnector, SecurityProtocol),
+    NlaUnavailable,
+}
+
+async fn open_stream(endpoint: &mut Endpoint, host: &str) -> Result<TcpStream, Error> {
+    match endpoint {
+        Endpoint::Direct(port) => TcpStream::connect((host, *port)).await.map_err(|_| Error::Tcp),
+        Endpoint::Forwarded { stream, listen } => match stream.take() {
+            Some(stream) => Ok(stream),
+            // 같은 승인된 로컬 전달에 다시 연결해 TLS 전용 협상을 반복한다.
+            None => TcpStream::connect(*listen).await.map_err(|_| Error::Tcp),
+        },
+    }
+}
+
+async fn negotiate(target: &mut Target, credssp: bool) -> Result<Negotiated, Error> {
+    let stream = open_stream(&mut target.endpoint, &target.server_name).await?;
     let local = stream.local_addr().map_err(|_| Error::Tcp)?;
     stream.set_nodelay(true).map_err(|_| Error::Tcp)?;
     let mut framed = TokioFramed::new(stream);
-    let mut connector = ClientConnector::new(config(target.size), local);
-    while !connector.should_perform_security_upgrade() {
-        step(&mut framed, &mut connector, Error::Negotiation).await?;
-    }
-    let ClientConnectorState::EnhancedSecurityUpgrade {
-        selected_protocol: selected,
-    } = connector.state
-    else {
-        return Err(Error::Negotiation);
+    let mut connector = ClientConnector::new(config(target.size, !credssp), local);
+    // 연결 요청만 보내고, 선택된 프로토콜을 직접 읽어 TLS 전용 선택을 구분한다.
+    step(&mut framed, &mut connector, Error::Negotiation).await?;
+    let hint = connector.next_pdu_hint().ok_or(Error::Negotiation)?;
+    let pdu = read_bounded(&mut framed, hint, Error::Negotiation, None).await?;
+    let selected = match decode::<X224<ConnectionConfirm>>(&pdu).map_err(|_| Error::Negotiation)?.0 {
+        ConnectionConfirm::Response { protocol, .. } => protocol,
+        ConnectionConfirm::Failure { .. } => return Err(Error::Negotiation),
     };
-    if !matches!(selected, SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX) {
+    if credssp {
+        // xrdp는 HYBRID를 모르면 SSL이 아니라 RDP(표준 보안)를 고른다. NLA가 아닌 선택은
+        // 모두 NLA 미지원으로 보고, opt-in이면 SSL 요청으로 한 번만 다시 협상한다.
+        if !matches!(selected, SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX) {
+            return Ok(Negotiated::NlaUnavailable);
+        }
+    } else if selected != SecurityProtocol::SSL {
         return Err(Error::Negotiation);
     }
+    let mut output = WriteBuf::new();
+    connector.step(&pdu, &mut output).map_err(|_| Error::Negotiation)?;
+    if !output.filled().is_empty() {
+        framed.write_all(output.filled()).await.map_err(|_| Error::Negotiation)?;
+    }
+    Ok(Negotiated::Upgraded(framed, connector, selected))
+}
+
+async fn verify(
+    mut target: Target,
+    server_name: ServerName<'static>,
+    tls: Arc<rustls::ClientConfig>,
+) -> Result<Verified, Error> {
+    let (framed, mut connector, selected) = match negotiate(&mut target, true).await? {
+        Negotiated::Upgraded(framed, connector, selected) => (framed, connector, selected),
+        Negotiated::NlaUnavailable => {
+            if !target.tls_only {
+                return Err(Error::TlsOnlyRequired);
+            }
+            // 첫 연결은 여기서 닫고, 같은 대상·같은 인증서 검증으로 한 번만 다시 협상한다.
+            match negotiate(&mut target, false).await? {
+                Negotiated::Upgraded(framed, connector, selected) => (framed, connector, selected),
+                // TLS 전용 요청은 SSL만 승인하므로 반복된 거부는 협상 실패다.
+                Negotiated::NlaUnavailable => return Err(Error::Negotiation),
+            }
+        }
+    };
     let (stream, leftover) = framed.into_inner();
     if !leftover.is_empty() {
         return Err(Error::Negotiation);
@@ -272,6 +313,15 @@ impl Verified {
                 .any(|field| field.len() > 1024 || field.contains('\0'))
         {
             return Err(Error::Credentials);
+        }
+        if !matches!(self.selected, SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX) {
+            // TLS 전용에는 CredSSP가 없으므로 계정은 검증된 TLS 위의 Client Info로 전달된다.
+            self.connector.config.credentials = Credentials::UsernamePassword {
+                username: account.username,
+                password: std::mem::take(&mut *account.password),
+            };
+            self.connector.config.domain = account.domain;
+            return Ok(());
         }
         let (mut sequence, mut request) = CredsspSequence::init(
             Credentials::UsernamePassword {

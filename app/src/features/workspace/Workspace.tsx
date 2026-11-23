@@ -33,7 +33,7 @@ type Tab = { id: number; label: string } & (
   | { kind: "terminal"; targetId?: string; remoteEditor?: true; ssm?: SsmTarget; ssh?: SshTransport["kind"]; status: TerminalStatus; sessionId?: string; sftpSessionId?: string; closeStatus?: CloseStatus }
   | { kind: "editor"; file: ApprovedEditorFile; transport: EditorTransport; close: () => Promise<void>; source: EditorSource; attaching?: true; readOnly?: true; nano?: Pick<RemoteNanoFile, "sessionId" | "disconnect"> }
   | { kind: "tunnel"; handle: string; targetId: string; name: string; method: "ssh" | "ssm"; closeStatus?: CloseStatus; closeError?: string }
-  | { kind: "rdp"; source?: DesktopTunnelSource; closeStatus?: CloseStatus }
+  | { kind: "rdp"; source?: DesktopTunnelSource; tlsOnly?: boolean; closeStatus?: CloseStatus }
   | { kind: "vnc"; source?: DesktopTunnelSource; closeStatus?: CloseStatus }
 );
 const compatibleStorage = { kind: "compatible", targetId: "s3:compatible", label: "S3 호환 HTTPS" } as const;
@@ -718,7 +718,9 @@ export function Workspace() {
                   onShare={(targetId, tabHandle, tunnelId) => openTunnel(targetId, tab.name, tab.method, { tab: tabHandle, id: tunnelId })}
                   onOpenDesktop={openDesktop} />
               ) : tab.kind === "rdp" ? (
-                <RdpTab ref={bindDesktopClose} active={id === active} label={label} source={tab.source} />
+                <RdpTab ref={bindDesktopClose} active={id === active} label={label} source={tab.source}
+                  onSecurityMode={(tlsOnly) => setTabs(current => current.map(item => item.id === id && item.kind === "rdp"
+                    ? { ...item, tlsOnly } : item))} />
               ) : tab.kind === "vnc" ? (
                 <VncView ref={bindDesktopClose} active={id === active} source={tab.source} />
               ) : (
@@ -819,7 +821,7 @@ export function Workspace() {
           !current.closeStatus && terminalStatus(current.status)].filter(Boolean).join(" · ")
           : current?.kind === "tunnel" ? current.label
             : current?.kind === "rdp" || current?.kind === "vnc"
-              ? `${current.label} · ${current.source ? (current.kind === "rdp" ? "SSH 터널 · NLA" : "SSH 터널") : (current.kind === "rdp" ? "직접 · NLA" : "직접 · TLS")}`
+              ? `${current.label} · ${current.source ? (current.kind === "rdp" ? `SSH 터널 · ${current.tlsOnly ? "TLS 전용(표준 RDP 보안 없음)" : "NLA"}` : "SSH 터널") : (current.kind === "rdp" ? `직접 · ${current.tlsOnly ? "TLS 전용(표준 RDP 보안 없음)" : "NLA"}` : "직접 · TLS")}`
               : current ? (current.source === "local" ? "내 PC · 로컬 파일" : current.source === "sftp" ? "SFTP" : "S3") : "연결 없음"}</span>
         {closeBlock && <span role="status">{closeBlock.message}</span>}
         {closeError && <span role="alert">{closeError}</span>}
