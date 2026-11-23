@@ -121,7 +121,7 @@ export function LocalTree({ profiles, onOpen, onElevate, onLocalElevate, onRegis
             toggle(group.key);
           }}><span aria-hidden="true">{expanded(group.key) ? "▾" : "▸"}</span> <span>{group.name}</span>
             {groups.some((other) => other.key !== group.key && other.name === group.name) &&
-              <small>{group.id || "내 PC"}</small>}
+              <small title={group.id || undefined}>{group.id.slice(0, 8) || "내 PC"}</small>}
           </div>
           <ul role="group" hidden={!expanded(group.key)}>
             {group.targets.map((target) => (
@@ -134,7 +134,7 @@ export function LocalTree({ profiles, onOpen, onElevate, onLocalElevate, onRegis
                 }}>
                 <div className="tree-row"><span>{target.name}</span>
                   {target.method === "S3" && <small>S3</small>}
-                  {group.targets.some((other) => other.key !== target.key && other.name === target.name) && <small>{target.id}</small>}
+                  {group.targets.some((other) => other.key !== target.key && other.name === target.name) && <small title={target.id}>{target.id.slice(0, 8)}</small>}
                 </div>
               </li>
             ))}
