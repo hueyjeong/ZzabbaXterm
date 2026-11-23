@@ -10,7 +10,7 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    connections::SavedSsm,
+    connections::profile::Ssm,
     ssm::{AwsCli, CliError, ForwardGuard, ForwardPermit, Scope, SessionDocument, SessionLookup, StartRequest, valid_session_id},
     terminal::remote::start_error,
 };
@@ -38,6 +38,8 @@ const LISTEN_TIMEOUT: Duration = Duration::from_secs(3);
 // 트리를 정리한 뒤 출력 읽기 작업이 끝나기를 기다리는 한도다. 터널 문서 잠금 안에서 호출된다.
 const READER_TIMEOUT: Duration = Duration::from_secs(1);
 const LINE_LIMIT: usize = 512;
+// 빈 포트를 고른 뒤 플러그인이 bind하기 전에 다른 프로그램이 가져간 경우의 재시도 한도다.
+const BIND_ATTEMPTS: usize = 3;
 const STDERR_LIMIT: usize = 8 * 1024;
 
 const FORMAT: &str = "SSM 플러그인 출력 형식을 확인할 수 없습니다";
@@ -57,9 +59,8 @@ pub(crate) struct ForwardPlan {
 
 impl ForwardPlan {
     /// 수신 주소·노드 형식·원격 호스트를 검사하고, 경로의 노드가 저장 대상의 노드와 같을 때만 계획을 만든다.
-    /// 프로필·리전은 `saved`에서만 가져오므로 따로 대조할 승인 값이 없다.
-    pub(crate) fn new(route: &Route, saved: &SavedSsm) -> Result<Self, String> {
-        let target = &saved.target;
+    /// 프로필·리전은 저장 대상에서만 가져오므로 따로 대조할 승인 값이 없다.
+    pub(crate) fn new(route: &Route, target: &Ssm) -> Result<Self, String> {
         let scope = SsmScope { profile: &target.profile, region: &target.region };
         let plan = SsmPlan::new(route, scope, route, scope).map_err(|error| format!("SSM 전달 승인: {error:?}"))?;
         let Route::Ssm { node, .. } = route else { unreachable!("SSM 전달 계획 필요") };
@@ -145,6 +146,41 @@ impl RemoteSession {
             eprintln!("SSM 포트 전달 세션 종료 확인 불가: {}", request.target());
         }
     }
+}
+
+/// SSH-over-SSM의 노드 SSH 포트 전달을 열고 수신 소유권까지 확인한다. 루프백 빈 포트를 쓰고 bind 충돌이면 새 포트로 다시 시도한다.
+pub(crate) fn open_ssh_forward(target: &Ssm, port: u16, cancel: &CancellationToken) -> Result<(u16, SsmChild), String> {
+    let pick = || std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).and_then(|listener| listener.local_addr());
+    ready_on_free_port(cancel, pick, |listen| {
+        let route = Route::Ssm { listen, node: target.instance_id.clone(), port, host: None };
+        let plan = ForwardPlan::new(&route, target)?;
+        tauri::async_runtime::block_on(prepare(plan, cancel))?.spawn()
+    })
+}
+
+fn ready_on_free_port(
+    cancel: &CancellationToken,
+    mut pick: impl FnMut() -> io::Result<SocketAddr>,
+    mut start: impl FnMut(SocketAddr) -> Result<SsmChild, String>,
+) -> Result<(u16, SsmChild), String> {
+    let mut conflict = None;
+    for _ in 0..BIND_ATTEMPTS {
+        let listen = pick().map_err(|error| format!("SSM 수신 포트 선택: {error}"))?;
+        let ready = start(listen).and_then(|mut child| loop {
+            if cancel.is_cancelled() { return Err("SSM 포트 전달이 취소되었습니다".into()); }
+            match child.observe() {
+                Observation::Listening => return Ok(child),
+                Observation::Pending => thread::sleep(Duration::from_millis(50)),
+                Observation::Ended(reason) => return Err(reason),
+            }
+        });
+        match ready {
+            Ok(child) => return Ok((listen.port(), child)),
+            Err(error) if error == OutputFault::BindConflict.message(listen) => conflict = Some(error),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(conflict.unwrap_or_default())
 }
 
 type Verify = Box<dyn FnOnce(&str, &CancellationToken) -> Result<String, String> + Send>;

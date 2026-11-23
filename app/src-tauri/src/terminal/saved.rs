@@ -5,12 +5,13 @@ use portable_pty::CommandBuilder;
 use crate::{connections::{profile::{MethodRef, Shell}, with_saved_method, with_saved_ssh}, ssh::terminal::{DirectLaunch, prepare_remote_editor}};
 
 use super::{process::Launch, remote};
+use crate::ssm::CancellationToken;
 
 pub(super) fn launch(config: &Path, id: &str) -> Result<Launch, String> {
     with_saved_method(config, id, |method, _| match method {
         MethodRef::Local { shell, start_directory } => local(shell, start_directory).map(Launch::Local),
         MethodRef::Ssm { profile, region, instance_id } => remote::Target::new(profile, region, instance_id).map(Launch::Ssm),
-        MethodRef::Ssh { ssh } => crate::ssh::terminal::saved(config, ssh).map(Launch::Ssh),
+        MethodRef::Ssh { ssh } => crate::ssh::terminal::saved(config, ssh, &CancellationToken::new()).map(Launch::Ssh),
         MethodRef::S3 { .. } => Err("S3 연결은 스토리지 탭에서 열 수 있습니다".into()),
         MethodRef::Desktop { .. } => Err("원격 화면 연결은 RDP·VNC 탭에서 열 수 있습니다".into()),
     })

@@ -561,7 +561,7 @@ impl TunnelTabs {
             return Err("macOS에서는 SSM 경로의 RDP·VNC를 지원하지 않습니다".into());
         }
         let route = Route::Ssm { listen: std::net::SocketAddr::from(([127, 0, 0, 1], listen)), node: ssm.target.instance_id.clone(), port, host };
-        let plan = ForwardPlan::new(&route, ssm)?;
+        let plan = ForwardPlan::new(&route, &ssm.target)?;
         let endpoint = format!("{} · {} · {}", ssm.target.profile, ssm.target.region, ssm.target.instance_id);
         let service = match protocol { Some(Protocol::Rdp) => "\n서비스: RDP", Some(Protocol::Vnc) => "\n서비스: VNC", None => "" };
         {

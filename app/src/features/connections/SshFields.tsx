@@ -20,7 +20,7 @@ export function SshMethodFields({ ssh, edit }: Props) {
       edit({ transport: event.currentTarget.value === "ssm" ? { kind: "ssm" } : { kind: "direct" } });
     }}>
       <option value="direct">직접 SSH</option>
-      <option value="ssm" disabled>SSH-over-SSM (사용 불가)</option>
+      <option value="ssm">SSH-over-SSM</option>
     </select></label></div>
     <div><label>호스트 키 SHA256 지문 <input value={ssh.hostKeyFingerprint} onChange={event => edit({ hostKeyFingerprint: event.target.value })} /></label></div>
   </>;

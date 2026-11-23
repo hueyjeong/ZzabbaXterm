@@ -557,7 +557,7 @@ impl Session {
                         }
                     });
                 }
-                let event = self.reap(child.as_mut(), ssh_plan.is_some());
+                let event = self.reap(child.as_mut(), ssh_plan.as_deref());
                 if let Some(cancel) = &self.cancel { cancel.cancel(); }
                 // 레지스트리에서 세션을 빼기 전에 승인된 로컬 생성 호출을 회수한다.
                 if self.document.is_some() && ssm { self.wait_control_submit(); }
@@ -691,9 +691,14 @@ impl Session {
         let _ = drain.join();
     }
 
-    fn reap(&self, child: &mut dyn Child, ssh: bool) -> Option<Event> {
+    fn reap(&self, child: &mut dyn Child, plan: Option<&ConnectionPlan>) -> Option<Event> {
+        let ssh = plan.is_some();
         loop {
             let mut flow = self.flow.lock().unwrap();
+            // SSH-over-SSM 전달이 먼저 끝나면 SSH 자식을 정리하고 종료 사유를 탭에 표시한다.
+            if flow.stop.is_none() && let Some(reason) = plan.and_then(ConnectionPlan::forward_ended) {
+                flow.stop = Some(Stop::Disconnected(reason));
+            }
             flow.expire_start();
             flow.expire_ack();
             if self.control {

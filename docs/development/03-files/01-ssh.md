@@ -15,11 +15,11 @@
 ## 개발 순서
 
 1. **Red — 동일한 보안 조건을 시험한다.** `app/src/features/ssh/ssh.test.ts`에 실제 호스트·계정·항목 ID 표시, 사용자 취소, SSM 셸 전용 대상의 SFTP 메뉴 부재를 쓴다. `app/src-tauri/src/ssh/`에 SSH와 F02의 SFTP가 소비할 접속 계획의 Rust 시험을 둔다. 직접/SSM 모두 호스트 키 검증이 필수이며, 다른 호스트·서비스·취소된 요청으로 인증 자료를 요구하면 비밀 조회 호출 수가 0이어야 한다.
-2. **Green — 서비스와 경로를 분리한다.** Rust는 C01의 대상 ID로 목적지(host/port·SSH 계정), 전송(직접 또는 C02의 profile/region/node), 서비스 인증(Agent·지정한 키 참조·선택한 비밀번호)을 확정한다. 직접 경로는 OS `ssh`, SSM 경로는 OpenSSH의 `ProxyCommand`가 공식 `AWS-StartSSHSession` 문서와 SSH 포트를 사용하게 한다. 프록시에는 고정한 앱 실행기와 Rust가 발급한 식별자만 넘긴다. 실행기가 검증한 값으로 `aws ssm start-session` 인자 배열을 만들고 표준 입출력은 SSH 바이트 전송 전용으로 둔다. 사용자 표시명·설정 문자열을 셸 구문으로 조립하거나 사용자 전역 SSH 설정을 고치지 않는다. 앱 소유 설정(`-F`)을 SSH와 SFTP에 함께 사용한다.
+2. **Green — 서비스와 경로를 분리한다.** Rust는 C01의 대상 ID로 목적지(host/port·SSH 계정), 전송(직접 또는 C02의 profile/region/node), 서비스 인증(Agent·지정한 키 참조·선택한 비밀번호)을 확정한다. 직접 경로와 SSM 경로 모두 OS `ssh`를 쓰고 `ProxyCommand none`을 유지한다. SSM 경로는 앱이 소유한 SSM 포트 전달([R01](../04-remote/01-tunnels.md)의 `AWS-StartPortForwardingSession`)을 먼저 열고, OpenSSH는 그 루프백 수신 포트로 접속한다. `ssh`가 띄운 `aws` 프로세스는 앱이 세션 소유권을 확인하거나 종료를 보장할 수 없으므로 `ProxyCommand`로 SSM 세션을 열지 않는다. 사용자 표시명·설정 문자열을 셸 구문으로 조립하거나 사용자 전역 SSH 설정을 고치지 않는다. 앱 소유 설정(`-F`)을 SSH와 SFTP에 함께 사용한다.
 3. **Green — 비밀번호보다 호스트 키를 먼저 확인한다.** 관리자가 제공한 공개 키의 지문을 `ssh-keygen -lf <공개키파일> -E sha256`로 확인하고 실제 서버 신원·포트에 묶어 사용자 전용 신뢰 파일에 등록한다. `StrictHostKeyChecking=yes`, 지정한 `UserKnownHostsFile`과 경로에 관계없이 같은 서버를 가리키는 `HostKeyAlias`를 적용한다. 전역 신뢰 파일이나 DNS 자동 신뢰로 시험 핀이 무력화되지 않게 한다. 최초 미등록·변경은 인증 전 중단하고 별도 채널로 재확인한다. Agent 모드는 선택한 공개 키와 `IdentitiesOnly=yes`를 사용하고, 키 파일 모드는 선택한 파일을 OpenSSH가 직접 연다. Agent 포워딩과 선택 밖 인증 폴백은 끈다.
 4. **Green — 암호는 인증 컴포넌트 안에서만 전달한다.** `직접 입력`은 사용자가 직접 입력하는 인증 경로, `저장된 인증 사용`은 로컬 확인 창을 거치는 별도 경로다. 저장 경로에서는 비밀번호 방식만 허용한 OpenSSH의 인증 요청을 전용 `SSH_ASKPASS` 실행기로 받는다. 터미널 출력 문자열을 감시해 답하지 않는다. 고정된 실행기와 해당 자식·대상·계정에 묶인 1회 IPC에서만 요청을 받고, 실제 대상과 항목 ID를 로컬에서 승인받은 뒤 `bw status`와 `bw get password <항목-ID>`를 실행한다. CLI 잠김·CLI 없음·항목 없음·취소를 구별한다. CLI 세션 키가 필요하면 로컬 인증 컴포넌트가 `bw` 자식에만 전달하며 PTY·SSH·AI 자식 환경에서는 제거한다. `bw` 출력은 비공개 파이프로 받아 askpass의 전용 응답 파이프에 한 번만 쓰고 즉시 폐기한다. 비밀을 WebView, argv, 임시 파일, 클립보드, 로그, AI 입력으로 복사하지 않는다. 취소·탭 종료 시 인증 요청을 무효화하고 해당 자식과 프록시만 회수한다. 재시도는 새 요청이다.
    저장 인증용 `ssh` 자식 환경에만 `SSH_ASKPASS=<설치한 실행기의 절대 경로>`와 `SSH_ASKPASS_REQUIRE=force`를 지정한다. `NumberOfPasswordPrompts=1`로 제한하고 그 자식에는 비밀번호 인증 이외의 방식을 끈다. 그래야 제어 터미널이 있는 상태에서도 프롬프트를 사람이 대신 채워 금고 연동 시험이 잘못 통과하는 일을 막을 수 있다. 직접 입력 모드는 이 환경을 상속하지 않는다. 두 OS에서 사람의 터미널 입력 없이 승인 1건·askpass 호출 1회·비밀번호 응답 1회로 로그인하는지 본다. 취소 시 응답은 0회여야 한다. 설치된 OpenSSH가 강제 askpass를 지원하지 않으면 저장 인증 불가 상태를 표시하고 직접 입력을 별도로 선택하게 한다.
-5. **자동 → 실기기 시연.** 다음 명령은 후속 구현 시 `app/`에서 실행한다. `npx vitest run src/features/ssh/ssh.test.ts`, `cargo test --manifest-path src-tauri/Cargo.toml ssh`로 검증하고 `npm run tauri dev`로 두 OS에서 직접/SSM의 실제 셸 응답을 확인한다. 한 탭을 닫고 나머지 탭에서 `whoami`를 반복한다. 지정 키·Agent·직접 입력·확인한 시험 항목으로 로그인하고, 그다음 시험 신뢰 파일에 다른 공개 키를 넣어 중단을 재현한다. 확인 취소·CLI 잠김·실행 파일 누락도 격리된 시험용 환경에서 반복한다. `bw status`는 데스크톱 금고 상태로 대체할 수 없다.
+5. **자동 → 실기기 시연.** 다음 명령은 후속 구현 시 `app/`에서 실행한다. `npx vitest run src/features/ssh/ssh.test.ts`, `cargo test --manifest-path src-tauri/Cargo.toml ssh`로 검증하고 `npm run tauri dev`로 두 OS에서 직접/SSM의 실제 셸 응답을 확인한다. 한 탭을 닫고 나머지 탭에서 `whoami`를 반복한다. SSM 탭을 닫은 뒤 `aws ssm describe-sessions --state History`로 해당 포트 전달 세션의 종료를 확인한다. 지정 키·Agent·직접 입력·확인한 시험 항목으로 로그인하고, 그다음 시험 신뢰 파일에 다른 공개 키를 넣어 중단을 재현한다. 확인 취소·CLI 잠김·실행 파일 누락도 격리된 시험용 환경에서 반복한다. `bw status`는 데스크톱 금고 상태로 대체할 수 없다.
 
 **완료 증거:** OS·OpenSSH 버전, 경로/인증별 실제 결과, 키 불일치·취소 때 조회 및 응답 파이프에 쓴 횟수(내용 제외), 닫은 탭의 자식·SSM 세션 회수 결과를 기록한다. T4의 Bitwarden 취소 증거를 [F03](03-elevation.md)에 연결한다. 장비·승인이 없는 조합은 `미실행(사유)`이다.
 
@@ -35,7 +35,22 @@
 
 마법사의 `verify_ssh_host`는 Rust에서 검증한 초안의 대상·호스트·포트·지문을 대조한다. 기본 앱 창에 연결된 네이티브 파일 선택과 확인을 거치면 Rust가 문서·초안 세대에 묶인 일회 예약을 반환한다. `commit_ssh_host`는 유효한 예약만 소비해 앱 설정 디렉터리의 `ssh-trust`에 등록한다. 마법사 종료, 초안 변경, 페이지 이동은 대기 중인 예약을 취소한다.
 
-Agent 공개 키는 열린 파일의 핸들로 링크 여부, 정규 파일 여부, 16 KiB 상한을 검사한 뒤 읽는다. SSH-over-SSM은 이 후보에서 사용할 수 없다. 저장 암호 대상은 터미널 탭의 승인 경로로 연다.
+Agent 공개 키는 열린 파일의 핸들로 링크 여부, 정규 파일 여부, 16 KiB 상한을 검사한 뒤 읽는다. 저장 암호 대상은 터미널 탭의 승인 경로로 연다.
+
+## SSH-over-SSM 경로
+
+`transport: "ssm"` 대상은 `ssh::terminal`이 접속 계획을 만들기 전에 다음 순서로 전송을 연다.
+
+1. 등록된 호스트 키 PIN을 먼저 확인한다. PIN이 없거나 다르면 AWS 호출 없이 중단한다.
+2. `tunnels::ssm::open_ssh_forward`가 저장된 `profile`·`region`·`instanceId`로 `Route::Ssm { listen: 127.0.0.1:<빈 포트>, node: instanceId, port: ssh.port, host: None }` 전달을 연다. 문서는 `AWS-StartPortForwardingSession`, 매개변수는 `portNumber=<SSH 포트>,localPortNumber=<빈 포트>`다. 자격 내보내기, 노드 온라인 확인, 플러그인 확인, 세션 소유권(DescribeSessions) 확인, 수신 소켓 소유권 확인은 포트 전달 탭과 같다.
+3. 빈 포트는 루프백에서 bind한 뒤 놓아 고른다. 플러그인이 bind 충돌로 끝나면 새 포트로 최대 3회까지 다시 연다. 그 밖의 시작 실패는 다시 시도하지 않는다.
+4. 수신이 확인되면 접속 계획의 `ssh_config`에 `HostName 127.0.0.1`, `Port <전달 포트>`를 쓰고 `HostKeyAlias`는 원래 대상의 `[host]:port`로 둔다. 그래서 저장된 PIN과 `StrictHostKeyChecking yes`, `ProxyCommand none` 등 나머지 설정이 직접 경로와 같게 적용된다.
+
+SSM 전달(`SsmChild`)은 접속 계획(`ConnectionPlan`)이 소유한다. 터미널 탭, 같은 탭의 SFTP 파일 목록, 원격 nano 편집기가 같은 계획을 공유하므로 모두 같은 전달로 접속한다. 탭을 닫거나 `ssh`가 끝나 계획이 해제되면 로컬 CLI·플러그인 트리를 정리하고 같은 요청의 원격 세션을 `terminate-session`으로 닫는다. 전달이 먼저 끝나면 터미널 감독자가 `ssh` 자식을 정리하고 탭에 `SSM 전달 종료: <사유>`를 표시한다.
+
+저장 전 연결 시험도 같은 경로를 쓴다. 시험을 취소하거나 시간이 초과되면 전달 준비를 중단한다. 호스트 키 등록은 관리자가 제공한 공개 키 파일만 읽으므로 네트워크 접속이 없고 SSM 대상도 원래 `[host]:port` 별칭으로 등록한다. 저장 암호 대상도 같은 전달 위에서 승인 경로로 연다.
+
+다음은 SSH-over-SSM 대상에서 명시적 오류로 남는다: SSH 포트 전달 탭, 원격 sudo 승격, AI CLI 등록, 원격 화면의 SSH 경로.
 
 **저장 인증 기반의 현재 상태(비기본 기능).** `stored-auth` 기능으로 빌드할 때만 다음이 포함된다: Bitwarden CLI 호출(`auth/vault.rs`), 로컬 승인 전송(Windows named pipe / Linux Unix 소켓, 상대 프로세스·이미지·자식 관계 확인), `zzabba-askpass` helper, 승인 1회 소비(`auth/mod.rs`). 터미널 탭은 `terminal_open` → `terminal::saved::launch_interactive` → `ssh::terminal::saved_interactive`로 저장 암호 대상을 열고, `Pending::approve`로 묶은 `Approval`이 PTY 자식과 `Exchange`를 함께 만든다. 승인 창을 읽는 시간은 별도 기한(120초)으로 재고, 승인 뒤 askpass 교환 기한은 spawn 시점부터 다시 잰다. `Exchange`는 탭 닫기·문서 이동·창 닫기에서 취소되고 `bw` 자식도 그 수명에 회수된다. 교환이 실패하면 금고 오류를 탭 상태줄 알림으로 전한다. 승인 창은 기존 네이티브 확인 패턴으로 서버·계정·지문·금고 항목 ID를 표시한다. 연결 시험·SFTP·원격 편집기·터널과 `DirectLaunch::prepare`는 지금처럼 저장 암호를 명시적 오류로 거부한다. 기본 빌드에는 이 경로가 없고, 마법사는 `connection_capabilities`의 `storedAuth` 값으로 옵션 노출과 저장을 함께 막는다. F01 완료 판정은 실제 OpenSSH 종단 증거가 남을 때 한다.
 

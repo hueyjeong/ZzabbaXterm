@@ -226,6 +226,54 @@ fn f01_two_saved_ssh_launches_reap_only_the_owned_plan_and_child() {
     });
 }
 
+#[test]
+fn f01_ssm_forward_end_disconnects_the_ssh_tab_and_releases_the_forward() {
+    use crate::ssh::{ApprovedHost, Authentication, Endpoint, TRUST_DIRECTORY, TrustStore, terminal::DirectLaunch, tests::FakeForward};
+    use std::sync::atomic::Ordering;
+
+    bounded(|| {
+        let config = tempfile::tempdir().unwrap();
+        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti";
+        let sha = "SHA256:UCUiLr7Pjs9wFFJMDByLgc3NrtdU344OgUM45wZPcIQ";
+        let store = TrustStore::create(&config.path().join(TRUST_DIRECTORY)).unwrap();
+        let endpoint = Endpoint::new("dev.example.invalid", 2222).unwrap();
+        let approved = ApprovedHost::confirm(&endpoint, &endpoint, sha).unwrap();
+        store.register(&approved, key).unwrap();
+        let (transport, ended, dropped) = FakeForward::transport(40022);
+        let mut launch = DirectLaunch::prepare(&store, &approved, "approved-user", "approved-user",
+            Authentication::Agent { public_key: key }, transport).unwrap();
+        // 실제 ssh 대신 종료하지 않는 셸을 같은 계획의 SSH 자식 자리에서 실행한다.
+        let mut command = shell();
+        #[cfg(windows)]
+        command.args(["-Command", "[Console]::WriteLine('SSM-' + 'FIXTURE-READY'); Start-Sleep 60"]);
+        #[cfg(unix)]
+        command.args(["-c", "printf 'SSM-%s\n' FIXTURE-READY; sleep 60"]);
+        launch.replace_command(command);
+        let sessions = Sessions::default();
+        let mut pty = Pty::open_launch(&sessions, super::Launch::Ssh(launch));
+        pty.until_bytes(b"SSM-FIXTURE-READY", 0, true);
+        assert!(!dropped.load(Ordering::SeqCst));
+
+        ended.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            match pty.next(deadline) {
+                Event::Bytes(_) => pty.ack(pty.output.len()),
+                Event::Disconnected(reason) => {
+                    assert_eq!(reason, "SSM 전달 종료: 시험 전달 종료");
+                    break;
+                }
+                other => panic!("SSM 전달 종료 대신 다른 이벤트: {other:?}"),
+            }
+        }
+        while !dropped.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "SSH 자식을 회수한 뒤에도 SSM 전달이 남아 있습니다");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(sessions.input("main", &pty.id, b"closed").is_err());
+    });
+}
+
 fn load(sessions: &Sessions) -> Pty<'_> {
     Pty::open(sessions, Some(&LOAD.replace("@COUNT@", &RECORDS.to_string()).replace("@PAYLOAD@", PAYLOAD)))
 }

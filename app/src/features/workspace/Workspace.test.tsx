@@ -1742,7 +1742,7 @@ describe("F01 직접 SSH", () => {
     await changeInput("표시명", "개발 서버");
     await press("다음");
     await chooseMethod("ssh");
-    expect(find<HTMLOptionElement>('option[value="ssm"][disabled]').textContent).toContain("SSH-over-SSM");
+    expect(find<HTMLOptionElement>('option[value="ssm"]:not([disabled])').textContent).toBe("SSH-over-SSM");
     await changeInput("서버 호스트", "dev.example.invalid");
     await changeInput("SSH 포트", "2222");
     await changeInput("SSH 계정", "deploy");

@@ -27,7 +27,7 @@ fn invalid_confirmation_creates_no_launch_files() {
         ("wrong-user", "approved-user", Authentication::ManualPassword, Error::ApprovedAccountMismatch),
         ("approved-user", "approved-user", Authentication::StoredPassword { item: "21eb36c3-234d-439d-9e1f-1d3cc5ba8125" }, Error::StoredAuthenticationUnavailable),
     ] {
-        let actual = match DirectLaunch::prepare(&store, &approved, account, approved_account, auth) {
+        let actual = match DirectLaunch::prepare(&store, &approved, account, approved_account, auth, Transport::Direct) {
             Err(error) => error,
             Ok(_) => panic!("승인하지 않은 기동 계획"),
         };
@@ -52,7 +52,7 @@ fn direct_ssh_fixture_receives_exact_plan_and_pty_input() {
     assert!(compiled.status.success(), "{}", String::from_utf8_lossy(&compiled.stderr));
 
     for close in [false, true] {
-        let launch = DirectLaunch::prepare(&store, &approved, "approved-user", "approved-user", Authentication::Agent { public_key: KEY }).unwrap();
+        let launch = DirectLaunch::prepare(&store, &approved, "approved-user", "approved-user", Authentication::Agent { public_key: KEY }, Transport::Direct).unwrap();
         let (mut command, plan) = launch.into_parts();
         let invocation = plan.invocation(Client::Ssh).unwrap();
         let config = PathBuf::from(invocation.args[1]);

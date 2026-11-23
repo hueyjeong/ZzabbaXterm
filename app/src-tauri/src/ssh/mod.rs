@@ -7,7 +7,7 @@ mod trust;
 mod trust_windows;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::{
     ffi::OsStr,
@@ -35,7 +35,6 @@ pub(crate) enum Error {
     UnregisteredHost,
     ExistingPinConflict,
     InvalidTrustRecord,
-    SsmProxyUnavailable,
     StoredAuthenticationUnavailable,
     StoredSftpAskpassRequired,
     Io(io::Error),
@@ -49,8 +48,11 @@ impl From<io::Error> for Error {
 
 pub(crate) enum Transport {
     Direct,
-    Ssm,
+    /// 앱이 소유한 SSM 포트 전달의 루프백 포트로 접속한다. 전달의 수명은 접속 계획에 묶인다.
+    Ssm { port: u16, forward: Forward },
 }
+
+pub(crate) type Forward = Box<dyn crate::tunnels::Transport + Send>;
 
 pub(crate) enum Authentication<'a> {
     Agent { public_key: &'a str },
@@ -78,6 +80,8 @@ pub(crate) struct ConnectionPlan {
     #[cfg(any(windows, target_os = "linux"))]
     stored: Option<Stored>,
     public_key: bool,
+    // SFTP·편집기 자식이 같은 계획을 쓰는 동안 전달을 유지하고, 계획이 사라질 때 함께 닫는다.
+    forward: Option<std::sync::Mutex<Forward>>,
     _files: SessionFiles,
     _root: trust::RootGuard,
 }
@@ -117,9 +121,12 @@ impl ConnectionPlan {
         let endpoint = approved.endpoint;
         let alias = endpoint.alias();
         let (pin, host_algorithms, root) = store.pin(approved)?;
-        if matches!(transport, Transport::Ssm) {
-            return Err(Error::SsmProxyUnavailable);
-        }
+        // SSM 전달은 루프백으로 접속하되 HostKeyAlias로 원래 대상의 PIN을 그대로 검증한다.
+        let (host, port, forward) = match transport {
+            Transport::Direct => (endpoint.host.as_str(), endpoint.port, None),
+            Transport::Ssm { port: 0, .. } => return Err(Error::InvalidEndpoint),
+            Transport::Ssm { port, forward } => ("127.0.0.1", port, Some(std::sync::Mutex::new(forward))),
+        };
         let stored_item = match auth {
             Authentication::StoredPassword { item } => Some(item),
             _ => None,
@@ -183,7 +190,7 @@ impl ConnectionPlan {
         // Host 패턴 대신 단일 목적지를 고정해 대상 인자가 달라도 기본 설정으로 빠지지 않는다.
         writeln!(
             output,
-            "HostName {}\nPort {}\nUser {account}\nHostKeyAlias {alias}\n\
+            "HostName {host}\nPort {port}\nUser {account}\nHostKeyAlias {alias}\n\
              StrictHostKeyChecking yes\nUserKnownHostsFile {known_hosts_value}\n\
              GlobalKnownHostsFile none\nKnownHostsCommand none\nVerifyHostKeyDNS no\n\
              CheckHostIP no\nUpdateHostKeys no\n\
@@ -196,7 +203,6 @@ impl ConnectionPlan {
              GSSAPIAuthentication no\nHostbasedAuthentication no\nKbdInteractiveAuthentication no\n\
              PreferredAuthentications {method}\nPubkeyAuthentication {public_key}\n\
              PasswordAuthentication {password}\nBatchMode {batch}\nIdentityFile {identity}",
-            endpoint.host, endpoint.port,
         )?;
         if let Some(agent) = agent {
             writeln!(output, "IdentityAgent {agent}")?;
@@ -250,12 +256,21 @@ impl ConnectionPlan {
             #[cfg(any(windows, target_os = "linux"))]
             stored,
             public_key: public_key == "yes",
+            forward,
             _files: files, _root: root,
         })
     }
 
     #[cfg(any(windows, target_os = "linux"))]
     pub(crate) fn stored(&self) -> Option<&Stored> { self.stored.as_ref() }
+
+    /// SSM 전달이 끝났으면 그 사유를 돌려준다. 직접 전송은 항상 `None`이다.
+    pub(crate) fn forward_ended(&self) -> Option<String> {
+        match self.forward.as_ref()?.lock().unwrap().observe() {
+            crate::tunnels::Observation::Ended(reason) => Some(format!("SSM 전달 종료: {reason}")),
+            _ => None,
+        }
+    }
 
     #[cfg(test)]
     pub(crate) fn config_path_for_test(&self) -> &std::path::Path {
