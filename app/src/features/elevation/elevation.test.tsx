@@ -4,7 +4,7 @@ import { createRoot } from "react-dom/client";
 import { expect, it, vi } from "vitest";
 import { connectLocalTerminal, type LocalTerminalIpc } from "../terminal/session";
 import { ElevationApproval } from "./ElevationApproval";
-import { approvalFields, parseArguments, validateElevationRequest } from "./elevation";
+import { approvalFields, elevationActions, parseArguments, validateElevationRequest } from "./elevation";
 
 const ITEM = "21eb36c3-234d-439d-9e1f-1d3cc5ba8125";
 
@@ -47,6 +47,9 @@ it("승격 정보는 구조로만 검증하고 셸 문자열로 다시 합치지
   expect(validateElevationRequest({ program: "/usr/bin/id", args: [], item: "not-an-item" }))
     .toBe("저장 암호 항목 ID는 36자 UUID여야 합니다");
   expect(validateElevationRequest({ program: "/usr/bin/id", args: ["-u"], item: ITEM })).toBeNull();
+  expect(elevationActions(true, "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")).toEqual({ local: false, remote: true });
+  expect(elevationActions(true, "Mozilla/5.0 (X11; Linux x86_64)")).toEqual({ local: true, remote: true });
+  expect(elevationActions(false, "Mozilla/5.0 (X11; Linux x86_64)")).toEqual({ local: false, remote: false });
 });
 
 it("터미널 출력의 sudo 문구만으로는 승격 요청을 만들지 않는다", async () => {

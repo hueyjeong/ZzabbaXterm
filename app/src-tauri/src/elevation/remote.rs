@@ -116,19 +116,44 @@ pub(crate) struct State {
     pub(crate) run_done: CancellationToken,
     pub(crate) cancel: CancellationToken,
     pub(crate) unconfirmed: AtomicBool,
+    /// bridge가 응답을 받기 전에 끊겼을 때 run 자식을 끝낸다.
+    pub(crate) abort: AtomicBool,
     /// 시험과 관찰을 위해 남긴다. 암호 내용은 담지 않는다.
     pub(crate) sent: AtomicBool,
+    /// run/bridge의 `-F` 설정을 세션 수명 동안 유지한다.
+    _plan: Option<Arc<ConnectionPlan>>,
 }
 
 impl State {
     pub(crate) fn unconfirmed(&self) -> bool {
         self.unconfirmed.load(Ordering::Relaxed)
     }
+
+    pub(crate) fn abort(&self) -> bool {
+        self.abort.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture(unconfirmed: bool, sent: bool) -> Self {
+        Self {
+            run_done: CancellationToken::new(),
+            cancel: CancellationToken::new(),
+            unconfirmed: AtomicBool::new(unconfirmed),
+            abort: AtomicBool::new(false),
+            sent: AtomicBool::new(sent),
+            _plan: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn plan_config(&self) -> Option<std::path::PathBuf> {
+        self._plan.as_ref().map(|plan| plan.config_path_for_test().to_owned())
+    }
 }
 
 impl Launch {
     pub(crate) fn build(
-        plan: &Arc<ConnectionPlan>,
+        plan: Arc<ConnectionPlan>,
         document: &Document,
         request: &Request,
         vault: Bitwarden,
@@ -141,11 +166,11 @@ impl Launch {
             .ok_or("실행 파일 경로가 UTF-8이 아닙니다")?;
         let frame = run_frame(&id, &nonce, program, &request.args)?;
         let run = crate::ssh::terminal::remote_channel(
-            plan,
+            &plan,
             &[HELPER.to_owned(), "serve".into(), id.clone(), nonce.clone()],
         )?;
         let bridge = crate::ssh::terminal::remote_channel(
-            plan,
+            &plan,
             &[HELPER.to_owned(), "bridge".into(), id.clone(), nonce.clone()],
         )?;
         Ok(Self {
@@ -162,7 +187,9 @@ impl Launch {
                 run_done: CancellationToken::new(),
                 cancel: CancellationToken::new(),
                 unconfirmed: AtomicBool::new(false),
+                abort: AtomicBool::new(false),
                 sent: AtomicBool::new(false),
+                _plan: Some(plan),
             }),
         })
     }
@@ -289,6 +316,10 @@ pub(crate) fn watch(bridge: Bridge, state: Arc<State>, notify: impl FnOnce(&'sta
         && !state.run_done.is_cancelled()
     {
         state.unconfirmed.store(true, Ordering::Relaxed);
+        // 암호를 아직 건네지 않았으면 askpass가 기다리므로 run을 끝낸다.
+        if !state.sent.load(Ordering::Relaxed) {
+            state.abort.store(true, Ordering::Relaxed);
+        }
         if let Some(message) = super::failure(error) {
             notify(message);
         }

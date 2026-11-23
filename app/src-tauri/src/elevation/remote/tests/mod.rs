@@ -96,7 +96,9 @@ fn state() -> Arc<State> {
         run_done: CancellationToken::new(),
         cancel: CancellationToken::new(),
         unconfirmed: AtomicBool::new(false),
+        abort: AtomicBool::new(false),
         sent: AtomicBool::new(false),
+        _plan: None,
     })
 }
 
@@ -185,8 +187,23 @@ fn elevation_remote_channel_loss_marks_result_unknown() {
         let mut notified = None;
         watch(fixture.bridge(mode, vault), Arc::clone(&state), |message| notified = Some(message));
         assert!(state.unconfirmed(), "{mode}");
+        assert_eq!(state.abort(), mode == "missing", "{mode}");
         assert!(notified.is_some_and(|message| message.contains("결과 미확인")), "{mode}: {notified:?}");
     }
+}
+
+#[test]
+fn elevation_remote_vault_failure_aborts_before_any_password() {
+    let fixture = Fixture::new();
+    let (vault_directory, vault) = fixture.vault();
+    std::fs::write(vault_directory.join("mode"), "locked").unwrap();
+    let state = state();
+    let mut notified = None;
+    watch(fixture.bridge("ok", vault), Arc::clone(&state), |message| notified = Some(message));
+    assert!(state.unconfirmed());
+    assert!(state.abort());
+    assert!(!state.sent.load(Ordering::Relaxed));
+    assert!(notified.is_some_and(|message| message.contains("금고")));
 }
 
 #[test]
@@ -255,9 +272,11 @@ fn elevation_remote_real_container_approves_once_and_runs_sudo() {
     );
     let pending = crate::elevation::Pending::request(document.clone(), request.clone()).unwrap();
     let _approval = pending.approve(&document, &request).unwrap();
-    let launch = Launch::build(&plan, &document, &request, vault).unwrap();
+    let launch = Launch::build(Arc::clone(&plan), &document, &request, vault).unwrap();
     let id = launch.bridge.id().to_owned();
     let nonce = launch.bridge.nonce().to_owned();
+    let config = launch.state.plan_config().expect("승격 상태가 계획을 보관해야 합니다");
+    assert!(config.is_file(), "계획 임시 SSH 설정이 승격 세션보다 먼저 삭제되었습니다");
     let frame = launch.frame.clone();
     let state = Arc::clone(&launch.state);
     // sudo 캐시를 지워 이 실행이 반드시 askpass를 쓰게 한다.
@@ -268,7 +287,6 @@ fn elevation_remote_real_container_approves_once_and_runs_sudo() {
     .unwrap()
     .piped;
     clear.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-    assert!(clear.status().unwrap().success());
     let mut run = crate::ssh::terminal::remote_channel(
         &plan,
         &[HELPER.to_owned(), "serve".into(), id, nonce],
@@ -276,6 +294,10 @@ fn elevation_remote_real_container_approves_once_and_runs_sudo() {
     .unwrap()
     .piped;
     run.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    // IPC가 반환하며 원본 계획을 버려도 세션 상태가 설정 파일을 유지해야 한다.
+    drop(plan);
+    assert!(config.is_file(), "원본 계획이 사라진 뒤에도 설정이 남아야 합니다");
+    assert!(clear.status().unwrap().success());
 
     runtime().block_on(async {
         let bridge = tokio::spawn(launch.bridge.run(Arc::clone(&state)));
@@ -305,4 +327,73 @@ fn elevation_remote_real_container_approves_once_and_runs_sudo() {
             "status\nget\n"
         );
     });
+}
+
+#[test]
+#[ignore = "sudo가 설치된 시험 컨테이너와 .omc 원격 JSON이 필요하다"]
+fn elevation_remote_askpass_times_out_when_bridge_never_answers() {
+    use crate::ssh::{ApprovedHost, Authentication, ConnectionPlan, Endpoint, Transport, TrustStore};
+    use std::{fs, io::Write, path::PathBuf};
+    use ssh_key::HashAlg;
+
+    let path = std::env::var("ZZABBA_SUDO_REMOTE").expect("ZZABBA_SUDO_REMOTE JSON 경로");
+    let data: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    let host = data["host"].as_str().unwrap();
+    let port: u16 = data["port"].as_u64().unwrap() as u16;
+    let account = data["account"].as_str().unwrap();
+    let private_key = PathBuf::from(data["private_key"].as_str().unwrap());
+    let host_public_key = data["host_public_key"].as_str().unwrap();
+    let trust_directory = tempfile::tempdir().unwrap();
+    let store = TrustStore::create(&trust_directory.path().join("trust")).unwrap();
+    let endpoint = Endpoint::new(host, port).unwrap();
+    let fingerprint = ssh_key::PublicKey::from_openssh(host_public_key)
+        .unwrap()
+        .fingerprint(HashAlg::Sha256)
+        .to_string();
+    let approved = ApprovedHost::confirm(&endpoint, &endpoint, &fingerprint).unwrap();
+    store.register(&approved, host_public_key).unwrap();
+    let plan = Arc::new(
+        ConnectionPlan::prepare(
+            &store,
+            &approved,
+            account,
+            Transport::Direct,
+            Authentication::KeyFile { private_key: &private_key },
+        )
+        .unwrap(),
+    );
+    verify(&plan, account).unwrap();
+    let id = "d".repeat(32);
+    let nonce = "e".repeat(32);
+    let frame = run_frame(&id, &nonce, "/usr/bin/id", &["-u".into()]).unwrap();
+    let mut bridge = crate::ssh::terminal::remote_channel(
+        &plan,
+        &[HELPER.to_owned(), "bridge".into(), id.clone(), nonce.clone()],
+    )
+    .unwrap()
+    .piped;
+    bridge.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut run = crate::ssh::terminal::remote_channel(
+        &plan,
+        &[HELPER.to_owned(), "serve".into(), id, nonce],
+    )
+    .unwrap()
+    .piped;
+    run.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut bridge = bridge.spawn().unwrap();
+    let start = std::time::Instant::now();
+    let mut child = run.spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(frame.as_bytes()).unwrap();
+    drop(stdin);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(start.elapsed() < Duration::from_secs(40), "askpass가 기한 없이 매달렸습니다");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let _ = bridge.wait();
+    assert!(!status.success(), "bridge가 응답하지 않았는데 run이 성공했습니다");
+    assert!(start.elapsed() < Duration::from_secs(40));
 }

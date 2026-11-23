@@ -322,12 +322,8 @@ impl Session {
                         None => event,
                     };
                     #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
-                    if let Some(state) = &self.flow.lock().unwrap().remote_elevation
-                        && state.unconfirmed()
-                    {
-                        event = Some(Event::Disconnected(
-                            "결과 미확인: 원격 승격 채널이 단절되었습니다".into(),
-                        ));
+                    if let Some(state) = &self.flow.lock().unwrap().remote_elevation {
+                        event = remote_final(event, state);
                     }
                     if let Some(error) = self.close_result().warning() {
                         event = Some(Event::Disconnected(match event {
@@ -705,6 +701,15 @@ impl Session {
                 if flow.stop.is_none() && self.cancel.as_ref().unwrap().is_cancelled() {
                     flow.stop = Some(Stop::Closed);
                 }
+            }
+            #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+            if flow.stop.is_none()
+                && flow
+                    .remote_elevation
+                    .as_ref()
+                    .is_some_and(|state| state.abort())
+            {
+                flow.stop = Some(Stop::Disconnected("원격 승격 채널이 단절되었습니다".into()));
             }
             if flow.stop.is_some() {
                 self.wake.notify_all();
@@ -1267,6 +1272,21 @@ fn watch_stored(
     }
 }
 
+/// bridge가 끊겨도 자식이 정상 종료했으면 실제 종료 코드를 유지한다.
+#[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+fn remote_final(
+    event: Option<Event>,
+    state: &crate::elevation::remote::State,
+) -> Option<Event> {
+    if state.unconfirmed() && !matches!(event, Some(Event::Exited(_))) {
+        Some(Event::Disconnected(
+            "결과 미확인: 원격 승격 채널이 단절되었습니다".into(),
+        ))
+    } else {
+        event
+    }
+}
+
 #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
 fn watch_elevation(
     mut exchange: crate::local_auth::Exchange,
@@ -1288,6 +1308,20 @@ fn watch_elevation(
     {
         let _ = (events.lock().unwrap())(Event::Notice(message.into()));
     }
+}
+
+#[cfg(all(test, feature = "stored-auth", any(windows, target_os = "linux")))]
+#[test]
+fn remote_bridge_loss_keeps_a_normal_exit_code() {
+    let unconfirmed = crate::elevation::remote::State::fixture(true, true);
+    assert!(matches!(remote_final(Some(Event::Exited(7)), &unconfirmed), Some(Event::Exited(7))));
+    assert!(matches!(remote_final(None, &unconfirmed), Some(Event::Disconnected(_))));
+    assert!(matches!(
+        remote_final(Some(Event::Disconnected("lost".into())), &unconfirmed),
+        Some(Event::Disconnected(reason)) if reason.contains("결과 미확인")
+    ));
+    let known = crate::elevation::remote::State::fixture(false, true);
+    assert!(matches!(remote_final(Some(Event::Exited(0)), &known), Some(Event::Exited(0))));
 }
 
 #[cfg(all(test, feature = "stored-auth", any(windows, target_os = "linux")))]

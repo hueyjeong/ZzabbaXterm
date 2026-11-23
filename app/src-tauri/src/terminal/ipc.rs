@@ -263,7 +263,7 @@ pub(crate) fn elevation_open_remote(invoke: Invoke) {
                 .map_err(|error| crate::elevation::failure(error).unwrap_or("원격 승격 요청이 올바르지 않습니다"))?;
             let _approval = pending.approve(&approval_document, &request)
                 .map_err(|error| crate::elevation::failure(error).unwrap_or("승격 승인이 만료되었습니다"))?;
-            let launch = crate::elevation::remote::Launch::build(&plan, &approval_document, &request, vault)?;
+            let launch = crate::elevation::remote::Launch::build(plan, &approval_document, &request, vault)?;
             sessions.open_document(owner, document, size, Launch::RemoteElevated(launch), send)
         }).await.map_err(Into::into)
     });

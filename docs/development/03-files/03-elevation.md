@@ -34,14 +34,16 @@
 구현한 원격 경로:
 
 - 서버 helper는 `app/src-tauri/src/bin/zzabba-elevate.rs`이며 관리자가 `/usr/local/libexec/zzabba-elevate`에 root:root·0755·그룹/월드 쓰기 없이 설치한다. 앱은 이 파일을 설치하지 않는다. `--verify`는 자기 소유자·권한·경로와 실행 계정을 출력하고, `serve`는 run 프레임을 받아 `sudo -A -- <실행파일> <인자…>`를 띄우며, `bridge`는 전용 SSH 채널에서 askpass 요청을 중계한다. askpass 모드는 자기 자신이 `SUDO_ASKPASS`일 때만 FIFO를 통해 1회 응답한다.
-- 앱은 F01과 같은 `ConnectionPlan`(같은 서버·계정·고정 호스트 키)에서 **확인·run·bridge 세 개의 별도 SSH `-T` 채널**을 연다. 확인 채널은 helper 설치·계정을 먼저 검증하고 실패하면 승인 창 없이 "직접 입력"을 안내한다. 승인 카드는 서버(`계정@호스트:포트`)·호출 계정·실행 계정·실행 파일·인자를 표시하고, 승인 뒤 저장 프로필이 바뀌지 않았는지 다시 대조한다.
+- 앱은 F01과 같은 `ConnectionPlan`(같은 서버·계정·고정 호스트 키)에서 **확인·run·bridge 세 개의 별도 SSH `-T` 채널**을 연다. 계획은 승격 `State`가 보관해 run/bridge가 여는 임시 `ssh_config`·`known_hosts`가 세션 수명보다 먼저 삭제되지 않는다. 확인 채널은 helper 설치·계정을 먼저 검증하고 실패하면 승인 창 없이 "직접 입력"을 안내한다. 승인 카드는 서버(`계정@호스트:포트`)·호출 계정·실행 계정·실행 파일·인자를 표시하고, 승인 뒤 저장 프로필이 바뀌지 않았는지 다시 대조한다.
 - run 채널은 메인 PTY에서 `serve`를 실행하고 `ZZABBA-ELEVATE 1 <ID> <난수> <b64 실행 파일> <인자 수> <b64 인자…>` 프레임을 쓴다. 프레임에는 암호가 없다. bridge 채널은 `REQUEST 2 <ID> <난수>`를 받은 뒤에만 금고를 조회하고 `PASSWORD 2 <ID> <난수> <b64 암호>`를 1회 쓴다. 메인 PTY·공용 포트·셸 프롬프트에는 암호를 쓰지 않는다.
-- helper는 승인 ID·난수·프레임 순번(1/2)을 검증하고, 잘린 프레임·순번 역행·다른 승인 ID·다른 난수를 거부한다. 시작 뒤 run이 끝나기 전 bridge가 끊기면 최종 상태를 `결과 미확인`으로 표시하고, run이 먼저 정상 종료했으면 종료 코드를 그대로 쓴다.
-- 원격은 직접 SSH의 Agent·키 파일(배치 로그인)만 지원한다. 수동 암호·저장 암호 SSH·SSH-over-SSM은 "직접 입력" 안내로 끝난다. helper가 없거나 `--verify`가 실패하면 금고 조회 0회다.
+- helper는 승인 ID·난수·프레임 순번(1/2)을 검증하고, 잘린 프레임·순번 역행·다른 승인 ID·다른 난수를 거부한다. askpass는 `pw` FIFO 응답을 15초까지만 기다려 bridge가 응답 없이 죽어도 sudo가 매달리지 않는다.
+- bridge가 암호를 건네기 전에 끊기면 앱은 run 자식을 중단하고 최종 상태를 `결과 미확인`으로 표시한다. 암호를 이미 건넸거나 run이 정상 종료했으면 실제 종료 코드를 유지하고 bridge 손실은 알림으로만 남긴다. 정상 종료하지 못한 FIFO 디렉터리는 다음 `serve`가 6시간 뒤 정리한다.
+- 원격은 직접 SSH의 Agent·키 파일(배치 로그인)만 지원한다. 수동 암호·저장 암호 SSH·SSH-over-SSM은 "터미널에서 직접 입력하세요" 안내로 끝난다. helper가 없거나 `--verify`가 실패하면 금고 조회 0회다.
+- Windows에서는 로컬 sudo 경로가 없으므로 "내 PC" 승격 메뉴를 숨기고, 원격 승격 메뉴만 `storedAuth` capability에 따라 표시한다.
 
 기능·배포 조건:
 
-- 로컬·원격 승격 명령과 UI는 `stored-auth` feature와 Windows/Linux에서만 컴파일된다. 기본 빌드·`--no-default-features`·macOS에서는 `connection_capabilities().storedAuth`가 false여서 승격 메뉴가 보이지 않고, 남은 호출도 한국어 거부 메시지를 받는다.
+- 로컬·원격 승격 명령과 UI는 `stored-auth` feature와 Windows/Linux에서만 컴파일된다. `connection_capabilities`는 `storedAuth` camelCase 키로 응답하며(백엔드 직렬화 시험 고정), 기본 빌드·`--no-default-features`·macOS에서는 false여서 승격 메뉴가 보이지 않고 남은 호출도 한국어 거부 메시지를 받는다. Windows에서는 로컬 메뉴만 플랫폼 조건으로 숨긴다.
 - 로컬은 앱과 같은 디렉터리의 `zzabba-askpass`가 root 소유·비쓰기여야 한다. 배포 번들에 `zzabba-askpass`를 포함해야 한다. 원격 서버에는 `zzabba-elevate`를 관리자가 별도로 설치해야 하며, 앱은 sudoers·helper를 수정하지 않는다.
 
 실측(`zzabbaxterm-sudo-remote:latest`, Ubuntu 24.04.5 기반. `zzabbaxterm-demo-remote:latest`에 `apt-get install sudo`로 실제 sudo를 넣고 `demo`를 sudo 그룹에 추가; 컨테이너 `zzabba-sudo-remote`, `127.0.0.1:2300`, 계정 `demo` uid 1001, 암호 요구 sudo):
@@ -54,15 +56,16 @@
 
 자동 시험 결과:
 
-- `cargo test --manifest-path app/src-tauri/Cargo.toml --features stored-auth --lib elevation` → 21 passed, 0 failed, 1 ignored(원격 컨테이너 실측). 승인 대상 불일치·만료·다른 세션/계정/실행 파일/인자, 재응답 거부, 취소, 캐시 인증 0회 조회, 신뢰되지 않은 helper, 계보 밖 helper, 원격 확인·프레임 절단·순번 역행·다른 승인 ID·채널 단절(`결과 미확인`)을 검사한다.
-- `cargo test … --lib elevation_remote_real_container -- --ignored` → 1 passed. 위 실측을 같은 시험으로 고정한다.
-- `cargo test … --lib auth` → 25 passed(상속 `SUDO_ASKPASS`·`ZZABBA_ASKPASS_MODE`가 SSH 모드를 깨지 않는 회귀 포함), `--lib ssh` → 57 passed, `--lib terminal` → 43 passed. 기본 빌드 `cargo check --lib` 통과.
+- `cargo test --manifest-path app/src-tauri/Cargo.toml --features stored-auth --lib elevation` → 22 passed, 0 failed, 2 ignored(원격 컨테이너 실측·askpass 기한). 승인 대상 불일치·만료·다른 세션/계정/실행 파일/인자, 재응답 거부, 취소, 캐시 인증 0회 조회, 신뢰되지 않은 helper, 계보 밖 helper, 원격 확인·프레임 절단·순번 역행·다른 승인 ID·채널 단절(`결과 미확인`), 금고 오류 시 run 중단, 정상 종료 코드 유지를 검사한다.
+- `cargo test … --lib elevation_remote_real_container -- --ignored` → 1 passed. 계획 원본을 버린 뒤에도 임시 설정이 남는지 단언하고, 승인 1회·응답 1회·`id -u` 0을 고정한다.
+- `cargo test … --lib elevation_remote_askpass_times_out -- --ignored` → 1 passed. bridge가 응답하지 않으면 15초 뒤 askpass가 실패해 run이 40초 안에 종료한다.
+- `cargo test … --lib auth` → 26 passed(상속 `SUDO_ASKPASS`·`ZZABBA_ASKPASS_MODE`가 SSH 모드를 깨지 않는 회귀 포함), `--lib ssh` → 57 passed, `--lib terminal` → 44 passed, `capabilities_serialize` → 1 passed. 기본 빌드 `cargo check --lib` 통과.
 - `npx vitest run` → 272 passed, 28 files. `tsc --noEmit` 통과. 승인 카드가 인자를 나눠 표시하고, `[sudo] password for demo:` 출력만으로는 승격 요청이 생기지 않으며, 저장 인증 capability가 없으면 승격 메뉴가 보이지 않음을 검사한다.
 - helper 단위 시험은 Linux에서 `rustc --edition=2024 --test`로 2 passed(run 프레임·askpass·password 프레임 검증).
 
 남은 위험:
 
-1. **Tauri 창·PTY 경로의 GUI 자동 시험은 미실행.** 원격 실측은 앱의 계획·확인·run·bridge 코드를 Windows에서 실행했지만 run 채널은 파이프로 돌렸다. 제품 탭은 같은 run 명령을 로컬 PTY에서 실행하고 프레임을 PTY에 쓴다. 프레임은 암호가 아니지만 로컬 터미널 에코에 보일 수 있다.
+1. **Tauri 창·PTY 경로의 GUI 자동 시험은 미실행.** 원격 실측은 앱의 계획·확인·run·bridge 코드를 Windows에서 실행했지만 run 채널은 파이프로 돌렸다. 제품 탭은 같은 run 명령을 로컬 PTY에서 실행하고 프레임을 PTY에 쓴다. 프레임은 암호가 아니지만 로컬 터미널 에코에 보일 수 있다. 계획 수명은 `State` 보관과 실측 단언으로 고정했다.
 2. 원격 실측은 실제 Bitwarden 항목 대신 컨테이너 암호를 돌려주는 시험 금고를 썼다. 제품의 금고 조회 경로(`Bitwarden::password`)는 같다.
 3. helper는 관리자가 root:root·비쓰기로 설치해야 한다. 앱은 설치하지 않으며, 원격은 직접 SSH의 Agent·키 파일만 지원한다. 수동 암호·저장 암호 SSH·SSM·helper 없음은 "직접 입력" 안내로 끝난다.
 4. SSH 채널이 강제로 끊기면 서버의 sudo/FIFO 정리가 늦어질 수 있고, 앱은 `결과 미확인`으로 끝낸다. 로컬은 앱과 같은 디렉터리의 `zzabba-askpass`를 배포 번들에 포함하고 root 소유·비쓰기로 설치해야 한다.

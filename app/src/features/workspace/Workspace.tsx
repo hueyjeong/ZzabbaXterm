@@ -8,7 +8,7 @@ import type { ConnectionClose, InitialWizardDraft, SshTransport } from "../conne
 import { subscribeLocalCliOpen } from "../editor/cliOpen";
 import { EditorTab, type EditorTabActions } from "../editor/EditorTab";
 import { ElevationDialog } from "../elevation/ElevationDialog";
-import type { ElevationRequest } from "../elevation/elevation";
+import { elevationActions, type ElevationRequest } from "../elevation/elevation";
 import type { ApprovedEditorFile, ConfirmEditorDiscard, EditorTransport } from "../editor/contract";
 import { closeLocalFile, localEditorError, localEditorTransport, openLocalFile } from "../editor/localEditorIpc";
 import { subscribeRemoteNanoOpen, type RemoteNanoFile } from "../editor/nanoOpen";
@@ -123,6 +123,7 @@ export function Workspace() {
   const [wizard, setWizard] = useState<WizardRequest>();
   const [elevationContext, setElevationContext] = useState<Readonly<{ targetId?: string; target?: string; account?: string }>>();
   const [storedAuth, setStoredAuth] = useState(false);
+  const elevation = elevationActions(storedAuth, navigator.userAgent);
   const [treeWidth, setTreeWidth] = useState(280);
   const [aiWidth, setAiWidth] = useState(360);
   const [bodyWidth, setBodyWidth] = useState(1200);
@@ -667,8 +668,8 @@ export function Workspace() {
             <button onClick={reloadProfiles}>다시 불러오기</button>
           </div>}
           <LocalTree profiles={profileLoad.profiles} onOpen={openTab}
-            onLocalElevate={storedAuth ? () => setElevationContext({}) : undefined}
-            onElevate={storedAuth ? (target) => {
+            onLocalElevate={elevation.local ? () => setElevationContext({}) : undefined}
+            onElevate={elevation.remote ? (target) => {
               if (target?.defaultMethod !== "ssh") return;
               setElevationContext({
                 targetId: target.id,

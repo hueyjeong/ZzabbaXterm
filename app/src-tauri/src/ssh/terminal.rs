@@ -138,10 +138,10 @@ pub(crate) fn restrict_fixture_key(path: &Path) {
 /// 원격 sudo 승격은 배치 로그인이 가능한 직접 SSH(Agent·키 파일)에서만 연다.
 pub(crate) fn remote_plan(config: &Path, ssh: &Ssh) -> Result<Arc<ConnectionPlan>, String> {
     if !matches!(ssh.transport, SshTransport::Direct {}) {
-        return Err("원격 sudo 승격은 직접 SSH 연결에서만 사용할 수 있습니다".into());
+        return Err("원격 sudo 승격은 직접 SSH 연결에서만 사용할 수 있습니다. 터미널에서 직접 입력하세요".into());
     }
     if !matches!(ssh.auth, SshAuth::Agent { .. } | SshAuth::KeyFile { .. }) {
-        return Err("원격 sudo 승격은 SSH Agent 또는 키 파일 연결에서만 사용할 수 있습니다".into());
+        return Err("원격 sudo 승격은 SSH Agent 또는 키 파일 연결에서만 사용할 수 있습니다. 터미널에서 직접 입력하세요".into());
     }
     let launch = saved(config, ssh)?;
     let (_, plan) = launch.into_parts();

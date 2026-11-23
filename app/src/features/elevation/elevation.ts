@@ -36,6 +36,14 @@ export function validateElevationRequest(request: ElevationRequest): string | nu
   return null;
 }
 
+/** 로컬 sudo는 Linux 앱에서만 가능하고, 원격은 저장 인증 capability를 따른다. */
+export function elevationActions(storedAuth: boolean, userAgent: string) {
+  return {
+    local: storedAuth && !/Windows/i.test(userAgent),
+    remote: storedAuth,
+  };
+}
+
 /** 한 줄에 하나씩 적은 인자를 빈 항목 없이 배열로 만든다. */
 export function parseArguments(text: string): string[] {
   return text.split("\n").map((argument) => argument.trim()).filter(Boolean);

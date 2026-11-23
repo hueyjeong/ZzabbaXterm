@@ -20,7 +20,7 @@ mod linux {
     use std::{
         env,
         ffi::OsString,
-        fs::{self, File, OpenOptions},
+        fs::{self, OpenOptions},
         io::{self, BufRead, BufReader, Read, Write},
         os::unix::{
             fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
@@ -139,13 +139,31 @@ mod linux {
             .flush()
             .map_err(|error| format!("stdout: {error}"))?;
 
-        let mut stdin = io::stdin().lock();
-        let line = read_line(&mut stdin, "password 프레임")?;
+        // SSH 채널이 EOF를 늦게 보내도 bridge가 무기한 매달리지 않는다.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let _ = io::stdin().read_line(&mut line);
+            let _ = sender.send(line);
+        });
+        let line = receiver
+            .recv_timeout(Duration::from_secs(15))
+            .map_err(|_| "password 프레임 시간 초과")?;
         let password = parse_password(&line, &id, &nonce)?;
-        let mut response = OpenOptions::new()
-            .write(true)
-            .open(directory.response())
-            .map_err(|error| format!("password FIFO: {error}"))?;
+        let started = std::time::Instant::now();
+        let mut response = loop {
+            match OpenOptions::new()
+                .write(true)
+                .custom_flags(O_NONBLOCK)
+                .open(directory.response())
+            {
+                Ok(response) => break response,
+                Err(_) if started.elapsed() < Duration::from_secs(5) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => return Err(format!("password FIFO: {error}")),
+            }
+        };
         response
             .write_all(&password)
             .and_then(|_| response.write_all(b"\n"))
@@ -187,11 +205,34 @@ mod linux {
         };
         writeln!(request, "ASKPASS 2 {id} {nonce}").map_err(|error| format!("요청 쓰기: {error}"))?;
         request.flush().map_err(|error| format!("요청 flush: {error}"))?;
-        let mut response = open_blocking_read(directory.response())?;
+        // bridge가 응답을 쓰지 않고 죽어도 askpass가 무기한 매달리지 않는다.
+        let mut response = BufReader::new(
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(O_NONBLOCK)
+                .open(directory.response())
+                .map_err(|error| format!("password FIFO 열기: {error}"))?,
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
         let mut line = String::new();
-        response
-            .read_line(&mut line)
-            .map_err(|error| format!("password 읽기: {error}"))?;
+        loop {
+            match response.read_line(&mut line) {
+                Ok(0) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err("password 응답 시간 초과".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Ok(_) => break,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err("password 응답 시간 초과".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => return Err(format!("password 읽기: {error}")),
+            }
+        }
         let password = line.strip_suffix('\n').unwrap_or(&line);
         let password = password.strip_suffix('\r').unwrap_or(password);
         if password.is_empty() || password.len() > MAX_PASSWORD || password.contains('\0') {
@@ -293,6 +334,7 @@ mod linux {
             let base = base_directory()?;
             let path = base.join(format!("{id}-{nonce}"));
             fs::create_dir_all(&base).map_err(|error| format!("승격 디렉터리: {error}"))?;
+        cleanup_stale(&base, &base.join(format!("{id}-{nonce}")))?;
             fs::set_permissions(&base, PermissionsExt::from_mode(0o700))
                 .map_err(|error| format!("승격 디렉터리 권한: {error}"))?;
             let base_meta = fs::symlink_metadata(&base)
@@ -363,6 +405,38 @@ mod linux {
         }
     }
 
+    /// 정상 종료하지 못한 예전 FIFO 디렉터리는 6시간 뒤 다음 serve가 정리한다.
+    fn cleanup_stale(base: &Path, current: &Path) -> Result<(), String> {
+        let uid = euid()?;
+        let Ok(entries) = fs::read_dir(base) else {
+            return Ok(());
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path == current {
+                continue;
+            }
+            let Ok(meta) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o777 != 0o700 {
+                continue;
+            }
+            if meta
+                .modified()
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_none_or(|age| age < Duration::from_secs(6 * 3600))
+            {
+                continue;
+            }
+            let _ = fs::remove_file(path.join("req"));
+            let _ = fs::remove_file(path.join("pw"));
+            let _ = fs::remove_dir(path);
+        }
+        Ok(())
+    }
+
     fn base_directory() -> Result<PathBuf, String> {
         let uid = euid()?;
         let run_user = PathBuf::from(format!("/run/user/{uid}"));
@@ -419,15 +493,42 @@ mod linux {
         Ok(name.to_owned())
     }
 
-    fn open_blocking_read(path: PathBuf) -> Result<BufReader<File>, String> {
-        let file = File::open(path).map_err(|error| format!("password FIFO 열기: {error}"))?;
-        Ok(BufReader::new(file))
-    }
-
     fn read_fifo(path: PathBuf, context: &str) -> Result<String, String> {
-        let file = File::open(path).map_err(|error| format!("{context} FIFO 열기: {error}"))?;
+        let started = std::time::Instant::now();
+        let file = loop {
+            match OpenOptions::new()
+                .read(true)
+                .custom_flags(O_NONBLOCK)
+                .open(&path)
+            {
+                Ok(file) => break file,
+                Err(_) if started.elapsed() < Duration::from_secs(10) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => return Err(format!("{context} FIFO 열기: {error}")),
+            }
+        };
         let mut reader = BufReader::new(file);
-        read_line(&mut reader, context)
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut line = String::new();
+        loop {
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(format!("{context} 시간 초과"));
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Ok(_) => return Ok(line),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(format!("{context} 시간 초과"));
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => return Err(format!("{context} 읽기: {error}")),
+            }
+        }
     }
 
     fn read_line(reader: &mut impl BufRead, context: &str) -> Result<String, String> {

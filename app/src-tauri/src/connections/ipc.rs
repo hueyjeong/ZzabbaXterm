@@ -6,8 +6,23 @@ use crate::terminal::Sessions;
 use super::{probe, store::Store};
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct Capabilities {
     stored_auth: bool,
+}
+
+#[cfg(test)]
+mod capabilities_tests {
+    use super::*;
+
+    #[test]
+    fn capabilities_serialize_stored_auth_as_camel_case() {
+        let value = serde_json::to_value(Capabilities { stored_auth: true }).unwrap();
+        assert_eq!(value, serde_json::json!({ "storedAuth": true }));
+        assert!(value.get("stored_auth").is_none());
+        let value = serde_json::to_value(Capabilities { stored_auth: false }).unwrap();
+        assert_eq!(value, serde_json::json!({ "storedAuth": false }));
+    }
 }
 
 pub(crate) fn handle(invoke: Invoke, other: fn(Invoke) -> bool) -> bool {
