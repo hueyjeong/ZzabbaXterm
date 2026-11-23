@@ -202,8 +202,8 @@ fn f01_two_saved_ssh_launches_reap_only_the_owned_plan_and_child() {
         let (second_context, second_cancel, second_worker) = sessions.get("main", &second.id).unwrap().sftp_context().unwrap();
         assert!(std::sync::Arc::ptr_eq(&first_context, &same_context));
         assert!(!std::sync::Arc::ptr_eq(&first_context, &second_context));
-        assert_eq!(first_context.invocation(crate::ssh::Client::Sftp).args[4], first_plan.as_os_str());
-        assert_eq!(second_context.invocation(crate::ssh::Client::Sftp).args[4], second_plan.as_os_str());
+        assert_eq!(first_context.invocation(crate::ssh::Client::Sftp).unwrap().args[4], first_plan.as_os_str());
+        assert_eq!(second_context.invocation(crate::ssh::Client::Sftp).unwrap().args[4], second_plan.as_os_str());
         drop((first_context, same_context, second_context, same_worker, second_worker));
         let cancelled = first_cancel.clone();
         let worker = thread::spawn(move || {

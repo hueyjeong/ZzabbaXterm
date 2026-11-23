@@ -6,6 +6,7 @@ const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZ
 const SHA: &str = "SHA256:UCUiLr7Pjs9wFFJMDByLgc3NrtdU344OgUM45wZPcIQ";
 const OTHER_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIC43GzF6fNOSizxOL5WTkKKSfu0OGcQymwLyXHRmq8Pm";
 const OTHER_SHA: &str = "SHA256:k/KBYp42xBgn72aCjefPr1hQdnwjGXOW2zC2gDA9ehw";
+const ITEM: &str = "21eb36c3-234d-439d-9e1f-1d3cc5ba8125";
 
 fn setup() -> (SessionFiles, TrustStore, Endpoint) {
     let root = session_files(&std::env::temp_dir()).unwrap();
@@ -64,7 +65,65 @@ fn f01_both_transports_require_the_exact_host_and_port_before_planning() {
         Err(Error::SsmProxyUnavailable),
     ));
     assert!(matches!(
-        ConnectionPlan::prepare(&store, &approved, "dev", Transport::Direct, Authentication::StoredPassword),
+        ConnectionPlan::prepare(&store, &approved, "dev", Transport::Ssm, Authentication::StoredPassword { item: ITEM }),
+        Err(Error::SsmProxyUnavailable),
+    ));
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+#[test]
+fn stored_plan_is_pinned_and_unavailable_to_ordinary_clients() {
+    let (_root, store, endpoint) = setup();
+    let approved = approve(&endpoint, SHA);
+    store.register(&approved, KEY).unwrap();
+    let prepare = |host: &ApprovedHost<'_>, user: &str| ConnectionPlan::prepare(
+        &store, host, user, Transport::Direct, Authentication::StoredPassword { item: ITEM },
+    );
+    let other_port = Endpoint::new("dev.example.invalid", 22).unwrap();
+    assert!(matches!(prepare(&approve(&other_port, SHA), "dev"), Err(Error::UnregisteredHost)));
+    assert!(matches!(prepare(&approve(&endpoint, OTHER_SHA), "dev"), Err(Error::FingerprintMismatch)));
+    assert!(matches!(prepare(&approved, "-root"), Err(Error::InvalidAccount)));
+    let plan = prepare(&approved, "dev").unwrap();
+    let stored = plan.stored().unwrap();
+    assert_eq!(stored.target, "[dev.example.invalid]:2222");
+    assert_eq!(stored.user, "dev");
+    assert_eq!(stored.fingerprint, SHA);
+    assert_eq!(stored.item, ITEM);
+    assert!(matches!(plan.invocation(Client::Ssh), Err(Error::StoredAuthenticationUnavailable)));
+    assert!(matches!(plan.invocation(Client::Sftp), Err(Error::StoredSftpAskpassRequired)));
+
+    let invocation = plan.stored_ssh_invocation().unwrap();
+    assert_eq!(invocation.args, [OsStr::new("-F"), plan.config.as_os_str(), OsStr::new("--"), OsStr::new(DESTINATION)]);
+    assert_eq!(invocation.environment, NO_ASKPASS);
+    let config = fs::read_to_string(&plan.config).unwrap();
+    assert!(!config.contains(ITEM));
+    for option in [
+        "HostName dev.example.invalid", "Port 2222", "User dev", "HostKeyAlias [dev.example.invalid]:2222",
+        "StrictHostKeyChecking yes", "HostKeyAlgorithms ssh-ed25519", "GlobalKnownHostsFile none",
+        "PreferredAuthentications password", "PasswordAuthentication yes", "NumberOfPasswordPrompts 1",
+        "PubkeyAuthentication no", "KbdInteractiveAuthentication no", "IdentityAgent none", "BatchMode no",
+    ] {
+        assert!(config.lines().any(|line| line == option), "{option}");
+    }
+    let pin = config.lines().find_map(|line| line.strip_prefix("UserKnownHostsFile ")).unwrap();
+    let pin = Path::new(pin.trim_matches('"'));
+    assert_eq!(fs::read_to_string(pin).unwrap(), format!("[dev.example.invalid]:2222 {KEY}\n"));
+    for snapshot in [pin, &plan.config] {
+        assert!(fs::write(snapshot, "replacement").is_err());
+    }
+    let manual = ConnectionPlan::prepare(&store, &approved, "dev", Transport::Direct, Authentication::ManualPassword).unwrap();
+    assert!(manual.stored().is_none());
+    assert!(matches!(manual.stored_ssh_invocation(), Err(Error::StoredAuthenticationUnavailable)));
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+#[test]
+fn unsupported_platform_rejects_stored_password() {
+    let (_root, store, endpoint) = setup();
+    let approved = approve(&endpoint, SHA);
+    store.register(&approved, KEY).unwrap();
+    assert!(matches!(
+        ConnectionPlan::prepare(&store, &approved, "dev", Transport::Direct, Authentication::StoredPassword { item: ITEM }),
         Err(Error::StoredAuthenticationUnavailable),
     ));
 }
@@ -210,8 +269,8 @@ fn f01_ssh_and_sftp_use_one_pinned_config_with_exclusive_authentication() {
         (Authentication::ManualPassword, "password", "no", "yes", "no"),
     ] {
         let plan = ConnectionPlan::prepare(&store, &approved, "test-user", Transport::Direct, auth).unwrap();
-        let ssh = plan.invocation(Client::Ssh);
-        let sftp = plan.invocation(Client::Sftp);
+        let ssh = plan.invocation(Client::Ssh).unwrap();
+        let sftp = plan.invocation(Client::Sftp).unwrap();
         assert!(ssh.program.is_absolute() && ssh.program.is_file());
         assert_eq!(sftp.program, ssh.program);
         assert_eq!(ssh.program.file_stem().unwrap(), "ssh");

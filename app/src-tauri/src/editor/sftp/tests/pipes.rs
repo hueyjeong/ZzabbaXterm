@@ -8,7 +8,7 @@ use super::*;
 const LIMIT: Duration = Duration::from_secs(5);
 
 fn command(plan: &ConnectionPlan, fixture: &Path) -> Command {
-    let ssh = Session::command(plan);
+    let ssh = Session::command(plan).unwrap();
     let ssh = ssh.as_std();
     let mut command = Command::new(fixture);
     command.args(ssh.get_args());
@@ -19,6 +19,25 @@ fn command(plan: &ConnectionPlan, fixture: &Path) -> Command {
         };
     }
     command
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+#[test]
+fn stored_ssh_password_is_rejected_before_building_sftp_command() {
+    let root = tempfile::tempdir().unwrap();
+    let trust = root.path().join("trust");
+    drop(plan(&trust, "editor"));
+    let store = TrustStore::open(&trust).unwrap();
+    let endpoint = Endpoint::new("editor.example.invalid", 22).unwrap();
+    let approved = ApprovedHost::confirm(
+        &endpoint, &endpoint, "SHA256:UCUiLr7Pjs9wFFJMDByLgc3NrtdU344OgUM45wZPcIQ",
+    ).unwrap();
+    let stored = ConnectionPlan::prepare(
+        &store, &approved, "editor", Transport::Direct,
+        Authentication::StoredPassword { item: "21eb36c3-234d-439d-9e1f-1d3cc5ba8125" },
+    ).unwrap();
+    assert!(matches!(Session::command(&stored), Err(Error::Terminal(message))
+        if message == "SFTP는 저장된 SSH 암호의 별도 승인을 지원하지 않습니다"));
 }
 
 async fn peer(plan: &ConnectionPlan, fixture: &Path, root: &Path, scenario: Scenario) -> (Command, JoinHandle<Fixture>) {

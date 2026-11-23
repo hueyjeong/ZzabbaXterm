@@ -15,6 +15,14 @@ pub mod editor_cli {
     pub use crate::editor::cli::{CliError, run};
 }
 
+#[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+#[path = "auth"]
+pub mod local_auth {
+    #[path = "mod.rs"]
+    mod implementation;
+    pub use self::implementation::run_askpass;
+}
+
 use editor::registry::LocalEditors;
 use editor::sftp_ipc::SftpIpc;
 use storage::ipc::{self as storage_ipc, StorageIpc};
