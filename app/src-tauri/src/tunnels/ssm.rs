@@ -574,19 +574,41 @@ pub(super) fn start_rejection(stderr: &[u8]) -> Option<String> {
 #[cfg(test)]
 pub(super) fn fixture_child(mode: &str, listen: SocketAddr, printed: Option<u16>, verified: Result<&str, &str>,
                             terminated: Option<Arc<std::sync::atomic::AtomicBool>>) -> Result<SsmChild, String> {
+    let verified = verified.map(str::to_owned).map_err(str::to_owned);
+    fixture_verified(mode, listen, printed, Box::new(move |expected: &str, _: &CancellationToken| {
+        assert_eq!(expected, tests::SESSION);
+        verified
+    }), terminated)
+}
+
+#[cfg(test)]
+fn fixture_verified(mode: &str, listen: SocketAddr, printed: Option<u16>, verify: Verify,
+                    terminated: Option<Arc<std::sync::atomic::AtomicBool>>) -> Result<SsmChild, String> {
     let program = tests::fixture_program();
     let (port, printed) = (listen.port().to_string(), printed.unwrap_or(listen.port()).to_string());
     let permit = ForwardPermit::fixture(program, &[mode, &port, tests::SESSION, &printed]);
-    let verified = verified.map(str::to_owned).map_err(str::to_owned);
     SsmChild::start(
         listen,
         |configure| permit.spawn_fixture(configure).map(|(child, guard)| (child, Some(guard))),
-        Box::new(move |expected: &str, _: &CancellationToken| {
-            assert_eq!(expected, tests::SESSION);
-            verified
-        }),
+        verify,
         terminated.map(|flag| Box::new(move || flag.store(true, std::sync::atomic::Ordering::SeqCst)) as Terminate),
     )
+}
+
+/// `open_ssh_forward`와 같은 대기·취소 경로를 가짜 CLI 트리로 실행한다. 플러그인은 bind 없이 준비 문장을 출력하고,
+/// 세션 확인은 `held`로 알린 뒤 전달이 닫힐 때까지 붙잡아 준비 중으로 둔다.
+#[cfg(test)]
+pub(crate) fn fixture_held_ssh_forward(cancel: &CancellationToken, held: std::sync::mpsc::Sender<()>,
+                                       terminated: Arc<std::sync::atomic::AtomicBool>) -> Result<(u16, SsmChild), String> {
+    ready_on_free_port(cancel, || tests::bind_loopback().local_addr(), |listen| {
+        let held = held.clone();
+        fixture_verified("impostor", listen, None, Box::new(move |expected: &str, closed: &CancellationToken| {
+            assert_eq!(expected, tests::SESSION);
+            let _ = held.send(());
+            tauri::async_runtime::block_on(closed.cancelled());
+            Err("SSM 세션 연결 확인 불가".into())
+        }), Some(terminated.clone()))
+    })
 }
 
 fn ended(observation: Observation) -> String {

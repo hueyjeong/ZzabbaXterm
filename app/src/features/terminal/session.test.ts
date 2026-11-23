@@ -24,7 +24,7 @@ function nativePeer() {
     await vi.waitFor(() => expect(open).toHaveBeenCalledTimes(1));
     opening.resolve(id);
   }
-  function send(bytes: ArrayBuffer | { kind: "exited"; value: number } | { kind: "disconnected"; value: string } | { kind: "notice"; value: string }) {
+  function send(bytes: ArrayBuffer | { kind: "exited"; value: number } | { kind: "disconnected"; value: string } | { kind: "notice"; value: string } | { kind: "connecting" }) {
     const receiver = open.mock.calls[0]?.[1];
     if (!receiver) throw new Error("세션 수신기가 없습니다");
     receiver(bytes);
@@ -125,6 +125,27 @@ describe("L01 터미널 세션", () => {
       ["a", "\x1b[1;1R"], ["a", "준비된 입력"],
     ]);
     peer.session.close();
+  });
+
+  it("시작 응답 전 SSH-over-SSM 전달 준비는 연결 중으로 표시하고 결과에 따라 실행 또는 실패로 바꾼다", async () => {
+    for (const result of ["running", "failed"] as const) {
+      const starting = Promise.withResolvers<void>();
+      const peer = nativePeer();
+      peer.start.mockReturnValueOnce(starting.promise);
+      await peer.openAs("a");
+      await vi.waitFor(() => expect(peer.start).toHaveBeenCalledWith("a"));
+      peer.send({ kind: "connecting" });
+      expect(peer.status).toHaveBeenLastCalledWith({ kind: "connecting" }, "a");
+      peer.session.input("준비 전 입력");
+      if (result === "running") starting.resolve();
+      else starting.reject("SSM: SSO 재로그인 필요");
+      const expected = result === "running" ? { kind: "running" } : { kind: "failed", value: "SSM: SSO 재로그인 필요" };
+      await vi.waitFor(() => expect(peer.status).toHaveBeenLastCalledWith(expected, "a"));
+      peer.send({ kind: "connecting" });
+      expect(peer.status).toHaveBeenLastCalledWith(expected, "a");
+      expect(peer.input).not.toHaveBeenCalled();
+      peer.session.close();
+    }
   });
 
   it("키와 붙여넣기를 한 번씩 순서대로 보내고 닫힌 탭의 대기 키는 버린다", async () => {

@@ -421,7 +421,7 @@ impl Sessions {
 
     fn register_document(&self, owner: &str, document: u64, command: &Launch, remote_editor: bool) -> Result<(String, Arc<Session>), String> {
         let id = self.next_id();
-        let mut session = Session::new(owner, command.is_ssm());
+        let mut session = Session::new(owner, command.defers_start());
         session.document = Some(document);
         let session = Arc::new(session);
         {
@@ -443,7 +443,7 @@ impl Sessions {
         send: impl Fn(Event) -> Result<(), String> + Send + 'static,
     ) -> Result<String, String> {
         let document = session.document.expect("registered document session");
-        let ssh = matches!(command, Launch::Ssh(_));
+        let ssh = matches!(command, Launch::Ssh(_) | Launch::Forward(_));
         let registry = Arc::clone(&self.registry);
         let worker_id = id.clone();
         let result = session.launch(size, command, send, move |session| {

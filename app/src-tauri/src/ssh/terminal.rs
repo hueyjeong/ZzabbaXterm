@@ -93,9 +93,8 @@ impl DirectLaunch {
     }
 
     pub(crate) fn enable_editor(&mut self, app: tauri::AppHandle, owner: String, document: u64) -> tokio::sync::oneshot::Sender<String> {
-        let (id, parent) = tokio::sync::oneshot::channel();
-        let (started, ready) = tokio::sync::oneshot::channel();
-        self.editor = Some((super::nano::Binding { app, owner, document, parent, started: ready }, started));
+        let (editor, id) = editor_binding(app, owner, document);
+        self.editor = Some(editor);
         id
     }
 
@@ -133,6 +132,67 @@ impl DirectLaunch {
         self.command.get_argv_mut()[0] = executable.as_os_str().to_owned();
         self.command.env("ZZABBA_F01_FIXTURE_WAIT", "1");
         self.plan.config.clone()
+    }
+}
+
+type Editor = (super::nano::Binding, tokio::sync::oneshot::Sender<()>);
+
+fn editor_binding(app: tauri::AppHandle, owner: String, document: u64) -> (Editor, tokio::sync::oneshot::Sender<String>) {
+    let (id, parent) = tokio::sync::oneshot::channel();
+    let (started, ready) = tokio::sync::oneshot::channel();
+    ((super::nano::Binding { app, owner, document, parent, started: ready }, started), id)
+}
+
+type PrepareForward = Box<dyn FnOnce(&CancellationToken) -> Result<DirectLaunch, String> + Send>;
+
+/// SSH-over-SSM 탭은 먼저 열고, PTY 작업자가 탭의 취소 토큰으로 전달과 접속 계획을 준비한다.
+pub(crate) struct ForwardLaunch {
+    prepare: PrepareForward,
+    editor: Option<Editor>,
+}
+
+impl ForwardLaunch {
+    /// 저장 암호가 아닌 SSH-over-SSM 대상은 PIN만 먼저 확인하고 전달 준비를 미룬다.
+    fn saved(config: &Path, ssh: &Ssh) -> Result<Option<Self>, String> {
+        if !matches!(ssh.transport, SshTransport::Ssm(_)) || matches!(ssh.auth, SshAuth::StoredPassword { .. }) {
+            return Ok(None);
+        }
+        let endpoint = super::Endpoint::new(&ssh.host, ssh.port).map_err(pin_error)?;
+        let approved = ApprovedHost::confirm(&endpoint, &endpoint, &ssh.host_key_fingerprint).map_err(pin_error)?;
+        trust_store(config)?.pin(&approved).map_err(pin_error)?;
+        let (config, ssh) = (config.to_owned(), ssh.clone());
+        Ok(Some(Self { prepare: Box::new(move |cancel| saved(&config, &ssh, cancel)), editor: None }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture(prepare: impl FnOnce(&CancellationToken) -> Result<DirectLaunch, String> + Send + 'static) -> Self {
+        Self { prepare: Box::new(prepare), editor: None }
+    }
+
+    /// 취소되면 이미 시작한 SSM 자식과 원격 세션은 전달을 버리는 경로로 정리된다.
+    pub(crate) fn prepare(self, cancel: &CancellationToken) -> Result<DirectLaunch, String> {
+        let mut launch = (self.prepare)(cancel)?;
+        launch.editor = self.editor;
+        Ok(launch)
+    }
+}
+
+/// 터미널 탭이 여는 저장 SSH 실행이다.
+pub(crate) enum SavedLaunch {
+    Ready(DirectLaunch),
+    Forward(ForwardLaunch),
+}
+
+impl SavedLaunch {
+    pub(crate) fn enable_editor(&mut self, app: tauri::AppHandle, owner: String, document: u64) -> tokio::sync::oneshot::Sender<String> {
+        match self {
+            Self::Ready(launch) => launch.enable_editor(app, owner, document),
+            Self::Forward(launch) => {
+                let (editor, id) = editor_binding(app, owner, document);
+                launch.editor = Some(editor);
+                id
+            }
+        }
     }
 }
 
@@ -215,20 +275,24 @@ pub(crate) fn saved(config: &Path, ssh: &Ssh, cancel: &CancellationToken) -> Res
 }
 
 /// 터미널 탭에서만 쓴다. 저장 암호 대상은 로컬 확인 창을 거친 한 번의 승인으로 실행한다.
+/// SSH-over-SSM 대상은 탭을 먼저 열 수 있도록 전달 준비를 미룬다.
 pub(crate) fn saved_interactive(
     config: &Path,
     ssh: &Ssh,
     owner: &str,
     document: u64,
     confirm: impl FnOnce(String) -> Result<bool, String>,
-) -> Result<DirectLaunch, String> {
+) -> Result<SavedLaunch, String> {
+    if let Some(forward) = ForwardLaunch::saved(config, ssh)? {
+        return Ok(SavedLaunch::Forward(forward));
+    }
     #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
     if let SshAuth::StoredPassword { item_id } = &ssh.auth {
         let endpoint = super::Endpoint::new(&ssh.host, ssh.port).map_err(pin_error)?;
-        return prepare_stored(config, ssh, &endpoint, item_id, owner, document, confirm);
+        return prepare_stored(config, ssh, &endpoint, item_id, owner, document, confirm).map(SavedLaunch::Ready);
     }
     let _ = (owner, document, confirm);
-    saved(config, ssh, &CancellationToken::new())
+    saved(config, ssh, &CancellationToken::new()).map(SavedLaunch::Ready)
 }
 
 #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
@@ -385,13 +449,16 @@ pub(crate) fn stored_failure(error: &crate::local_auth::Error) -> Option<String>
 }
 
 pub(crate) fn prepare_remote_editor(config: &Path, id: &str, revision: std::num::NonZeroU64, ssh: &Ssh)
-    -> Result<(DirectLaunch, String), String>
+    -> Result<(SavedLaunch, String), String>
 {
     if !matches!(ssh.auth, SshAuth::Agent { .. } | SshAuth::KeyFile { .. }) {
         return Err("nano 연동에는 SSH Agent 또는 키 파일이 필요합니다".into());
     }
     let endpoint = super::Endpoint::new(&ssh.host, ssh.port).map_err(pin_error)?;
-    let launch = prepare_saved(config, ssh, &endpoint, &CancellationToken::new())?;
+    let launch = match ForwardLaunch::saved(config, ssh)? {
+        Some(forward) => SavedLaunch::Forward(forward),
+        None => SavedLaunch::Ready(prepare_saved(config, ssh, &endpoint, &CancellationToken::new())?),
+    };
     let message = format!(
         "프로필: {id}\n리비전: {revision}\n서버: {}\n포트: {}\n계정: {}\n호스트 키 지문: {}\n\n관리자가 SSH 셸과 SFTP에서 같은 경로가 같은 파일을 가리킨다고 확인했습니까?",
         endpoint.host, endpoint.port, ssh.account, ssh.host_key_fingerprint,
