@@ -537,7 +537,7 @@ export function Workspace() {
       }]);
       placeTab(id, split);
     } catch (error) {
-      if (error instanceof DesktopRouteError) keepUnclosedRoute(error.handle, error.targetId, target.displayName, error.message);
+      if (error instanceof DesktopRouteError) keepUnclosedRoute(error.handle, error.targetId, target.displayName, error.message, error.method);
       if (!pending.controller.signal.aborted || error instanceof DesktopRouteError) {
         setWindowError(`${target.displayName} 열기 실패: ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -547,9 +547,9 @@ export function Workspace() {
   }
 
   /** 종료를 확인하지 못한 경로 터널은 보이는 터널 탭으로 남겨 같은 핸들로 다시 닫게 한다. */
-  function keepUnclosedRoute(handle: string, targetId: string, name: string, error: string) {
+  function keepUnclosedRoute(handle: string, targetId: string, name: string, error: string, method: "ssh" | "ssm") {
     const id = nextTab.current++;
-    setTabs(current => [...current, { kind: "tunnel", id, label: `${name} · 경로`, handle, targetId, name, method: "ssh", closeStatus: "unconfirmed", closeError: error }]);
+    setTabs(current => [...current, { kind: "tunnel", id, label: `${name} · 경로`, handle, targetId, name, method, closeStatus: "unconfirmed", closeError: error }]);
     updateLayout(current => L.appendTab(current, id));
   }
 
@@ -664,7 +664,8 @@ export function Workspace() {
       const source = tab.source;
       void tab.release?.().catch(error => {
         setWindowError(`${tab.label} 경로 종료 실패: ${String(error)}`);
-        if (source) keepUnclosedRoute(source.tabHandle, source.targetId, tab.label, String(error));
+        // SSM 경로는 원격 화면 프로필 자신을 경로 대상으로 연다.
+        if (source) keepUnclosedRoute(source.tabHandle, source.targetId, tab.label, String(error), source.targetId === tab.targetId ? "ssm" : "ssh");
       });
     }
     if (tab.kind === "tunnel" || tab.kind === "storage" || (tab.kind === "terminal" && (tab.ssm || tab.ssh))) {

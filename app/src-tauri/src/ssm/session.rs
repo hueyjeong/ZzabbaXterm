@@ -19,6 +19,8 @@ use crate::terminal::ControlBinding;
 pub(crate) enum SessionDocument<'a> {
     DefaultShell,
     AiSharedControl { role: &'a AssumedRole, target: &'a str },
+    /// R01이 승인 범위를 대조해 만든 공식 포트 전달 문서와 매개변수다.
+    PortForward { document: &'static str, parameters: &'a str },
 }
 
 // 각 요청을 앱 세션에 보관하고 start-session은 요청당 한 번만 호출한다.
@@ -26,6 +28,7 @@ pub struct StartRequest {
     scope: Scope,
     target: String,
     document_name: Option<&'static str>,
+    parameters: Option<String>,
     reason: String,
     owner: Arc<str>,
     role: Option<Arc<AssumedRole>>,
@@ -103,6 +106,64 @@ impl StartPermit {
     }
 }
 
+const FORWARD_DOCUMENTS: [&str; 2] = ["AWS-StartPortForwardingSession", "AWS-StartPortForwardingSessionToRemoteHost"];
+
+/// 포트 전달 자식을 시작할 때 소비하는 인가다. 자식의 stdout·stderr는 호출자가 판독한다.
+pub(crate) struct ForwardPermit {
+    command: std::process::Command,
+    program: Arc<Path>,
+    cwd: std::path::PathBuf,
+    credentials: Arc<Credentials>,
+    plugin: plugin::CheckedPlugin,
+}
+
+/// 자식이 끝날 때까지 CLI 홈과 검증한 플러그인 파일을 보존한다.
+pub(crate) struct ForwardGuard {
+    _credentials: Arc<Credentials>,
+    _plugin: plugin::CheckedPlugin,
+}
+
+impl ForwardPermit {
+    /// `configure`는 프로세스 트리 정리 설정(작업 개체·프로세스 그룹)만 더한다.
+    pub(crate) fn spawn(self, configure: impl FnOnce(&mut std::process::Command)) -> io::Result<(std::process::Child, ForwardGuard)> {
+        let expired = || io::Error::new(io::ErrorKind::PermissionDenied, "SSM credentials expired");
+        self.credentials.require_current().map_err(|_| expired())?;
+        self.plugin.recheck(&self.program, &self.cwd)
+            .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "SSM plugin search changed"))?;
+        self.credentials.require_current().map_err(|_| expired())?;
+        self.spawn_unchecked(configure)
+    }
+
+    fn spawn_unchecked(mut self, configure: impl FnOnce(&mut std::process::Command)) -> io::Result<(std::process::Child, ForwardGuard)> {
+        self.command.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        configure(&mut self.command);
+        let child = self.command.spawn()?;
+        Ok((child, ForwardGuard { _credentials: self.credentials, _plugin: self.plugin }))
+    }
+}
+
+#[cfg(test)]
+impl ForwardPermit {
+    /// 가짜 플러그인 프로그램을 같은 파이프·트리 설정으로 실행한다.
+    pub(crate) fn fixture(program: &Path, args: &[&str]) -> Self {
+        let mut command = std::process::Command::new(program);
+        command.args(args);
+        Self {
+            command,
+            program: program.into(),
+            cwd: std::env::temp_dir(),
+            credentials: super::tests::fixture_credentials(),
+            plugin: plugin::tests::fixture_plugin(),
+        }
+    }
+
+    pub(crate) fn spawn_fixture(self, configure: impl FnOnce(&mut std::process::Command)) -> io::Result<(std::process::Child, ForwardGuard)> {
+        self.spawn_unchecked(configure)
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn fixture_start(program: &Path) -> (AwsCli, Scope, StartRequest, StartPermit) {
     let scope = Scope::new("fixture".into(), "us-west-2".into()).unwrap();
@@ -112,6 +173,7 @@ pub(crate) fn fixture_start(program: &Path) -> (AwsCli, Scope, StartRequest, Sta
         scope: scope.clone(),
         target: "i-01234567".into(),
         document_name: None,
+        parameters: None,
         reason: "zzabbaxterm-0123456789abcdef0123456789abcdef".into(),
         owner: "arn:aws:sts::123456789012:assumed-role/Sample/Sample".into(),
         role: None,
@@ -240,6 +302,19 @@ impl AwsCli {
             .await
     }
 
+    pub(crate) async fn authorize_forward(
+        &self,
+        request: &mut StartRequest,
+        scope: &Scope,
+        cancel: &CancellationToken,
+    ) -> Result<Option<ForwardPermit>, CliError> {
+        request
+            .authorize_forward_with(&self.0, scope, async |cwd| {
+                plugin::checked_path(&self.0, cwd, cancel).await
+            })
+            .await
+    }
+
     pub async fn verify_session(
         &self,
         request: &StartRequest,
@@ -346,8 +421,40 @@ impl StartRequest {
         &mut self,
         program: &Path,
         scope: &Scope,
-        mut check_plugin: impl AsyncFnMut(&Path) -> Result<plugin::CheckedPlugin, CliError>,
+        check_plugin: impl AsyncFnMut(&Path) -> Result<plugin::CheckedPlugin, CliError>,
     ) -> Result<Option<StartPermit>, CliError> {
+        if self.parameters.is_some() {
+            return Err(CliError::InvalidTarget);
+        }
+        let Some((cwd, path)) = self.authorize_checked(program, scope, check_plugin).await? else {
+            return Ok(None);
+        };
+        let command = self.start_command(&cwd, path.path());
+        Ok(Some(StartPermit(command, self.credentials.clone(), path)))
+    }
+
+    async fn authorize_forward_with(
+        &mut self,
+        program: &Path,
+        scope: &Scope,
+        check_plugin: impl AsyncFnMut(&Path) -> Result<plugin::CheckedPlugin, CliError>,
+    ) -> Result<Option<ForwardPermit>, CliError> {
+        if self.parameters.is_none() || self.document_name.is_none() {
+            return Err(CliError::InvalidTarget);
+        }
+        let Some((cwd, plugin)) = self.authorize_checked(program, scope, check_plugin).await? else {
+            return Ok(None);
+        };
+        let command = self.forward_command(&cwd, plugin.path());
+        Ok(Some(ForwardPermit { command, program: self.program.clone(), cwd, credentials: self.credentials.clone(), plugin }))
+    }
+
+    async fn authorize_checked(
+        &mut self,
+        program: &Path,
+        scope: &Scope,
+        mut check_plugin: impl AsyncFnMut(&Path) -> Result<plugin::CheckedPlugin, CliError>,
+    ) -> Result<Option<(std::path::PathBuf, plugin::CheckedPlugin)>, CliError> {
         if !self.matches(program, scope) {
             return Err(CliError::InvalidTarget);
         }
@@ -358,29 +465,42 @@ impl StartRequest {
         let cwd = self.credentials.home().path().to_path_buf();
         let path = check_plugin(&cwd).await?;
         self.credentials.require_current()?;
-        let command = self.start_command(&cwd, path.path());
         self.command_issued = true;
-        Ok(Some(StartPermit(command, self.credentials.clone(), path)))
+        Ok(Some((cwd, path)))
+    }
+
+    fn start_spec(&self) -> CommandSpec {
+        let mut args = vec!["--target", self.target.as_str(), "--reason", self.reason.as_str()];
+        if let Some(document) = self.document_name {
+            args.extend(["--document-name", document]);
+        }
+        if let Some(parameters) = &self.parameters {
+            args.extend(["--parameters", parameters.as_str()]);
+        }
+        self.scope
+            .command(&self.program, "ssm", "start-session", &args)
+            .with_credentials(&self.scope, &self.credentials)
     }
 
     fn start_command(&self, cwd: &Path, plugin_path: &OsStr) -> CommandBuilder {
-        let args = ["--target", self.target.as_str(), "--reason", self.reason.as_str(),
-            "--document-name", self.document_name.unwrap_or_default()];
-        let args = if self.document_name.is_some() { &args[..] } else { &args[..4] };
-        let spec = self
-            .scope
-            .command(
-                &self.program,
-                "ssm",
-                "start-session",
-                args,
-            )
-            .with_credentials(&self.scope, &self.credentials);
+        let spec = self.start_spec();
         let mut command = CommandBuilder::new(spec.program());
         command.args(spec.args());
         command.cwd(cwd);
         apply_start_environment(&mut command, &spec, std::env::vars_os());
         // StartSession 작업 이름이 들어 있는 CLI 오류 형식으로 고정한다.
+        command.env("AWS_CLI_ERROR_FORMAT", "legacy");
+        command.env("PATH", plugin_path);
+        command
+    }
+
+    // 포트 전달은 PTY 대신 파이프로 실행해 플러그인의 준비 출력을 그대로 읽는다.
+    fn forward_command(&self, cwd: &Path, plugin_path: &OsStr) -> std::process::Command {
+        let spec = self.start_spec();
+        let mut command = std::process::Command::new(spec.program());
+        command.args(spec.args());
+        command.current_dir(cwd);
+        apply_start_environment(&mut command, &spec, std::env::vars_os());
         command.env("AWS_CLI_ERROR_FORMAT", "legacy");
         command.env("PATH", plugin_path);
         command
@@ -620,26 +740,44 @@ fn start_rejection_accepts_conpty_shutdown_modes_before_diagnostic() {
     assert!(matches!(start_rejection(output), Some(CliError::TargetNotConnected)));
 }
 
+trait StartEnvironment {
+    fn clear(&mut self);
+    fn set(&mut self, key: &OsStr, value: &OsStr);
+    fn remove(&mut self, key: &str);
+}
+
+impl StartEnvironment for CommandBuilder {
+    fn clear(&mut self) { self.env_clear(); }
+    fn set(&mut self, key: &OsStr, value: &OsStr) { self.env(key, value); }
+    fn remove(&mut self, key: &str) { self.env_remove(key); }
+}
+
+impl StartEnvironment for std::process::Command {
+    fn clear(&mut self) { self.env_clear(); }
+    fn set(&mut self, key: &OsStr, value: &OsStr) { self.env(key, value); }
+    fn remove(&mut self, key: &str) { self.env_remove(key); }
+}
+
 fn apply_start_environment(
-    command: &mut CommandBuilder,
+    command: &mut impl StartEnvironment,
     spec: &CommandSpec,
     inherited: impl IntoIterator<Item = (impl AsRef<std::ffi::OsStr>, impl AsRef<std::ffi::OsStr>)>,
 ) {
     // portable-pty의 Windows 레지스트리 환경 대신 일반 CLI와 같은 프로세스 환경을 사용한다.
-    command.env_clear();
+    command.clear();
     for (key, value) in inherited {
-        command.env(key, value);
+        command.set(key.as_ref(), value.as_ref());
     }
     #[cfg(windows)]
-    command.env("PATHEXT", ".EXE");
+    command.set(OsStr::new("PATHEXT"), OsStr::new(".EXE"));
     for key in spec.env_remove() {
-        command.env_remove(key);
+        command.remove(key);
     }
     for (key, value) in spec.env_set() {
-        command.env(key, value);
+        command.set(OsStr::new(key), OsStr::new(value));
     }
     spec.bound_environment(|key, value| {
-        command.env(key, value);
+        command.set(OsStr::new(key), value);
     });
 }
 
@@ -655,8 +793,8 @@ fn caller_account_id(owner: &str) -> &str {
 }
 
 fn prepare_start(scope: &Scope, node: &OnlineNode, document: SessionDocument<'_>) -> Result<StartRequest, CliError> {
-    let document_name = match document {
-        SessionDocument::DefaultShell => None,
+    let (document_name, parameters) = match document {
+        SessionDocument::DefaultShell => (None, None),
         SessionDocument::AiSharedControl { role, target } => {
             if target != node.instance_id() {
                 return Err(CliError::InvalidTarget);
@@ -664,7 +802,13 @@ fn prepare_start(scope: &Scope, node: &OnlineNode, document: SessionDocument<'_>
             if node.role.as_deref() != Some(role) {
                 return Err(CliError::CallerChanged);
             }
-            Some("ZzabbaAiSharedControl")
+            (Some("ZzabbaAiSharedControl"), None)
+        }
+        SessionDocument::PortForward { document, parameters } => {
+            if !FORWARD_DOCUMENTS.contains(&document) || parameters.is_empty() {
+                return Err(CliError::InvalidTarget);
+            }
+            (Some(document), Some(parameters.to_owned()))
         }
     };
     let mut nonce = [0; 16];
@@ -673,6 +817,7 @@ fn prepare_start(scope: &Scope, node: &OnlineNode, document: SessionDocument<'_>
         scope: scope.clone(),
         target: node.instance_id.clone(),
         document_name,
+        parameters,
         reason: format!("zzabbaxterm-{:032x}", u128::from_be_bytes(nonce)),
         owner: node.owner.clone(),
         role: node.role.clone(),
@@ -780,7 +925,7 @@ fn assumed_role(partition: &str, account: &str, resource: &str, user_id: &str) -
     Some(Arc::new(AssumedRole { partition: partition.into(), account: account.into(), id: id.into() }))
 }
 
-fn valid_session_id(id: &str) -> bool {
+pub(crate) fn valid_session_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 96
         && !id.starts_with('-')

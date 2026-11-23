@@ -64,7 +64,7 @@ fn save(store: &Store, input: Value) -> Result<SaveStatus, StoreError> {
     store.save(draft.validate().unwrap())
 }
 
-fn ssm_draft(dir: &Path) -> Value {
+pub(crate) fn ssm_draft(dir: &Path) -> Value {
     let mut value = draft(dir, "work", "ssm-node");
     let target = value["target"].as_object_mut().unwrap();
     target.remove("local");

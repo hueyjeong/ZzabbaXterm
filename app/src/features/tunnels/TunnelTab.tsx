@@ -18,7 +18,7 @@ const states = {
 
 export function TunnelTab({ tab, targetId, method, closeState, onShare, onOpenDesktop }: Props) {
   const windows = /Windows/.test(navigator.userAgent);
-  const [direction, setDirection] = useState<TunnelRequest["direction"]>("local");
+  const [direction, setDirection] = useState<Exclude<TunnelRequest["direction"], "ssm">>("local");
   const [tunnels, setTunnels] = useState<readonly TunnelStatus[]>([]);
   const [pending, setPending] = useState(false);
   const busy = useRef(false);
@@ -55,24 +55,37 @@ export function TunnelTab({ tab, targetId, method, closeState, onShare, onOpenDe
 
   function start(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (method !== "ssh" || (windows && direction === "remote")) return;
+    if (method === "ssh" && windows && direction === "remote") return;
     const fields = new FormData(event.currentTarget);
     const listen = Number(fields.get("listen"));
     const port = Number(fields.get("port"));
     const host = String(fields.get("host") ?? "").trim();
     const service = fields.get("protocol");
     const protocol = service === "rdp" || service === "vnc" ? service : undefined;
-    const request: TunnelRequest = direction === "local" ? { direction, listen, host, port, protocol }
-      : direction === "remote" ? { direction, listen, host, port }
-        : { direction, listen };
+    const request: TunnelRequest = method === "ssm" ? { direction: "ssm", listen, port, host: host || undefined, protocol }
+      : direction === "local" ? { direction, listen, host, port, protocol }
+        : direction === "remote" ? { direction, listen, host, port }
+          : { direction, listen };
     void run(() => tunnelIpc.start(tab, request));
   }
+
+  const service = <label>서비스 <select name="protocol">
+    <option value="">TCP</option><option value="rdp">RDP</option><option value="vnc">VNC</option>
+  </select></label>;
 
   return <section className="tunnel-panel" aria-label="터널">
     <h2>터널</h2>
     {closeState?.kind === "closing" && <p role="status">종료 중</p>}
     {closeState?.kind === "unconfirmed" && <p role="alert">{closeState.error}</p>}
-    {method === "ssm" ? <p role="status">공식 SSM 포트 전달의 바이너리 보존을 확인할 수 없습니다</p> : <>
+    {method === "ssm" ? <form onSubmit={start}>
+      <fieldset disabled={closing || pending}>
+        <label>수신 포트 <input name="listen" type="number" min="1" max="65535" required /></label>
+        <label>원격 호스트 <input name="host" defaultValue="" maxLength={253} /></label>
+        <label>목적지 포트 <input name="port" type="number" min="1" max="65535" required /></label>
+        {service}
+        <button type="submit">시작</button>
+      </fieldset>
+    </form> : <>
       <form onSubmit={start}>
         <fieldset disabled={closing || pending}>
           <label>방향 <select value={direction} onChange={event => {
@@ -88,9 +101,7 @@ export function TunnelTab({ tab, targetId, method, closeState, onShare, onOpenDe
             <label>목적지 호스트 <input name="host" defaultValue="127.0.0.1" maxLength={253} required /></label>
             <label>목적지 포트 <input name="port" type="number" min="1" max="65535" required /></label>
           </>}
-          {direction === "local" && <label>서비스 <select name="protocol">
-            <option value="">TCP</option><option value="rdp">RDP</option><option value="vnc">VNC</option>
-          </select></label>}
+          {direction === "local" && service}
           <button type="submit">시작</button>
         </fieldset>
       </form>

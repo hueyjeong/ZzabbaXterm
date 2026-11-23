@@ -6,8 +6,7 @@ use tokio::sync::oneshot;
 use zeroize::Zeroizing;
 use tokio_util::sync::CancellationToken;
 
-use crate::{connections::{profile::{Ssh, SshTransport}, with_saved_ssh},
-    tunnels::{Destination, ipc::{DesktopLease, Protocol, TunnelTabs}}};
+use crate::{connections::SavedRoute, tunnels::{Destination, ipc::{Confirmed, DesktopLease, Protocol, TunnelTabs, describe_route, load_route, route_scope, route_title}}};
 
 use super::{Auth, Error, Route, Secrets, Tab, Target, SessionId, lifetime::Lifetime, transport};
 #[cfg(target_os = "linux")]
@@ -71,9 +70,8 @@ impl Draft {
                 #[cfg(not(any(windows, target_os = "linux")))]
                 if password { return Err("이 운영체제는 VNC 비밀번호 연결을 지원하지 않습니다".into()); }
                 let lease = source.lease(window, &life, epoch, auth, held).await?;
-                let (_, ssh) = lease.ssh();
                 let destination = lease.destination();
-                let target = Target { profile_id: routed_scope(ssh, destination), host: destination.host.clone(), port: destination.port };
+                let target = Target { profile_id: routed_scope(lease.route(), destination), host: destination.host.clone(), port: destination.port };
                 let password = if auth == Auth::VncPassword {
                     lease.while_live(|| ()).ok_or(ROUTE_LOST)?;
                     let loss = lease.loss();
@@ -106,9 +104,8 @@ const ROUTE_LOST: &str = "VNC SSH 터널 연결이 끊겼습니다";
 
 fn auth_for(password: bool) -> Auth { if password { Auth::VncPassword } else { Auth::ExplicitNone } }
 
-fn routed_scope(ssh: &Ssh, destination: &Destination) -> String {
-    format!("ssh://{}@[{}]:{}#{}|vnc://[{}]:{}", ssh.account, ssh.host, ssh.port,
-        ssh.host_key_fingerprint, destination.host, destination.port)
+fn routed_scope(route: &SavedRoute, destination: &Destination) -> String {
+    format!("{}|vnc://[{}]:{}", route_scope(route), destination.host, destination.port)
 }
 
 impl Source {
@@ -119,24 +116,21 @@ impl Source {
             !tunnel_id.parse::<u64>().is_ok_and(|id| id > 0 && id.to_string() == tunnel_id)
         { return Err("VNC 터널 선택자가 올바르지 않습니다".into()); }
         if port == 0 || !matches!(host.as_str(), "127.0.0.1" | "::1") {
-            return Err("VNC 터널은 SSH 서버의 루프백 서비스만 지원합니다".into());
+            return Err("VNC 터널은 터널 끝 호스트의 루프백 서비스만 지원합니다".into());
         }
         let app = window.app_handle().clone();
         if life.revoked() || app.state::<TunnelTabs>().epoch() != epoch { return Err(CANCELLED.into()); }
         let destination = Destination { host, port };
-        let directory = window.path().app_config_dir().map_err(|_| "SSH 대상 설정을 읽을 수 없습니다")?;
+        let directory = window.path().app_config_dir().map_err(|_| "터널 대상 설정을 읽을 수 없습니다")?;
         let snapshot = {
             let directory = directory.clone();
             let target_id = target_id.clone();
-            tauri::async_runtime::spawn_blocking(move || with_saved_ssh(&directory, &target_id, |saved| saved)).await
-                .map_err(|_| "SSH 대상 설정을 읽을 수 없습니다")?.map_err(|_| "SSH 대상 설정을 읽을 수 없습니다")?
-                .filter(|(_, ssh)| matches!(ssh.transport, SshTransport::Direct {}))
-                .ok_or("저장된 직접 SSH 대상이 필요합니다")?
+            tauri::async_runtime::spawn_blocking(move || load_route(&directory, &target_id)).await
+                .map_err(|_| "터널 대상 설정을 읽을 수 없습니다")??
         };
-        let ssh = &snapshot.1;
         let service = match auth { Auth::VncPassword => "VNC 비밀번호", Auth::ExplicitNone => "없음" };
-        let description = format!("경로: SSH 터널 {tunnel_id}\nSSH 대상: {}@[{}]:{}\nSSH 호스트 키: {}\n원격 VNC 목적지: [{}]:{}\n서비스 인증: {service}",
-            ssh.account, ssh.host, ssh.port, ssh.host_key_fingerprint, destination.host, destination.port);
+        let description = format!("경로: 터널 {tunnel_id}\n{}\n원격 VNC 목적지: [{}]:{}\n서비스 인증: {service}",
+            describe_route(&snapshot), destination.host, destination.port);
         app.state::<TunnelTabs>().preflight_desktop(epoch, (&tab_handle, &tunnel_id),
             &target_id, &destination, Protocol::Vnc)?;
         if !confirm(window, description, life, None).await {
@@ -146,9 +140,9 @@ impl Source {
         let (lease, verified) = tauri::async_runtime::spawn_blocking(move || {
             if grant.revoked() { return Err(CANCELLED); }
             let lease = app.state::<TunnelTabs>().open_desktop(epoch, &directory, (&tab_handle, &tunnel_id),
-                &target_id, &destination, Protocol::Vnc, (snapshot.0, &snapshot.1))
-                .map_err(|_| "승인된 VNC SSH 터널을 열 수 없습니다")?;
-            let verified = lease.ssh() == (snapshot.0, &snapshot.1) && lease.target() == target_id && lease.destination() == &destination;
+                &target_id, &destination, Protocol::Vnc, &snapshot)
+                .map_err(|_| "승인된 VNC 터널을 열 수 없습니다")?;
+            let verified = lease.approval() == Confirmed::from(&snapshot) && lease.target() == target_id && lease.destination() == &destination;
             Ok((lease, verified))
         }).await.map_err(|_| "VNC SSH 터널을 열 수 없습니다")??;
         let lease = held.insert(lease);
@@ -243,9 +237,7 @@ impl Secrets for Approved {
             #[cfg(windows)]
             Password::Windows(window) => {
                 let display = if let Some(lease) = &self.lease {
-                    let (_, ssh) = lease.ssh();
-                    format!("SSH 터널: {}@[{}]:{}\n원격 VNC: [{}]:{}", ssh.account, ssh.host, ssh.port,
-                        verified_target.host, verified_target.port)
+                    format!("{}\n원격 VNC: [{}]:{}", route_title(lease.route()), verified_target.host, verified_target.port)
                 } else { verified_target.profile_id.clone() };
                 super::password_dialog::read(window, display, &self.life, self.loss()).await
             },
@@ -329,12 +321,13 @@ mod tests {
 
     #[test]
     fn vnc_routed_scope_binds_ssh_identity_and_exact_service() {
-        use crate::connections::profile::SshAuth;
+        use crate::connections::{SavedSsm, profile::{Ssh, SshAuth, SshTransport, Ssm}};
+        let routed_scope = |ssh: Ssh, destination: &Destination| routed_scope(&SavedRoute::Ssh((std::num::NonZeroU64::MIN, ssh)), destination);
 
         let ssh = Ssh { host: "server.example".into(), port: 22, account: "operator".into(),
             host_key_fingerprint: "SHA256:pin".into(), transport: SshTransport::Direct {}, auth: SshAuth::ManualPassword {} };
         let destination = Destination { host: "127.0.0.1".into(), port: 5900 };
-        let scope = routed_scope(&ssh, &destination);
+        let scope = routed_scope(ssh, &destination);
         assert_eq!(scope, "ssh://operator@[server.example]:22#SHA256:pin|vnc://[127.0.0.1]:5900");
         for change in 0..6 {
             let mut ssh = Ssh { host: "server.example".into(), port: 22, account: "operator".into(),
@@ -348,7 +341,11 @@ mod tests {
                 4 => destination.host = "::1".into(),
                 _ => destination.port = 5901,
             }
-            assert_ne!(routed_scope(&ssh, &destination), scope);
+            assert_ne!(routed_scope(ssh, &destination), scope);
         }
+        let ssm = SavedRoute::Ssm(SavedSsm { revision: std::num::NonZeroU64::MIN, desktop: None,
+            target: Ssm { profile: "zzabba-demo".into(), region: "ap-northeast-1".into(), instance_id: "i-07c8e1d461943e5f3".into() } });
+        assert_eq!(super::routed_scope(&ssm, &destination),
+            "ssm://zzabba-demo@ap-northeast-1/i-07c8e1d461943e5f3|vnc://[127.0.0.1]:5900");
     }
 }

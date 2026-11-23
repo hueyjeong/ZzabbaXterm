@@ -5,13 +5,14 @@ use tauri::{Manager, Webview, ipc::{Invoke, InvokeBody}};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    connections::{profile::{MethodRef, Ssh, SshAuth, SshTransport}, with_saved_method, with_saved_ssh},
+    connections::{SavedRoute, SavedSsm, profile::{Ssh, SshAuth, SshTransport}, with_saved_route},
     ssh::registration::confirm_tunnel,
     workspace_window::EXPIRED,
 };
 
-use super::{Destination, Owner, Route, State, TunnelId, Tunnels, View,
-    ssh::{SavedSsh, SshChild, require_supported_listener},
+use super::{Destination, Observation, Owner, Route, State, Transport, TunnelId, Tunnels, View,
+    ssh::{SshChild, require_supported_listener},
+    ssm::{ForwardPlan, SsmChild},
     transport::{Listener, SshPlan, SshServerPolicy}};
 
 const OPEN: &str = "tunnel_tab_open";
@@ -35,7 +36,7 @@ struct Document {
     close_request: Option<String>,
     tabs: HashMap<String, Tab>,
     entries: HashMap<TunnelId, Entry>,
-    tunnels: Tunnels<SshChild>,
+    tunnels: Tunnels<Forward>,
 }
 
 impl Document {
@@ -43,14 +44,108 @@ impl Document {
         if self.close_request.is_some() { return Err(CLOSING); }
         Ok(())
     }
+
+    // SSM 준비 작업이 끝났을 때 같은 문서의 같은 시작 기록만 핸들을 받는다.
+    fn starting(&self, epoch: u64, id: TunnelId) -> bool {
+        !self.destroyed && self.epoch == epoch && self.tunnels.entries.get(&id)
+            .is_some_and(|tunnel| matches!(tunnel.state, State::Starting) && tunnel.transport.is_none())
+    }
+}
+
+/// 터널 등록부가 소유하는 전달 자식이다.
+pub(crate) enum Forward {
+    Ssh(SshChild),
+    Ssm(SsmChild),
+}
+
+impl Forward {
+    fn open_stream(&mut self, address: std::net::SocketAddr) -> Result<TcpStream, String> {
+        match self {
+            Self::Ssh(child) => child.open_stream(address),
+            Self::Ssm(child) => child.open_stream(address),
+        }
+    }
+}
+
+impl Transport for Forward {
+    fn observe(&mut self) -> Observation {
+        match self {
+            Self::Ssh(child) => child.observe(),
+            Self::Ssm(child) => child.observe(),
+        }
+    }
+
+    fn close(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Ssh(child) => child.close(),
+            Self::Ssm(child) => child.close(),
+        }
+    }
 }
 
 struct Tab {
     owner: Owner,
     target: String,
-    ssh: Option<Arc<SavedSsh>>,
+    saved: Arc<SavedRoute>,
     label: String,
     ids: Vec<TunnelId>,
+}
+
+/// RDP·VNC 작업이 화면 승인 전에 읽은 저장 경로의 신원이다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Confirmed<'a> {
+    Ssh(NonZeroU64, &'a Ssh),
+    Ssm(&'a SavedSsm),
+}
+
+impl<'a> From<(NonZeroU64, &'a Ssh)> for Confirmed<'a> {
+    fn from((revision, ssh): (NonZeroU64, &'a Ssh)) -> Self { Self::Ssh(revision, ssh) }
+}
+
+impl<'a> From<&'a SavedRoute> for Confirmed<'a> {
+    fn from(saved: &'a SavedRoute) -> Self {
+        match saved {
+            SavedRoute::Ssh((revision, ssh)) => Self::Ssh(*revision, ssh),
+            SavedRoute::Ssm(ssm) => Self::Ssm(ssm),
+        }
+    }
+}
+
+/// 원격 화면 경로로 쓸 수 있는 저장 대상(직접 SSH 또는 SSM)을 읽는다.
+pub(crate) fn load_route(directory: &Path, target: &str) -> Result<SavedRoute, String> {
+    with_saved_route(directory, target, |saved| saved)?
+        .filter(|saved| !matches!(saved, SavedRoute::Ssh((_, ssh)) if !matches!(ssh.transport, SshTransport::Direct {})))
+        .ok_or_else(|| "저장된 직접 SSH 또는 SSM 경로가 필요합니다".into())
+}
+
+/// 승인 창에 표시할 경로 신원이다.
+pub(crate) fn describe_route(saved: &SavedRoute) -> String {
+    match saved {
+        SavedRoute::Ssh((_, ssh)) => format!("SSH 서버: {}:{}\nSSH 계정: {}\nSSH 호스트 키: {}",
+            ssh.host, ssh.port, ssh.account, ssh.host_key_fingerprint),
+        SavedRoute::Ssm(ssm) => format!("SSM 프로필: {}\nSSM 리전: {}\nSSM 관리 노드: {}",
+            ssm.target.profile, ssm.target.region, ssm.target.instance_id),
+    }
+}
+
+/// 같은 경로 신원에만 묶는 짧은 범위 이름이다.
+pub(crate) fn route_scope(saved: &SavedRoute) -> String {
+    match saved {
+        SavedRoute::Ssh((_, ssh)) => format!("ssh://{}@[{}]:{}#{}", ssh.account, ssh.host, ssh.port, ssh.host_key_fingerprint),
+        SavedRoute::Ssm(ssm) => format!("ssm://{}@{}/{}", ssm.target.profile, ssm.target.region, ssm.target.instance_id),
+    }
+}
+
+fn route_kind(saved: &SavedRoute) -> &'static str {
+    match saved { SavedRoute::Ssh(_) => "SSH", SavedRoute::Ssm(_) => "SSM" }
+}
+
+/// 한 줄 경로 표시다.
+pub(crate) fn route_title(saved: &SavedRoute) -> String {
+    match saved {
+        SavedRoute::Ssh((_, ssh)) => format!("SSH 터널: {}@[{}]:{}", ssh.account, ssh.host, ssh.port),
+        SavedRoute::Ssm(ssm) => format!("SSM 터널: {} · {} · {}", ssm.target.profile, ssm.target.region, ssm.target.instance_id),
+    }
 }
 
 struct Entry {
@@ -68,7 +163,8 @@ enum PortRequest {
     Local { listen: u16, host: String, port: u16, protocol: Option<Protocol> },
     Remote { listen: u16, host: String, port: u16 },
     Dynamic { listen: u16 },
-    Ssm { listen: u16, port: u16 },
+    /// `host`가 없으면 노드 자신의 포트, 있으면 노드에서 접속하는 원격 호스트다.
+    Ssm { listen: u16, port: u16, host: Option<String>, protocol: Option<Protocol> },
 }
 
 impl PortRequest {
@@ -89,7 +185,7 @@ impl PortRequest {
             }
             Self::Dynamic { listen } => (Route::SshDynamic { server, listen: address(listen) },
                 SshServerPolicy::DestinationRestrictedSocks, None),
-            Self::Ssm { .. } => return Err(self.ssm_error()),
+            Self::Ssm { .. } => return Err("SSM 전달은 저장된 SSM 경로에서 시작합니다".into()),
         };
         Ok(result)
     }
@@ -131,11 +227,15 @@ fn route_label(route: &Route) -> String {
         Route::SshLocal { listen, destination, .. } => format!("-L {}", forward(listen, destination)),
         Route::SshRemote { listen, destination, .. } => format!("-R {}", forward(listen, destination)),
         Route::SshDynamic { listen, .. } => format!("-D {listen} → SOCKS"),
-        #[cfg(test)]
         Route::Ssm { listen, node, port, host: None } => format!("SSM {listen} → {node}:{port}"),
-        #[cfg(test)]
+        Route::Ssm { listen, node, port, host: Some(host) } if host.contains(':') => format!("SSM {listen} → {node} → [{host}]:{port}"),
         Route::Ssm { listen, node, port, host: Some(host) } => format!("SSM {listen} → {node} → {host}:{port}"),
     }
+}
+
+// 노드 자신의 서비스는 문서가 노드의 localhost로 접속하므로 루프백 목적지로 표시한다.
+fn ssm_destination(host: &Option<String>, port: u16) -> Destination {
+    Destination { host: host.clone().unwrap_or_else(|| "127.0.0.1".into()), port }
 }
 
 fn status(view: View<'_>, owners: Vec<String>, entry: &Entry, target: &str) -> Status {
@@ -145,10 +245,15 @@ fn status(view: View<'_>, owners: Vec<String>, entry: &Entry, target: &str) -> S
         State::Failed(end) => ("failed", Some(end)),
         State::Disconnected(end) => ("disconnected", Some(end)),
     };
-    let desktop = match (view.state, view.route, entry.protocol) {
-        (State::Ready, Route::SshLocal { server, destination, .. }, Some(protocol))
-            if desktop_listener(view.route, target, destination).is_ok() => Some(DesktopStatus {
-                protocol, target_id: server.clone(), destination: DesktopDestination { host: destination.host.clone(), port: destination.port },
+    let destination = match view.route {
+        Route::SshLocal { destination, .. } => Some(destination.clone()),
+        Route::Ssm { host, port, .. } => Some(ssm_destination(host, *port)),
+        _ => None,
+    };
+    let desktop = match (view.state, destination, entry.protocol) {
+        (State::Ready, Some(destination), Some(protocol))
+            if desktop_listener(view.route, target, &destination).is_ok() => Some(DesktopStatus {
+                protocol, target_id: target.into(), destination: DesktopDestination { host: destination.host, port: destination.port },
             }),
         _ => None,
     };
@@ -167,7 +272,7 @@ pub(crate) struct DesktopLease {
     id: TunnelId,
     owner: Option<Owner>,
     target: String,
-    ssh: Arc<SavedSsh>,
+    route: Arc<SavedRoute>,
     destination: Destination,
     protocol: Protocol,
     stream: Option<TcpStream>,
@@ -177,7 +282,8 @@ pub(crate) struct DesktopLease {
 #[allow(dead_code, reason = "R02·R03의 네이티브 세션에서 사용")]
 impl DesktopLease {
     pub(crate) fn target(&self) -> &str { &self.target }
-    pub(crate) fn ssh(&self) -> (NonZeroU64, &Ssh) { (self.ssh.0, &self.ssh.1) }
+    pub(crate) fn route(&self) -> &SavedRoute { &self.route }
+    pub(crate) fn approval(&self) -> Confirmed<'_> { self.route.as_ref().into() }
     pub(crate) fn destination(&self) -> &Destination { &self.destination }
     pub(crate) fn protocol(&self) -> Protocol { self.protocol }
     pub(crate) fn loss(&self) -> CancellationToken { self.loss.child_token() }
@@ -206,7 +312,8 @@ impl DesktopLease {
     /// 그래픽 세션이 인계받은 소켓을 닫은 뒤 차단 작업에서 호출한다.
     pub(crate) fn release(mut self) -> Result<(), DesktopCleanupError> {
         self.release_inner().map_err(|(owner, reason)| DesktopCleanupError {
-            document: self.document.clone(), epoch: self.epoch, id: self.id, window: owner.window, reason,
+            document: self.document.clone(), epoch: self.epoch, id: self.id, window: owner.window,
+            kind: route_kind(&self.route), reason,
         })
     }
 
@@ -241,12 +348,13 @@ pub(crate) struct DesktopCleanupError {
     epoch: u64,
     id: TunnelId,
     window: String,
+    kind: &'static str,
     reason: String,
 }
 
 impl std::fmt::Display for DesktopCleanupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "SSH 터널 종료 확인 불가: {}", self.reason)
+        write!(f, "{} 터널 종료 확인 불가: {}", self.kind, self.reason)
     }
 }
 
@@ -268,12 +376,12 @@ impl Drop for DesktopLease {
     fn drop(&mut self) {
         if let Err((_, reason)) = self.release_inner() {
             // 작업이 사라져도 실패한 자식은 문서의 종료 확인 대상에 남는다.
-            eprintln!("SSH 터널 종료 확인 불가: {reason}");
+            eprintln!("{} 터널 종료 확인 불가: {reason}", route_kind(&self.route));
         }
     }
 }
 
-// 터널 탭을 닫아도 SSH 자식 종료를 확인한다. 작업은 활성 전달당 하나다.
+// 터널 탭을 닫아도 전달 자식 종료를 확인한다. 작업은 활성 전달당 하나다.
 fn watch_desktop_route(document: Weak<Mutex<Document>>, epoch: u64, id: TunnelId, loss: CancellationToken) -> std::io::Result<()> {
     thread::Builder::new().name("desktop-tunnel".into()).spawn(move || loop {
         thread::sleep(Duration::from_millis(100));
@@ -289,6 +397,16 @@ fn watch_desktop_route(document: Weak<Mutex<Document>>, epoch: u64, id: TunnelId
 }
 
 fn desktop_listener(route: &Route, target: &str, expected: &Destination) -> Result<std::net::SocketAddr, String> {
+    if let Route::Ssm { listen, port, host, .. } = route {
+        // 대상 일치는 호출자가 탭의 저장 대상으로 확인한다.
+        if listen.ip() != std::net::Ipv4Addr::LOCALHOST || listen.port() == 0 {
+            return Err("승인된 로컬 SSM 수신 주소가 일치하지 않습니다".into());
+        }
+        if *port == 0 || ssm_destination(host, *port) != *expected {
+            return Err("승인된 터널 목적지가 일치하지 않습니다".into());
+        }
+        return Ok(*listen);
+    }
     let Route::SshLocal { server, listen, destination } = route else { return Err("로컬 SSH 전달이 필요합니다".into()); };
     if listen.ip() != std::net::Ipv4Addr::LOCALHOST || listen.port() == 0 {
         return Err("승인된 로컬 SSH 수신 주소가 일치하지 않습니다".into());
@@ -314,7 +432,7 @@ impl TunnelTabs {
         doc.close_request = Some(request_id.into());
         let Document { entries, tunnels, .. } = &mut *doc;
         tunnels.confirm_desktop_cleanup(&epoch.to_string(), |id| { entries.remove(&id); })
-            .map_err(|error| format!("SSH 터널 종료 확인 불가: {error}"))
+            .map_err(|error| format!("터널 종료 확인 불가: {error}"))
     }
 
     pub(crate) fn release_desktop_close_gate(&self, epoch: u64, request_id: &str) {
@@ -339,7 +457,7 @@ impl TunnelTabs {
         drop(doc);
         for (id, error) in old.close_window(&window) {
             if let Err(retry) = old.retry_cleanup(id) {
-                eprintln!("SSH 터널 종료 확인 불가: {error}; {retry}");
+                eprintln!("터널 종료 확인 불가: {error}; {retry}");
             }
         }
     }
@@ -358,37 +476,32 @@ impl TunnelTabs {
 
     fn open(&self, epoch: u64, directory: &Path, target: String, label: String) -> Result<String, String> {
         if label.is_empty() || label.len() > 256 || label.chars().any(char::is_control) { return Err("터널 탭 이름이 올바르지 않습니다".into()); }
-        let ssh = match with_saved_ssh(directory, &target, |saved| saved)? {
-            Some(saved) => Some(Arc::new(saved)),
-            None => with_saved_method(directory, &target, |method, _| match method {
-                MethodRef::Ssm { .. } => Ok(None),
-                _ => Err("저장된 SSH 또는 SSM 대상이 필요합니다".into()),
-            })?,
-        };
+        let saved = Arc::new(with_saved_route(directory, &target, |saved| saved)?
+            .ok_or("저장된 SSH 또는 SSM 대상이 필요합니다")?);
         let mut doc = self.writable_document(epoch)?;
         if doc.tabs.len() >= LIMIT { return Err("열 수 있는 터널 탭 수를 초과했습니다".into()); }
         let mut nonce = [0; 16];
         getrandom::fill(&mut nonce).map_err(|_| "터널 탭 ID를 발급할 수 없습니다")?;
         let handle = format!("{:032x}", u128::from_ne_bytes(nonce));
         let owner = doc.tunnels.open_tab(&epoch.to_string(), &handle).ok_or(STALE)?;
-        doc.tabs.insert(handle.clone(), Tab { owner, target, ssh, label, ids: Vec::new() });
+        doc.tabs.insert(handle.clone(), Tab { owner, target, saved, label, ids: Vec::new() });
         Ok(handle)
     }
 
     fn start(&self, epoch: u64, directory: &Path, handle: &str, request: PortRequest,
              confirm: impl FnOnce(String) -> Result<bool, String>) -> Result<Option<String>, String> {
-        if matches!(request, PortRequest::Ssm { .. }) {
-            return Err(request.ssm_error());
-        }
-        let (target, owner, approved) = {
+        let (target, owner, saved) = {
             let doc = self.writable_document(epoch)?;
             let tab = doc.tabs.get(handle).filter(|tab| doc.tunnels.is_open(&tab.owner)).ok_or(STALE)?;
-            (tab.target.clone(), tab.owner.clone(), tab.ssh.clone())
+            (tab.target.clone(), tab.owner.clone(), tab.saved.clone())
         };
-        let Some(approved) = approved else {
+        if matches!(request, PortRequest::Ssm { .. }) {
+            return self.start_ssm(epoch, directory, handle, (target, owner, saved), request, confirm);
+        }
+        let SavedRoute::Ssh(approved) = saved.as_ref() else {
             return Err("저장된 직접 SSH 대상이 필요합니다".into());
         };
-        let (_, ssh) = approved.as_ref();
+        let (_, ssh) = approved;
         if !matches!(ssh.transport, SshTransport::Direct {}) { return Err("SSH-over-SSM 전달을 사용할 수 없습니다".into()); }
         let (route, policy, protocol) = request.ssh(target)?;
         if !matches!(ssh.auth, SshAuth::Agent { .. } | SshAuth::KeyFile { .. }) {
@@ -417,12 +530,67 @@ impl TunnelTabs {
         if doc.destroyed || doc.epoch != epoch || !doc.tunnels.is_open(&owner) { return Err(STALE.into()); }
         doc.ensure_not_closing()?;
         if !accepted? { return Ok(None); }
-        let start = doc.tunnels.begin_ssh(owner, directory, route.clone(), &route, &approved, policy)?;
+        let start = doc.tunnels.begin_ssh(owner, directory, route.clone(), &route, approved, policy)?;
         // 생성과 핸들 등록을 같은 잠금에서 완료해 문서 종료 뒤 살아남는 자식을 막는다.
         let (id, result) = start.spawn();
-        doc.tunnels.finish_start(id, result).map_err(|error| error.to_string())?;
+        doc.tunnels.finish_start(id, result.map(Forward::Ssh)).map_err(|error| error.to_string())?;
         doc.entries.insert(id, Entry { endpoint, protocol });
         doc.tabs.get_mut(handle).unwrap().ids.push(id);
+        Ok(Some(id.0.to_string()))
+    }
+
+    /// 저장된 SSM 대상 또는 SSM 경로를 쓰는 원격 화면 프로필에서만 공식 포트 전달을 시작한다.
+    /// 승인 후에는 시작 기록만 등록하고 응답한다. 자격 확인·노드 조회·실행은 작업자에서 이어진다.
+    fn start_ssm(&self, epoch: u64, directory: &Path, handle: &str, (target, owner, saved): (String, Owner, Arc<SavedRoute>),
+                 request: PortRequest, confirm: impl FnOnce(String) -> Result<bool, String>) -> Result<Option<String>, String> {
+        let PortRequest::Ssm { listen, port, host, protocol } = request else { unreachable!("SSM 요청 필요") };
+        let SavedRoute::Ssm(ssm) = saved.as_ref() else {
+            return Err("저장된 SSM 대상이 필요합니다".into());
+        };
+        match &ssm.desktop {
+            Some(desktop) if protocol != Some(desktop.protocol) || port != desktop.port || host != desktop.host => {
+                return Err("저장된 원격 화면 경로와 전달 요청이 일치하지 않습니다".into());
+            }
+            None if protocol == Some(Protocol::Vnc) && host.is_some() => {
+                return Err("VNC SSM 터널은 노드 자신의 서비스만 지원합니다".into());
+            }
+            _ => {}
+        }
+        // 이 플랫폼은 SSM 플러그인이 받아들인 소켓의 소유 프로세스를 확인할 수 없어 화면 소켓을 인계하지 않는다.
+        if cfg!(target_os = "macos") && protocol.is_some() {
+            return Err("macOS에서는 SSM 경로의 RDP·VNC를 지원하지 않습니다".into());
+        }
+        let route = Route::Ssm { listen: std::net::SocketAddr::from(([127, 0, 0, 1], listen)), node: ssm.target.instance_id.clone(), port, host };
+        let plan = ForwardPlan::new(&route, ssm)?;
+        let endpoint = format!("{} · {} · {}", ssm.target.profile, ssm.target.region, ssm.target.instance_id);
+        let service = match protocol { Some(Protocol::Rdp) => "\n서비스: RDP", Some(Protocol::Vnc) => "\n서비스: VNC", None => "" };
+        {
+            let mut doc = self.writable_document(epoch)?;
+            if !doc.tunnels.is_open(&owner) { return Err(STALE.into()); }
+            if doc.approving { return Err(APPROVAL_PENDING.into()); }
+            if doc.entries.len() >= LIMIT { return Err("열 수 있는 터널 수를 초과했습니다".into()); }
+            doc.approving = true;
+        }
+        let accepted = confirm(format!("{}\n문서: {}\n매개변수: {}\n{}{service}",
+            describe_route(&saved), plan.document(), plan.parameters(), route_label(&route)));
+        let mut doc = self.0.lock().unwrap();
+        doc.approving = false;
+        if doc.destroyed || doc.epoch != epoch || !doc.tunnels.is_open(&owner) { return Err(STALE.into()); }
+        doc.ensure_not_closing()?;
+        if !accepted? { return Ok(None); }
+        // 승인한 기록이 저장 파일의 현재 값과 같을 때만 시작한다.
+        if with_saved_route(directory, &target, |current| current.as_ref() == Some(saved.as_ref()))? != true {
+            return Err("승인된 SSM 대상 설정이 변경되었습니다".into());
+        }
+        let id = doc.tunnels.begin(owner, route).ok_or(STALE)?;
+        doc.entries.insert(id, Entry { endpoint, protocol });
+        doc.tabs.get_mut(handle).unwrap().ids.push(id);
+        let prepare = move |cancel: CancellationToken| async move {
+            super::ssm::prepare(plan, &cancel).await.map(|prepared| move || prepared.spawn())
+        };
+        if let Err(error) = start_ssm_worker(Arc::downgrade(&self.0), epoch, id, prepare) {
+            doc.tunnels.finish_start(id, Err(format!("SSM 시작 작업: {error}"))).map_err(|error| error.to_string())?;
+        }
         Ok(Some(id.0.to_string()))
     }
 
@@ -433,7 +601,7 @@ impl TunnelTabs {
         let id = TunnelId(id.parse().map_err(|_| "터널 ID가 올바르지 않습니다")?);
         let doc = self.writable_document(epoch)?;
         let tab = doc.tabs.get(handle).filter(|tab| doc.tunnels.is_open(&tab.owner)).ok_or(STALE)?;
-        if tab.ssh.is_none() || tab.target != target { return Err("승인된 SSH 대상이 일치하지 않습니다".into()); }
+        if tab.target != target { return Err("승인된 터널 대상이 일치하지 않습니다".into()); }
         if !tab.ids.contains(&id) { return Err("이 탭이 소유한 터널이 아닙니다".into()); }
         if doc.entries.get(&id).ok_or(STALE)?.protocol != Some(protocol) {
             return Err("승인된 터널 서비스가 일치하지 않습니다".into());
@@ -448,24 +616,27 @@ impl TunnelTabs {
 
     /// 네이티브 승인과 문서 검증을 마친 그래픽 작업에만 연결 소켓을 인계한다.
     #[allow(dead_code, reason = "R02·R03의 네이티브 세션에서 사용")]
-    pub(crate) fn open_desktop(&self, epoch: u64, directory: &Path, source: (&str, &str),
+    pub(crate) fn open_desktop<'c>(&self, epoch: u64, directory: &Path, source: (&str, &str),
                                target: &str, destination: &Destination, protocol: Protocol,
-                               confirmed_ssh: (NonZeroU64, &Ssh)) -> Result<DesktopLease, String> {
+                               confirmed: impl Into<Confirmed<'c>>) -> Result<DesktopLease, String> {
+        let confirmed = confirmed.into();
         let (handle, id) = source;
         let id = TunnelId(id.parse().map_err(|_| "터널 ID가 올바르지 않습니다")?);
         let mut doc = self.writable_document(epoch)?;
         let Document { tabs, entries, tunnels, .. } = &mut *doc;
         let tab = tabs.get(handle).filter(|tab| tunnels.is_open(&tab.owner)).ok_or(STALE)?;
-        let approved = tab.ssh.as_ref().filter(|_| tab.target == target).ok_or("승인된 SSH 대상이 일치하지 않습니다")?;
+        let approved = Some(&tab.saved).filter(|_| tab.target == target).ok_or("승인된 터널 대상이 일치하지 않습니다")?;
         if !tab.ids.contains(&id) { return Err("이 탭이 소유한 터널이 아닙니다".into()); }
         let service = entries.get(&id).ok_or(STALE)?.protocol;
         let document = Arc::downgrade(&self.0);
         // 읽기 잠금을 소켓 검증과 등록까지 유지해 저장 설정 변경과 발급을 직렬화한다.
-        with_saved_ssh(directory, target, |current| {
-            if confirmed_ssh != (approved.0, &approved.1) || current.as_ref() != Some(approved.as_ref())
-                || !matches!(approved.1.transport, SshTransport::Direct {})
-            {
-                return Err("승인된 SSH 접속 설정이 변경되었습니다".into());
+        with_saved_route(directory, target, |current| {
+            let changed = confirmed != Confirmed::from(approved.as_ref()) || current.as_ref() != Some(approved.as_ref());
+            match approved.as_ref() {
+                SavedRoute::Ssh((_, ssh)) if changed || !matches!(ssh.transport, SshTransport::Direct {}) =>
+                    return Err("승인된 SSH 접속 설정이 변경되었습니다".into()),
+                SavedRoute::Ssm(_) if changed => return Err("승인된 SSM 대상 설정이 변경되었습니다".into()),
+                _ => {}
             }
             if service != Some(protocol) { return Err("승인된 터널 서비스가 일치하지 않습니다".into()); }
             let view = tunnels.observe(id, &tab.owner).ok_or("이 탭이 소유한 터널이 아닙니다")?;
@@ -475,12 +646,12 @@ impl TunnelTabs {
             let stream = route.transport.as_mut().ok_or(STALE)?.open_stream(address)?;
             if route.desktop_loss.is_none() {
                 let loss = CancellationToken::new();
-                watch_desktop_route(document.clone(), epoch, id, loss.clone()).map_err(|error| format!("SSH 터널 상태 감시: {error}"))?;
+                watch_desktop_route(document.clone(), epoch, id, loss.clone()).map_err(|error| format!("{} 터널 상태 감시: {error}", route_kind(approved)))?;
                 route.desktop_loss = Some(loss);
             }
             let loss = route.desktop_loss.as_ref().unwrap().child_token();
             let owner = tunnels.retain_desktop(id, &tab.owner).ok_or(STALE)?;
-            Ok(DesktopLease { document, epoch, id, owner: Some(owner), target: target.into(), ssh: approved.clone(),
+            Ok(DesktopLease { document, epoch, id, owner: Some(owner), target: target.into(), route: approved.clone(),
                 destination: destination.clone(), protocol, stream: Some(stream), loss })
         })?
     }
@@ -502,7 +673,7 @@ impl TunnelTabs {
         let mut doc = self.writable_document(epoch)?;
         let from = doc.tabs.get(handle).ok_or(STALE)?;
         let recipient = doc.tabs.get(to).ok_or(STALE)?;
-        if from.target != recipient.target || from.ssh != recipient.ssh { return Err("같은 저장 대상의 탭에만 터널을 공유할 수 있습니다".into()); }
+        if from.target != recipient.target || from.saved != recipient.saved { return Err("같은 저장 대상의 탭에만 터널을 공유할 수 있습니다".into()); }
         let (owner, recipient) = (from.owner.clone(), recipient.owner.clone());
         if !doc.tunnels.share(id, &owner, recipient) { return Err("공유할 수 있는 터널이 없습니다".into()); }
         let ids = &mut doc.tabs.get_mut(to).unwrap().ids;
@@ -532,11 +703,36 @@ impl TunnelTabs {
     }
 }
 
-impl PortRequest {
-    fn ssm_error(&self) -> String {
-        let Self::Ssm { listen, port } = self else { unreachable!() };
-        format!("공식 SSM 포트 전달의 바이너리 보존을 확인할 수 없습니다: 127.0.0.1:{listen} → {port}")
-    }
+// SSM 준비 작업은 등록부 잠금 밖에서 실행한다. 탭이 닫히면 준비를 취소하고 자식을 만들지 않는다.
+// `prepare`는 취소 토큰을 받아 자식 생성 함수를 돌려준다. 생성 함수는 같은 시작 기록이 살아 있을 때만 잠금 안에서 호출한다.
+fn start_ssm_worker<F, S>(document: Weak<Mutex<Document>>, epoch: u64, id: TunnelId,
+                          prepare: impl FnOnce(CancellationToken) -> F + Send + 'static) -> std::io::Result<thread::JoinHandle<()>>
+where
+    F: std::future::Future<Output = Result<S, String>>,
+    S: FnOnce() -> Result<SsmChild, String>,
+{
+    thread::Builder::new().name("ssm-forward-start".into()).spawn(move || {
+        let live = || document.upgrade().is_some_and(|document| document.lock().unwrap().starting(epoch, id));
+        let cancel = CancellationToken::new();
+        let prepared = tauri::async_runtime::block_on(async {
+            let prepare = prepare(cancel.clone());
+            tokio::pin!(prepare);
+            loop {
+                tokio::select! {
+                    result = &mut prepare => break result,
+                    () = tokio::time::sleep(Duration::from_millis(200)) => if !live() { cancel.cancel(); },
+                }
+            }
+        });
+        let Some(document) = document.upgrade() else { return };
+        let mut doc = document.lock().unwrap();
+        if !doc.starting(epoch, id) { return; }
+        // 생성과 핸들 등록을 같은 잠금에서 완료해 문서 종료 뒤 살아남는 자식을 막는다.
+        let result = prepared.and_then(|spawn| spawn()).map(Forward::Ssm);
+        if let Err(error) = doc.tunnels.finish_start(id, result) {
+            eprintln!("SSM 터널 종료 확인 불가: {error}");
+        }
+    })
 }
 
 pub(crate) fn handles(command: &str) -> bool {

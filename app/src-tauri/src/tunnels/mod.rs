@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) mod ipc;
 pub(crate) mod ssh;
+pub(crate) mod ssm;
 pub(crate) mod transport;
 
 #[cfg(test)]
@@ -36,7 +37,6 @@ pub(crate) enum Route {
     SshLocal { server: String, listen: SocketAddr, destination: Destination },
     SshRemote { server: String, listen: SocketAddr, destination: Destination },
     SshDynamic { server: String, listen: SocketAddr },
-    #[cfg(test)]
     // host가 없으면 노드 자신의 포트, 있으면 노드에서 접속하는 원격 호스트다.
     Ssm { listen: SocketAddr, node: String, port: u16, host: Option<String> },
 }

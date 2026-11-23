@@ -46,6 +46,50 @@ pub(crate) fn with_saved_ssh<T>(
     }).map_err(|error| format!("프로필 읽기: {error:?}"))
 }
 
+/// 터널 탭이 승인 범위로 고정하는 저장 대상이다.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SavedRoute {
+    Ssh((std::num::NonZeroU64, profile::Ssh)),
+    Ssm(SavedSsm),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SavedSsm {
+    pub(crate) revision: std::num::NonZeroU64,
+    pub(crate) target: profile::Ssm,
+    /// 저장된 RDP·VNC 프로필의 SSM 경로면 그 프로필의 고정 서비스다. SSM 대상이면 없다.
+    pub(crate) desktop: Option<SavedDesktop>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SavedDesktop {
+    pub(crate) protocol: crate::tunnels::ipc::Protocol,
+    /// RDP는 TLS 인증 DNS 이름을 노드에서 접속할 원격 호스트로 쓴다. VNC는 노드 자신의 서비스만 연다.
+    pub(crate) host: Option<String>,
+    pub(crate) port: u16,
+}
+
+/// SSH 대상, SSM 대상, SSM 경로를 쓰는 저장 RDP·VNC 프로필만 터널 경로로 돌려준다.
+pub(crate) fn with_saved_route<T>(directory: &Path, id: &str, read: impl FnOnce(Option<SavedRoute>) -> T) -> Result<T, String> {
+    use crate::tunnels::ipc::Protocol;
+    store::Store::new(directory).with_loaded(|file| {
+        let saved = file.targets.into_iter().find(|entry| entry.profile.id.as_str() == id).and_then(|entry| {
+            let revision = entry.revision;
+            let ssm = |target, desktop| Some(SavedRoute::Ssm(SavedSsm { revision, target, desktop }));
+            match entry.profile.method {
+                profile::Method::Ssh { ssh } => Some(SavedRoute::Ssh((revision, ssh))),
+                profile::Method::Ssm { ssm: target } => ssm(target, None),
+                profile::Method::Rdp { rdp: profile::Rdp { host, port, route: profile::DesktopRoute::Ssm(target), .. } } =>
+                    ssm(target, Some(SavedDesktop { protocol: Protocol::Rdp, host: Some(host), port })),
+                profile::Method::Vnc { vnc: profile::Vnc { port, route: profile::DesktopRoute::Ssm(target), .. } } =>
+                    ssm(target, Some(SavedDesktop { protocol: Protocol::Vnc, host: None, port })),
+                _ => None,
+            }
+        });
+        read(saved)
+    }).map_err(|error| format!("프로필 읽기: {error:?}"))
+}
+
 #[cfg(test)]
 pub(crate) fn save_test_profile(directory: &Path, draft: profile::ValidatedDraft) {
     assert_eq!(store::Store::new(directory).save(draft).unwrap(), store::SaveStatus::Saved);

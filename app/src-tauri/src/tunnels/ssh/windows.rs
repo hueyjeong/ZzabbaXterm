@@ -1,4 +1,4 @@
-use std::{io, mem, net::{Ipv4Addr, Ipv6Addr, SocketAddr}, path::Path, process::{Child, Command}, ptr};
+use std::{io, mem, net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6}, path::Path, process::{Child, Command}, ptr};
 
 use windows_sys::Win32::{
     Foundation::{ERROR_INSUFFICIENT_BUFFER, NO_ERROR},
@@ -22,19 +22,24 @@ impl Readiness {
     }
 
     pub(super) fn owns_stream(&self, child: &Child, listen: SocketAddr, peer: SocketAddr) -> io::Result<bool> {
-        let (SocketAddr::V4(listen), SocketAddr::V4(peer)) = (listen, peer) else { return Ok(false); };
-        table::<MIB_TCPROW_OWNER_PID>(2, TCP_TABLE_OWNER_PID_CONNECTIONS, |row| {
-            row.dwOwningPid == child.id() && row.dwState == MIB_TCP_STATE_ESTAB as u32
-                && u16::from_be(row.dwLocalPort as u16) == listen.port()
-                && Ipv4Addr::from(row.dwLocalAddr.to_ne_bytes()) == *listen.ip()
-                && u16::from_be(row.dwRemotePort as u16) == peer.port()
-                && Ipv4Addr::from(row.dwRemoteAddr.to_ne_bytes()) == *peer.ip()
-        })
+        owns_stream(&[child.id()], listen, peer)
     }
 
     pub(super) fn close(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+/// 승인 수신 주소에서 받아들인 `peer` 연결의 서버 쪽 소켓을 `pids` 중 하나가 소유하는지 확인한다.
+pub(in crate::tunnels) fn owns_stream(pids: &[u32], listen: SocketAddr, peer: SocketAddr) -> io::Result<bool> {
+    let (SocketAddr::V4(listen), SocketAddr::V4(peer)) = (listen, peer) else { return Ok(false); };
+    table::<MIB_TCPROW_OWNER_PID>(2, TCP_TABLE_OWNER_PID_CONNECTIONS, |row| {
+        pids.contains(&row.dwOwningPid) && row.dwState == MIB_TCP_STATE_ESTAB as u32
+            && u16::from_be(row.dwLocalPort as u16) == listen.port()
+            && Ipv4Addr::from(row.dwLocalAddr.to_ne_bytes()) == *listen.ip()
+            && u16::from_be(row.dwRemotePort as u16) == peer.port()
+            && Ipv4Addr::from(row.dwRemoteAddr.to_ne_bytes()) == *peer.ip()
+    })
 }
 
 pub(super) fn owns_listener(address: SocketAddr, pid: u32) -> io::Result<bool> {
@@ -51,7 +56,25 @@ pub(super) fn owns_listener(address: SocketAddr, pid: u32) -> io::Result<bool> {
     }
 }
 
-fn table<Row>(family: u32, class: TCP_TABLE_CLASS, matches: impl Fn(&Row) -> bool) -> io::Result<bool> {
+/// `pids` 중 하나가 소유한 `port`의 LISTEN 소켓 주소를 IPv4·IPv6 모두에서 모은다.
+pub(in crate::tunnels) fn listeners(pids: &[u32], port: u16) -> io::Result<Vec<SocketAddr>> {
+    let mut found = Vec::new();
+    table::<MIB_TCPROW_OWNER_PID>(2, TCP_TABLE_OWNER_PID_LISTENER, |row| {
+        if pids.contains(&row.dwOwningPid) && u16::from_be(row.dwLocalPort as u16) == port {
+            found.push(SocketAddr::from((Ipv4Addr::from(row.dwLocalAddr.to_ne_bytes()), port)));
+        }
+        false
+    })?;
+    table::<MIB_TCP6ROW_OWNER_PID>(23, TCP_TABLE_OWNER_PID_LISTENER, |row| {
+        if pids.contains(&row.dwOwningPid) && u16::from_be(row.dwLocalPort as u16) == port {
+            found.push(SocketAddrV6::new(Ipv6Addr::from(row.ucLocalAddr), port, 0, row.dwLocalScopeId).into());
+        }
+        false
+    })?;
+    Ok(found)
+}
+
+fn table<Row>(family: u32, class: TCP_TABLE_CLASS, matches: impl FnMut(&Row) -> bool) -> io::Result<bool> {
     let mut words = Vec::<u32>::new();
     let written = loop {
         let mut size = u32::try_from(mem::size_of_val(words.as_slice())).map_err(|_| io::ErrorKind::InvalidData)?;

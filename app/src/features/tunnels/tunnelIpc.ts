@@ -4,6 +4,8 @@ export type TunnelRequest = Readonly<{ listen: number } & (
   | { direction: "local"; host: string; port: number; protocol?: "rdp" | "vnc" }
   | { direction: "remote"; host: string; port: number }
   | { direction: "dynamic" }
+  // host가 없으면 SSM 노드 자신의 포트, 있으면 노드에서 접속하는 원격 호스트다.
+  | { direction: "ssm"; port: number; host?: string; protocol?: "rdp" | "vnc" }
 )>;
 
 export type DesktopTunnelSource = Readonly<{

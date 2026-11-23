@@ -13,7 +13,7 @@ pub use cli::{CliError, CommandSpec};
 pub(crate) use home::{sso_cache_entry, user_home};
 pub(crate) use profile::DirectSsoConfig;
 pub use session::{SessionLookup, StartPermit, StartRequest, VerificationError, VerifiedSession};
-pub(crate) use session::{AssumedRole, SessionDocument, start_rejection};
+pub(crate) use session::{AssumedRole, ForwardGuard, ForwardPermit, SessionDocument, start_rejection, valid_session_id};
 #[cfg(test)]
 pub(crate) use session::fixture_start;
 pub use tokio_util::sync::CancellationToken;

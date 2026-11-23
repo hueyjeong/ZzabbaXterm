@@ -14,6 +14,7 @@ fn request() -> StartRequest {
         scope: Scope::new("team".into(), "us-west-2".into()).unwrap(),
         target: TARGET.into(),
         document_name: None,
+        parameters: None,
         reason: REASON.into(),
         owner: OWNER.into(),
         role: None,
@@ -771,4 +772,53 @@ async fn missing_denied_and_mismatched_write_responses_cannot_trigger_another_wr
             Err(Unconfirmed)
         );
     }
+}
+
+#[test]
+fn port_forward_start_uses_fixed_document_and_exported_credentials_without_profile() {
+    let mut request = request();
+    request.document_name = Some("AWS-StartPortForwardingSessionToRemoteHost");
+    request.parameters = Some("host=rdp.example.test,portNumber=3389,localPortNumber=50000".into());
+    let cwd = std::path::Path::new("fixture-cwd");
+    let command = request.forward_command(cwd, OsStr::new("fixture-plugin-path"));
+    assert_eq!(command.get_program(), request.program.as_os_str());
+    assert_eq!(command.get_current_dir(), Some(cwd));
+    let args: Vec<_> = command.get_args().collect();
+    assert_eq!(args, [
+        "ssm", "start-session", "--region", "us-west-2", "--output", "json",
+        "--target", TARGET, "--reason", REASON,
+        "--document-name", "AWS-StartPortForwardingSessionToRemoteHost",
+        "--parameters", "host=rdp.example.test,portNumber=3389,localPortNumber=50000",
+        "--no-cli-pager", "--no-cli-auto-prompt",
+    ]);
+    assert!(!args.iter().any(|arg| *arg == "--profile"));
+    let env: std::collections::HashMap<_, _> = command.get_envs().collect();
+    let value = |key: &str| env.get(OsStr::new(key)).copied().flatten();
+    assert_eq!(value("AWS_CLI_ERROR_FORMAT"), Some(OsStr::new("legacy")));
+    assert_eq!(value("PATH"), Some(OsStr::new("fixture-plugin-path")));
+    assert_eq!(value("AWS_REGION"), Some(OsStr::new("us-west-2")));
+    assert!(value("AWS_ACCESS_KEY_ID").is_some_and(|key| !key.is_empty()));
+    for removed in ["AWS_PROFILE", "AWS_DEFAULT_PROFILE", "AWS_ENDPOINT_URL_SSM"] {
+        assert_eq!(value(removed), None, "{removed}");
+    }
+}
+
+#[tokio::test]
+async fn port_forward_and_terminal_permits_do_not_cross() {
+    let cli = fixture_cli();
+    let mut forward = request();
+    forward.command_issued = false;
+    forward.document_name = Some("AWS-StartPortForwardingSession");
+    forward.parameters = Some("portNumber=22,localPortNumber=50022".into());
+    let scope = forward.scope.clone();
+    assert_eq!(forward.authorize_with(&cli.0, &scope, async |_| panic!("unexpected command")).await.err(),
+        Some(CliError::InvalidTarget));
+    let permit = forward.authorize_forward_with(&cli.0, &scope, async |_| Ok(plugin::tests::fixture_plugin()))
+        .await.unwrap().unwrap();
+    assert!(permit.command.get_args().any(|arg| arg == "AWS-StartPortForwardingSession"));
+    assert!(forward.authorize_forward_with(&cli.0, &scope, async |_| panic!("unexpected command")).await.unwrap().is_none());
+    let mut shell = request();
+    shell.command_issued = false;
+    assert_eq!(shell.authorize_forward_with(&cli.0, &scope, async |_| panic!("unexpected command")).await.err(),
+        Some(CliError::InvalidTarget));
 }

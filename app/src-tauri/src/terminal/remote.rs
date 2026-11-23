@@ -395,7 +395,7 @@ fn close_attempt_release_only_affects_the_current_unsealed_document() {
     assert!(Sessions::default().close_ssh_probes(None));
 }
 
-fn start_error(error: CliError) -> String {
+pub(crate) fn start_error(error: CliError) -> String {
     let status = match error {
         CliError::AwsCliMissing => "AWS CLI 없음",
         CliError::AwsCliNotV2 => "AWS CLI v2 필요",

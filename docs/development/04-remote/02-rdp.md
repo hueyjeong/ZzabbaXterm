@@ -4,7 +4,7 @@
 
 사용자 결과: 가운데 탭에 실제 원격 데스크톱이 열리고, 키 입력과 클립보드가 선택한 데스크톱에만 전달된다. xrdp를 SSM 터널로 열어도 인증 대상은 원격 xrdp 서버다.
 
-제목줄의 **RDP**는 직접 접속한다. 준비된 로컬 SSH 전달 행의 **RDP로 열기**는 Rust가 소유한 그 연결을 사용한다. 두 경로에서 원격 인증서 이름을 따로 확인하고 검증된 TLS 위에서 NLA/CredSSP NTLM을 사용한다. 서버가 NLA를 지원하지 않고 `PROTOCOL_SSL`(TLS 전용)만 고르는 경우에는 연결 설정의 **NLA를 지원하지 않는 서버(TLS 전용) 허용**을 켠 사용자만 같은 대상으로 한 번 재연결해 TLS 위 Client Info로 계정을 전달한다. 공식 SSM 전달은 현재 지원 범위 밖이다.
+제목줄의 **RDP**는 직접 접속한다. 준비된 로컬 SSH 전달 행의 **RDP로 열기**는 Rust가 소유한 그 연결을 사용한다. 두 경로에서 원격 인증서 이름을 따로 확인하고 검증된 TLS 위에서 NLA/CredSSP NTLM을 사용한다. 서버가 NLA를 지원하지 않고 `PROTOCOL_SSL`(TLS 전용)만 고르는 경우에는 연결 설정의 **NLA를 지원하지 않는 서버(TLS 전용) 허용**을 켠 사용자만 같은 대상으로 한 번 재연결해 TLS 위 Client Info로 계정을 전달한다. 준비된 SSM 전달 행에서도 같은 방식으로 **RDP로 열기**를 사용한다. SSM 경로의 포워드 목적지는 노드 자신(루프백) 또는 TLS 인증 DNS 이름과 같은 원격 호스트만 받는다.
 
 준비물: 네이티브 Windows 11·Ubuntu 24.04 GNOME Wayland 클라이언트, 승인된 비운영 Windows RDP 및 Linux xrdp 서버, 검증 가능한 원격 DNS 이름과 신뢰 CA, 시험용 원격 계정·필요한 경우 도메인, xrdp 관리 노드의 SSM 전달 권한. 정상 원격 접속 도구와 같은 계정으로 서비스·정책을 먼저 확인한다. 아래 명령은 구현 시점의 `app/` 기준이다.
 
@@ -54,4 +54,4 @@
 
 ## 저장 프로필로 열기
 
-연결 트리의 RDP 프로필은 `app/src/features/remoteDesktop/desktopProfile.ts`의 `openDesktopProfile`로 연다. 직접 경로는 입력칸만 미리 채운다. SSH 경로는 저장된 직접 SSH 대상으로 서버 루프백 `-L` 전달을 승인받아 열고, Rust가 준비 완료로 확인한 전달을 탭의 터널 출처로 넘긴다. TLS 인증 DNS와 TLS 전용 허용 값은 프로필에서 채운다. 연결은 사용자가 **직접 연결** 또는 **터널 연결**을 눌러 시작한다. SSM 경로는 공식 SSM 포트 전달이 차단된 동안 같은 사유로 열지 않는다.
+연결 트리의 RDP 프로필은 `app/src/features/remoteDesktop/desktopProfile.ts`의 `openDesktopProfile`로 연다. 직접 경로는 입력칸만 미리 채운다. SSH 경로는 저장된 직접 SSH 대상으로 서버 루프백 `-L` 전달을 승인받아 열고, Rust가 준비 완료로 확인한 전달을 탭의 터널 출처로 넘긴다. TLS 인증 DNS와 TLS 전용 허용 값은 프로필에서 채운다. 연결은 사용자가 **직접 연결** 또는 **터널 연결**을 눌러 시작한다. SSM 경로는 프로필 자신을 경로 대상으로 공식 SSM 포트 전달(`AWS-StartPortForwardingSessionToRemoteHost`, 원격 호스트는 프로필의 TLS 인증 DNS 이름)을 승인받아 열고, Rust가 세션 소유권까지 확인한 전달을 같은 방식으로 넘긴다. 승인 창에는 SSM 프로필·리전·관리 노드를 표시한다. 실제 AWS 경로는 미실행이다([R01 SSM 포트 전달](01-tunnels.md#ssm-포트-전달)).

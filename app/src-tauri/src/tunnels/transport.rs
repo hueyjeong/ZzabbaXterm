@@ -12,7 +12,6 @@ pub(crate) fn local_loopback(port: NonZeroU16) -> SocketAddr {
 pub(crate) enum PlanError {
     ApprovalMismatch,
     ServerPolicyRequired,
-    #[cfg(test)]
     WrongTransport,
     InvalidListener,
     InvalidDestination,
@@ -63,7 +62,6 @@ impl SshPlan {
                 server, "-D", Listener::Local(*listen), None,
                 SshServerPolicy::DestinationRestrictedSocks,
             ),
-            #[cfg(test)]
             Route::Ssm { .. } => return Err(PlanError::WrongTransport),
         };
         if policy != required_policy {
@@ -150,14 +148,12 @@ fn dns_name(host: &str) -> bool {
     })
 }
 
-#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SsmScope<'a> {
     pub(crate) profile: &'a str,
     pub(crate) region: &'a str,
 }
 
-#[cfg(test)]
 pub(crate) struct SsmPlan<'a> {
     listen: SocketAddr,
     node: String,
@@ -166,7 +162,6 @@ pub(crate) struct SsmPlan<'a> {
     parameters: String,
 }
 
-#[cfg(test)]
 impl<'a> SsmPlan<'a> {
     /// 승인 범위는 C02가 조회한 노드와 프로필·리전을 모두 포함한다.
     pub(crate) fn new(
@@ -219,28 +214,44 @@ impl<'a> SsmPlan<'a> {
         Ok(["--document-name", self.document, "--parameters", &self.parameters])
     }
 
+    #[cfg(test)]
     pub(crate) fn observe(&self, event: Event, verified_session_id: Option<&str>) -> Observation {
-        match event {
-            Event::SsmPluginBound { address, session_id }
-                if self.listen == address && !session_id.is_empty() && verified_session_id == Some(session_id) =>
-            {
-                Observation::Listening
-            }
-            _ => event.pending_or_ended(Listener::Local(self.listen)),
+        observe_ssm(self.listen, event, verified_session_id)
+    }
+
+    pub(crate) fn listen(&self) -> SocketAddr {
+        self.listen
+    }
+
+    /// `document_options`로 승인 범위를 대조한 뒤에만 사용한다.
+    pub(crate) fn document(&self) -> &'static str {
+        self.document
+    }
+}
+
+/// 실행 핸들이 보관한 승인 수신 주소로 SSM 준비를 판정한다.
+/// 플러그인 출력의 세션 ID는 DescribeSessions로 소유권을 확인한 값과 같을 때만 준비 근거다.
+pub(crate) fn observe_ssm(listen: SocketAddr, event: Event, verified_session_id: Option<&str>) -> Observation {
+    match event {
+        Event::SsmPluginBound { address, session_id }
+            if listen == address && !session_id.is_empty() && verified_session_id == Some(session_id) =>
+        {
+            Observation::Listening
         }
+        _ => event.pending_or_ended(Listener::Local(listen)),
     }
 }
 
 /// 소유한 실행 핸들에서 읽은 이벤트다. 수신 준비와 각 사용자의 목적지 응답은 별개다.
-pub(crate) enum Event {
+pub(crate) enum Event<'a> {
     #[cfg(test)]
     Pending,
     // OpenSSH의 "Local forwarding listening on" 로그는 bind 전이므로 준비 근거가 아니다.
     SshLocalBound(SocketAddr),
     // 승인한 sshd의 원격 전달 성공 응답이다. 실제 인터페이스는 서버 정책에 의존한다.
     SshRemoteAccepted(SocketAddr),
-    #[cfg(test)]
-    SsmPluginBound { address: SocketAddr, session_id: &'static str },
+    // 플러그인의 `Port <n> opened for sessionId <id>.` 뒤 `Waiting for connections...`까지 읽은 결과다.
+    SsmPluginBound { address: SocketAddr, session_id: &'a str },
     Ended(Failure),
 }
 
@@ -249,7 +260,7 @@ pub(crate) enum Failure {
     OwnedProcessExited,
 }
 
-impl Event {
+impl Event<'_> {
     fn pending_or_ended(self, listener: Listener) -> Observation {
         let Self::Ended(failure) = self else {
             return Observation::Pending;

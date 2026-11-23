@@ -1267,7 +1267,7 @@ describe("C02 SSM 연결", () => {
 
   const node = { profile: "company", region: "ap-northeast-2", instanceId: "i-00000001" };
 
-  it("저장된 SSM 터널 탭에는 공식 포트 전달 차단 상태만 표시한다", async () => {
+  it("저장된 SSM 터널 탭은 SSM 전달 입력만 표시하고 시작 전에는 전달을 요청하지 않는다", async () => {
     loadProfiles = async () => ({
       ...emptyStore,
       groups: [{ revision: 1, profile: { id: "work", displayName: "작업" } }],
@@ -1286,8 +1286,8 @@ describe("C02 SSM 연결", () => {
     await press("터널 열기");
     expect(connectionCalls("tunnel_tab_open")).toEqual([["tunnel_tab_open", { target: "node", label: "관리 노드 · 터널 2" }]]);
     const panel = find('.workspace-center section[aria-label="터널"]');
-    expect(panel.textContent).toContain("공식 SSM 포트 전달의 바이너리 보존을 확인할 수 없습니다");
-    expect(panel.querySelector("form")).toBeNull();
+    expect([...panel.querySelectorAll("form [name]")].map(field => field.getAttribute("name"))).toEqual(["listen", "host", "port", "protocol"]);
+    expect(panel.textContent).not.toContain("-L 로컬");
     expect(connectionCalls("tunnel_start")).toEqual([]);
   });
 
