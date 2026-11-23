@@ -2,6 +2,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { useImperativeHandle, useLayoutEffect, useRef, useState, type Ref } from "react";
+import type { ElevationRequest } from "../elevation/elevation";
 import { connectLocalTerminal, type LocalTerminal, type LocalTerminalIpc, type TerminalStatus } from "./session";
 import "./terminal.css";
 
@@ -14,6 +15,7 @@ export interface TerminalViewProps {
   readonly remote?: boolean;
   readonly ssh?: boolean;
   readonly remoteEditor?: true;
+  readonly elevation?: ElevationRequest;
   readonly closing?: boolean;
   readonly closeRef?: Ref<{ confirmClose(): Promise<void> }>;
   readonly onStatus?: (status: TerminalStatus, sessionId?: string) => void;
@@ -30,7 +32,7 @@ function text(status: TerminalStatus) {
   }
 }
 
-export function TerminalView({ active, focusRequested, label, targetId, ipc, remote, ssh, remoteEditor, closing, closeRef, onStatus }: TerminalViewProps) {
+export function TerminalView({ active, focusRequested, label, targetId, ipc, remote, ssh, remoteEditor, elevation, closing, closeRef, onStatus }: TerminalViewProps) {
   const host = useRef<HTMLDivElement>(null);
   const session = useRef<LocalTerminal | undefined>(undefined);
   const stopRequested = useRef(false);
@@ -85,7 +87,7 @@ export function TerminalView({ active, focusRequested, label, targetId, ipc, rem
         session.current = connectLocalTerminal(dimensions, (bytes, parsed) => term.write(bytes, parsed), (next, id) => {
           setStatus(next);
           statusListener.current?.(next, id);
-        }, ipc, targetId, remote, !!(remote || ssh), remoteEditor);
+        }, ipc, targetId, remote, !!(remote || ssh), remoteEditor, elevation);
       } else {
         session.current.resize(dimensions);
       }
@@ -107,7 +109,7 @@ export function TerminalView({ active, focusRequested, label, targetId, ipc, rem
       session.current = undefined;
       term.dispose();
     };
-  }, [targetId, ipc, remote, ssh, remoteEditor]);
+  }, [targetId, ipc, remote, ssh, remoteEditor, elevation]);
 
   useLayoutEffect(() => {
     refresh.current?.(active, !closing && status.kind === "running", focusRequested);

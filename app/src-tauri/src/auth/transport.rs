@@ -28,18 +28,33 @@ fn address_id() -> io::Result<String> {
 }
 
 pub(super) fn run_helper() -> io::Result<()> {
-    if std::env::var_os("SSH_ASKPASS_REQUIRE").as_deref() != Some("force".as_ref())
-        || std::env::var_os("SSH_ASKPASS_PROMPT").is_some()
+    if std::env::var_os("SSH_ASKPASS_PROMPT").is_some()
         || std::env::var_os("BW_SESSION").is_some()
     {
         return Err(io::ErrorKind::PermissionDenied.into());
     }
+    // sudo가 실행한 askpass는 호출 사용자 신원으로 돌고 setuid 부모의 환경을 물려받는다.
+    let sudo_mode = std::env::var_os(super::sudo::MODE_ENV).as_deref() == Some(super::sudo::SUDO_MODE.as_ref());
+    let requested = if sudo_mode {
+        if std::env::var_os("SSH_ASKPASS").is_some()
+            || std::env::var_os("SSH_ASKPASS_REQUIRE").is_some()
+        {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        std::env::var_os("SUDO_ASKPASS").ok_or(io::ErrorKind::InvalidInput)?
+    } else {
+        if std::env::var_os("SSH_ASKPASS_REQUIRE").as_deref() != Some("force".as_ref())
+            || std::env::var_os("SUDO_ASKPASS").is_some()
+        {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        std::env::var_os("SSH_ASKPASS").ok_or(io::ErrorKind::InvalidInput)?
+    };
     let endpoint: OsString = std::env::var_os(ENDPOINT_ENV).ok_or(io::ErrorKind::NotFound)?;
     let broker = std::env::var(BROKER_ENV)
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
         .ok_or(io::ErrorKind::InvalidInput)?;
-    let requested = std::env::var_os("SSH_ASKPASS").ok_or(io::ErrorKind::InvalidInput)?;
     if std::path::Path::new(&requested).canonicalize()?
         != std::env::current_exe()?.canonicalize()?
     {

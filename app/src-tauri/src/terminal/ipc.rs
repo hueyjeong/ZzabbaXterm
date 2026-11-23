@@ -118,3 +118,67 @@ pub(crate) async fn terminal_close(webview: WebviewWindow, id: String) -> Result
         result.warning().map_or(Ok(()), Err)
     }).await
 }
+
+/// 사용자가 명시적으로 요청한 승격 실행 한 건이다. 일반 PTY 출력이나 AI 제안은 이 명령을 부르지 않는다.
+#[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+pub(crate) fn elevation_open(invoke: Invoke) {
+    const COMMAND: &str = "elevation_open";
+    let Invoke { message, resolver, acl } = invoke;
+    let caller = message.webview_ref();
+    let document = caller.state::<Sessions>().document(caller.label());
+    let argument = |key| CommandItem { name: COMMAND, key, plugin: None, message: &message, acl: &acl };
+    let parse = || {
+        Ok((
+            WebviewWindow::from_command(argument("webview"))?,
+            u16::from_command(argument("rows"))?,
+            u16::from_command(argument("cols"))?,
+            Channel::<InvokeResponseBody>::from_command(argument("output"))?,
+            String::from_command(argument("program"))?,
+            Vec::<String>::from_command(argument("args"))?,
+            String::from_command(argument("item"))?,
+        ))
+    };
+    let (webview, rows, cols, output, program, args, item) = match parse() {
+        Ok(args) => args,
+        Err(error) => { resolver.invoke_error(error); return; }
+    };
+    if caller.label() != "main" || caller.window_ref().label() != "main" || acl.is_none() {
+        resolver.reject("앱의 로컬 기본 창에서만 sudo 승격을 요청할 수 있습니다");
+        return;
+    }
+    resolver.respond_async(async move {
+        blocking(move || {
+            let sessions = webview.state::<Sessions>();
+            let owner = webview.label();
+            let size = size(rows, cols);
+            let send = move |event: super::Event| event.send(&output).map_err(|error| error.to_string());
+            let program = crate::elevation::canonical_program(&program)
+                .ok_or("실행 파일은 존재하는 절대 경로여야 합니다")?;
+            let caller_account = crate::elevation::account()
+                .ok_or("호출 계정을 확인할 수 없습니다")?;
+            let request = crate::elevation::Request::new(caller_account, program, args, item);
+            let request_id = crate::elevation::request_id()
+                .ok_or("승격 요청 ID를 만들 수 없습니다")?;
+            let target = crate::elevation::Document { owner: owner.into(), document, request: request_id };
+            let pending = crate::elevation::Pending::request(target.clone(), request.clone())
+                .map_err(|error| crate::elevation::failure(error).unwrap_or("승격 요청이 올바르지 않습니다"))?;
+            let (helper, sudo) = crate::elevation::binaries().map_err(|_| {
+                "sudo 승격 헬퍼를 확인할 수 없습니다. 터미널에서 직접 입력하세요"
+            })?;
+            let vault = crate::local_auth::Bitwarden::discover().map_err(|_| {
+                "Bitwarden CLI를 확인할 수 없습니다. 터미널에서 직접 입력하세요"
+            })?;
+            tauri::async_runtime::block_on(vault.ready()).map_err(|_| {
+                "Bitwarden 금고를 사용할 수 없습니다. 터미널에서 직접 입력하세요"
+            })?;
+            let message = crate::elevation::message(&target, &request);
+            if !crate::ssh::registration::confirm_elevation(&webview.as_ref().window(), message)? {
+                return Err("sudo 승격 승인이 취소되었습니다".into());
+            }
+            let approval = pending.approve(&target, &request)
+                .map_err(|error| crate::elevation::failure(error).unwrap_or("승격 승인이 만료되었습니다"))?;
+            let launch = crate::elevation::Launch::new(approval, target, request, helper, sudo, vault);
+            sessions.open_document(owner, document, size, Launch::Elevated(launch), send)
+        }).await.map_err(Into::into)
+    });
+}

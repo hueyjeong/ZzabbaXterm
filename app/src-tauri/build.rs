@@ -10,7 +10,7 @@ fn main() {
 
     let app = tauri_build::AppManifest::new().commands(&[
         "terminal_open", "terminal_start", "terminal_input", "terminal_resize", "terminal_ack",
-        "terminal_close", "workspace_window",
+        "terminal_close", "elevation_open", "workspace_window",
         "connection_test_start", "connection_test_wait", "connection_test_cancel", "connection_save",
         "connection_capabilities",
         "connection_ssh_test_attach",

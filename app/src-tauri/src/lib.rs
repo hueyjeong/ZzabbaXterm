@@ -1,6 +1,8 @@
 pub mod ai;
 mod connections;
 mod editor;
+#[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+mod elevation;
 mod local_ipc;
 mod rdp;
 mod ssh;
@@ -21,7 +23,13 @@ pub mod local_auth {
     #[path = "mod.rs"]
     mod implementation;
     pub use self::implementation::run_askpass;
-    pub(crate) use self::implementation::{Approval, Bitwarden, Document, Error, Exchange, Pending};
+    pub(crate) use self::implementation::{
+        Approval, Bitwarden, Document, Error, Exchange, Pending, TrustedFile, installed_helper,
+    };
+    pub(crate) use self::implementation::sudo::{
+        failure as sudo_failure, program as sudo_program, spawn as spawn_sudo,
+    };
+    pub(crate) use self::implementation::vault::valid_item;
 }
 
 use editor::registry::LocalEditors;
@@ -97,6 +105,16 @@ pub fn run() {
             if invoke.message.command() == "terminal_open" {
                 terminal_open(invoke);
                 true
+            } else if invoke.message.command() == "elevation_open" {
+                #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+                {
+                    elevation_open(invoke);
+                    true
+                }
+                #[cfg(not(all(feature = "stored-auth", any(windows, target_os = "linux"))))]
+                {
+                    false
+                }
             } else if ai::session_selection::handles(invoke.message.command()) {
                 ai::session_selection::dispatch(invoke);
                 true

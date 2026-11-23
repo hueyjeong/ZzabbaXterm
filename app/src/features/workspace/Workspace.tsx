@@ -7,6 +7,8 @@ import { LocalConnectionWizard } from "../connections/LocalConnectionWizard";
 import type { ConnectionClose, InitialWizardDraft, SshTransport } from "../connections/profiles";
 import { subscribeLocalCliOpen } from "../editor/cliOpen";
 import { EditorTab, type EditorTabActions } from "../editor/EditorTab";
+import { ElevationDialog } from "../elevation/ElevationDialog";
+import type { ElevationRequest } from "../elevation/elevation";
 import type { ApprovedEditorFile, ConfirmEditorDiscard, EditorTransport } from "../editor/contract";
 import { closeLocalFile, localEditorError, localEditorTransport, openLocalFile } from "../editor/localEditorIpc";
 import { subscribeRemoteNanoOpen, type RemoteNanoFile } from "../editor/nanoOpen";
@@ -30,7 +32,7 @@ type CloseStatus = "closing" | "unconfirmed";
 type Split = { left: number; right: number };
 type DesktopKind = "rdp" | "vnc";
 type Tab = { id: number; label: string } & (
-  | { kind: "terminal"; targetId?: string; remoteEditor?: true; ssm?: SsmTarget; ssh?: SshTransport["kind"]; status: TerminalStatus; sessionId?: string; sftpSessionId?: string; closeStatus?: CloseStatus }
+  | { kind: "terminal"; targetId?: string; remoteEditor?: true; elevation?: ElevationRequest; ssm?: SsmTarget; ssh?: SshTransport["kind"]; status: TerminalStatus; sessionId?: string; sftpSessionId?: string; closeStatus?: CloseStatus }
   | { kind: "editor"; file: ApprovedEditorFile; transport: EditorTransport; close: () => Promise<void>; source: EditorSource; attaching?: true; readOnly?: true; nano?: Pick<RemoteNanoFile, "sessionId" | "disconnect"> }
   | { kind: "tunnel"; handle: string; targetId: string; name: string; method: "ssh" | "ssm"; closeStatus?: CloseStatus; closeError?: string }
   | { kind: "rdp"; source?: DesktopTunnelSource; closeStatus?: CloseStatus }
@@ -119,6 +121,7 @@ export function Workspace() {
   const [profileLoad, setProfileLoad] = useState<ProfileLoad>({ kind: "loading" });
   const [hostRegistration, setHostRegistration] = useState<{ kind: "status" | "alert"; message: string }>();
   const [wizard, setWizard] = useState<WizardRequest>();
+  const [elevationOpen, setElevationOpen] = useState(false);
   const [treeWidth, setTreeWidth] = useState(280);
   const [aiWidth, setAiWidth] = useState(360);
   const [bodyWidth, setBodyWidth] = useState(1200);
@@ -398,6 +401,15 @@ export function Workspace() {
     selectTab(id);
   }
 
+  function openElevation(request: ElevationRequest) {
+    const id = nextTab.current++;
+    const name = request.program.split("/").filter(Boolean).pop() ?? request.program;
+    setTabs((current) => [...current, {
+      id, label: `승격 · ${name}`, kind: "terminal", elevation: request, status: { kind: "opening" },
+    }]);
+    selectTab(id);
+  }
+
   function openDesktop(kind: DesktopKind, source?: DesktopTunnelSource) {
     const id = nextTab.current++;
     setTabs(current => [...current, { id, label: `${kind.toUpperCase()} ${id}`, kind, source }]);
@@ -645,7 +657,8 @@ export function Workspace() {
             <div role="alert">연결 불러오기 실패: {profileLoad.error}</div>
             <button onClick={reloadProfiles}>다시 불러오기</button>
           </div>}
-          <LocalTree profiles={profileLoad.profiles} onOpen={openTab} onRegisterSshHost={(targetId) => void registerSavedSshHost(targetId)}
+          <LocalTree profiles={profileLoad.profiles} onOpen={openTab} onElevate={/Windows/i.test(navigator.userAgent) ? undefined : () => setElevationOpen(true)}
+            onRegisterSshHost={(targetId) => void registerSavedSshHost(targetId)}
             onRetestS3={retestStorageTarget} onOpenTunnel={(targetId, name, method) => {
               setWindowError("");
               void openTunnel(targetId, name, method).catch(error => setWindowError(String(error)));
@@ -709,6 +722,7 @@ export function Workspace() {
               }}>
               {tab.kind === "terminal" ? (
                 <TerminalView active={visible} focusRequested={id === focusTab} label={label} targetId={tab.targetId}
+                  elevation={tab.elevation}
                   remote={!!tab.ssm} ssh={!!tab.ssh} remoteEditor={tab.remoteEditor} closing={!!tab.closeStatus} closeRef={tab.ssm || tab.ssh ? bindClose : undefined}
                   onStatus={(status, sessionId) => updateStatus(id, status, sessionId)} />
               ) : tab.kind === "tunnel" ? (
@@ -815,7 +829,7 @@ export function Workspace() {
       <footer className="workspace-status">
         <span role="status">{current?.kind === "terminal"
           ? [current.targetId ? current.label : "내 PC", current.ssm ?
-            `SSM · ${current.ssm.profile} / ${current.ssm.region} / ${current.ssm.instanceId}` : current.ssh ? "SSH" : "로컬", current.sessionId,
+            `SSM · ${current.ssm.profile} / ${current.ssm.region} / ${current.ssm.instanceId}` : current.ssh ? "SSH" : current.elevation ? "sudo 승격" : "로컬", current.sessionId,
           !current.closeStatus && terminalStatus(current.status)].filter(Boolean).join(" · ")
           : current?.kind === "tunnel" ? current.label
             : current?.kind === "rdp" || current?.kind === "vnc"
@@ -827,6 +841,10 @@ export function Workspace() {
         {fileError && <span role="alert">{fileError}</span>}
         {hostRegistration && <span role={hostRegistration.kind}>{hostRegistration.message}</span>}
       </footer>
+      {elevationOpen && <ElevationDialog onClose={() => setElevationOpen(false)} onSubmit={(request) => {
+        setElevationOpen(false);
+        openElevation(request);
+      }} />}
       {wizard && <LocalConnectionWizard {...wizard} groups={profileLoad.profiles?.groups ?? []}
         capabilities={connections.capabilities}
         verifySshHost={connections.verifySshHost}

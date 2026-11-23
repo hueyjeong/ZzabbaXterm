@@ -1,6 +1,7 @@
-mod peer;
+pub(crate) mod peer;
+pub(crate) mod sudo;
 mod transport;
-mod vault;
+pub(crate) mod vault;
 
 #[cfg(test)]
 mod tests;
@@ -23,6 +24,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 pub use vault::Bitwarden;
+pub(crate) use peer::{TrustedFile, installed_helper};
 
 use crate::ssh::ConnectionPlan;
 
@@ -48,6 +50,7 @@ pub(crate) struct Document {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
+    InvalidRequest,
     InvalidApproval,
     Cancelled,
     Expired,
@@ -230,6 +233,35 @@ impl Exchange {
             cancel,
             task,
             _plan: Some(plan),
+        }
+    }
+
+    /// 연결 계획 없이 승인 한 건만 감시한다. sudo 교환은 plan 대신 탭 수명 토큰으로 취소한다.
+    pub(crate) fn start_detached<F>(expires: Instant, run: impl FnOnce(Arc<AtomicBool>) -> F) -> Self
+    where
+        F: Future<Output = Result<(), Error>> + Send + 'static,
+    {
+        let cancel = CancellationToken::new();
+        let cancelled = cancel.clone();
+        let sent = Arc::new(AtomicBool::new(false));
+        let run = run(sent.clone());
+        let task = tokio::spawn(async move {
+            let outcome = tokio::select! {
+                biased;
+                _ = cancelled.cancelled() => Err(Error::Cancelled),
+                _ = tokio::time::sleep_until(expires) => Err(Error::Expired),
+                result = run => return result,
+            };
+            if sent.load(Ordering::Relaxed) {
+                Err(Error::ResponseUnknown)
+            } else {
+                outcome
+            }
+        });
+        Self {
+            cancel,
+            task,
+            _plan: None,
         }
     }
 

@@ -39,6 +39,8 @@ struct Flow {
     editor_startup: Option<Startup>,
     #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
     stored: Option<CancellationToken>,
+    #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+    elevation: Option<CancellationToken>,
     sent: u64,
     acked: u64,
     ack_deadline: Option<std::time::Instant>,
@@ -83,6 +85,8 @@ pub(crate) enum Launch {
     Ssm(remote::Target),
     AiControl(remote::Target, Arc<ControlBinding>),
     Ssh(DirectLaunch),
+    #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+    Elevated(crate::elevation::Launch),
 }
 
 impl Launch {
@@ -246,6 +250,8 @@ impl Session {
             Launch::Ssm(target) => Some(tauri::async_runtime::block_on(target.prepare(None, self.cancel.as_ref().unwrap()))?),
             Launch::AiControl(target, binding) => Some(tauri::async_runtime::block_on(target.prepare_control(binding))?),
             Launch::Local(_) | Launch::Ssh(_) => None,
+            #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+            Launch::Elevated(_) => None,
         };
         if self.flow.lock().unwrap().stop.is_some() {
             return Err(stage("open", CLOSED));
@@ -335,9 +341,13 @@ impl Session {
                 Remote,
                 Command(CommandBuilder),
                 Saved(crate::ssh::terminal::DirectLaunch),
+                #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+                Elevated(crate::elevation::Launch),
             }
             #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
             let mut stored_exchange = None;
+            #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+            let mut elevation_exchange = None;
             let mut notice = None;
             let mut editor = None;
             let prepared = match command {
@@ -362,6 +372,8 @@ impl Session {
                     notice = launch.notice().map(str::to_owned);
                     Prepared::Saved(launch)
                 }
+                #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+                Launch::Elevated(launch) => Prepared::Elevated(launch),
             };
             let mut child = match prepared {
                 Prepared::Remote => remote_child.take().unwrap(),
@@ -398,6 +410,24 @@ impl Session {
                         }
                     }
                 }
+                #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+                Prepared::Elevated(launch) => {
+                    if self.flow.lock().unwrap().stop.is_some() {
+                        self.teardown(pair, writer, event_tx, drain);
+                        return Err(stage("open", CLOSED));
+                    }
+                    match launch.spawn(&*pair.slave) {
+                        Ok((child, exchange)) => {
+                            elevation_exchange = Some(exchange);
+                            child
+                        }
+                        Err(error) => {
+                            self.teardown(pair, writer, event_tx, drain);
+                            return Err(stage("sudo", crate::elevation::failure(error)
+                                .unwrap_or("sudo 승격 실행을 시작할 수 없습니다")));
+                        }
+                    }
+                }
             };
             self.close_result.lock().unwrap().local = LocalClose::Unconfirmed;
             drop(pair.slave);
@@ -420,6 +450,14 @@ impl Session {
                         // 교환 결과를 관찰해 승인 뒤 금고 오류를 사용자 상태로 전달한다.
                         let _ = thread::Builder::new().name("stored-auth".into())
                             .spawn(move || watch_stored(exchange, cancel, events));
+                    }
+                    #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+                    if let Some(exchange) = elevation_exchange.take() {
+                        let cancel = CancellationToken::new();
+                        flow.elevation = Some(cancel.clone());
+                        let events = Arc::clone(&send);
+                        let _ = thread::Builder::new().name("elevation-auth".into())
+                            .spawn(move || watch_elevation(exchange, cancel, events));
                     }
                 }
                 if !ssm { flow.start_deadline = Some(std::time::Instant::now() + START_TIMEOUT); }
@@ -922,6 +960,8 @@ impl Session {
         if let Some(cancel) = &flow.editor_cancel { cancel.cancel(); }
         #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
         if let Some(cancel) = flow.stored.take() { cancel.cancel(); }
+        #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+        if let Some(cancel) = flow.elevation.take() { cancel.cancel(); }
         if flow.stop.is_none() || matches!(reason, Stop::Closed) {
             flow.stop = Some(reason);
         }
@@ -1152,6 +1192,29 @@ fn watch_stored(
         && let Some(message) = crate::ssh::terminal::stored_failure(&error)
     {
         let _ = (events.lock().unwrap())(Event::Notice(message));
+    }
+}
+
+#[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+fn watch_elevation(
+    mut exchange: crate::local_auth::Exchange,
+    cancel: CancellationToken,
+    events: Arc<Mutex<impl Fn(Event) -> Result<(), String> + Send + 'static>>,
+) {
+    let outcome = tauri::async_runtime::block_on(async {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                exchange.cancel();
+                None
+            }
+            result = exchange.result() => Some(result),
+        }
+    });
+    if let Some(Err(error)) = outcome
+        && let Some(message) = crate::elevation::failure(error)
+    {
+        let _ = (events.lock().unwrap())(Event::Notice(message.into()));
     }
 }
 
