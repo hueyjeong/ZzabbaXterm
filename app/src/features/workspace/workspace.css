@@ -130,6 +130,8 @@
 .local-tree { padding-block: 6px; font-size: 15px; }
 .tree-row { display: flex; align-items: center; gap: 6px; height: 36px; padding-inline: 12px; cursor: pointer; }
 [role="group"] .tree-row { padding-inline-start: 32px; }
+.tree-row > span:not([aria-hidden]) { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tree-row > small { flex: none; color: #8fa39c; font-size: 12px; }
 .local-tree [aria-selected="true"] > .tree-row { background: #2b3b3f; box-shadow: inset 2px 0 var(--accent); }
 .local-tree .tree-row:hover { background: #34413f; }
 .local-tree [role="treeitem"]:focus-visible { outline: none; }
