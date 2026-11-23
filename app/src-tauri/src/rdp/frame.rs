@@ -325,81 +325,67 @@ fn check_bitmaps(bitmap: BitmapUpdateData<'_>, image: &DecodedImage) -> Result<b
     Ok(has_rects)
 }
 
-struct Source {
-    rect: InclusiveRectangle,
-    width: u16,
-    height: u16,
-    bits_per_pixel: u16,
-    compressed: bool,
-    data: Vec<u8>,
+pub(super) enum Normalized {
+    Pass,
+    Drop,
+    Replace(Vec<(Action, Bytes)>),
 }
 
-fn sources(bitmap: &BitmapUpdateData<'_>) -> Vec<Source> {
-    bitmap.rectangles.iter().map(|update| Source {
-        rect: update.rectangle.clone(),
-        width: update.width,
-        height: update.height,
-        bits_per_pixel: update.bits_per_pixel,
-        compressed: update.compression_flags.contains(Compression::BITMAP_COMPRESSION),
-        data: update.bitmap_data.to_vec(),
-    }).collect()
+#[derive(Default)]
+pub(super) struct Normalizer {
+    fragment: Option<Vec<u8>>,
 }
 
-fn fastpath_bitmap(pdu: &[u8]) -> Result<Option<Vec<Source>>, Error> {
-    let mut input = ReadCursor::new(pdu);
-    let header: FastPathHeader = decode_cursor(&mut input).map_err(|_| Error::Protocol)?;
-    if header.data_length != input.remaining().len() || !header.flags.is_empty() {
-        return Err(Error::Protocol);
-    }
-    let mut found = None;
-    while !input.is_empty() {
-        let update: FastPathUpdatePdu<'_> = decode_cursor(&mut input).map_err(|_| Error::Protocol)?;
-        if update.compression_flags.is_some() || update.fragmentation != Fragmentation::Single {
-            return Ok(None);
-        }
-        if update.update_code == UpdateCode::Bitmap {
-            let bitmap: BitmapUpdateData<'_> = decode_cursor(&mut ReadCursor::new(update.data))
-                .map_err(|_| Error::Protocol)?;
-            if found.is_some() {
-                return Ok(None);
-            }
-            found = Some(sources(&bitmap));
-        }
-    }
-    Ok(found)
-}
-
-fn slowpath_bitmap(pdu: &[u8]) -> Result<Option<Vec<Source>>, Error> {
-    let Ok(data) = decode_send_data_indication(pdu) else { return Ok(None) };
-    let Ok(IoChannelPdu::Data(ctx)) = decode_io_channel(data).map_err(|_| Error::Protocol) else { return Ok(None) };
-    let ShareDataPdu::Update(bytes) = ctx.pdu else { return Ok(None) };
-    let mut input = ReadCursor::new(&bytes);
-    if slow_path::read_graphics_update_type(&mut input).map_err(|_| Error::Protocol)? != GraphicsUpdateType::Bitmap {
-        return Ok(None);
-    }
-    let bitmap = slow_path::decode_slow_path_bitmap(&mut input).map_err(|_| Error::Protocol)?;
-    Ok(Some(sources(&bitmap)))
-}
-
-fn crop_bitmap(update: &Source) -> Result<(u16, Vec<u8>), Error> {
-    let src = usize::from(update.width);
-    let dest_width = update.rect.right.saturating_sub(update.rect.left).saturating_add(1);
-    let dest = usize::from(dest_width);
-    let height = usize::from(update.height);
-    if src < dest || height == 0 {
-        return Err(Error::Bounds);
-    }
-    if update.compressed {
-        // 관측된 xrdp RDP6(32bpp)만 원본 폭으로 디코드한 뒤 목적지 폭으로 잘라 낸다.
-        if update.bits_per_pixel != 32 {
+fn validate(bitmap: &BitmapUpdateData<'_>, image: &DecodedImage) -> Result<(), Error> {
+    for update in &bitmap.rectangles {
+        let rect = &update.rectangle;
+        let width = rect.right - rect.left + 1;
+        if rect.left > rect.right
+            || rect.top > rect.bottom
+            || rect.right >= image.width()
+            || rect.bottom >= image.height()
+            || update.height == 0
+            || rect.bottom - rect.top + 1 != update.height
+            || update.width < width
+        {
             return Err(Error::Bounds);
         }
+        // 원격이 선언한 크기로 디코드하기 전에 기존 프레임 한도를 먼저 적용한다.
+        frame_len(update.width, update.height)?;
+        if update.compression_flags.contains(Compression::BITMAP_COMPRESSION) {
+            if update.bits_per_pixel != 32 || update.bitmap_data.is_empty() {
+                return Err(Error::Bounds);
+            }
+        } else {
+            let bytes = usize::from(update.bits_per_pixel.div_ceil(8));
+            let row = (usize::from(update.width) * bytes + 3) & !3;
+            if update.bitmap_data.len() < row * usize::from(update.height) {
+                return Err(Error::Bounds);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn needs_crop(bitmap: &BitmapUpdateData<'_>) -> bool {
+    bitmap.rectangles.iter().any(|update| update.width > update.rectangle.right - update.rectangle.left + 1)
+}
+
+fn decode_rect(update: &BitmapData<'_>) -> Result<(u16, Vec<u8>), Error> {
+    let source = usize::from(update.width);
+    let dest = usize::from(update.rectangle.right - update.rectangle.left + 1);
+    let height = usize::from(update.height);
+    if source < dest || height == 0 {
+        return Err(Error::Bounds);
+    }
+    if update.compression_flags.contains(Compression::BITMAP_COMPRESSION) {
+        // 압축은 원본 폭으로 디코드한 뒤 목적지 폭으로 잘라 낸다(행 밀림 방지).
         let mut rgb = Vec::new();
         BitmapStreamDecoder::default()
-            .decode_bitmap_stream_to_rgb24(&update.data, &mut rgb, src, height)
+            .decode_bitmap_stream_to_rgb24(update.bitmap_data, &mut rgb, source, height)
             .map_err(|_| Error::Protocol)?;
         let mut out = Vec::with_capacity(dest * height * 4);
-        for row in rgb.chunks_exact(src * 3) {
+        for row in rgb.chunks_exact(source * 3) {
             for pixel in row[..dest * 3].chunks_exact(3) {
                 out.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 0]);
             }
@@ -407,68 +393,175 @@ fn crop_bitmap(update: &Source) -> Result<(u16, Vec<u8>), Error> {
         return Ok((32, out));
     }
     let bytes = usize::from(update.bits_per_pixel.div_ceil(8));
-    let source_row = (src * bytes + 3) & !3;
+    let source_row = (source * bytes + 3) & !3;
     let destination_row = (dest * bytes + 3) & !3;
-    if update.data.len() < source_row * height {
-        return Err(Error::Bounds);
-    }
     let mut out = vec![0; destination_row * height];
-    for (index, row) in update.data.chunks_exact(source_row).take(height).enumerate() {
+    for (index, row) in update.bitmap_data.chunks_exact(source_row).take(height).enumerate() {
         out[index * destination_row..index * destination_row + dest * bytes]
             .copy_from_slice(&row[..dest * bytes]);
     }
     Ok((update.bits_per_pixel, out))
 }
 
-struct Cropped {
-    rect: InclusiveRectangle,
-    height: u16,
-    bits_per_pixel: u16,
-    data: Vec<u8>,
-}
-
-/// 압축 비트맵을 원본 폭으로 디코드해 목적지 폭으로 잘라 낸 새 uncompressed fast-path PDU를 만든다.
-pub(super) fn normalize_bitmap(action: Action, pdu: &[u8]) -> Result<Option<(Action, Bytes)>, Error> {
-    let sources = match action {
-        Action::FastPath => fastpath_bitmap(pdu)?,
-        Action::X224 => slowpath_bitmap(pdu)?,
-        _ => return Ok(None),
-    };
-    let Some(sources) = sources else { return Ok(None) };
-    if !sources.iter().any(|update| update.width > update.rect.right - update.rect.left + 1) {
-        return Ok(None);
-    }
-    let mut cropped = Vec::with_capacity(sources.len());
-    for update in &sources {
-        let (bits_per_pixel, data) = crop_bitmap(update)?;
-        cropped.push(Cropped {
-            rect: update.rect.clone(),
-            height: update.height,
+fn bitmap_pdu(rect: InclusiveRectangle, width: u16, height: u16, bits_per_pixel: u16, data: &[u8]) -> Result<Bytes, Error> {
+    let encoded = encode_vec(&BitmapUpdateData {
+        rectangles: vec![BitmapData {
+            rectangle: rect,
+            width,
+            height,
             bits_per_pixel,
-            data,
-        });
-    }
-    let rectangles = cropped.iter().map(|update| BitmapData {
-        rectangle: update.rect.clone(),
-        width: update.rect.right - update.rect.left + 1,
-        height: update.height,
-        bits_per_pixel: update.bits_per_pixel,
-        compression_flags: Compression::empty(),
-        compressed_data_header: None,
-        bitmap_data: &update.data,
-    }).collect::<Vec<_>>();
-    let data = encode_vec(&BitmapUpdateData { rectangles }).map_err(|_| Error::Protocol)?;
+            compression_flags: Compression::empty(),
+            compressed_data_header: None,
+            bitmap_data: data,
+        }],
+    }).map_err(|_| Error::Protocol)?;
     let update = encode_vec(&FastPathUpdatePdu {
         fragmentation: Fragmentation::Single,
         update_code: UpdateCode::Bitmap,
         compression_flags: None,
         compression_type: None,
-        data: &data,
+        data: &encoded,
     }).map_err(|_| Error::Protocol)?;
     let mut output = encode_vec(&FastPathHeader::new(EncryptionFlags::empty(), update.len()))
         .map_err(|_| Error::Protocol)?;
     output.extend_from_slice(&update);
-    Ok(Some((Action::FastPath, Bytes::from(output))))
+    Ok(Bytes::from(output))
+}
+
+fn bitmap_pdus(bitmap: &BitmapUpdateData<'_>, image: &DecodedImage, force: bool) -> Result<Vec<Bytes>, Error> {
+    validate(bitmap, image)?;
+    if !force && !needs_crop(bitmap) {
+        return Ok(Vec::new());
+    }
+    let mut output = Vec::new();
+    for update in &bitmap.rectangles {
+        let (bits_per_pixel, data) = decode_rect(update)?;
+        let dest_width = update.rectangle.right - update.rectangle.left + 1;
+        let bytes = usize::from(bits_per_pixel.div_ceil(8));
+        let row = (usize::from(dest_width) * bytes + 3) & !3;
+        let height = usize::from(update.height);
+        let mut start = 0;
+        while start < height {
+            let mut rows = ((32_767 - 256) / row.max(1)).clamp(1, height - start);
+            let pdu = loop {
+                let top = update.rectangle.top + u16::try_from(height - start - rows).map_err(|_| Error::Bounds)?;
+                let bottom = update.rectangle.top + u16::try_from(height - start - 1).map_err(|_| Error::Bounds)?;
+                let slice = &data[start * row..(start + rows) * row];
+                let pdu = bitmap_pdu(
+                    InclusiveRectangle { left: update.rectangle.left, top, right: update.rectangle.right, bottom },
+                    dest_width, u16::try_from(rows).map_err(|_| Error::Bounds)?, bits_per_pixel, slice,
+                )?;
+                if pdu.len() <= 32_767 || rows == 1 { break pdu; }
+                rows -= 1;
+            };
+            output.push(pdu);
+            start += rows;
+        }
+    }
+    Ok(output)
+}
+
+fn updates_pdu(updates: &[(UpdateCode, Vec<u8>)]) -> Result<Bytes, Error> {
+    let mut payload = Vec::new();
+    for (code, data) in updates {
+        let encoded = encode_vec(&FastPathUpdatePdu {
+            fragmentation: Fragmentation::Single,
+            update_code: *code,
+            compression_flags: None,
+            compression_type: None,
+            data,
+        }).map_err(|_| Error::Protocol)?;
+        payload.extend_from_slice(&encoded);
+    }
+    let mut output = encode_vec(&FastPathHeader::new(EncryptionFlags::empty(), payload.len()))
+        .map_err(|_| Error::Protocol)?;
+    output.extend_from_slice(&payload);
+    Ok(Bytes::from(output))
+}
+
+impl Normalizer {
+    pub(super) fn normalize(&mut self, action: Action, pdu: &[u8], image: &DecodedImage) -> Result<Normalized, Error> {
+        match action {
+            Action::FastPath => self.fastpath(pdu, image),
+            Action::X224 => self.slowpath(pdu, image),
+            _ => Ok(Normalized::Pass),
+        }
+    }
+
+    fn fastpath(&mut self, pdu: &[u8], image: &DecodedImage) -> Result<Normalized, Error> {
+        let mut input = ReadCursor::new(pdu);
+        let header: FastPathHeader = decode_cursor(&mut input).map_err(|_| Error::Protocol)?;
+        if header.data_length != input.remaining().len() || !header.flags.is_empty() {
+            return Err(Error::Protocol);
+        }
+        let mut kept: Vec<(UpdateCode, Vec<u8>)> = Vec::new();
+        let mut output: Vec<Bytes> = Vec::new();
+        let mut consumed_fragment = false;
+        while !input.is_empty() {
+            let update: FastPathUpdatePdu<'_> = decode_cursor(&mut input).map_err(|_| Error::Protocol)?;
+            if update.compression_flags.is_some() {
+                return Err(Error::Protocol);
+            }
+            if update.update_code != UpdateCode::Bitmap {
+                kept.push((update.update_code, update.data.to_vec()));
+                continue;
+            }
+            match update.fragmentation {
+                Fragmentation::Single => {
+                    let bitmap: BitmapUpdateData<'_> = decode_cursor(&mut ReadCursor::new(update.data))
+                        .map_err(|_| Error::Protocol)?;
+                    if needs_crop(&bitmap) {
+                        output.extend(bitmap_pdus(&bitmap, image, false)?);
+                    } else {
+                        kept.push((UpdateCode::Bitmap, update.data.to_vec()));
+                    }
+                }
+                Fragmentation::First => {
+                    self.fragment = Some(update.data.to_vec());
+                    consumed_fragment = true;
+                }
+                Fragmentation::Next | Fragmentation::Last => {
+                    consumed_fragment = true;
+                    let mut buffer = self.fragment.take().ok_or(Error::Protocol)?;
+                    buffer.extend_from_slice(update.data);
+                    consumed_fragment = true;
+                    if update.fragmentation == Fragmentation::Last {
+                        let bitmap: BitmapUpdateData<'_> = decode_cursor(&mut ReadCursor::new(&buffer))
+                            .map_err(|_| Error::Protocol)?;
+                        output.extend(bitmap_pdus(&bitmap, image, true)?);
+                    } else {
+                        self.fragment = Some(buffer);
+                    }
+                }
+            }
+        }
+        if kept.is_empty() && output.is_empty() {
+            return Ok(if consumed_fragment { Normalized::Drop } else { Normalized::Pass });
+        }
+        let mut pdus = Vec::new();
+        if !kept.is_empty() {
+            pdus.push((Action::FastPath, updates_pdu(&kept)?));
+        }
+        pdus.extend(output.into_iter().map(|pdu| (Action::FastPath, pdu)));
+        Ok(Normalized::Replace(pdus))
+    }
+
+    fn slowpath(&mut self, pdu: &[u8], image: &DecodedImage) -> Result<Normalized, Error> {
+        let Ok(data) = decode_send_data_indication(pdu) else { return Ok(Normalized::Pass) };
+        let Ok(IoChannelPdu::Data(ctx)) = decode_io_channel(data).map_err(|_| Error::Protocol) else { return Ok(Normalized::Pass) };
+        let ShareDataPdu::Update(bytes) = ctx.pdu else { return Ok(Normalized::Pass) };
+        let mut input = ReadCursor::new(&bytes);
+        if slow_path::read_graphics_update_type(&mut input).map_err(|_| Error::Protocol)? != GraphicsUpdateType::Bitmap {
+            return Ok(Normalized::Pass);
+        }
+        let bitmap = slow_path::decode_slow_path_bitmap(&mut input).map_err(|_| Error::Protocol)?;
+        let pdus = bitmap_pdus(&bitmap, image, false)?;
+        if pdus.is_empty() {
+            Ok(Normalized::Pass)
+        } else {
+            Ok(Normalized::Replace(pdus.into_iter().map(|pdu| (Action::FastPath, pdu)).collect()))
+        }
+    }
 }
 
 #[derive(Default)]

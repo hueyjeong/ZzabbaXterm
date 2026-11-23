@@ -432,11 +432,11 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
             let window = window.clone();
             let live = prompt.clone();
             let approval = approval.clone();
-            move |text| {
+            move |request| {
                 let window = window.clone();
                 let live = live.clone();
                 let approval = approval.clone();
-                async move { native::trust(window, text, live, approval).await }
+                async move { native::trust(window, request, live, approval).await }
             }
         },
     };

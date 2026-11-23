@@ -174,7 +174,7 @@ impl Session {
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Account, Error>>,
-        A: FnOnce(String) -> AFut,
+        A: FnOnce(trust::Request) -> AFut,
         AFut: Future<Output = Result<bool, Error>>,
     {
         frame::frame_len(target.size.width, target.size.height)?;
@@ -200,7 +200,7 @@ impl Session {
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Account, Error>>,
-        A: FnOnce(String) -> AFut,
+        A: FnOnce(trust::Request) -> AFut,
         AFut: Future<Output = Result<bool, Error>>,
     {
         let area = Arc::new(AtomicU64::new(0));
@@ -245,6 +245,7 @@ impl Session {
                 let mut channels = Channels::default();
                 let mut pending = VecDeque::new();
                 let mut display_generation = 1_u64;
+                let mut normalizer = frame::Normalizer::default();
                 loop {
                     let clipboard_deadline = clipboard::deadline(&mut active);
                     tokio::select! {
@@ -259,33 +260,36 @@ impl Session {
                         next = connect::read_bounded(&mut transport, &ironrdp::pdu::RDP_HINT, Error::Transport, None), if pending.is_empty() => {
                             let pdu = next?;
                             let action = ironrdp::pdu::find_size(&pdu).map_err(|_| Error::Protocol)?.ok_or(Error::Protocol)?.action;
-                            let (action, pdu) = match frame::normalize_bitmap(action, &pdu)? {
-                                Some(replaced) => replaced,
-                                None => (action, pdu),
+                            let pdus = match normalizer.normalize(action, &pdu, &graphics.image)? {
+                                frame::Normalized::Pass => vec![(action, pdu)],
+                                frame::Normalized::Drop => Vec::new(),
+                                frame::Normalized::Replace(pdus) => pdus,
                             };
-                            let pixels = inbound.check(action, &pdu, &graphics.image)?;
-                            let outputs = active.process(&mut graphics.image, action, &pdu).map_err(|_| Error::Protocol)?;
-                            let mut dirty = None;
-                            for output in outputs {
-                                match output {
-                                    ActiveStageOutput::ResponseFrame(data) => write(&mut transport, &data).await?,
-                                    ActiveStageOutput::GraphicsUpdate(rect) if pixels => {
-                                        use ironrdp::pdu::geometry::{InclusiveRectangle, Rectangle as _};
-                                        dirty = Some(dirty.map_or_else(|| rect.clone(), |previous: InclusiveRectangle| previous.union(&rect)));
+                            for (action, pdu) in pdus {
+                                let pixels = inbound.check(action, &pdu, &graphics.image)?;
+                                let outputs = active.process(&mut graphics.image, action, &pdu).map_err(|_| Error::Protocol)?;
+                                let mut dirty = None;
+                                for output in outputs {
+                                    match output {
+                                        ActiveStageOutput::ResponseFrame(data) => write(&mut transport, &data).await?,
+                                        ActiveStageOutput::GraphicsUpdate(rect) if pixels => {
+                                            use ironrdp::pdu::geometry::{InclusiveRectangle, Rectangle as _};
+                                            dirty = Some(dirty.map_or_else(|| rect.clone(), |previous: InclusiveRectangle| previous.union(&rect)));
+                                        }
+                                        ActiveStageOutput::DeactivateAll => {
+                                            graphics = timeout(IO_TIMEOUT, reactivate(&mut transport, &mut active, &result.activation_factory))
+                                                .await.map_err(|_| Error::Timeout)??;
+                                            display_generation += 1;
+                                            inbound.reset_graphics();
+                                            dirty = None;
+                                        }
+                                        ActiveStageOutput::Terminate(_) => return Ok(()),
+                                        _ => {}
                                     }
-                                    ActiveStageOutput::DeactivateAll => {
-                                        graphics = timeout(IO_TIMEOUT, reactivate(&mut transport, &mut active, &result.activation_factory))
-                                            .await.map_err(|_| Error::Timeout)??;
-                                        display_generation += 1;
-                                        inbound.reset_graphics();
-                                        dirty = None;
-                                    }
-                                    ActiveStageOutput::Terminate(_) => return Ok(()),
-                                    _ => {}
                                 }
-                            }
-                            if let Some(dirty) = dirty {
-                                if let Some(frame) = graphics.update(id, &dirty)? { pending.push_back(Event::Frame(frame)); }
+                                if let Some(dirty) = dirty {
+                                    if let Some(frame) = graphics.update(id, &dirty)? { pending.push_back(Event::Frame(frame)); }
+                                }
                             }
                             let next_channels = channel_state(&mut active, inbound.clipboard_id, &area);
                             if next_channels != channels {

@@ -203,63 +203,163 @@ fn clipboard_fragments_cannot_exceed_the_declared_and_bounded_message() {
         .unwrap();
 }
 
-#[test]
-fn xrdp_compressed_bitmap_crops_source_stride_without_shear() {
-    use ironrdp::graphics::rdp6::{BitmapStreamEncoder, RgbChannels};
+fn test_image() -> DecodedImage {
+    DecodedImage::new(PixelFormat::RgbA32, 1024, 768)
+}
 
-    let (source_width, height) = (8usize, 3usize);
-    let mut rgb = vec![0u8; source_width * height * 3];
+fn fastpath_frame(updates: &[(Fragmentation, UpdateCode, &[u8])]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    for (fragmentation, code, data) in updates {
+        payload.extend_from_slice(&encode_vec(&FastPathUpdatePdu {
+            fragmentation: *fragmentation,
+            update_code: *code,
+            compression_flags: None,
+            compression_type: None,
+            data,
+        }).unwrap());
+    }
+    let mut pdu = encode_vec(&FastPathHeader::new(EncryptionFlags::empty(), payload.len())).unwrap();
+    pdu.extend_from_slice(&payload);
+    pdu
+}
+
+fn encoded_bitmap(rect: InclusiveRectangle, width: u16, height: u16, bpp: u16, flags: Compression, data: &[u8]) -> Vec<u8> {
+    encode_vec(&BitmapUpdateData {
+        rectangles: vec![BitmapData {
+            rectangle: rect, width, height, bits_per_pixel: bpp,
+            compression_flags: flags, compressed_data_header: None, bitmap_data: data,
+        }],
+    }).unwrap()
+}
+
+fn rdp6(width: usize, height: usize) -> (Vec<u8>, Vec<u8>) {
+    use ironrdp::graphics::rdp6::{BitmapStreamEncoder, RgbChannels};
+    let mut rgb = vec![0u8; width * height * 3];
     for y in 0..height {
-        for x in 0..source_width {
-            let index = (y * source_width + x) * 3;
-            rgb[index] = (x as u8) * 10;
+        for x in 0..width {
+            rgb[(y * width + x) * 3] = x as u8;
         }
     }
-    let mut encoded = vec![0u8; source_width * height * 4 + 2];
-    let written = BitmapStreamEncoder::new(source_width, height)
-        .encode_bitmap::<RgbChannels>(&rgb, &mut encoded, true)
-        .unwrap();
-    let bitmap = BitmapUpdateData {
-        rectangles: vec![BitmapData {
-            rectangle: InclusiveRectangle { left: 0, top: 0, right: 6, bottom: 2 },
-            width: 8,
-            height: 3,
-            bits_per_pixel: 32,
-            compression_flags: Compression::BITMAP_COMPRESSION | Compression::NO_BITMAP_COMPRESSION_HDR,
-            compressed_data_header: None,
-            bitmap_data: &encoded[..written],
-        }],
-    };
-    let data = encode_vec(&bitmap).unwrap();
-    let update = encode_vec(&FastPathUpdatePdu {
-        fragmentation: Fragmentation::Single,
-        update_code: UpdateCode::Bitmap,
-        compression_flags: None,
-        compression_type: None,
-        data: &data,
-    }).unwrap();
-    let mut pdu = encode_vec(&FastPathHeader::new(EncryptionFlags::empty(), update.len())).unwrap();
-    pdu.extend_from_slice(&update);
+    let mut encoded = vec![0u8; width * height * 4 + 2];
+    let written = BitmapStreamEncoder::new(width, height)
+        .encode_bitmap::<RgbChannels>(&rgb, &mut encoded, true).unwrap();
+    encoded.truncate(written);
+    (encoded, rgb)
+}
 
-    let (action, normalized) = super::normalize_bitmap(Action::FastPath, &pdu).unwrap().unwrap();
-    assert_eq!(action, Action::FastPath);
-    let mut input = ReadCursor::new(&normalized);
-    let header: FastPathHeader = decode_cursor(&mut input).unwrap();
-    assert_eq!(header.data_length, input.remaining().len());
-    let update: FastPathUpdatePdu = decode_cursor(&mut input).unwrap();
-    let out: BitmapUpdateData = decode_cursor(&mut ReadCursor::new(update.data)).unwrap();
-    let rect = &out.rectangles[0];
+fn output_bitmaps(normalized: Normalized) -> Vec<BitmapUpdateData<'static>> {
+    let Normalized::Replace(pdus) = normalized else { panic!("expected replacement") };
+    let mut out = Vec::new();
+    for (action, pdu) in pdus {
+        assert_eq!(action, Action::FastPath);
+        let mut input = ReadCursor::new(&pdu);
+        let header: FastPathHeader = decode_cursor(&mut input).unwrap();
+        assert!(header.data_length == input.remaining().len());
+        while !input.is_empty() {
+            let update: FastPathUpdatePdu<'_> = decode_cursor(&mut input).unwrap();
+            if update.update_code == UpdateCode::Bitmap {
+                let bitmap: BitmapUpdateData<'_> = decode_cursor(&mut ReadCursor::new(update.data)).unwrap();
+                out.push(BitmapUpdateData {
+                    rectangles: bitmap.rectangles.iter().map(|rect| BitmapData {
+                        rectangle: rect.rectangle.clone(), width: rect.width, height: rect.height,
+                        bits_per_pixel: rect.bits_per_pixel, compression_flags: rect.compression_flags,
+                        compressed_data_header: None, bitmap_data: Box::leak(rect.bitmap_data.to_vec().into_boxed_slice()),
+                    }).collect(),
+                });
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn xrdp_compressed_bitmap_crops_source_stride_without_shear() {
+    let (encoded, _) = rdp6(8, 3);
+    let data = encoded_bitmap(InclusiveRectangle { left: 0, top: 0, right: 6, bottom: 2 }, 8, 3, 32,
+        Compression::BITMAP_COMPRESSION | Compression::NO_BITMAP_COMPRESSION_HDR, &encoded);
+    let pdu = fastpath_frame(&[(Fragmentation::Single, UpdateCode::Bitmap, &data)]);
+    let normalized = Normalizer::default().normalize(Action::FastPath, &pdu, &test_image()).unwrap();
+    let bitmaps = output_bitmaps(normalized);
+    let rect = &bitmaps[0].rectangles[0];
     assert_eq!((rect.width, rect.height, rect.bits_per_pixel), (7, 3, 32));
     assert_eq!(rect.compression_flags, Compression::empty());
-    assert_eq!(rect.bitmap_data.len(), 7 * 3 * 4);
     for y in 0..3 {
         for x in 0..7 {
             let index = (y * 7 + x) * 4;
-            assert_eq!(
-                &rect.bitmap_data[index..index + 4],
-                &[0, 0, (x as u8) * 10, 0],
-                "row {y} column {x} shifted"
-            );
+            assert_eq!(&rect.bitmap_data[index..index + 4], &[0, 0, x as u8, 0], "row {y} column {x} shifted");
         }
     }
+}
+
+#[test]
+fn oversized_declared_bitmap_is_rejected_before_decoding() {
+    let data = encoded_bitmap(InclusiveRectangle { left: 0, top: 0, right: 10, bottom: 9 }, 65535, 700, 32, Compression::empty(), &[]);
+    let pdu = fastpath_frame(&[(Fragmentation::Single, UpdateCode::Bitmap, &data)]);
+    assert!(matches!(Normalizer::default().normalize(Action::FastPath, &pdu, &test_image()), Err(Error::Bounds)));
+}
+
+#[test]
+fn large_cropped_bitmap_is_split_into_bounded_pdus_with_correct_pixels() {
+    let (encoded, _) = rdp6(1024, 30);
+    let data = encoded_bitmap(InclusiveRectangle { left: 0, top: 0, right: 1020, bottom: 29 }, 1024, 30, 32,
+        Compression::BITMAP_COMPRESSION | Compression::NO_BITMAP_COMPRESSION_HDR, &encoded);
+    let pdu = fastpath_frame(&[(Fragmentation::Single, UpdateCode::Bitmap, &data)]);
+    let normalized = Normalizer::default().normalize(Action::FastPath, &pdu, &test_image()).unwrap();
+    let Normalized::Replace(pdus) = &normalized else { panic!("expected replacement") };
+    assert!(pdus.len() > 1);
+    assert!(pdus.iter().all(|(_, pdu)| pdu.len() <= 32_767));
+    let bitmaps = output_bitmaps(normalized);
+    let rows: u32 = bitmaps.iter().map(|bitmap| u32::from(bitmap.rectangles[0].height)).sum();
+    assert_eq!(rows, 30);
+    for bitmap in &bitmaps {
+        let rect = &bitmap.rectangles[0];
+        assert_eq!(rect.width, 1021);
+        let first = rect.bitmap_data[..4].to_vec();
+        assert_eq!(first, vec![0, 0, 0, 0]);
+        let last = rect.bitmap_data[(1021 * 4) - 4..(1021 * 4)].to_vec();
+        assert_eq!(last, vec![0, 0, 252, 0]);
+    }
+}
+
+#[test]
+fn fragmented_compressed_bitmap_is_reassembled_and_normalized() {
+    let (encoded, _) = rdp6(8, 3);
+    let data = encoded_bitmap(InclusiveRectangle { left: 0, top: 0, right: 6, bottom: 2 }, 8, 3, 32,
+        Compression::BITMAP_COMPRESSION | Compression::NO_BITMAP_COMPRESSION_HDR, &encoded);
+    let split = data.len() / 2;
+    let first = fastpath_frame(&[(Fragmentation::First, UpdateCode::Bitmap, &data[..split])]);
+    let next = fastpath_frame(&[(Fragmentation::Next, UpdateCode::Bitmap, &data[split..])]);
+    let mut normalizer = Normalizer::default();
+    assert!(matches!(normalizer.normalize(Action::FastPath, &first, &test_image()).unwrap(), Normalized::Drop));
+    assert!(matches!(normalizer.normalize(Action::FastPath, &next, &test_image()).unwrap(), Normalized::Drop));
+    let last = fastpath_frame(&[(Fragmentation::Last, UpdateCode::Bitmap, &[])]);
+    let normalized = normalizer.normalize(Action::FastPath, &last, &test_image()).unwrap();
+    let bitmaps = output_bitmaps(normalized);
+    assert_eq!(bitmaps[0].rectangles[0].width, 7);
+    assert_eq!(&bitmaps[0].rectangles[0].bitmap_data[..4], &[0, 0, 0, 0]);
+}
+
+#[test]
+fn pointer_update_sharing_a_pdu_with_a_bitmap_is_kept() {
+    let (encoded, _) = rdp6(8, 3);
+    let data = encoded_bitmap(InclusiveRectangle { left: 0, top: 0, right: 6, bottom: 2 }, 8, 3, 32,
+        Compression::BITMAP_COMPRESSION | Compression::NO_BITMAP_COMPRESSION_HDR, &encoded);
+    let pointer = [0x0a, 0, 0, 0, 0, 0, 0, 0];
+    let pdu = fastpath_frame(&[
+        (Fragmentation::Single, UpdateCode::PositionPointer, &pointer),
+        (Fragmentation::Single, UpdateCode::Bitmap, &data),
+    ]);
+    let normalized = Normalizer::default().normalize(Action::FastPath, &pdu, &test_image()).unwrap();
+    let Normalized::Replace(pdus) = normalized else { panic!("expected replacement") };
+    let mut codes = Vec::new();
+    for (_, pdu) in pdus {
+        let mut input = ReadCursor::new(&pdu);
+        let _: FastPathHeader = decode_cursor(&mut input).unwrap();
+        while !input.is_empty() {
+            let update: FastPathUpdatePdu<'_> = decode_cursor(&mut input).unwrap();
+            codes.push(update.update_code);
+        }
+    }
+    assert!(codes.contains(&UpdateCode::PositionPointer));
+    assert!(codes.contains(&UpdateCode::Bitmap));
 }

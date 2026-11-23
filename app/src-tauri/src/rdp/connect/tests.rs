@@ -99,7 +99,7 @@ fn credssp_does_not_resume_write_or_flush_after_revocation() {
 
 const REMOTE: &str = "rdp.example.test";
 
-fn no_trust() -> trust::Trust<impl FnOnce(String) -> std::future::Ready<Result<bool, Error>>> {
+fn no_trust() -> trust::Trust<impl FnOnce(trust::Request) -> std::future::Ready<Result<bool, Error>>> {
     trust::Trust {
         path: std::path::PathBuf::new(),
         dns: "fixture".into(),
@@ -855,3 +855,79 @@ async fn unknown_certificate_requires_one_time_approval_and_is_pinned() {
     let _ = std::fs::remove_file(path);
 }
 
+
+#[test]
+fn changed_certificate_approval_shows_previous_and_new_fingerprints() {
+    let ca = root();
+    let key = KeyPair::generate().unwrap();
+    let cert = CertificateParams::new(vec![REMOTE.to_owned()]).unwrap().signed_by(&key, &ca).unwrap();
+    let fingerprint = trust::fingerprint(cert.der());
+    let changed = describe(REMOTE, "127.0.0.1:3389", cert.der(), &fingerprint, Some("AA:BB:CC"), "알 수 없는 CA");
+    assert!(changed.changed);
+    assert!(changed.text.contains("서버 인증서가 바뀌었습니다"));
+    assert!(changed.text.contains("AA:BB:CC"));
+    assert!(changed.text.contains(&fingerprint));
+    assert!(changed.text.contains("새 지문으로 교체하고 연결"));
+    let first = describe(REMOTE, "127.0.0.1:3389", cert.der(), &fingerprint, None, "알 수 없는 CA");
+    assert!(!first.changed);
+    assert!(first.text.contains("RDP 서버 인증서를 신뢰합니까?"));
+    assert!(first.text.contains("사유: 알 수 없는 CA"));
+}
+
+#[tokio::test]
+async fn rejecting_a_changed_fingerprint_keeps_the_old_pin_without_credentials() {
+    let listener = listener();
+    let ca = root();
+    let unknown = root();
+    let key = KeyPair::generate().unwrap();
+    let cert = CertificateParams::new(vec![REMOTE.to_owned()]).unwrap().signed_by(&key, &ca).unwrap();
+    let tls_server = tls_server(key, cert.der().clone());
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(unknown.der().clone()).unwrap();
+    let path = std::env::temp_dir().join(format!("zzabba-rdp-pin-change-{}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    trust::save(&path, REMOTE, "fixture", "AA:BB").unwrap();
+
+    let server = async {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut framed = TokioFramed::new(socket);
+        let (_, bytes) = framed.read_pdu().await.unwrap();
+        assert_eq!(decode::<X224<ConnectionRequest>>(&bytes).unwrap().0.protocol,
+            SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX);
+        framed.write_all(&encode_vec(&X224(ConnectionConfirm::Response {
+            flags: ResponseFlags::empty(), protocol: SecurityProtocol::HYBRID,
+        })).unwrap()).await.unwrap();
+        let (socket, _) = framed.into_inner();
+        let Ok(mut tls) = TlsAcceptor::from(tls_server).accept(socket).await else { return; };
+        let mut first = [0u8; 1];
+        let _ = tls.read_exact(&mut first).await;
+    };
+    let calls = AtomicUsize::new(0);
+    let slot = Slot::new(1);
+    let client = connect(
+        fixture_target(&listener, size_of_desktop(), false, REMOTE).await,
+        REMOTE.try_into().unwrap(),
+        tls_config(roots),
+        trust::Trust {
+            path: path.clone(), dns: REMOTE.into(), endpoint: "fixture".into(),
+            approve: |_| std::future::ready(Ok(false)),
+        },
+        || async {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok(Account { username: "fixture".into(), domain: None,
+                password: zeroize::Zeroizing::new("fixture-only".into()) })
+        },
+        ironrdp::displaycontrol::client::DisplayControlClient::new(|_| Ok(Vec::new())),
+        AuthIo::new(&slot, None),
+    );
+    let client = TEST_PEER_POLICY.scope(fixture_policy, client);
+    let (result, ()) = timeout(Duration::from_secs(5), async { tokio::join!(client, server) }).await.unwrap();
+    assert!(matches!(result, Err(Error::TlsIdentity | Error::Transport)));
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    assert_eq!(trust::load(&path, REMOTE, "fixture").as_deref(), Some("AA:BB"));
+    let _ = std::fs::remove_file(path);
+}
+
+fn size_of_desktop() -> DesktopSize {
+    DesktopSize { width: 800, height: 600 }
+}

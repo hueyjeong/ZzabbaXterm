@@ -333,7 +333,21 @@ async fn negotiate(target: &mut Target, credssp: bool) -> Result<Negotiated, Err
     Ok(Negotiated::Upgraded(framed, connector, selected))
 }
 
-fn describe(dns: &str, endpoint: &str, cert: &CertificateDer<'_>, fingerprint: &str) -> String {
+fn failure_reason(error: &std::io::Error) -> &'static str {
+    use rustls::CertificateError;
+    let Some(rustls::Error::InvalidCertificate(certificate)) = error.get_ref().and_then(|error| error.downcast_ref::<rustls::Error>()) else {
+        return "체인 검증 실패";
+    };
+    match certificate {
+        CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. } => "이름 불일치",
+        CertificateError::Expired | CertificateError::ExpiredContext { .. } => "만료",
+        CertificateError::NotValidYet | CertificateError::NotValidYetContext { .. } => "유효 기간 전",
+        CertificateError::UnknownIssuer => "알 수 없는 CA",
+        _ => "체인 검증 실패",
+    }
+}
+
+fn describe(dns: &str, endpoint: &str, cert: &CertificateDer<'_>, fingerprint: &str, previous: Option<&str>, reason: &str) -> trust::Request {
     use x509_cert::ext::pkix::{SubjectAltName, name::GeneralName};
     let subject = Certificate::from_der(cert.as_ref())
         .map(|cert| format!("{}", cert.tbs_certificate.subject))
@@ -349,9 +363,16 @@ fn describe(dns: &str, endpoint: &str, cert: &CertificateDer<'_>, fingerprint: &
         })
         .filter(|san| !san.is_empty())
         .unwrap_or_else(|| "없음".into());
-    format!(
-        "RDP 서버 인증서를 신뢰합니까?\n\n원격 DNS: {dns}\n대상: {endpoint}\n주체: {subject}\nSAN: {san}\nSHA-256: {fingerprint}\n\n이 지문을 저장하고 연결합니다."
-    )
+    let text = if let Some(previous) = previous {
+        format!(
+            "RDP 서버 인증서가 바뀌었습니다\n\n원격 DNS: {dns}\n대상: {endpoint}\n주체: {subject}\nSAN: {san}\n사유: {reason}\n이전 SHA-256: {previous}\n새 SHA-256: {fingerprint}\n\n새 지문으로 교체하고 연결합니까?"
+        )
+    } else {
+        format!(
+            "RDP 서버 인증서를 신뢰합니까?\n\n원격 DNS: {dns}\n대상: {endpoint}\n주체: {subject}\nSAN: {san}\n사유: {reason}\nSHA-256: {fingerprint}\n\n이 지문을 저장하고 연결합니다."
+        )
+    };
+    trust::Request { text, changed: previous.is_some() }
 }
 
 async fn negotiate_rdp(target: &mut Target) -> Result<(TokioFramed<TcpStream>, ClientConnector, SecurityProtocol), Error> {
@@ -376,7 +397,7 @@ async fn verify<A, AFut>(
     trust: trust::Trust<A>,
 ) -> Result<Verified, Error>
 where
-    A: FnOnce(String) -> AFut,
+    A: FnOnce(trust::Request) -> AFut,
     AFut: Future<Output = Result<bool, Error>>,
 {
     let name = server_name.to_str().into_owned();
@@ -393,13 +414,14 @@ where
             verify_peer_policy(&name, peer)?;
             stream
         }
-        Err(_) => {
+        Err(error) => {
             let cert = tls.seen().ok_or(Error::TlsIdentity)?;
             let fingerprint = trust::fingerprint(cert.as_ref());
-            let known = trust::load(&trust.path, &trust.dns, &trust.endpoint)
-                .is_some_and(|pinned| pinned == fingerprint);
+            let stored = trust::load(&trust.path, &trust.dns, &trust.endpoint);
+            let known = stored.as_deref() == Some(fingerprint.as_str());
             if !known {
-                if !(trust.approve)(describe(&trust.dns, &trust.endpoint, &cert, &fingerprint)).await? {
+                let request = describe(&trust.dns, &trust.endpoint, &cert, &fingerprint, stored.as_deref(), failure_reason(&error));
+                if !(trust.approve)(request).await? {
                     return Err(Error::TlsIdentity);
                 }
                 trust::save(&trust.path, &trust.dns, &trust.endpoint, &fingerprint)?;
@@ -452,7 +474,7 @@ pub(super) async fn connect<F, Fut, A, AFut>(
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<Account, Error>>,
-    A: FnOnce(String) -> AFut,
+    A: FnOnce(trust::Request) -> AFut,
     AFut: Future<Output = Result<bool, Error>>,
 {
     // 인증서 승인은 사용자 입력을 기다리므로 연결 타임아웃에 넣지 않는다.

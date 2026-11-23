@@ -67,6 +67,11 @@ pub(super) fn fingerprint(der: &[u8]) -> String {
         .join(":")
 }
 
+pub(super) struct Request {
+    pub text: String,
+    pub changed: bool,
+}
+
 pub(super) struct Trust<A> {
     pub path: PathBuf,
     pub dns: String,
