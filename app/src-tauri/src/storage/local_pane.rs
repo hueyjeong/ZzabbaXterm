@@ -6,8 +6,8 @@ use tauri::Manager;
 use tokio::sync::watch;
 use uuid::Uuid;
 
-use crate::editor::storage_files::{LocalEntry, LocalRoot, is_outside_root, is_root_changed, valid_local_name};
-use crate::storage::{Error, Stage};
+use crate::editor::storage_files::{LocalEntry, LocalRoot, is_cloud_only, is_outside_root, is_root_changed, valid_local_name};
+use crate::storage::{Error, Failure, ObjectHead, Stage, UploadCondition};
 
 use super::{
     ApprovedFile, Direction, Document, LocalFileApproval, StorageIpc, TabClient, Target, bucket_verified, unavailable, until_closed,
@@ -70,6 +70,8 @@ pub(super) enum LocalFailure {
     Link,
     NotFound,
     RootChanged,
+    /// 데이터가 로컬에 없는 클라우드 전용 파일(OneDrive Files On-Demand 등)이다.
+    CloudOnly,
     LocalIo { error_kind: String },
 }
 
@@ -77,6 +79,7 @@ impl From<std::io::Error> for LocalFailure {
     fn from(error: std::io::Error) -> Self {
         use std::io::ErrorKind;
         if is_root_changed(&error) { return Self::RootChanged; }
+        if is_cloud_only(&error) { return Self::CloudOnly; }
         if is_outside_root(&error) { return Self::Link; }
         match error.kind() {
             ErrorKind::InvalidInput => Self::InvalidPath,
@@ -246,8 +249,8 @@ impl StorageIpc {
         Ok(Listing { entries, truncated })
     }
 
-    /// 업로드 전에 같은 키의 객체가 있는지 확인한다. 확인할 수 없으면 오류를 그대로 돌려준다.
-    pub(super) async fn object_exists(&self, document: &Document, target: &Target) -> Result<bool, Error> {
+    /// 업로드 전에 같은 키의 객체와 ETag를 확인한다. 확인할 수 없으면 오류를 그대로 돌려준다.
+    pub(super) async fn object_head(&self, document: &Document, target: &Target) -> Result<ObjectHead, Error> {
         let stage = Stage::HeadObject;
         let (client, closed) = {
             let mut registry = self.0.lock().unwrap();
@@ -257,8 +260,8 @@ impl StorageIpc {
         };
         let result = until_closed(&closed, stage, async {
             match &client {
-                TabClient::AwsSso(client) => client.in_region(&target.region, stage)?.object_exists(&target.bucket, &target.key).await,
-                TabClient::Compatible(client) => client.object_exists(&target.bucket, &target.key).await.map_err(|error| error.operation),
+                TabClient::AwsSso(client) => client.in_region(&target.region, stage)?.object_head(&target.bucket, &target.key).await,
+                TabClient::Compatible(client) => client.object_head(&target.bucket, &target.key).await.map_err(|error| error.operation),
             }
         }).await;
         self.record_expiration(document, &target.session_id, &closed, &result);
@@ -325,10 +328,23 @@ impl StorageIpc {
                 return SelectResult::Rejected { reason };
             }
         };
+        // 업로드 PUT 조건: 없으면 If-None-Match, 교체를 승인하면 확인한 ETag로 If-Match를 붙인다.
+        let mut condition = UploadCondition::None;
         let confirm_with = match &file {
-            ApprovedFile::Upload(_) => match self.object_exists(document, &checked).await {
-                Ok(false) => None,
-                Ok(true) => Some(("S3 객체 교체", format!("{title}\n\n같은 키의 객체를 교체하시겠습니까?"))),
+            ApprovedFile::Upload(_) => match self.object_head(document, &checked).await {
+                Ok(ObjectHead::Absent) => {
+                    condition = UploadCondition::Absent;
+                    None
+                }
+                Ok(ObjectHead::Present { etag }) => {
+                    condition = UploadCondition::Matches(etag);
+                    Some(("S3 객체 교체", format!("{title}\n\n같은 키의 객체를 교체하시겠습니까?")))
+                }
+                // 업로드 전용 역할은 HeadObject가 거부될 수 있다. 확인하면 같은 키가 없을 때만 쓴다.
+                Err(error) if matches!(error.failure, Failure::Service { status: 403, .. }) => {
+                    condition = UploadCondition::Absent;
+                    Some(("S3 객체 확인 불가", title.clone()))
+                }
                 Err(error) => {
                     self.finish_selection(document, &session_id, id, None);
                     return SelectResult::Failed { error };
@@ -352,7 +368,15 @@ impl StorageIpc {
         if let Some((dialog, prompt)) = confirm_with && !confirm(dialog, prompt, closed).await {
             return self.finish_selection(document, &session_id, id, None).into();
         }
+        self.set_upload_condition(document, &session_id, &id, condition);
         self.finish_selection(document, &session_id, id, Some(Ok(file))).into()
+    }
+
+    fn set_upload_condition(&self, document: &Document, session_id: &str, id: &str, condition: UploadCondition) {
+        let mut registry = self.0.lock().unwrap();
+        if let Some(selection) = registry.tab(document, session_id).and_then(|tab| tab.selection.as_mut()).filter(|selection| selection.id == id) {
+            selection.condition = condition;
+        }
     }
 }
 

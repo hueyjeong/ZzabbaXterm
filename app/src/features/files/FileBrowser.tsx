@@ -1,12 +1,12 @@
 import { useCallback, useLayoutEffect, useMemo, useRef, useState, type DragEvent, type KeyboardEvent, type MouseEvent, type ReactNode } from "react";
 import {
-  ArrowDown, ArrowUp, File, FileArchive, FileAudio, FileCode, FileImage, FileKey, FileSpreadsheet, FileSymlink, FileText, FileVideo, Folder,
+  ArrowDown, ArrowUp, CloudOff, File, FileArchive, FileAudio, FileCode, FileImage, FileKey, FileSpreadsheet, FileSymlink, FileText, FileVideo, Folder,
   type LucideIcon,
 } from "lucide-react";
 import { Menu, type MenuItem } from "../ui/controls";
 import "./files.css";
 
-export type FileEntry = Readonly<{ key: string; name?: string; title?: string; link?: boolean }> & (
+export type FileEntry = Readonly<{ key: string; name?: string; title?: string; link?: boolean; offline?: boolean }> & (
   | Readonly<{ kind: "folder" }>
   | Readonly<{ kind: "file"; bytes: number | null; modified?: string | null; storageClass?: string | null }>
 );
@@ -81,8 +81,8 @@ export function fileType(entry: FileEntry): FileType {
 
 export function FileIcon({ entry }: { entry: FileEntry }) {
   const type = fileType(entry);
-  const Icon = entry.link ? FileSymlink : typeIcons[type];
-  return <Icon className="file-icon" data-type={entry.link ? "link" : type} aria-hidden="true" />;
+  const [Icon, shown] = entry.link ? [FileSymlink, "link"] : entry.offline ? [CloudOff, "offline"] : [typeIcons[type], type];
+  return <Icon className="file-icon" data-type={shown} aria-hidden="true" />;
 }
 
 type SortKey = "name" | FileColumn;

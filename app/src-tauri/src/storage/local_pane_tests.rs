@@ -250,3 +250,6 @@ fn storage_local_list_ipc_returns_root_relative_entries() {
 
 #[path = "local_pane_review_tests.rs"]
 mod review;
+
+#[path = "local_pane_followup_tests.rs"]
+mod followup;

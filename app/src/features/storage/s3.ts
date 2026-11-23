@@ -29,7 +29,8 @@ type Stage = "profile" | "identity" | "listBuckets" | "headBucket" | "listObject
 type Failure =
   | Readonly<{
     kind: "invalidSsoProfile" | "retestRequired" | "accountMismatch" | "invalidRegion" | "invalidBucket" | "invalidResponse" |
-    "credentials" | "ssoLoginRequired" | "loginFailed" | "request" | "timedOut" | "bodyRead" | "checksum" | "destination" | "tls"
+    "credentials" | "ssoLoginRequired" | "loginFailed" | "request" | "timedOut" | "bodyRead" | "checksum" | "destination" | "tls" |
+    "preconditionFailed"
   }>
   | Readonly<{ kind: "bucketRegionMismatch"; region: string }>
   | Readonly<{ kind: "service"; status: number; code: string | null }>
@@ -62,10 +63,14 @@ export type S3Actions = Readonly<{
 // 로컬 창 경로는 네이티브 폴더 대화상자로 승인한 루트 기준 상대 경로("a/b")다. 빈 문자열이 루트다.
 export type LocalRoot = Readonly<{ rootId: string; label: string }>;
 export type LocalRootApproval = (Readonly<{ kind: "approved" }> & LocalRoot) | Readonly<{ kind: "cancelled" | "denied" | "restricted" }>;
-export type LocalEntry = Readonly<{ name: string; kind: "folder" | "file" | "link"; bytes: number | null; modified: number | null }>;
+export type LocalEntry = Readonly<{
+  name: string; kind: "folder" | "file" | "link"; bytes: number | null; modified: number | null;
+  /** 데이터가 로컬에 없는 클라우드 전용 파일이다. */
+  offline?: boolean;
+}>;
 export type LocalListing = Readonly<{ entries: readonly LocalEntry[]; truncated: boolean }>;
 export type LocalFailure =
-  | Readonly<{ kind: "denied" | "invalidPath" | "link" | "notFound" | "rootChanged" }>
+  | Readonly<{ kind: "denied" | "invalidPath" | "link" | "notFound" | "rootChanged" | "cloudOnly" }>
   | Readonly<{ kind: "localIo"; errorKind: string }>;
 export type LocalResult<T> = Readonly<{ ok: true; value: T }> | Readonly<{ ok: false; error: LocalFailure }>;
 export type LocalSelection = ObjectTarget & Readonly<{ rootId: string; path: string; direction: "upload" | "download" }>;

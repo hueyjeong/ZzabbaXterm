@@ -387,12 +387,21 @@ impl Access {
     }
 
     pub(super) fn read_editor(file: &File) -> io::Result<Self> {
-        check_auxiliary_data(file)?;
-        Self::read(file)
+        Self::read_preserved(file, false)
     }
 
     pub(super) fn matches_editor(&self, file: &File) -> io::Result<bool> {
-        check_auxiliary_data(file)?;
+        self.matches_preserved(file, false)
+    }
+
+    /// zone이면 다운로드 교체에서 원본의 `Zone.Identifier` 스트림 하나는 버려도 된다.
+    fn read_preserved(file: &File, zone: bool) -> io::Result<Self> {
+        check_auxiliary_data(file, zone)?;
+        Self::read(file)
+    }
+
+    fn matches_preserved(&self, file: &File, zone: bool) -> io::Result<bool> {
+        check_auxiliary_data(file, zone)?;
         self.matches(file)
     }
 
@@ -476,7 +485,7 @@ fn reject_central_access_policy(sacl: *const ACL) -> io::Result<()> {
     Ok(())
 }
 
-fn check_auxiliary_data(file: &File) -> io::Result<()> {
+fn check_auxiliary_data(file: &File, zone: bool) -> io::Result<()> {
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     // SAFETY: the file handle and correctly sized output are valid.
     if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
@@ -493,8 +502,8 @@ fn check_auxiliary_data(file: &File) -> io::Result<()> {
     }
 
     const UNNAMED: [u16; 7] = [58, 58, 36, 68, 65, 84, 65]; // ::$DATA
-    // The aligned buffer has space for only the unnamed stream.
-    let mut buffer = [0u64; 5];
+    // The aligned buffer has space for the unnamed stream and, for downloads, a zone stream.
+    let mut buffer = [0u64; 32];
     // SAFETY: the output buffer is writable and its byte size is supplied.
     if unsafe {
         GetFileInformationByHandleEx(
@@ -507,15 +516,34 @@ fn check_auxiliary_data(file: &File) -> io::Result<()> {
     {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: the buffer is aligned, initialized, and holds the header and seven UTF-16 units.
-    let (streams, name) = unsafe {
-        let ptr = buffer.as_ptr();
-        let name = ptr.cast::<u8>().add(offset_of!(FILE_STREAM_INFO, StreamName));
-        (
-            ptr.cast::<FILE_STREAM_INFO>().read(),
-            slice::from_raw_parts(name.cast::<u16>(), UNNAMED.len()),
-        )
-    };
+    let mut offset = 0;
+    let mut extra = false;
+    loop {
+        let header = offset + offset_of!(FILE_STREAM_INFO, StreamName);
+        if header > size_of_val(&buffer) {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        // SAFETY: the entry header lies inside the aligned, initialized buffer.
+        let entry = unsafe { buffer.as_ptr().cast::<u8>().add(offset).cast::<FILE_STREAM_INFO>().read_unaligned() };
+        let length = entry.StreamNameLength as usize;
+        if header + length > size_of_val(&buffer) {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        // SAFETY: the name bytes were bounds-checked against the buffer above.
+        let name: Vec<u16> = unsafe {
+            slice::from_raw_parts(buffer.as_ptr().cast::<u8>().add(header), length)
+                .chunks_exact(2)
+                .map(|unit| u16::from_ne_bytes([unit[0], unit[1]]))
+                .collect()
+        };
+        let allowed = name == UNNAMED
+            || (zone && String::from_utf16_lossy(&name).eq_ignore_ascii_case(":Zone.Identifier:$DATA"));
+        extra |= !allowed;
+        if entry.NextEntryOffset == 0 {
+            break;
+        }
+        offset += entry.NextEntryOffset as usize;
+    }
     let mut ea = FILE_EA_INFORMATION { EaSize: 0 };
     // SAFETY: the synchronous file handle and fixed-size NT query output are live.
     let status = unsafe {
@@ -530,11 +558,7 @@ fn check_auxiliary_data(file: &File) -> io::Result<()> {
     if status < 0 {
         return Err(nt_error(status));
     }
-    if streams.NextEntryOffset != 0
-        || streams.StreamNameLength as usize != size_of_val(&UNNAMED)
-        || name != UNNAMED
-        || ea.EaSize != 0
-    {
+    if extra || ea.EaSize != 0 {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "file streams or extended attributes cannot be preserved",
@@ -553,6 +577,9 @@ fn reopen(file: &File, access: u32, share: u32) -> io::Result<File> {
     Ok(unsafe { File::from_raw_handle(handle) })
 }
 
+/// 인터넷 영역(ZoneId=3)이다. HostUrl은 S3 주소를 남기지 않도록 `about:internet`으로 둔다.
+pub(super) const ZONE_IDENTIFIER: &[u8] = b"[ZoneTransfer]\r\nZoneId=3\r\nHostUrl=about:internet\r\n";
+
 pub(super) struct Temporary<'a> {
     directory: &'a Directory,
     file: Option<File>,
@@ -568,6 +595,17 @@ struct Rename {
 }
 
 impl Temporary<'_> {
+    /// 게시 전 임시 파일에 인터넷 영역 표시(Mark of the Web)를 기록한다. 이름을 바꿔도 스트림은 파일과 함께 간다.
+    pub(super) fn mark_internet(&mut self) -> io::Result<()> {
+        use std::io::Write;
+        let stream = Directory::open_at(
+            self.file(), OsStr::new(":Zone.Identifier"), FILE_OVERWRITE_IF, GENERIC_WRITE, null(), false,
+        ).map_err(nt_error)?;
+        let mut stream = stream;
+        stream.write_all(ZONE_IDENTIFIER)?;
+        stream.flush()
+    }
+
     pub(super) fn file(&mut self) -> &mut File {
         self.file.as_mut().expect("temporary file is open")
     }
@@ -596,6 +634,7 @@ impl Temporary<'_> {
         self.publish_existing(
             name,
             expected,
+            false,
             |file| verify(file),
             after_backup,
             |published| {
@@ -622,13 +661,14 @@ impl Temporary<'_> {
         verify: impl FnOnce(&mut File) -> io::Result<()>,
         after_backup: impl FnOnce(),
     ) -> Result<(), PublicationError> {
-        self.publish_existing(name, current, verify, after_backup, Ok).map(drop)
+        self.publish_existing(name, current, true, verify, after_backup, Ok).map(drop)
     }
 
     fn publish_existing(
         mut self,
         name: &OsStr,
         current: &File,
+        zone: bool,
         verify: impl FnOnce(&mut File) -> io::Result<()>,
         after_backup: impl FnOnce(),
         retain: impl FnOnce(File) -> io::Result<File>,
@@ -641,14 +681,14 @@ impl Temporary<'_> {
         if file_id(&original)? != original_id {
             return Err(io::Error::from(io::ErrorKind::AlreadyExists).into());
         }
-        let access = Access::read_editor(&original)?;
+        let access = Access::read_preserved(&original, zone)?;
         let staged_id = file_id(self.file())?;
         verify(&mut original)?;
         if directory.entry_id(name)? != Some(original_id) {
             return Err(io::Error::from(io::ErrorKind::AlreadyExists).into());
         }
         access.finish_staging(self.file())?;
-        if !directory.still_at_path()? || !access.matches_editor(&original)? {
+        if !directory.still_at_path()? || !access.matches_preserved(&original, zone)? {
             return Err(io::Error::from(io::ErrorKind::AlreadyExists).into());
         }
 
@@ -666,7 +706,7 @@ impl Temporary<'_> {
         };
         after_backup();
         if directory.entry_id(&backup).ok() != Some(Some(original_id))
-            || !matches!(access.matches_editor(&original), Ok(true))
+            || !matches!(access.matches_preserved(&original, zone), Ok(true))
             || !matches!(directory.still_at_path(), Ok(true))
         {
             return Err(unconfirmed());
@@ -677,7 +717,7 @@ impl Temporary<'_> {
         let published = retain(published).map_err(|_| unconfirmed())?;
         if access.finish_staging(&published).is_err()
             || file_id(&published).ok() != Some(staged_id)
-            || !matches!(access.matches_editor(&original), Ok(true))
+            || !matches!(access.matches_preserved(&original, zone), Ok(true))
             || directory.entry_id(name).ok() != Some(Some(staged_id))
             || directory.entry_id(&backup).ok() != Some(Some(original_id))
             || !matches!(directory.still_at_path(), Ok(true))

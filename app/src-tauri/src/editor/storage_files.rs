@@ -110,6 +110,11 @@ impl DownloadStage<'_> {
         }
         self.temp.file().sync_all()?;
         if version(self.temp.file())?.digest != digest { return Err(changed().into()); }
+        // 내려받은 파일은 인터넷 영역으로 표시한다. 표시 실패는 다운로드 실패로 만들지 않는다.
+        #[cfg(windows)]
+        if let Err(error) = self.temp.mark_internet() {
+            eprintln!("S3 다운로드 영역 표시 실패: {error}");
+        }
         target.check_parent()?;
         let replacement = if let Some((original, selected)) = &self.target.original {
             let mut current = target.open_file()?.ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
@@ -171,6 +176,8 @@ pub(crate) struct LocalEntry {
     pub(crate) kind: LocalKind,
     pub(crate) bytes: Option<u64>,
     pub(crate) modified: Option<u64>,
+    /// 클라우드 전용 파일(데이터 회수 필요)이다. 업로드할 수 없다.
+    pub(crate) offline: bool,
 }
 
 /// 루트 밖을 가리키는 링크·재분석 지점 또는 경로 별칭을 거부할 때의 오류 원인이다.
@@ -205,6 +212,51 @@ impl std::error::Error for RootChanged {}
 
 pub(crate) fn is_root_changed(error: &io::Error) -> bool {
     error.get_ref().is_some_and(|source| source.is::<RootChanged>())
+}
+
+/// 데이터가 로컬에 없는 클라우드 전용 파일을 열지 않을 때의 오류 원인이다.
+#[derive(Debug)]
+pub(crate) struct CloudOnly;
+
+impl std::fmt::Display for CloudOnly {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("cloud-only file")
+    }
+}
+
+impl std::error::Error for CloudOnly {}
+
+pub(crate) fn is_cloud_only(error: &io::Error) -> bool {
+    error.get_ref().is_some_and(|source| source.is::<CloudOnly>())
+}
+
+/// 파일 데이터를 읽으려면 클라우드에서 회수해야 하는 속성이다.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn needs_recall(attributes: u32) -> bool {
+    const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x0004_0000;
+    const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+    attributes & (FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS) != 0
+}
+
+fn offline(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        needs_recall(metadata.file_attributes())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
+/// 이름이 클라우드 전용 파일이면 거부한다. 없거나 읽을 수 없으면 이후 열기 검사에 맡긴다.
+fn reject_offline(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && offline(&metadata) => Err(io::Error::new(io::ErrorKind::Unsupported, CloudOnly)),
+        _ => Ok(()),
+    }
 }
 
 /// Windows 장치 이름이다. 확장자 앞부분을 대소문자 구분 없이 비교한다.
@@ -313,7 +365,10 @@ impl LocalRoot {
             let modified = metadata.modified().ok()
                 .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
                 .and_then(|time| u64::try_from(time.as_millis()).ok());
-            entries.push(LocalEntry { name: name.into(), kind, bytes: (kind == LocalKind::File).then(|| metadata.len()), modified });
+            let file = kind == LocalKind::File;
+            entries.push(LocalEntry {
+                name: name.into(), kind, bytes: file.then(|| metadata.len()), modified, offline: file && offline(&metadata),
+            });
         }
         if fs::canonicalize(&directory)? != directory { return Err(outside_root()); }
         self.check()?;
@@ -324,13 +379,16 @@ impl LocalRoot {
     pub(crate) fn open_upload(&self, relative: &str) -> io::Result<File> {
         let names = local_names(relative)?;
         let (name, parent) = names.split_last().ok_or(io::ErrorKind::InvalidInput)?;
-        let location = self.locate(&self.directory(parent)?, name)?;
+        let directory = self.directory(parent)?;
+        reject_offline(&directory.join(name))?;
+        let location = self.locate(&directory, name)?;
         upload_at(&location)
     }
 
     /// 루트 안의 폴더에 같은 게시 규칙으로 내려받을 대상을 연다.
     pub(crate) fn download_target(&self, folder: &str, name: &str) -> io::Result<DownloadTarget> {
         let directory = self.directory(&local_names(folder)?)?;
+        if valid_local_name(name) { reject_offline(&directory.join(name))?; }
         DownloadTarget::at(self.locate(&directory, name)?)
     }
 }

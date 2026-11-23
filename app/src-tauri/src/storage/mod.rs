@@ -100,6 +100,25 @@ pub(crate) enum Failure {
     BodyRead,
     Checksum,
     Length { expected: Option<u64> },
+    /// 조건부 PUT의 412(또는 동시 조건부 쓰기 409)다. 승인한 뒤 다른 곳에서 객체가 바뀌었다.
+    PreconditionFailed,
+}
+
+/// 업로드 PUT에 붙이는 조건이다. 대화상자 업로드는 조건 없이 보낸다.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum UploadCondition {
+    #[default]
+    None,
+    /// `If-None-Match: *`: 같은 키가 없을 때만 쓴다.
+    Absent,
+    /// `If-Match: <ETag>`: 확인한 객체가 그대로일 때만 교체한다.
+    Matches(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ObjectHead {
+    Absent,
+    Present { etag: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -252,7 +271,11 @@ impl AwsS3 {
         key: &str,
         source: File,
     ) -> Result<u64, Error> {
-        self.operations().upload(bucket, key, source).await
+        self.operations().upload(bucket, key, source, &UploadCondition::None).await
+    }
+
+    pub(crate) async fn upload_if(&self, bucket: &str, key: &str, source: File, condition: &UploadCondition) -> Result<u64, Error> {
+        self.operations().upload(bucket, key, source, condition).await
     }
 
     pub(crate) async fn download(
@@ -265,8 +288,8 @@ impl AwsS3 {
         self.operations().download(bucket, key, target, closed).await
     }
 
-    pub(crate) async fn object_exists(&self, bucket: &str, key: &str) -> Result<bool, Error> {
-        self.operations().object_exists(bucket, key).await
+    pub(crate) async fn object_head(&self, bucket: &str, key: &str) -> Result<ObjectHead, Error> {
+        self.operations().object_head(bucket, key).await
     }
 
     fn operations(&self) -> S3Operations<&Client> {
@@ -378,22 +401,38 @@ impl<C: std::borrow::Borrow<Client>> S3Operations<C> {
         })
     }
 
-    async fn upload(&self, bucket: &str, key: &str, source: File) -> Result<u64, Error> {
+    async fn upload(&self, bucket: &str, key: &str, source: File, condition: &UploadCondition) -> Result<u64, Error> {
         check_bucket(bucket, Stage::PutObject)?;
         let body = ByteStream::read_from().file(tokio::fs::File::from_std(source)).build()
             .await
             .map_err(|_| Error::at(Stage::UploadSource, Failure::Request))?;
         let bytes = body.size_hint().0;
-        self.client.borrow()
+        let request = self.client.borrow()
             .put_object()
             .bucket(bucket)
             .key(key)
-            .body(body)
+            .body(body);
+        let request = match condition {
+            UploadCondition::None => request,
+            UploadCondition::Absent => request.if_none_match("*"),
+            UploadCondition::Matches(etag) => request.if_match(etag),
+        };
+        // 조건을 지원하지 않는 응답(501 등)도 조건 없이 다시 보내지 않고 그대로 오류로 돌려준다.
+        request
             .customize()
             .config_override(single_attempt())
             .send()
             .await
-            .map_err(|err| self.sdk_error(Stage::PutObject, err))?;
+            .map_err(|err| {
+                let conflict = err.raw_response().map(|response| response.status().as_u16()).is_some_and(|status| {
+                    status == 412 || (status == 409 && err.as_service_error().and_then(ProvideErrorMetadata::code) == Some("ConditionalRequestConflict"))
+                });
+                if conflict && *condition != UploadCondition::None {
+                    Error::at(Stage::PutObject, Failure::PreconditionFailed)
+                } else {
+                    self.sdk_error(Stage::PutObject, err)
+                }
+            })?;
         Ok(bytes)
     }
 
@@ -408,15 +447,17 @@ impl<C: std::borrow::Borrow<Client>> S3Operations<C> {
         download::download(self, bucket, key, target, closed).await
     }
 
-    /// 업로드 전에 같은 키의 객체가 있는지 확인한다. 404만 없음으로 보고 나머지 오류는 그대로 돌려준다.
-    async fn object_exists(&self, bucket: &str, key: &str) -> Result<bool, Error> {
+    /// 업로드 전에 같은 키의 객체와 ETag를 확인한다. 404만 없음으로 보고 나머지 오류는 그대로 돌려준다.
+    async fn object_head(&self, bucket: &str, key: &str) -> Result<ObjectHead, Error> {
         let stage = Stage::HeadObject;
         check_bucket(bucket, stage)?;
         match self.client.borrow().head_object().bucket(bucket).key(key)
             .customize().config_override(single_attempt()).send().await
         {
-            Ok(_) => Ok(true),
-            Err(error) if error.raw_response().is_some_and(|response| response.status().as_u16() == 404) => Ok(false),
+            Ok(output) => output.e_tag.filter(|etag| !etag.is_empty())
+                .map(|etag| ObjectHead::Present { etag })
+                .ok_or_else(|| Error::at(stage, Failure::InvalidResponse)),
+            Err(error) if error.raw_response().is_some_and(|response| response.status().as_u16() == 404) => Ok(ObjectHead::Absent),
             Err(error) => Err(self.sdk_error(stage, error)),
         }
     }
