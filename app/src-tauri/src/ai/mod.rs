@@ -2,6 +2,7 @@ pub mod approval;
 #[doc(hidden)]
 pub mod cli;
 pub(crate) mod control;
+pub(crate) mod execution;
 pub(crate) mod ipc;
 mod ollama;
 pub(crate) mod session_selection;

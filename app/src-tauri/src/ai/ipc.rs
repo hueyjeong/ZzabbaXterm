@@ -1,4 +1,4 @@
-use std::{num::NonZeroU64, sync::Mutex, time::Instant};
+use std::{num::NonZeroU64, sync::{Arc, Mutex}, time::Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -7,12 +7,16 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{connections, terminal::Sessions};
 use super::{ChatMessage, ChatRole, Ollama, Operation, SelectedTarget, UPTIME,
-    approval::{Candidate, Card, Choice, Decision as RecordedDecision, DecisionRequest, LocalReview, Policy, Reviews}};
+    approval::{Candidate, Card, Choice, Decision as RecordedDecision, DecisionRequest, LocalReview, Policy, Reviews},
+    execution, session_selection};
 use super::ReviewCandidate;
 use super::cli::{Proposal as CliProposal, Query, Rejected};
 const STALE: &str = "조회 대상 또는 문서가 바뀌었습니다";
 const INVALID: &str = "AI 요청 형식이 올바르지 않습니다";
 const CANCELLED: &str = "제안 요청이 취소되었습니다";
+const EXEC_SESSION: &str = "확인된 AI 작업 세션과 실행 승인이 일치하지 않습니다";
+const EXEC_APPROVAL: &str = "실행 승인을 다시 받아야 합니다";
+const EXEC_POLICY: &str = "정책이 바뀌어 실행 승인을 사용할 수 없습니다";
 type Result<T, E = String> = std::result::Result<T, E>;
 
 #[derive(Default)]
@@ -146,6 +150,83 @@ impl ReviewState {
         self.reviews.decide(local, request, Some(selected), self.policy).map_err(review_error)
     }
 
+    fn approve_execution(
+        &mut self,
+        local: &LocalReview,
+        targets: &[SelectedTarget],
+        request: &ExecApproveRequest,
+        live: &execution::LiveSession,
+        document: u64,
+        exec: &execution::State,
+        now: Instant,
+    ) -> Result<execution::Card> {
+        if request.session_id != live.id || request.selection_id != live.selection_id.to_string() {
+            return Err(EXEC_SESSION.into());
+        }
+        let proposal_id = parse_proposal_id(&request.proposal_id)?;
+        let task = execution::task(&request.task_id).ok_or_else(|| "지원하지 않는 작업입니다".to_string())?;
+        let recorded = self.reviews.recorded(local, proposal_id).map_err(review_error)?;
+        let target = targets.iter().find(|target| **target == recorded.target).ok_or_else(|| STALE.to_string())?;
+        let card = self.reviews.approved_for(local, proposal_id, Some(target), self.policy).map_err(review_error)?;
+        if card.operation != Operation::Uptime {
+            return Err("승인된 조회 작업만 실행할 수 있습니다".into());
+        }
+        if !execution::matches_session(&card.target, &live.identity) {
+            return Err(EXEC_SESSION.into());
+        }
+        exec.issue(execution::NewApproval {
+            proposal_id,
+            target: card.target.clone(),
+            policy: self.policy,
+            session: live.clone(),
+            document,
+            task,
+        }, now).map_err(|error| error.to_string())
+    }
+
+    fn start_execution(
+        &mut self,
+        local: &LocalReview,
+        targets: &[SelectedTarget],
+        request: &ExecStartRequest,
+        live: &execution::LiveSession,
+        document: u64,
+        exec: &execution::State,
+        now: Instant,
+    ) -> Result<(execution::Approval, Arc<execution::Run>, std::sync::mpsc::Receiver<execution::Command>)> {
+        let approval_id = parse_exec_id(&request.approval_id)?;
+        let generation = parse_exec_id(&request.generation)?;
+        let snapshot = exec.snapshot(approval_id).ok_or_else(|| EXEC_APPROVAL.to_string())?;
+        if snapshot.policy != self.policy {
+            return Err(EXEC_POLICY.into());
+        }
+        if request.session_id != snapshot.session.id
+            || generation != snapshot.session.selection_id
+            || live.id != snapshot.session.id
+            || live.selection_id != snapshot.session.selection_id
+            || live.identity != snapshot.session.identity
+        {
+            return Err(EXEC_SESSION.into());
+        }
+        let target = targets.iter().find(|target| **target == snapshot.target).ok_or_else(|| STALE.to_string())?;
+        let card = self.reviews.approved_for(local, snapshot.proposal_id, Some(target), self.policy).map_err(review_error)?;
+        if card.operation != Operation::Uptime {
+            return Err("승인된 조회 작업만 실행할 수 있습니다".into());
+        }
+        exec.start(
+            &execution::Start {
+                approval_id,
+                task_id: request.task_id.clone(),
+                session_id: request.session_id.clone(),
+                generation,
+            },
+            live,
+            self.policy,
+            document,
+            now,
+        ).map_err(|error| error.to_string())
+    }
+
     fn history(&self, local: &LocalReview) -> Result<Value> {
         let records = self.reviews.history(local).map(|(card, decision)| {
             Ok(HistoryEntry { proposal: project_card(card.proposal_id, card)?, decision })
@@ -236,6 +317,30 @@ struct Decision {
 #[serde(rename_all = "lowercase")]
 enum PanelChoice { Approve, Reject, Cancel }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExecApproveRequest {
+    proposal_id: String,
+    task_id: String,
+    session_id: String,
+    selection_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExecStartRequest {
+    session_id: String,
+    generation: String,
+    approval_id: String,
+    task_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExecStopRequest {
+    approval_id: String,
+}
+
 #[derive(Serialize)]
 struct Proposal {
     id: String,
@@ -286,7 +391,8 @@ fn project_card(id: u32, card: &Card) -> Result<Proposal> {
 }
 
 pub(crate) fn handles(command: &str) -> bool {
-    matches!(command, "ai_targets" | "ai_models" | "ai_select" | "ai_chat" | "ai_propose" | "ai_cancel_proposal" | "ai_decide" | "ai_decisions" | "ai_cli_review" | "ai_policy" | "ai_set_policy")
+    matches!(command, "ai_targets" | "ai_models" | "ai_select" | "ai_chat" | "ai_propose" | "ai_cancel_proposal" | "ai_decide" | "ai_decisions" | "ai_cli_review" | "ai_policy" | "ai_set_policy"
+        | "ai_exec_approve" | "ai_exec_start" | "ai_exec_status" | "ai_exec_stop")
 }
 
 pub(crate) fn dispatch(invoke: Invoke) {
@@ -318,6 +424,10 @@ enum Request {
     CliReview,
     Policy,
     SetPolicy(PolicyRequest),
+    ExecApprove(ExecApproveRequest),
+    ExecStart(ExecStartRequest),
+    ExecStatus,
+    ExecStop(ExecStopRequest),
 }
 
 #[derive(Deserialize)]
@@ -344,8 +454,29 @@ fn parse(command: &str, body: &InvokeBody) -> Result<Request> {
         "ai_decisions" if value.as_object().is_some_and(|fields| fields.is_empty()) => return Ok(Request::Decisions),
         "ai_policy" if value.as_object().is_some_and(|fields| fields.is_empty()) => return Ok(Request::Policy),
         "ai_set_policy" => PolicyRequest::deserialize(value).map(Request::SetPolicy),
+        "ai_exec_approve" => ExecApproveRequest::deserialize(value).map(Request::ExecApprove),
+        "ai_exec_start" => ExecStartRequest::deserialize(value).map(Request::ExecStart),
+        "ai_exec_status" if value.as_object().is_some_and(|fields| fields.is_empty()) => return Ok(Request::ExecStatus),
+        "ai_exec_stop" => ExecStopRequest::deserialize(value).map(Request::ExecStop),
         _ => return Err(INVALID.into()),
     }.map_err(|_| INVALID.into())
+}
+
+fn confirmed_session(caller: &Webview, document: u64) -> Result<(NonZeroU64, crate::terminal::LiveSsmIdentity)> {
+    let sessions = caller.state::<Sessions>();
+    caller.state::<session_selection::State>().confirmed(&sessions, document)
+        .ok_or_else(|| "AI 작업 세션을 선택하고 연결을 확인하세요".to_string())
+}
+
+fn parse_proposal_id(value: &str) -> Result<u32> {
+    value.parse().map_err(|_| INVALID.into())
+}
+
+fn parse_exec_id(value: &str) -> Result<NonZeroU64> {
+    if value.is_empty() || value.starts_with('0') || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(INVALID.into());
+    }
+    value.parse().map_err(|_| INVALID.into())
 }
 
 fn document_check<T>(caller: &Webview, document: u64, work: impl FnOnce() -> Result<T>) -> Result<T> {
@@ -425,6 +556,43 @@ async fn handle(caller: Webview, document: u64, local: LocalReview, request: Req
             caller.state::<State>().0.lock().unwrap().set_policy(request.blocked)?;
             Ok(Value::Null)
         }),
+        Request::ExecApprove(request) => {
+            let (selection_id, identity) = confirmed_session(&caller, document)?;
+            let live = execution::LiveSession { id: identity.id.clone(), selection_id, identity };
+            let exec = caller.state::<execution::State>().inner().clone();
+            let now = Instant::now();
+            stored(caller, document, move |state, targets| {
+                let card = state.approve_execution(&local, &targets, &request, &live, document, &exec, now)?;
+                serde_json::to_value(card).map_err(|_| INVALID.into())
+            }).await
+        }
+        Request::ExecStart(request) => {
+            let (selection_id, identity) = confirmed_session(&caller, document)?;
+            let live = execution::LiveSession { id: identity.id.clone(), selection_id, identity };
+            let exec = caller.state::<execution::State>().inner().clone();
+            let started = exec.clone();
+            let now = Instant::now();
+            let (approval, run, commands) = stored(caller.clone(), document, move |state, targets| {
+                state.start_execution(&local, &targets, &request, &live, document, &started, now)
+            }).await?;
+            execution::launch(caller.app_handle().clone(), run, approval, commands);
+            let view = exec.status(document).ok_or_else(|| "실행 상태를 읽을 수 없습니다".to_string())?;
+            serde_json::to_value(view).map_err(|_| INVALID.into())
+        }
+        Request::ExecStatus => document_check(&caller, document, || {
+            match caller.state::<execution::State>().status(document) {
+                Some(view) => serde_json::to_value(view).map_err(|_| INVALID.into()),
+                None => Ok(Value::Null),
+            }
+        }),
+        Request::ExecStop(request) => {
+            let approval_id = parse_exec_id(&request.approval_id)?;
+            document_check(&caller, document, || {
+                let view = caller.state::<execution::State>().stop(approval_id, document)
+                    .map_err(|error| error.to_string())?;
+                serde_json::to_value(view).map_err(|_| INVALID.into())
+            })
+        }
     }
 }
 

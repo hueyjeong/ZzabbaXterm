@@ -74,3 +74,15 @@
 .a01-proposal { display: grid; gap: 8px; padding: 8px; border: 1px solid var(--border, #36454b); }
 .a01-proposal dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 10px; margin: 0; }
 .a01-proposal dd { margin: 0; overflow-wrap: anywhere; }
+.a01-execution { display: grid; gap: 8px; padding-block-start: 8px; border-block-start: 1px solid var(--border, #36454b); }
+.a01-execution-output {
+  margin: 0;
+  max-height: 12em;
+  overflow: auto;
+  padding: 6px 8px;
+  border: 1px solid var(--border, #36454b);
+  background: #12171b;
+  font: 12px/1.4 ui-monospace, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

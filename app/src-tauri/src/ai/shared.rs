@@ -1,6 +1,9 @@
 //! 명시적으로 선택한 메인 세션의 승인과 입력을 관리하는 순수 상태.
 
-use std::{num::NonZeroU64, time::Instant};
+use std::{collections::HashMap, num::NonZeroU64, time::{Duration, Instant}};
+
+const PREFIX_WINDOW: Duration = Duration::from_secs(2);
+const EVIDENCE_WINDOW: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
@@ -311,6 +314,74 @@ impl SharedState {
             _ => return Err(()),
         }
         Ok(None)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReservedKey {
+    Pair,
+    Claim,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KeyEvidence {
+    pub(crate) approval_id: u64,
+    pub(crate) main: MainSession,
+    pub(crate) key: ReservedKey,
+}
+
+/// 예약 키는 실제로 눌린 백엔드 세션과 그때 확인된 선택 세대에만 묶인다.
+#[derive(Default)]
+pub(crate) struct KeyTracker {
+    prefix: HashMap<u64, Instant>,
+    pair: Option<(KeyEvidence, Instant)>,
+    claim: Option<(KeyEvidence, Instant)>,
+}
+
+impl KeyTracker {
+    pub(crate) fn prefix(&mut self, session: u64, now: Instant) {
+        self.prefix.retain(|_, at| now.saturating_duration_since(*at) <= PREFIX_WINDOW);
+        self.prefix.insert(session, now);
+    }
+
+    pub(crate) fn clear(&mut self, session: u64) {
+        self.prefix.remove(&session);
+    }
+
+    pub(crate) fn complete(&mut self, session: u64, now: Instant) -> bool {
+        let Some(started) = self.prefix.remove(&session) else { return false };
+        now.saturating_duration_since(started) <= PREFIX_WINDOW
+    }
+
+    pub(crate) fn record(&mut self, evidence: KeyEvidence, now: Instant) {
+        match evidence.key {
+            ReservedKey::Pair => self.pair = Some((evidence, now)),
+            ReservedKey::Claim => self.claim = Some((evidence, now)),
+        }
+    }
+
+    pub(crate) fn take(&mut self, approval_id: u64, main: MainSession, key: ReservedKey, now: Instant) -> bool {
+        let slot = match key {
+            ReservedKey::Pair => &mut self.pair,
+            ReservedKey::Claim => &mut self.claim,
+        };
+        let Some((evidence, at)) = slot.take() else { return false };
+        evidence.approval_id == approval_id
+            && evidence.main == main
+            && now.saturating_duration_since(at) <= EVIDENCE_WINDOW
+    }
+
+    pub(crate) fn invalidate(&mut self, key: ReservedKey) {
+        match key {
+            ReservedKey::Pair => self.pair = None,
+            ReservedKey::Claim => self.claim = None,
+        }
+    }
+
+    pub(crate) fn clear_all(&mut self) {
+        self.prefix.clear();
+        self.pair = None;
+        self.claim = None;
     }
 }
 
