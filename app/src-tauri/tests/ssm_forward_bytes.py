@@ -5,18 +5,23 @@ r"""SSM 포트 전달 바이너리 보존 검증 도구.
 수 MB의 바이트를 보내고, 노드의 에코 서버가 돌려준 바이트의 SHA-256을 보낸 바이트와 비교한다.
 표준 라이브러리만 사용한다. Python 3.9 이상.
 
-사용 순서(데모 노드 기준: 프로필 zzabba-demo, 리전 ap-northeast-1, 노드 i-07c8e1d461943e5f3)
+대상 값은 아래 환경 변수로 지정한다(필수, 기본값 없음). 예시 명령은 POSIX 셸 기준이다.
+  ZZABBA_SSM_FORWARD_PROFILE  AWS CLI SSO 프로필 이름
+  ZZABBA_SSM_FORWARD_REGION   리전
+  ZZABBA_SSM_FORWARD_NODE     관리 노드 ID(i-… 또는 mi-…)
+
+사용 순서
 
 1. SSO 로그인
-     aws sso login --profile zzabba-demo
+     aws sso login --profile "$ZZABBA_SSM_FORWARD_PROFILE"
 
 2. 노드에 에코 서버 띄우기(127.0.0.1:9009, 기본 15분 뒤 스스로 종료)
    a) Run Command로 띄우기: 아래 명령이 send-command 매개변수 파일을 만든다.
         python ssm_forward_bytes.py node-params --port 9009 --lifetime 900 > echo-params.json
-        aws ssm send-command --profile zzabba-demo --region ap-northeast-1 \
-            --instance-ids i-07c8e1d461943e5f3 --document-name AWS-RunShellScript \
+        aws ssm send-command --profile "$ZZABBA_SSM_FORWARD_PROFILE" --region "$ZZABBA_SSM_FORWARD_REGION" \
+            --instance-ids "$ZZABBA_SSM_FORWARD_NODE" --document-name AWS-RunShellScript \
             --parameters file://echo-params.json
-        aws ssm list-command-invocations --profile zzabba-demo --region ap-northeast-1 \
+        aws ssm list-command-invocations --profile "$ZZABBA_SSM_FORWARD_PROFILE" --region "$ZZABBA_SSM_FORWARD_REGION" \
             --command-id <위 CommandId> --details
       (출력의 마지막 줄에 `LISTEN ... 127.0.0.1:9009`가 보이면 준비된 것이다.)
    b) 앱의 SSM 셸 탭에서 직접 띄우기: 아래 명령의 출력(셸 스크립트)을 SSM 셸에 붙여 넣는다.
@@ -26,8 +31,8 @@ r"""SSM 포트 전달 바이너리 보존 검증 도구.
       socat이 있으면: socat TCP-LISTEN:9009,bind=127.0.0.1,reuseaddr,fork EXEC:cat
 
 3. 기준선: 공식 CLI로 전달을 열고 검사한다(다른 터미널에서 실행 상태 유지).
-        aws ssm start-session --profile zzabba-demo --region ap-northeast-1 \
-            --target i-07c8e1d461943e5f3 --document-name AWS-StartPortForwardingSession \
+        aws ssm start-session --profile "$ZZABBA_SSM_FORWARD_PROFILE" --region "$ZZABBA_SSM_FORWARD_REGION" \
+            --target "$ZZABBA_SSM_FORWARD_NODE" --document-name AWS-StartPortForwardingSession \
             --parameters portNumber=9009,localPortNumber=50090
         python ssm_forward_bytes.py check --port 50090
 
@@ -39,8 +44,8 @@ r"""SSM 포트 전달 바이너리 보존 검증 도구.
 
 5. 정리: 터널 탭을 닫은 뒤 포트 해제와 세션 종료를 확인한다.
         python ssm_forward_bytes.py check --port 50091      # 연결 거부여야 한다(종료 코드 2)
-        aws ssm describe-sessions --profile zzabba-demo --region ap-northeast-1 --state History \
-            --filters key=Target,value=i-07c8e1d461943e5f3 --max-items 5
+        aws ssm describe-sessions --profile "$ZZABBA_SSM_FORWARD_PROFILE" --region "$ZZABBA_SSM_FORWARD_REGION" \
+            --state History --filters key=Target,value="$ZZABBA_SSM_FORWARD_NODE" --max-items 5
 
 종료 코드: 0 일치, 1 불일치·짧은 응답, 2 연결 실패.
 """

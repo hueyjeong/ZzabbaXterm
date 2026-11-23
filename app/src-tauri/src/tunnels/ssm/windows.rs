@@ -115,4 +115,9 @@ impl Tree {
     pub(super) fn owns_stream(&self, _: &Child, listen: SocketAddr, peer: SocketAddr) -> io::Result<bool> {
         crate::tunnels::ssh::windows::owns_stream(&self.pids()?, listen, peer)
     }
+
+    /// 작업 개체 안의 프로세스가 소유한 `port`의 LISTEN 주소다.
+    pub(super) fn listeners(&self, _: &Child, port: u16) -> io::Result<Option<Vec<SocketAddr>>> {
+        crate::tunnels::ssh::windows::listeners(&self.pids()?, port).map(Some)
+    }
 }

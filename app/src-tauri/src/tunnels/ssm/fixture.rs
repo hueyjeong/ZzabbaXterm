@@ -23,11 +23,20 @@ fn main() {
             println!("Cannot perform start session: listen tcp 127.0.0.1:{port}: bind: address already in use");
             exit(1);
         }
+        // bind 없이 준비 문장만 출력한다. 같은 포트는 트리 밖의 다른 프로그램이 연다.
+        "impostor" => {
+            let mut out = std::io::stdout();
+            write!(out, "\nStarting session with SessionId: {session}\nPort {printed} opened for sessionId {session}.\nWaiting for connections...\n").unwrap();
+            out.flush().unwrap();
+            thread::sleep(Duration::from_secs(60));
+        }
         "garbage" => {
             println!("\nStarting session with SessionId: {session}");
             println!("Unexpected banner from another program");
             thread::sleep(Duration::from_secs(60));
         }
+        // 출력 없이 끝난다. StartSession 응답 여부를 알 수 없는 종료다.
+        "exit" => exit(1),
         _ => exit(2),
     }
 }

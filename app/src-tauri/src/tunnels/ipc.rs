@@ -12,7 +12,7 @@ use crate::{
 
 use super::{Destination, Observation, Owner, Route, State, Transport, TunnelId, Tunnels, View,
     ssh::{SshChild, require_supported_listener},
-    ssm::{ForwardPlan, Prepared, SsmChild},
+    ssm::{ForwardPlan, SsmChild},
     transport::{Listener, SshPlan, SshServerPolicy}};
 
 const OPEN: &str = "tunnel_tab_open";
@@ -134,6 +134,10 @@ pub(crate) fn route_scope(saved: &SavedRoute) -> String {
         SavedRoute::Ssh((_, ssh)) => format!("ssh://{}@[{}]:{}#{}", ssh.account, ssh.host, ssh.port, ssh.host_key_fingerprint),
         SavedRoute::Ssm(ssm) => format!("ssm://{}@{}/{}", ssm.target.profile, ssm.target.region, ssm.target.instance_id),
     }
+}
+
+fn route_kind(saved: &SavedRoute) -> &'static str {
+    match saved { SavedRoute::Ssh(_) => "SSH", SavedRoute::Ssm(_) => "SSM" }
 }
 
 /// 한 줄 경로 표시다.
@@ -308,7 +312,8 @@ impl DesktopLease {
     /// 그래픽 세션이 인계받은 소켓을 닫은 뒤 차단 작업에서 호출한다.
     pub(crate) fn release(mut self) -> Result<(), DesktopCleanupError> {
         self.release_inner().map_err(|(owner, reason)| DesktopCleanupError {
-            document: self.document.clone(), epoch: self.epoch, id: self.id, window: owner.window, reason,
+            document: self.document.clone(), epoch: self.epoch, id: self.id, window: owner.window,
+            kind: route_kind(&self.route), reason,
         })
     }
 
@@ -343,12 +348,13 @@ pub(crate) struct DesktopCleanupError {
     epoch: u64,
     id: TunnelId,
     window: String,
+    kind: &'static str,
     reason: String,
 }
 
 impl std::fmt::Display for DesktopCleanupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "SSH 터널 종료 확인 불가: {}", self.reason)
+        write!(f, "{} 터널 종료 확인 불가: {}", self.kind, self.reason)
     }
 }
 
@@ -370,12 +376,12 @@ impl Drop for DesktopLease {
     fn drop(&mut self) {
         if let Err((_, reason)) = self.release_inner() {
             // 작업이 사라져도 실패한 자식은 문서의 종료 확인 대상에 남는다.
-            eprintln!("SSH 터널 종료 확인 불가: {reason}");
+            eprintln!("{} 터널 종료 확인 불가: {reason}", route_kind(&self.route));
         }
     }
 }
 
-// 터널 탭을 닫아도 SSH 자식 종료를 확인한다. 작업은 활성 전달당 하나다.
+// 터널 탭을 닫아도 전달 자식 종료를 확인한다. 작업은 활성 전달당 하나다.
 fn watch_desktop_route(document: Weak<Mutex<Document>>, epoch: u64, id: TunnelId, loss: CancellationToken) -> std::io::Result<()> {
     thread::Builder::new().name("desktop-tunnel".into()).spawn(move || loop {
         thread::sleep(Duration::from_millis(100));
@@ -426,7 +432,7 @@ impl TunnelTabs {
         doc.close_request = Some(request_id.into());
         let Document { entries, tunnels, .. } = &mut *doc;
         tunnels.confirm_desktop_cleanup(&epoch.to_string(), |id| { entries.remove(&id); })
-            .map_err(|error| format!("SSH 터널 종료 확인 불가: {error}"))
+            .map_err(|error| format!("터널 종료 확인 불가: {error}"))
     }
 
     pub(crate) fn release_desktop_close_gate(&self, epoch: u64, request_id: &str) {
@@ -451,7 +457,7 @@ impl TunnelTabs {
         drop(doc);
         for (id, error) in old.close_window(&window) {
             if let Err(retry) = old.retry_cleanup(id) {
-                eprintln!("SSH 터널 종료 확인 불가: {error}; {retry}");
+                eprintln!("터널 종료 확인 불가: {error}; {retry}");
             }
         }
     }
@@ -550,8 +556,12 @@ impl TunnelTabs {
             }
             _ => {}
         }
+        // 이 플랫폼은 SSM 플러그인이 받아들인 소켓의 소유 프로세스를 확인할 수 없어 화면 소켓을 인계하지 않는다.
+        if cfg!(target_os = "macos") && protocol.is_some() {
+            return Err("macOS에서는 SSM 경로의 RDP·VNC를 지원하지 않습니다".into());
+        }
         let route = Route::Ssm { listen: std::net::SocketAddr::from(([127, 0, 0, 1], listen)), node: ssm.target.instance_id.clone(), port, host };
-        let plan = ForwardPlan::new(&route, &route, ssm)?;
+        let plan = ForwardPlan::new(&route, ssm)?;
         let endpoint = format!("{} · {} · {}", ssm.target.profile, ssm.target.region, ssm.target.instance_id);
         let service = match protocol { Some(Protocol::Rdp) => "\n서비스: RDP", Some(Protocol::Vnc) => "\n서비스: VNC", None => "" };
         {
@@ -575,7 +585,10 @@ impl TunnelTabs {
         let id = doc.tunnels.begin(owner, route).ok_or(STALE)?;
         doc.entries.insert(id, Entry { endpoint, protocol });
         doc.tabs.get_mut(handle).unwrap().ids.push(id);
-        if let Err(error) = start_ssm_worker(Arc::downgrade(&self.0), epoch, id, plan) {
+        let prepare = move |cancel: CancellationToken| async move {
+            super::ssm::prepare(plan, &cancel).await.map(|prepared| move || prepared.spawn())
+        };
+        if let Err(error) = start_ssm_worker(Arc::downgrade(&self.0), epoch, id, prepare) {
             doc.tunnels.finish_start(id, Err(format!("SSM 시작 작업: {error}"))).map_err(|error| error.to_string())?;
         }
         Ok(Some(id.0.to_string()))
@@ -633,7 +646,7 @@ impl TunnelTabs {
             let stream = route.transport.as_mut().ok_or(STALE)?.open_stream(address)?;
             if route.desktop_loss.is_none() {
                 let loss = CancellationToken::new();
-                watch_desktop_route(document.clone(), epoch, id, loss.clone()).map_err(|error| format!("SSH 터널 상태 감시: {error}"))?;
+                watch_desktop_route(document.clone(), epoch, id, loss.clone()).map_err(|error| format!("{} 터널 상태 감시: {error}", route_kind(approved)))?;
                 route.desktop_loss = Some(loss);
             }
             let loss = route.desktop_loss.as_ref().unwrap().child_token();
@@ -691,12 +704,18 @@ impl TunnelTabs {
 }
 
 // SSM 준비 작업은 등록부 잠금 밖에서 실행한다. 탭이 닫히면 준비를 취소하고 자식을 만들지 않는다.
-fn start_ssm_worker(document: Weak<Mutex<Document>>, epoch: u64, id: TunnelId, plan: ForwardPlan) -> std::io::Result<()> {
+// `prepare`는 취소 토큰을 받아 자식 생성 함수를 돌려준다. 생성 함수는 같은 시작 기록이 살아 있을 때만 잠금 안에서 호출한다.
+fn start_ssm_worker<F, S>(document: Weak<Mutex<Document>>, epoch: u64, id: TunnelId,
+                          prepare: impl FnOnce(CancellationToken) -> F + Send + 'static) -> std::io::Result<thread::JoinHandle<()>>
+where
+    F: std::future::Future<Output = Result<S, String>>,
+    S: FnOnce() -> Result<SsmChild, String>,
+{
     thread::Builder::new().name("ssm-forward-start".into()).spawn(move || {
         let live = || document.upgrade().is_some_and(|document| document.lock().unwrap().starting(epoch, id));
         let cancel = CancellationToken::new();
         let prepared = tauri::async_runtime::block_on(async {
-            let prepare = super::ssm::prepare(plan, &cancel);
+            let prepare = prepare(cancel.clone());
             tokio::pin!(prepare);
             loop {
                 tokio::select! {
@@ -709,12 +728,11 @@ fn start_ssm_worker(document: Weak<Mutex<Document>>, epoch: u64, id: TunnelId, p
         let mut doc = document.lock().unwrap();
         if !doc.starting(epoch, id) { return; }
         // 생성과 핸들 등록을 같은 잠금에서 완료해 문서 종료 뒤 살아남는 자식을 막는다.
-        let result = prepared.and_then(Prepared::spawn).map(Forward::Ssm);
+        let result = prepared.and_then(|spawn| spawn()).map(Forward::Ssm);
         if let Err(error) = doc.tunnels.finish_start(id, result) {
             eprintln!("SSM 터널 종료 확인 불가: {error}");
         }
-    })?;
-    Ok(())
+    })
 }
 
 pub(crate) fn handles(command: &str) -> bool {

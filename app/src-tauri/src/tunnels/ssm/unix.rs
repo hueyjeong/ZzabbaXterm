@@ -91,6 +91,19 @@ impl Tree {
     pub(super) fn owns_stream(&self, _: &Child, _: SocketAddr, _: SocketAddr) -> io::Result<bool> {
         Ok(false)
     }
+
+    /// 트리가 소유한 `port`의 LISTEN 주소다. 확인 중 끝난 자손의 /proc 읽기 실패는 소유하지 않은 것으로 본다.
+    #[cfg(target_os = "linux")]
+    pub(super) fn listeners(&self, child: &Child, port: u16) -> io::Result<Option<Vec<SocketAddr>>> {
+        Ok(Some(descendants(child.id())?.into_iter()
+            .flat_map(|pid| crate::tunnels::ssh::unix::listeners(pid, port).unwrap_or_default()).collect()))
+    }
+
+    /// 이 플랫폼은 프로세스별 소켓 목록을 읽지 않는다. 화면 경로는 시작 전에 거부한다.
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn listeners(&self, _: &Child, _: u16) -> io::Result<Option<Vec<SocketAddr>>> {
+        Ok(None)
+    }
 }
 
 /// `/proc/<pid>/task/*/children`으로 리더와 그 자손을 모은다. 자손 수는 CLI와 플러그인 몇 개로 제한된다.

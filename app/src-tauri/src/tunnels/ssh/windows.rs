@@ -1,4 +1,4 @@
-use std::{io, mem, net::{Ipv4Addr, Ipv6Addr, SocketAddr}, path::Path, process::{Child, Command}, ptr};
+use std::{io, mem, net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6}, path::Path, process::{Child, Command}, ptr};
 
 use windows_sys::Win32::{
     Foundation::{ERROR_INSUFFICIENT_BUFFER, NO_ERROR},
@@ -56,7 +56,25 @@ pub(super) fn owns_listener(address: SocketAddr, pid: u32) -> io::Result<bool> {
     }
 }
 
-fn table<Row>(family: u32, class: TCP_TABLE_CLASS, matches: impl Fn(&Row) -> bool) -> io::Result<bool> {
+/// `pids` 중 하나가 소유한 `port`의 LISTEN 소켓 주소를 IPv4·IPv6 모두에서 모은다.
+pub(in crate::tunnels) fn listeners(pids: &[u32], port: u16) -> io::Result<Vec<SocketAddr>> {
+    let mut found = Vec::new();
+    table::<MIB_TCPROW_OWNER_PID>(2, TCP_TABLE_OWNER_PID_LISTENER, |row| {
+        if pids.contains(&row.dwOwningPid) && u16::from_be(row.dwLocalPort as u16) == port {
+            found.push(SocketAddr::from((Ipv4Addr::from(row.dwLocalAddr.to_ne_bytes()), port)));
+        }
+        false
+    })?;
+    table::<MIB_TCP6ROW_OWNER_PID>(23, TCP_TABLE_OWNER_PID_LISTENER, |row| {
+        if pids.contains(&row.dwOwningPid) && u16::from_be(row.dwLocalPort as u16) == port {
+            found.push(SocketAddrV6::new(Ipv6Addr::from(row.ucLocalAddr), port, 0, row.dwLocalScopeId).into());
+        }
+        false
+    })?;
+    Ok(found)
+}
+
+fn table<Row>(family: u32, class: TCP_TABLE_CLASS, matches: impl FnMut(&Row) -> bool) -> io::Result<bool> {
     let mut words = Vec::<u32>::new();
     let written = loop {
         let mut size = u32::try_from(mem::size_of_val(words.as_slice())).map_err(|_| io::ErrorKind::InvalidData)?;

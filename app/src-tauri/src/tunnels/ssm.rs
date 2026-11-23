@@ -33,6 +33,10 @@ const READY_TIMEOUT: Duration = Duration::from_secs(60);
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(20);
 const VERIFY_INTERVAL: Duration = Duration::from_millis(500);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(1);
+// 플러그인은 bind 뒤에 준비 문장을 출력하므로 소켓 표 반영 지연만 기다린다.
+const LISTEN_TIMEOUT: Duration = Duration::from_secs(3);
+// 트리를 정리한 뒤 출력 읽기 작업이 끝나기를 기다리는 한도다. 터널 문서 잠금 안에서 호출된다.
+const READER_TIMEOUT: Duration = Duration::from_secs(1);
 const LINE_LIMIT: usize = 512;
 const STDERR_LIMIT: usize = 8 * 1024;
 
@@ -40,8 +44,9 @@ const FORMAT: &str = "SSM 플러그인 출력 형식을 확인할 수 없습니�
 const SESSION_MISMATCH: &str = "SSM 플러그인 세션 ID가 일치하지 않습니다";
 const PLUGIN_FAILED: &str = "SSM 플러그인 시작 실패";
 const OWNERSHIP: &str = "SSM 세션 소유권 확인 불가";
+const LISTENER_OWNERSHIP: &str = "SSM 수신 소유권 불일치";
 
-/// 승인된 SSM 대상과 전달 경로를 대조해 공식 문서 인자를 고정한다.
+/// 저장 SSM 대상으로 전달 경로를 검증하고 공식 문서 인자를 고정한다. 사용자는 이 계획의 문서·매개변수를 보고 승인한다.
 pub(crate) struct ForwardPlan {
     listen: SocketAddr,
     node: String,
@@ -51,11 +56,12 @@ pub(crate) struct ForwardPlan {
 }
 
 impl ForwardPlan {
-    /// `approved`와 `saved`는 IPC 입력이 아니라 저장 대상과 사용자 승인에서 가져온다.
-    pub(crate) fn new(route: &Route, approved: &Route, saved: &SavedSsm) -> Result<Self, String> {
+    /// 수신 주소·노드 형식·원격 호스트를 검사하고, 경로의 노드가 저장 대상의 노드와 같을 때만 계획을 만든다.
+    /// 프로필·리전은 `saved`에서만 가져오므로 따로 대조할 승인 값이 없다.
+    pub(crate) fn new(route: &Route, saved: &SavedSsm) -> Result<Self, String> {
         let target = &saved.target;
         let scope = SsmScope { profile: &target.profile, region: &target.region };
-        let plan = SsmPlan::new(route, scope, approved, scope).map_err(|error| format!("SSM 전달 승인: {error:?}"))?;
+        let plan = SsmPlan::new(route, scope, route, scope).map_err(|error| format!("SSM 전달 승인: {error:?}"))?;
         let Route::Ssm { node, .. } = route else { unreachable!("SSM 전달 계획 필요") };
         let [_, _, _, parameters] = plan.document_options(scope, &target.instance_id)
             .map_err(|error| format!("SSM 전달 승인: {error:?}"))?;
@@ -146,7 +152,6 @@ type Terminate = Box<dyn FnOnce() + Send>;
 
 #[derive(Default)]
 struct Progress {
-    started: bool,
     bound: Option<(u16, String)>,
     verified: Option<String>,
     failure: Option<String>,
@@ -163,6 +168,7 @@ pub(crate) struct SsmChild {
     progress: Arc<Mutex<Progress>>,
     cancel: CancellationToken,
     deadline: Instant,
+    listen_deadline: Option<Instant>,
     ready: bool,
     terminate: Option<Terminate>,
     readers: Vec<JoinHandle<()>>,
@@ -205,7 +211,7 @@ impl SsmChild {
             io::Result::Ok(())
         })();
         let mut forward = Self {
-            child, tree, listen, progress, cancel, deadline: Instant::now() + READY_TIMEOUT, ready: false,
+            child, tree, listen, progress, cancel, deadline: Instant::now() + READY_TIMEOUT, listen_deadline: None, ready: false,
             terminate, readers, _guard: guard,
         };
         if let Err(error) = spawned {
@@ -237,6 +243,19 @@ impl SsmChild {
                 return Err(if address == self.listen { OWNERSHIP.into() } else { format!("SSM 플러그인 수신 주소 불일치: {address}") });
             }
             drop(progress);
+            // 출력만으로는 다른 프로그램이 연 같은 포트와 구분할 수 없다. 이 트리가 승인 주소의 LISTEN 소켓을 소유할 때만 준비다.
+            let owned = self.tree.listeners(&self.child, self.listen.port())
+                .map_err(|error| format!("{LISTENER_OWNERSHIP}: {error}"))?;
+            if let Some(owned) = owned.filter(|owned| !owned.contains(&self.listen)) {
+                if let Some(other) = owned.first() {
+                    return Err(format!("{LISTENER_OWNERSHIP}: {other}"));
+                }
+                let deadline = *self.listen_deadline.get_or_insert_with(|| (Instant::now() + LISTEN_TIMEOUT).min(self.deadline));
+                if Instant::now() >= deadline {
+                    return Err(format!("{LISTENER_OWNERSHIP}: {}", self.listen));
+                }
+                return Ok(false);
+            }
             self.ready = true;
             return Ok(true);
         }
@@ -307,12 +326,21 @@ impl Transport for SsmChild {
     fn close(&mut self) -> io::Result<()> {
         self.cancel.cancel();
         self.tree.stop(&mut self.child)?;
-        for reader in self.readers.drain(..) {
-            // 트리를 정리했으므로 파이프 끝이 닫혀 읽기 작업이 끝난다.
-            let _ = reader.join();
+        // 트리를 정리했으므로 파이프 끝이 닫혀 읽기 작업이 끝난다. 트리 밖으로 넘어간 파이프가 있으면 한도 뒤 분리한다.
+        let deadline = Instant::now() + READER_TIMEOUT;
+        while self.readers.iter().any(|reader| !reader.is_finished()) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
         }
-        let started = self.progress.lock().unwrap().started;
-        if let Some(terminate) = self.terminate.take().filter(|_| started) {
+        for reader in self.readers.drain(..) {
+            if reader.is_finished() {
+                let _ = reader.join();
+            } else {
+                eprintln!("SSM 포트 전달 출력 읽기 종료 확인 불가");
+            }
+        }
+        // StartSession 거부로 끝난 경우에만 원격 세션이 없다. 준비 출력 전에 닫혀도 같은 요청의 세션을 찾아 닫는다.
+        let rejected = start_rejection(&self.progress.lock().unwrap().stderr).is_some();
+        if let Some(terminate) = self.terminate.take().filter(|_| !rejected) {
             // 원격 종료 조회는 수 초가 걸리므로 등록부 잠금 밖에서 같은 요청의 세션만 닫는다.
             if let Err(error) = thread::Builder::new().name("ssm-forward-close".into()).spawn(terminate) {
                 eprintln!("SSM 포트 전달 세션 종료 작업 시작 불가: {error}");
@@ -352,7 +380,6 @@ fn read_stdout(stdout: impl Read, listen: SocketAddr, progress: &Arc<Mutex<Progr
             std::str::from_utf8(&line).map_err(|_| OutputFault::Format).and_then(|text| output.line(text))
         };
         let mut state = progress.lock().unwrap();
-        state.started |= output.session().is_some();
         match parsed {
             Ok(None) => {}
             Ok(Some((port, session))) => {
@@ -427,8 +454,6 @@ impl PluginOutput {
     pub(super) fn new() -> Self { Self::default() }
 
     pub(super) fn is_ready(&self) -> bool { self.ready }
-
-    pub(super) fn session(&self) -> Option<&str> { self.session.as_deref() }
 
     /// 준비가 확인된 줄에서 `(수신 포트, 세션 ID)`를 돌려준다.
     pub(super) fn line(&mut self, raw: &str) -> Result<Option<(u16, String)>, OutputFault> {

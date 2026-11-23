@@ -20,3 +20,7 @@ node_modules/
 
 # 화면 미리보기 산출물
 .playwright-mcp/
+
+# 에이전트 작업 상태
+.omc/
+**/.omc/

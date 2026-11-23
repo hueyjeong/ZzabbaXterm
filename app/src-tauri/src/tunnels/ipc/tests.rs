@@ -738,3 +738,120 @@ fn ssm_desktop_lease_uses_the_owned_plugin_listener_and_outlives_the_source_tab(
     lease.release().unwrap();
     super::super::ssm::tests::assert_closed(listen);
 }
+
+#[test]
+fn ssm_start_rejects_a_saved_target_changed_during_approval() {
+    let tabs = TunnelTabs::default();
+    let dir = tempfile::tempdir().unwrap();
+    let mut profile = crate::connections::tests::ssm_draft(dir.path());
+    save_draft(dir.path(), profile.clone());
+    let node = tabs.open(0, dir.path(), "ssm-node".into(), "SSM 탭".into()).unwrap();
+    let request = PortRequest::Ssm { listen: 50022, port: 22, host: None, protocol: None };
+    let result = tabs.start(0, dir.path(), &node, request, |_| {
+        // 같은 내용으로 다시 저장해 revision만 바꾼다.
+        profile["targetRevision"] = json!(1);
+        save_draft(dir.path(), profile.clone());
+        Ok(true)
+    });
+    assert_eq!(result.unwrap_err(), "승인된 SSM 대상 설정이 변경되었습니다");
+    let doc = tabs.document(0).unwrap();
+    assert!(doc.entries.is_empty());
+    assert!(doc.tunnels.entries.is_empty());
+    assert!(doc.tabs[&node].ids.is_empty());
+}
+
+// 승인을 마친 SSM 시작 기록을 문서에 등록한다.
+fn begin_ssm_record(tabs: &TunnelTabs, directory: &Path, listen: std::net::SocketAddr) -> (u64, String, TunnelId) {
+    save_draft(directory, crate::connections::tests::ssm_draft(directory));
+    let epoch = tabs.epoch();
+    let handle = tabs.open(epoch, directory, "ssm-node".into(), "SSM 탭".into()).unwrap();
+    let mut doc = tabs.document(epoch).unwrap();
+    let owner = doc.tabs[&handle].owner.clone();
+    let id = doc.tunnels.begin(owner, Route::Ssm { listen, node: "i-0123456789abcdef0".into(), port: 22, host: None }).unwrap();
+    doc.tabs.get_mut(&handle).unwrap().ids.push(id);
+    doc.entries.insert(id, Entry { endpoint: String::new(), protocol: None });
+    (epoch, handle, id)
+}
+
+#[test]
+fn closing_the_tab_while_ssm_prepare_waits_cancels_without_spawning() {
+    use std::sync::{atomic::{AtomicBool, Ordering}, mpsc};
+
+    let tabs = TunnelTabs::default();
+    let dir = tempfile::tempdir().unwrap();
+    let (epoch, handle, id) = begin_ssm_record(&tabs, dir.path(), ([127, 0, 0, 1], 50022).into());
+    let (events, received) = mpsc::channel();
+    let spawned = Arc::new(AtomicBool::new(false));
+    let worker = start_ssm_worker(Arc::downgrade(&tabs.0), epoch, id, {
+        let spawned = spawned.clone();
+        move |cancel: CancellationToken| async move {
+            events.send("waiting").unwrap();
+            tokio::select! {
+                () = cancel.cancelled() => events.send("cancelled").unwrap(),
+                () = tokio::time::sleep(Duration::from_secs(10)) => events.send("timeout").unwrap(),
+            }
+            Ok(move || -> Result<SsmChild, String> {
+                spawned.store(true, Ordering::SeqCst);
+                Err("자식 생성 함수를 호출했습니다".into())
+            })
+        }
+    }).unwrap();
+    assert_eq!(received.recv_timeout(Duration::from_secs(5)).unwrap(), "waiting");
+    tabs.close(epoch, &handle).unwrap();
+    assert_eq!(received.recv_timeout(Duration::from_secs(5)).unwrap(), "cancelled");
+    worker.join().unwrap();
+    assert!(!spawned.load(Ordering::SeqCst));
+    let doc = tabs.document(epoch).unwrap();
+    assert!(doc.entries.is_empty());
+    assert!(doc.tunnels.entries.is_empty());
+}
+
+#[test]
+fn navigation_right_after_ssm_prepare_skips_registration_and_cleans_created_children() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // 살아 있는 시작 기록은 생성 함수로 자식을 받고, 창 이동이 그 자식을 정리한다.
+    // 포트를 열지 않는 가짜 CLI 트리를 쓰고, 정리는 같은 요청의 원격 종료 작업 실행으로 관찰한다.
+    let tabs = TunnelTabs::default();
+    let dir = tempfile::tempdir().unwrap();
+    let listen = ([127, 0, 0, 1], 50024).into();
+    let (epoch, _, id) = begin_ssm_record(&tabs, dir.path(), listen);
+    let terminated = Arc::new(AtomicBool::new(false));
+    let worker = start_ssm_worker(Arc::downgrade(&tabs.0), epoch, id, {
+        let terminated = terminated.clone();
+        move |_: CancellationToken| async move {
+            Ok(move || super::super::ssm::fixture_child("garbage", listen, None, Ok("fixture-0123456789abcdef0"), Some(terminated)))
+        }
+    }).unwrap();
+    worker.join().unwrap();
+    assert!(tabs.document(epoch).unwrap().tunnels.entries[&id].transport.is_some());
+    assert!(!terminated.load(Ordering::SeqCst));
+    tabs.navigate(false);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !terminated.load(Ordering::SeqCst) {
+        assert!(std::time::Instant::now() < deadline, "창 이동 뒤 생성된 SSM 자식을 정리하지 않았습니다");
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // 준비가 끝나기 직전에 창이 이동하면 생성 함수를 호출하지 않고 등록도 하지 않는다.
+    let tabs = TunnelTabs::default();
+    let dir = tempfile::tempdir().unwrap();
+    let (epoch, _, id) = begin_ssm_record(&tabs, dir.path(), ([127, 0, 0, 1], 50023).into());
+    let spawned = Arc::new(AtomicBool::new(false));
+    let document = tabs.0.clone();
+    let worker = start_ssm_worker(Arc::downgrade(&tabs.0), epoch, id, {
+        let spawned = spawned.clone();
+        move |_: CancellationToken| async move {
+            TunnelTabs(document).navigate(false);
+            Ok(move || -> Result<SsmChild, String> {
+                spawned.store(true, Ordering::SeqCst);
+                Err("자식 생성 함수를 호출했습니다".into())
+            })
+        }
+    }).unwrap();
+    worker.join().unwrap();
+    assert!(!spawned.load(Ordering::SeqCst));
+    let doc = tabs.document(epoch + 1).unwrap();
+    assert!(doc.entries.is_empty() && doc.tabs.is_empty());
+    assert!(doc.tunnels.entries.is_empty());
+}

@@ -10,7 +10,7 @@ use super::*;
 use crate::connections::{SavedSsm, profile::Ssm};
 
 pub(super) const SESSION: &str = "fixture-0123456789abcdef0";
-const NODE: &str = "i-07c8e1d461943e5f3";
+const NODE: &str = "i-0123456789abcdef0";
 
 pub(super) fn fixture_program() -> &'static Path {
     static PROGRAM: OnceLock<PathBuf> = OnceLock::new();
@@ -156,7 +156,7 @@ fn start_session_rejections_are_distinguished() {
 fn saved(desktop: bool) -> SavedSsm {
     SavedSsm {
         revision: std::num::NonZeroU64::MIN,
-        target: Ssm { profile: "zzabba-demo".into(), region: "ap-northeast-1".into(), instance_id: NODE.into() },
+        target: Ssm { profile: "company-sso".into(), region: "ap-northeast-2".into(), instance_id: NODE.into() },
         desktop: desktop.then(|| crate::connections::SavedDesktop {
             protocol: crate::tunnels::ipc::Protocol::Rdp, host: Some("rdp.example.test".into()), port: 3389,
         }),
@@ -167,21 +167,20 @@ fn saved(desktop: bool) -> SavedSsm {
 fn forward_plan_binds_saved_scope_and_fixed_document_arguments() {
     let listen = SocketAddr::from((Ipv4Addr::LOCALHOST, 50022));
     let node_route = Route::Ssm { listen, node: NODE.into(), port: 22, host: None };
-    let plan = ForwardPlan::new(&node_route, &node_route, &saved(false)).unwrap();
+    let plan = ForwardPlan::new(&node_route, &saved(false)).unwrap();
     assert_eq!((plan.document(), plan.parameters()), ("AWS-StartPortForwardingSession", "portNumber=22,localPortNumber=50022"));
-    assert_eq!((plan.scope.profile(), plan.scope.region(), plan.node.as_str()), ("zzabba-demo", "ap-northeast-1", NODE));
+    assert_eq!((plan.scope.profile(), plan.scope.region(), plan.node.as_str()), ("company-sso", "ap-northeast-2", NODE));
     let remote = Route::Ssm { listen, node: NODE.into(), port: 3389, host: Some("rdp.example.test".into()) };
-    let plan = ForwardPlan::new(&remote, &remote, &saved(true)).unwrap();
+    let plan = ForwardPlan::new(&remote, &saved(true)).unwrap();
     assert_eq!((plan.document(), plan.parameters()),
         ("AWS-StartPortForwardingSessionToRemoteHost", "host=rdp.example.test,portNumber=3389,localPortNumber=50022"));
-    for (route, approved) in [
-        (Route::Ssm { listen, node: "i-00000000000000000".into(), port: 22, host: None }, None),
-        (node_route.clone(), Some(Route::Ssm { listen, node: NODE.into(), port: 23, host: None })),
-        (Route::Ssm { listen: SocketAddr::from(([0, 0, 0, 0], 50022)), node: NODE.into(), port: 22, host: None }, None),
-        (Route::Ssm { listen, node: NODE.into(), port: 22, host: Some("a,b".into()) }, None),
+    // 승인 경로와 범위의 불일치는 transport 시험이 SsmPlan에서 확인한다. 여기서는 저장 대상과 다른 노드와 형식 오류를 거부한다.
+    for route in [
+        Route::Ssm { listen, node: "i-00000000000000000".into(), port: 22, host: None },
+        Route::Ssm { listen: SocketAddr::from(([0, 0, 0, 0], 50022)), node: NODE.into(), port: 22, host: None },
+        Route::Ssm { listen, node: NODE.into(), port: 22, host: Some("a,b".into()) },
     ] {
-        let approved = approved.unwrap_or_else(|| route.clone());
-        assert!(ForwardPlan::new(&route, &approved, &saved(false)).err().is_some_and(|error| error.starts_with("SSM 전달 승인")));
+        assert!(ForwardPlan::new(&route, &saved(false)).err().is_some_and(|error| error.starts_with("SSM 전달 승인")));
     }
 }
 
@@ -254,28 +253,70 @@ fn fake_cli_failures_are_reported_by_stage_and_cleaned() {
     let mut child = fixture_child("bind", listen, None, Ok(SESSION), None).unwrap();
     assert_eq!(wait(&mut child).err(), Some(format!("로컬 수신 주소 사용 중: {listen}")));
     child.close().unwrap();
+
+    // 준비 출력 전에 끝나도 StartSession 거부가 아니면 같은 요청의 원격 세션 정리를 시도한다.
+    let listen = free_port();
+    let terminated = Arc::new(AtomicBool::new(false));
+    let mut child = fixture_child("exit", listen, None, Ok(SESSION), Some(terminated.clone())).unwrap();
+    assert!(wait(&mut child).err().is_some_and(|error| error.starts_with("SSM 포트 전달 시작 실패")));
+    child.close().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !terminated.load(Ordering::SeqCst) {
+        assert!(Instant::now() < deadline, "준비 전 종료에서 원격 세션 종료 작업이 실행되지 않았습니다");
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
-/// 실기 확인용. 기본값은 데모 노드다. `ZZABBA_SSM_FORWARD_HOLD_SECS`를 주면 실제 전달을 열어 그 시간 동안 유지한다.
+#[test]
+fn listener_outside_the_tree_is_not_ready_and_streams_are_refused() {
+    // 플러그인 역할 프로세스는 bind하지 않고, 시험 프로세스가 같은 승인 주소를 열고 받아들인다.
+    // 이 시험 PC는 방금 놓은 포트의 재bind가 실패할 때가 있어 시험 준비만 새 포트로 다시 시도한다.
+    let (listen, mut child, impostor) = (0..20).find_map(|_| {
+        let listen = free_port();
+        let mut child = fixture_child("impostor", listen, None, Ok(SESSION), None).ok()?;
+        match (0..50).find_map(|_| TcpListener::bind(listen).inspect_err(|_| std::thread::sleep(Duration::from_millis(10))).ok()) {
+            Some(impostor) => Some((listen, child, impostor)),
+            None => { child.close().unwrap(); None }
+        }
+    }).expect("시험 수신 bind 실패");
+    let accepted = std::thread::spawn(move || impostor.accept().map(|(stream, _)| stream));
+    assert_eq!(wait(&mut child).err(), Some(format!("{LISTENER_OWNERSHIP}: {listen}")));
+    assert!(child.open_stream(listen).is_err());
+    // 준비 판정을 우회해도 받아들인 소켓의 소유 프로세스 확인이 연결을 거부한다.
+    child.ready = true;
+    // 이 시험 PC의 일시적인 connect WSAEFAULT만 다시 시도한다.
+    let refused = (0..20).map(|_| child.open_stream(listen).err())
+        .find(|error| !error.as_deref().is_some_and(|error| error.starts_with("SSM 터널 스트림 연결:"))).flatten();
+    assert_eq!(refused.as_deref(), Some("SSM 플러그인이 승인된 터널 스트림을 소유하지 않습니다"));
+    assert!(accepted.join().unwrap().is_ok());
+    child.close().unwrap();
+}
+
+/// 실기 확인용. 대상은 환경 변수로만 받는다.
+/// 필수: `ZZABBA_SSM_FORWARD_PROFILE`, `ZZABBA_SSM_FORWARD_REGION`, `ZZABBA_SSM_FORWARD_NODE`
+/// 선택: `ZZABBA_SSM_FORWARD_LISTEN`(기본 50091), `ZZABBA_SSM_FORWARD_PORT`(기본 9009), `ZZABBA_SSM_FORWARD_HOST`,
+/// `ZZABBA_SSM_FORWARD_HOLD_SECS`(주면 실제 전달을 열어 그 시간 동안 유지)
 /// cargo test --lib tunnels::ssm::tests::real_cli_forward -- --ignored --nocapture
 #[test]
 #[ignore = "로컬 AWS CLI·Session Manager 플러그인과 SSO 로그인 필요"]
 fn real_cli_forward() {
     let env = |key: &str, default: &str| std::env::var(key).unwrap_or_else(|_| default.into());
+    let required = |key: &str| std::env::var(key).ok().filter(|value| !value.is_empty())
+        .unwrap_or_else(|| panic!("{key} 환경 변수가 필요합니다"));
     let listen = SocketAddr::from((Ipv4Addr::LOCALHOST, env("ZZABBA_SSM_FORWARD_LISTEN", "50091").parse().unwrap()));
     let port = env("ZZABBA_SSM_FORWARD_PORT", "9009").parse().unwrap();
     let host = std::env::var("ZZABBA_SSM_FORWARD_HOST").ok().filter(|host| !host.is_empty());
     let saved = SavedSsm {
         revision: std::num::NonZeroU64::MIN,
         target: Ssm {
-            profile: env("ZZABBA_SSM_FORWARD_PROFILE", "zzabba-demo"),
-            region: env("ZZABBA_SSM_FORWARD_REGION", "ap-northeast-1"),
-            instance_id: env("ZZABBA_SSM_FORWARD_NODE", NODE),
+            profile: required("ZZABBA_SSM_FORWARD_PROFILE"),
+            region: required("ZZABBA_SSM_FORWARD_REGION"),
+            instance_id: required("ZZABBA_SSM_FORWARD_NODE"),
         },
         desktop: None,
     };
     let route = Route::Ssm { listen, node: saved.target.instance_id.clone(), port, host };
-    let plan = ForwardPlan::new(&route, &route, &saved).unwrap();
+    let plan = ForwardPlan::new(&route, &saved).unwrap();
     println!("문서: {} · 매개변수: {}", plan.document(), plan.parameters());
     let prepared = match tauri::async_runtime::block_on(prepare(plan, &CancellationToken::new())) {
         Ok(prepared) => prepared,
