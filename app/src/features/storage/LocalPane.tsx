@@ -179,21 +179,27 @@ export function LocalPane({ sessionId, view, actions, update, fileView, canTrans
           })}
         </ol>
       </nav>}
-      <div className="s3-local-tools" role="toolbar" aria-label="로컬 도구">
+      {!root && <span className="s3-local-title"><HardDrive aria-hidden="true" />로컬</span>}
+      {root && <div className="s3-local-tools" role="toolbar" aria-label="로컬 도구">
         <IconButton icon={FolderOpen} label="로컬 폴더 열기" disabled={view.picking || transferring} onClick={() => void openRoot()} />
-        {root && <>
+        <>
           <IconButton icon={ArrowUp} label="로컬 상위 폴더" disabled={parent === null || !navigable} onClick={goUp} />
           <IconButton icon={RefreshCw} label="로컬 새로고침" className={view.loading ? "spinning" : undefined} disabled={!navigable}
             onClick={() => go(path)} />
           <IconButton icon={HardDriveUpload} label="S3로 업로드" disabled={!canTransfer || !uploadable(selected)} onClick={() => upload(selected)} />
-        </>}
-      </div>
+        </>
+      </div>}
     </div>
     {view.problem && <div className="s3-banner">
       <p role="alert" className="storage-problem">로컬 폴더: {describe(view.problem)}</p>
       <div className="s3-banner-actions">
         <IconButton small icon={X} label="로컬 오류 닫기" onClick={() => update(() => ({ problem: undefined }))} />
       </div>
+    </div>}
+    {!root && <div className="s3-local-body s3-local-start">
+      <button type="button" className="ui-button" disabled={view.picking || transferring} onClick={() => void openRoot()}>
+        <FolderOpen aria-hidden="true" />로컬 폴더 열기
+      </button>
     </div>}
     {root && <div className="s3-local-body">
       {listing ? <FileBrowser label="로컬 파일 목록" entries={entries} selected={selected} view={fileView} busy={view.loading}

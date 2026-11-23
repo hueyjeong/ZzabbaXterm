@@ -107,7 +107,7 @@ async function drag(node: Element, type: string, data: ReturnType<typeof transfe
 it("루트 미승인 상태에서는 로컬 폴더 열기 단추만 보이고 승인 뒤 상대 경로로 목록을 연다", async () => {
   const local = localActions();
   await render(s3Actions(), local);
-  expect(Array.from(localPane().querySelectorAll("button")).map(button => button.getAttribute("aria-label"))).toEqual(["로컬 폴더 열기"]);
+  expect(Array.from(localPane().querySelectorAll("button")).map(button => button.getAttribute("aria-label") ?? button.textContent)).toEqual(["로컬 폴더 열기"]);
   expect(localPane().querySelector('[role="grid"]')).toBeNull();
   expect(local.list).not.toHaveBeenCalled();
 
@@ -140,7 +140,7 @@ it("취소한 루트 선택은 상태를 바꾸지 않고 폐기된 루트는 �
   await click("로컬 폴더 열기", localPane());
   await click("로컬 새로고침", localPane());
   expect(localPane().querySelector('[role="alert"]')?.textContent).toBe("로컬 폴더: 승인 거부");
-  expect(Array.from(localPane().querySelectorAll(".s3-local-tools button")).map(button => button.getAttribute("aria-label")))
+  expect(Array.from(localPane().querySelectorAll(".s3-local-start button")).map(button => button.textContent))
     .toEqual(["로컬 폴더 열기"]);
 });
 
@@ -273,7 +273,7 @@ it("시스템·자격 증명 폴더는 루트로 쓰지 않고 상태만 표시�
   await click("로컬 폴더 열기", localPane());
   expect(localPane().querySelector('[role="alert"]')?.textContent).toBe("로컬 폴더: 이 폴더는 쓸 수 없음");
   expect(local.list).not.toHaveBeenCalled();
-  expect(Array.from(localPane().querySelectorAll(".s3-local-tools button")).map(button => button.getAttribute("aria-label")))
+  expect(Array.from(localPane().querySelectorAll(".s3-local-start button")).map(button => button.textContent))
     .toEqual(["로컬 폴더 열기"]);
 });
 

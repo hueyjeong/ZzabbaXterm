@@ -154,7 +154,7 @@ pub(super) fn restricted_root(root: &Path) -> bool {
     ].into_iter().filter_map(var).collect::<Vec<_>>());
     #[cfg(not(windows))]
     let (home, mut protected) = (var("HOME"), [
-        "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/boot", "/dev", "/proc", "/sys", "/root", "/System", "/Library",
+        "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/boot", "/dev", "/proc", "/sys", "/System", "/Library",
     ].map(PathBuf::from).to_vec());
     if let Some(home) = &home {
         protected.extend([".ssh", ".config", ".local", ".aws", ".gnupg"].map(|name| home.join(name)));
