@@ -36,6 +36,7 @@ fn main() {
         "storage_compatible_enroll",
         "storage_count_previous_files",
         "storage_upload", "storage_download", "storage_cancel_approval", "storage_close",
+        "storage_local_open_root", "storage_local_list", "storage_local_select",
         "storage_relogin",
         "storage_edit_open", "storage_edit_compare", "storage_edit_reload", "storage_edit_save",
         "storage_edit_close",

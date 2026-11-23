@@ -29,6 +29,8 @@ mod compatible;
 
 #[path = "edit_ipc.rs"]
 mod edit_ipc;
+#[path = "local_pane.rs"]
+mod local_pane;
 use edit_ipc::{EditOpenRequest, EditRequest, EditSaveRequest, Edits, ListedRow};
 
 #[derive(Clone, PartialEq, Eq)]
@@ -73,6 +75,8 @@ struct Tab {
     fixed_bucket: Option<String>,
     verified_bucket: Option<(String, String)>,
     edits: Edits,
+    local: Option<local_pane::LocalApproval>,
+    local_picking: bool,
 }
 
 impl Tab {
@@ -89,6 +93,8 @@ impl Tab {
             fixed_bucket: None,
             verified_bucket: None,
             edits: Edits::default(),
+            local: None,
+            local_picking: false,
         }
     }
 }
@@ -778,7 +784,7 @@ fn verified_selection(directory: &std::path::Path, target_id: &str) -> Result<Ve
     Ok(VerifiedStorageSelection { sso: VerifiedSsoSelection { scope, config }, location })
 }
 
-#[derive(Deserialize, PartialEq, Eq)]
+#[derive(Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct Target {
     session_id: String,
@@ -941,7 +947,42 @@ async fn select_file(
 #[path = "dialogs_windows.rs"]
 mod dialogs_windows;
 #[cfg(windows)]
-use dialogs_windows::{choose_replace, confirm_replace, pick as pick_local_file};
+use dialogs_windows::{choose_replace, confirm_replace, pick as pick_local_file, pick_folder as pick_local_folder};
+
+#[cfg(not(any(windows, target_os = "linux")))]
+async fn pick_local_folder<R: tauri::Runtime>(window: tauri::Window<R>, title: String, mut closed: watch::Receiver<bool>) -> Option<PathBuf> {
+    let dialog = rfd::AsyncFileDialog::new().set_parent(&window).set_title(&title);
+    tokio::select! {
+        biased;
+        _ = closed.wait_for(|closed| *closed) => None,
+        result = dialog.pick_folder() => result.map(|folder| folder.path().to_owned()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn pick_local_folder<R: tauri::Runtime>(window: tauri::Window<R>, title: String, mut closed: watch::Receiver<bool>) -> Option<PathBuf> {
+    use gtk::{FileChooserAction, FileChooserDialog, ResponseType, prelude::*};
+    let (answer, selected) = tokio::sync::oneshot::channel();
+    let owner = window.clone();
+    window.run_on_main_thread(move || {
+        let Ok(parent) = owner.gtk_window() else { return; };
+        gtk::glib::MainContext::default().spawn_local(async move {
+            let picker = FileChooserDialog::with_buttons(Some(&title), Some(&parent), FileChooserAction::SelectFolder,
+                &[("취소", ResponseType::Cancel), ("선택", ResponseType::Accept)]);
+            picker.set_modal(true);
+            picker.set_destroy_with_parent(true);
+            picker.set_local_only(true);
+            let path = tokio::select! {
+                biased;
+                _ = closed.wait_for(|closed| *closed) => None,
+                answer = picker.run_future() => (answer == ResponseType::Accept).then(|| picker.filename()).flatten(),
+            };
+            picker.close();
+            let _ = answer.send(path);
+        });
+    }).ok()?;
+    selected.await.ok().flatten()
+}
 
 #[cfg(not(any(windows, target_os = "linux")))]
 async fn pick_local_file<R: tauri::Runtime>(window: tauri::Window<R>, title: String, direction: Direction, mut closed: watch::Receiver<bool>) -> Option<PathBuf> {
@@ -1239,6 +1280,24 @@ pub(crate) fn dispatch<R: tauri::Runtime>(invoke: Invoke<R>) -> bool {
             FileSelection,
             async |webview, document, request| {
                 Ok(select_file(webview, &document, request).await)
+            }
+        ),
+        "storage_local_open_root" => handle!(
+            "storage_local_open_root", local_pane::RootRequest,
+            async |webview, document, request| {
+                Ok(local_pane::open_root(webview, &document, request).await)
+            }
+        ),
+        "storage_local_list" => handle!(
+            "storage_local_list", local_pane::ListRequest,
+            async |webview: tauri::Webview<R>, document, request| {
+                Ok(local_pane::LocalResult::from(webview.state::<StorageIpc>().list_local(&document, request).await))
+            }
+        ),
+        "storage_local_select" => handle!(
+            "storage_local_select", local_pane::SelectRequest,
+            async |webview, document, request| {
+                Ok(local_pane::select(webview, &document, request).await)
             }
         ),
         "storage_upload" => handle!(

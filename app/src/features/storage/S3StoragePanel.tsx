@@ -1,19 +1,24 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type PointerEvent as ReactPointerEvent } from "react";
 import {
-  ArrowLeft, ArrowRight, ArrowUp, Copy, Database, Download, FilePen, FolderOpen, Globe, KeyRound, LayoutGrid, Link, List,
+  useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type KeyboardEvent, type PointerEvent as ReactPointerEvent,
+} from "react";
+import {
+  ArrowLeft, ArrowRight, ArrowUp, Copy, Database, Download, FilePen, FolderOpen, Globe, HardDriveDownload, KeyRound, LayoutGrid, Link, List,
   LogIn, MapPin, RefreshCw, Server, TextCursorInput, Upload, X,
 } from "lucide-react";
 import {
   FileBrowser, VersionedFiles, exactBytes, formatBytes, sameEntry, type EntryRef, type FileEntry, type FileView, type VersionedFilesStatus,
 } from "../files/FileBrowser";
 import { IconButton, type MenuItem } from "../ui/controls";
-import type { BucketRow, ObjectRow, S3Actions, S3FileSelection, S3Location, S3Session, StorageEditorOpen } from "./s3";
+import type { BucketRow, LocalFileActions, ObjectRow, S3Actions, S3FileSelection, S3Location, S3Session, StorageEditorOpen } from "./s3";
+import {
+  LOCAL_DRAG_TYPE, LocalPane, S3_DRAG_TYPE, initialLocal, localDisplay, readDrag, type LocalDrag, type LocalView, type S3Drag,
+} from "./LocalPane";
 import { folderLabel, parentPrefix, prefixSegments, relativeName } from "./s3Path";
 import { S3Tree, type PrefixTree } from "./S3Tree";
 import { StorageProblem, TransferQueue, type Problem, type Transfer } from "./StorageStatus";
 import type { CompatibleSession } from "./compatible-settings";
 import { bindStorageEditor } from "./storageEditorIpc";
-import { countPreviousFiles } from "./storageIpc";
+import { countPreviousFiles, localFileActions } from "./storageIpc";
 import "./storage.css";
 
 type ObjectListing = Readonly<{ location: S3Location; rows: readonly ObjectRow[]; nextToken: string | null }>;
@@ -36,8 +41,14 @@ type View = {
   back: readonly S3Location[];
   forward: readonly S3Location[];
   tree: PrefixTree;
+  local: LocalView;
+  /** 로컬 창에서 업로드를 마친 위치다. 목록이 같은 위치면 다시 읽는다. */
+  remoteStale?: S3Location;
 };
-const initial: View = { confirmed: false, loading: false, selected: null, transfers: [], uploadKey: null, editing: false, back: [], forward: [], tree: new Map() };
+const initial: View = {
+  confirmed: false, loading: false, selected: null, transfers: [], uploadKey: null, editing: false, back: [], forward: [], tree: new Map(),
+  local: initialLocal,
+};
 const historyLimit = 50;
 
 type Props = Readonly<{
@@ -49,10 +60,16 @@ type Props = Readonly<{
   editEnabled?: boolean;
   onEditFile?(opened: StorageEditorOpen): false | void;
   countHistory?: typeof countPreviousFiles;
+  localActions?: LocalFileActions;
 }>;
 
 function sameLocation(a: S3Location | undefined | null, b: S3Location | undefined | null) {
   return !!a && !!b && a.bucket === b.bucket && a.prefix === b.prefix && a.region === b.region;
+}
+
+/** 로컬 파일을 현재 S3 접두어 아래에 올릴 전체 키다. 접두어는 폴더로 본다. */
+function uploadKey(prefix: string, name: string) {
+  return !prefix || prefix.endsWith("/") ? `${prefix}${name}` : `${prefix}/${name}`;
 }
 
 /** 목록을 연 접두어의 조상 경로와 하위 접두어를 트리에 기록한다. */
@@ -70,7 +87,10 @@ function remember(tree: PrefixTree, { bucket, prefix }: S3Location, rows: readon
   return new Map(tree).set(bucket, children);
 }
 
-export function S3StoragePanel({ session, initialPage, actions, onRelogin, refresh = 0, editEnabled = true, onEditFile, countHistory = countPreviousFiles }: Props) {
+export function S3StoragePanel({
+  session, initialPage, actions, onRelogin, refresh = 0, editEnabled = true, onEditFile, countHistory = countPreviousFiles,
+  localActions = localFileActions,
+}: Props) {
   const fixedLocation = initialPage?.kind === "objects" ? initialPage.location : undefined;
   const [views, setViews] = useState(() => {
     const initialViews = new Map<string, View>();
@@ -89,6 +109,22 @@ export function S3StoragePanel({ session, initialPage, actions, onRelogin, refre
   const [fileView, setFileView] = useState<FileView>("list");
   const [queueOpen, setQueueOpen] = useState(false);
   const [treeWidth, setTreeWidth] = useState(240);
+  const [localWidth, setLocalWidth] = useState(360);
+  const [dropping, setDropping] = useState(false);
+  const [splitWidth, setSplitWidth] = useState(0);
+  const stacked = splitWidth > 0 && splitWidth < 760;
+  // 로컬 창은 CSS에서 두 창 영역의 60%를 넘지 않는다. 크기를 모르면 960px을 상한으로 쓴다.
+  const localMax = splitWidth > 0 ? Math.max(220, Math.floor(splitWidth * 0.6)) : 960;
+  const localShown = Math.min(localWidth, localMax);
+  const split = useRef<HTMLDivElement>(null);
+  // 좁은 폭에서는 두 창을 위아래로 쌓는다. 고정 위치 메뉴가 어긋나지 않게 컨테이너 쿼리 대신 크기를 관찰한다.
+  useLayoutEffect(() => {
+    const node = split.current;
+    if (!node || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(([entry]) => setSplitWidth(entry.contentRect.width));
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
   const editAttempt = useRef<{ sessionId: string } | null>(null);
   const editListener = useRef(onEditFile);
   useLayoutEffect(() => { editListener.current = onEditFile; }, [onEditFile]);
@@ -103,6 +139,10 @@ export function S3StoragePanel({ session, initialPage, actions, onRelogin, refre
       const previous = current.get(sessionId) ?? initial;
       return new Map(current).set(sessionId, { ...previous, ...change(previous) });
     });
+  }
+
+  function updateLocal(change: (current: LocalView) => Partial<LocalView>) {
+    update(current => ({ local: { ...current.local, ...change(current.local) } }));
   }
 
   async function load(location: S3Location | null, { token = null, afterRelogin = false, step }: {
@@ -261,18 +301,39 @@ export function S3StoragePanel({ session, initialPage, actions, onRelogin, refre
     ? historyDone && history ? history.status : { kind: "loading" }
     : undefined;
 
-  async function transfer(direction: S3FileSelection["direction"], key: string | null) {
+  /** local이 있으면 대화상자 대신 승인된 로컬 루트의 경로로 전송한다. */
+  async function transfer(direction: S3FileSelection["direction"], key: string | null,
+    local?: Readonly<{ rootId: string; path: string; display: string; size?: number | null }>) {
     if (!canTransfer || !location || key === null || key === "") return;
     const target = { sessionId, bucket: location.bucket, region: location.region, key };
     const row = direction === "download" ? listing?.rows.find(row => row.kind === "object" && row.key === key) : undefined;
     const id = crypto.randomUUID();
-    const display = { id, direction, bucket: location.bucket, region: location.region, key, size: row?.kind === "object" ? row.bytes : null };
+    const display = {
+      id, direction, bucket: location.bucket, region: location.region, key,
+      size: local?.size ?? (row?.kind === "object" ? row.bytes : null), ...(local ? { local: local.display } : {}),
+    };
     const set = (next: Transfer, extra: Partial<View> = {}) =>
       update(current => ({ transfers: current.transfers.map(item => item.id === id ? next : item), ...extra }));
     update(current => ({ transfers: [{ ...display, state: "selecting" } as Transfer, ...current.transfers] }));
     setQueueOpen(true);
     try {
-      const selection = await actions.selectLocalFile({ ...target, direction });
+      const selection = local
+        ? await localActions.select({ ...target, rootId: local.rootId, path: local.path, direction })
+        : await actions.selectLocalFile({ ...target, direction });
+      if (selection.kind === "rejected") {
+        set({ ...display, state: "rejected", reason: selection.reason });
+        // 루트가 옮겨졌으면 Rust가 승인을 폐기했으므로 로컬 창도 루트를 해제한다.
+        if (local && selection.reason.kind === "rootChanged") {
+          updateLocal(current => current.root?.rootId === local.rootId
+            ? { root: undefined, listing: undefined, path: "", selected: null, problem: selection.reason } : {});
+        }
+        return;
+      }
+      if (selection.kind === "failed") {
+        const loginRequired = selection.error.failure.kind === "ssoLoginRequired";
+        set({ ...display, state: "failed", problem: selection.error }, loginRequired ? { expired: true } : {});
+        return;
+      }
       if (selection.kind !== "approved") {
         set({ ...display, state: selection.kind });
         return;
@@ -284,12 +345,36 @@ export function S3StoragePanel({ session, initialPage, actions, onRelogin, refre
         const loginRequired = result.error.failure.kind === "ssoLoginRequired";
         if (loginRequired && editAttempt.current?.sessionId === sessionId) editAttempt.current = null;
         set({ ...display, state: "failed", problem: result.error }, loginRequired ? { expired: true } : {});
-      } else if (typeof result.value === "number") set({ ...display, state: "uploaded", bytes: result.value });
-      else set({ ...display, state: "downloaded", result: result.value });
+      } else if (typeof result.value === "number") set({ ...display, state: "uploaded", bytes: result.value }, local ? { remoteStale: location } : {});
+      else {
+        set({ ...display, state: "downloaded", result: result.value });
+        if (local) updateLocal(current => current.root?.rootId === local.rootId ? { stale: true } : {});
+      }
     } catch {
       set({ ...display, state: "failed", problem: "unavailable" });
     }
   }
+
+  const localRoot = view.local.root;
+  const canLocalTransfer = canTransfer && !!localRoot && !view.local.loading;
+
+  function downloadLocal(key: string | null) {
+    if (!canLocalTransfer || !localRoot || !listing?.rows.some(row => row.kind === "object" && row.key === key)) return;
+    const { path } = view.local;
+    void transfer("download", key, { rootId: localRoot.rootId, path, display: localDisplay(localRoot, path) });
+  }
+
+  function uploadLocal(path: string, name: string, size: number | null) {
+    if (!canLocalTransfer || !localRoot || !location) return;
+    void transfer("upload", uploadKey(location.prefix, name), { rootId: localRoot.rootId, path, display: localDisplay(localRoot, path), size });
+  }
+
+  useEffect(() => {
+    const stale = view.remoteStale;
+    if (!stale || view.loading || transferring) return;
+    update(() => ({ remoteStale: undefined }));
+    if (listing && view.confirmed && sameLocation(listing.location, stale)) void load(listing.location);
+  });
 
   function closeUpload(focus = false) {
     update(() => ({ uploadKey: null, invalidUploadPaste: false }));
@@ -334,23 +419,25 @@ export function S3StoragePanel({ session, initialPage, actions, onRelogin, refre
     return [
       ...(canEdit && approvedRowId(entry.key) ? [{ label: "편집", icon: FilePen, onSelect: () => void edit(entry.key) }] : []),
       { label: "다운로드", icon: Download, disabled: !canTransfer, onSelect: () => void transfer("download", entry.key) },
+      ...(localRoot ? [{ label: "로컬 폴더로 다운로드", icon: HardDriveDownload, disabled: !canLocalTransfer, onSelect: () => downloadLocal(entry.key) }] : []),
       { kind: "separator" }, copy,
     ];
   }
 
   function shortcuts(event: KeyboardEvent<HTMLElement>) {
-    if (!event.altKey || event.ctrlKey || event.metaKey) return;
+    // 로컬 창의 키 입력은 S3 위치를 바꾸지 않는다.
+    if (!event.altKey || event.ctrlKey || event.metaKey || (event.target as Element).closest?.(".s3-local")) return;
     const action = { ArrowLeft: goBack, ArrowRight: goForward, ArrowUp: goUp }[event.key];
     if (!action) return;
     event.preventDefault();
     action();
   }
 
-  function resize(event: ReactPointerEvent<HTMLDivElement>) {
+  function resize(event: ReactPointerEvent<HTMLDivElement>, width = treeWidth, setWidth = setTreeWidth, min = 160, max = 480) {
     const handle = event.currentTarget;
-    const start = event.clientX - treeWidth;
+    const start = event.clientX - width;
     handle.setPointerCapture?.(event.pointerId);
-    const moveTo = (move: PointerEvent) => setTreeWidth(Math.max(160, Math.min(480, move.clientX - start)));
+    const moveTo = (move: PointerEvent) => setWidth(Math.max(min, Math.min(max, move.clientX - start)));
     const stop = () => {
       handle.removeEventListener("pointermove", moveTo);
       handle.removeEventListener("pointerup", stop);
@@ -370,146 +457,187 @@ export function S3StoragePanel({ session, initialPage, actions, onRelogin, refre
   const fixedBucket = fixedLocation?.bucket;
   const showBanner = view.problem || view.editError || (expired && onRelogin);
 
+  const acceptsLocal = (event: ReactDragEvent) => canLocalTransfer && !!location && event.dataTransfer.types.includes(LOCAL_DRAG_TYPE);
+
   return <section className="s3-explorer" aria-label={title} onKeyDown={shortcuts}>
-    <div className="s3-toolbar" role="toolbar" aria-label="탐색 도구">
-      <IconButton icon={ArrowLeft} label="뒤로" disabled={!view.back.length || !navigable} onClick={goBack} />
-      <IconButton icon={ArrowRight} label="앞으로" disabled={!view.forward.length || !navigable} onClick={goForward} />
-      <IconButton icon={ArrowUp} label="상위 폴더" disabled={parent === null || !navigable} onClick={goUp} />
-      <IconButton icon={RefreshCw} label="새로고침" className={view.loading ? "spinning" : undefined} disabled={!location || !navigable} onClick={reload} />
-      <span className="s3-toolbar-sep" role="separator" aria-orientation="vertical" />
-      <span className="s3-popover-anchor" ref={uploadAnchor}>
-        <IconButton icon={Upload} label="업로드" aria-expanded={view.uploadKey !== null} aria-haspopup="dialog" disabled={!canTransfer || !location}
-          onClick={() => view.uploadKey === null ? update(() => ({ uploadKey: location?.prefix ?? "", invalidUploadPaste: false })) : closeUpload()} />
-        {view.uploadKey !== null && location && <form className="s3-popover" role="dialog" aria-label="업로드" onKeyDown={event => {
-          if (event.key !== "Escape") return;
-          event.preventDefault();
-          event.stopPropagation();
-          closeUpload(true);
-        }} onSubmit={event => {
-          event.preventDefault();
-          const key = view.uploadKey;
-          if (!key || key.endsWith("/")) return;
-          closeUpload();
-          void transfer("upload", key);
-        }}>
-          <label className="ui-label">업로드 전체 키<input className="ui-field mono" autoFocus value={view.uploadKey} spellCheck={false}
-            onFocus={event => event.currentTarget.setSelectionRange(event.currentTarget.value.length, event.currentTarget.value.length)}
-            onChange={event => {
-              const uploadKey = event.target.value;
-              update(() => ({ uploadKey, invalidUploadPaste: false }));
-            }} onPaste={event => {
-              if (!/[\r\n]/.test(event.clipboardData.getData("text/plain"))) return;
-              event.preventDefault();
-              update(() => ({ invalidUploadPaste: true }));
-            }} onDrop={event => {
-              // 끌어 놓은 텍스트는 줄바꿈이 조용히 지워지므로 받지 않는다.
-              event.preventDefault();
-            }} /></label>
-          <div className="s3-popover-target"><Database aria-hidden="true" />{location.bucket}<span>{location.region}</span></div>
-          {view.invalidUploadPaste && <p role="alert" className="s3-inline-error">줄바꿈이 포함된 키는 붙여넣을 수 없습니다</p>}
-          <div className="s3-popover-actions">
-            <button type="button" className="ui-button ghost" onClick={() => closeUpload(true)}>취소</button>
-            <button type="submit" className="ui-button primary" disabled={!view.uploadKey || view.uploadKey.endsWith("/") || !canTransfer}><Upload aria-hidden="true" />파일 선택</button>
-          </div>
-        </form>}
-      </span>
-      <IconButton icon={Download} label="다운로드" disabled={selectedKey === null || !canTransfer} onClick={() => void transfer("download", selectedKey)} />
-      <IconButton icon={FilePen} label="편집" disabled={!canEdit || !approvedRowId(selectedKey)} onClick={() => { if (selectedKey !== null) void edit(selectedKey); }} />
-      <span className="s3-toolbar-sep" role="separator" aria-orientation="vertical" />
-      <IconButton icon={List} label="목록 보기" aria-pressed={fileView === "list"} onClick={() => setFileView("list")} />
-      <IconButton icon={LayoutGrid} label="아이콘 보기" aria-pressed={fileView === "icons"} onClick={() => setFileView("icons")} />
-      <div className="s3-badges">
-        <span className="s3-badge" title={compatible ? "별칭" : "SSO 프로필"}><KeyRound aria-hidden="true" />{session.profile}</span>
-        {compatible && <span className="s3-badge" title="서비스 ID"><Server aria-hidden="true" />{compatible.serviceId}</span>}
-        {compatible && <span className="s3-badge wide" title="HTTPS 출처"><Link aria-hidden="true" />{session.endpoint}</span>}
-        {compatible && <span className="s3-badge" title="주소 방식">{compatible.addressing === "path" ? "경로" : "가상 호스트"}</span>}
-        <span className="s3-badge" title={compatible ? "서명 리전" : "리전"}><Globe aria-hidden="true" />{session.region}</span>
-      </div>
-    </div>
-
-    {editing ? <form className="s3-address" data-editing="" onSubmit={event => {
-      event.preventDefault();
-      if (input.bucket && input.region && navigable) open(input);
-    }} onKeyDown={event => {
-      if (event.key !== "Escape" || !listing) return;
-      event.preventDefault();
-      update(() => ({ editing: false, input: listing.location }));
-    }}>
-      <Database className="s3-address-icon" aria-hidden="true" />
-      {fixedBucket !== undefined ? <span className="s3-address-fixed">{fixedBucket}</span> :
-        <label className="s3-address-field bucket"><span className="sr-only">버킷</span><input className="ui-field mono" placeholder="버킷" value={input.bucket}
-          spellCheck={false} disabled={!navigable} onChange={event => {
-            const value = event.target.value;
-            editAttempt.current = null;
-            update(() => ({ input: { ...input, bucket: value }, confirmed: false }));
-          }} /></label>}
-      <span className="s3-address-sep" aria-hidden="true">/</span>
-      <label className="s3-address-field"><span className="sr-only">접두어</span><input className="ui-field mono" placeholder="접두어" value={input.prefix}
-        spellCheck={false} disabled={!navigable} onChange={event => {
-          const value = event.target.value;
-          editAttempt.current = null;
-          update(() => ({ input: { ...input, prefix: value }, confirmed: false }));
-        }} /></label>
-      <span className="s3-chip" title={compatible ? "서명 리전" : "리전"}><MapPin aria-hidden="true" />{input.region}</span>
-      <button type="submit" className="ui-button primary" disabled={!input.bucket || !input.region || !navigable}>{fixedLocation ? "접두어 열기" : "버킷 열기"}</button>
-      {listing && <IconButton icon={X} label="편집 취소" onClick={() => update(() => ({ editing: false, input: listing.location }))} />}
-    </form> : <div className="s3-address" onClick={event => {
-      if (event.target === event.currentTarget) update(() => ({ editing: true }));
-    }}>
-      <nav aria-label="위치" className="s3-crumbs">
-        <ol>
-          <li><button type="button" className="s3-crumb bucket" title={input.bucket} aria-current={input.prefix === "" ? "location" : undefined}
-            disabled={!navigable} onClick={() => open({ ...input, prefix: "" })}><Database aria-hidden="true" />{input.bucket}</button></li>
-          {prefixSegments(input.prefix).map(segment => <li key={segment.prefix}>
-            <span className="s3-crumb-sep" aria-hidden="true">/</span>
-            <button type="button" className="s3-crumb" title={segment.prefix} aria-current={segment.prefix === input.prefix ? "location" : undefined}
-              disabled={!navigable} onClick={() => open({ ...input, prefix: segment.prefix })}>{segment.label || "/"}</button>
-          </li>)}
-        </ol>
-      </nav>
-      <span className="s3-chip" title={compatible ? "서명 리전" : "리전"}><MapPin aria-hidden="true" />{input.region}</span>
-      <IconButton icon={TextCursorInput} label="주소 편집" disabled={!navigable} onClick={() => update(() => ({ editing: true }))} />
-    </div>}
-
-    {showBanner && <div className="s3-banner">
-      {view.problem && <StorageProblem problem={view.problem} session={session} />}
-      {view.editError && <p role="alert" className="storage-problem">파일 열기 실패: {view.editError}</p>}
-      {!view.problem && !view.editError && expired && <p className="storage-problem">SSO 로그인 만료</p>}
-      <div className="s3-banner-actions">
-        {detectedRegion && <button type="button" className="ui-button" disabled={!navigable} onClick={() => {
-          editAttempt.current = null;
-          update(() => ({ input: { ...input, region: detectedRegion }, confirmed: false, problem: undefined, editing: true }));
-        }}><MapPin aria-hidden="true" />{detectedRegion} 선택</button>}
-        {expired && onRelogin && <button type="button" className="ui-button primary" disabled={!navigable} onClick={onRelogin}>
-          <LogIn aria-hidden="true" />SSO 재로그인</button>}
-        {(view.problem || view.editError) && <IconButton small icon={X} label="오류 닫기"
-          onClick={() => update(() => ({ problem: undefined, editError: undefined }))} />}
-      </div>
-    </div>}
-
-    <div className="s3-body">
-      <div className="s3-tree-pane" style={{ width: treeWidth }}>
-        <S3Tree buckets={treeBuckets} current={location ?? undefined} tree={view.tree} disabled={!navigable}
-          canList={!fixedLocation} loadMore={!fixedLocation && !!view.buckets && view.buckets.nextToken !== null}
-          onOpen={target => open(target)} onListBuckets={() => void load(null)}
-          onLoadMore={() => void load(null, { token: view.buckets?.nextToken ?? null })} />
-      </div>
-      <div className="s3-resizer" role="separator" aria-orientation="vertical" aria-label="폴더 창 크기" tabIndex={0}
-        aria-valuemin={160} aria-valuemax={480} aria-valuenow={treeWidth} onPointerDown={resize}
+    <div className="s3-split" ref={split} data-stacked={stacked ? "" : undefined} style={{ ["--local-width" as string]: `${localShown}px` }}>
+      <LocalPane sessionId={sessionId} view={view.local} actions={localActions} update={updateLocal} fileView={fileView}
+        canTransfer={canLocalTransfer && !!location} transferring={transferring} onUpload={uploadLocal} onDropObject={downloadLocal} />
+      {!stacked && <div className="s3-resizer s3-split-resizer" role="separator" aria-orientation="vertical" aria-label="로컬 창 크기" tabIndex={0}
+        aria-valuemin={220} aria-valuemax={localMax} aria-valuenow={localShown} onPointerDown={event => resize(event, localShown, setLocalWidth, 220, localMax)}
         onKeyDown={event => {
           const delta = event.key === "ArrowLeft" ? -16 : event.key === "ArrowRight" ? 16 : 0;
           if (!delta) return;
           event.preventDefault();
-          setTreeWidth(width => Math.max(160, Math.min(480, width + delta)));
-        }} />
-      <div className="s3-files">
-        {listing ? <FileBrowser label="객체 목록" entries={entries} selected={selected} view={fileView} busy={view.loading}
-          columns={["size", "modified", "class"]} empty="빈 폴더"
-          onSelect={entry => update(() => ({ selected: { kind: entry.kind, key: entry.key } }))}
-          onOpen={openEntry} onParent={parent === null ? undefined : goUp} menuItems={menuItems}
-          footer={listing.nextToken !== null && <button type="button" className="ui-button ghost"
-            disabled={view.loading || transferring || !view.confirmed} onClick={() => void load(listing.location, { token: listing.nextToken })}>더 불러오기</button>} />
-          : <p className="s3-placeholder">{view.loading ? "목록 요청 중" : "열린 버킷 없음"}</p>}
+          setLocalWidth(width => Math.max(220, Math.min(localMax, Math.min(width, localMax) + delta)));
+        }} />}
+      <div className="s3-remote">
+        <div className="s3-toolbar" role="toolbar" aria-label="탐색 도구">
+          <IconButton icon={ArrowLeft} label="뒤로" disabled={!view.back.length || !navigable} onClick={goBack} />
+          <IconButton icon={ArrowRight} label="앞으로" disabled={!view.forward.length || !navigable} onClick={goForward} />
+          <IconButton icon={ArrowUp} label="상위 폴더" disabled={parent === null || !navigable} onClick={goUp} />
+          <IconButton icon={RefreshCw} label="새로고침" className={view.loading ? "spinning" : undefined} disabled={!location || !navigable} onClick={reload} />
+          <span className="s3-toolbar-sep" role="separator" aria-orientation="vertical" />
+          <span className="s3-popover-anchor" ref={uploadAnchor}>
+            <IconButton icon={Upload} label="업로드" aria-expanded={view.uploadKey !== null} aria-haspopup="dialog" disabled={!canTransfer || !location}
+              onClick={() => view.uploadKey === null ? update(() => ({ uploadKey: location?.prefix ?? "", invalidUploadPaste: false })) : closeUpload()} />
+            {view.uploadKey !== null && location && <form className="s3-popover" role="dialog" aria-label="업로드" onKeyDown={event => {
+              if (event.key !== "Escape") return;
+              event.preventDefault();
+              event.stopPropagation();
+              closeUpload(true);
+            }} onSubmit={event => {
+              event.preventDefault();
+              const key = view.uploadKey;
+              if (!key || key.endsWith("/")) return;
+              closeUpload();
+              void transfer("upload", key);
+            }}>
+              <label className="ui-label">업로드 전체 키<input className="ui-field mono" autoFocus value={view.uploadKey} spellCheck={false}
+                onFocus={event => event.currentTarget.setSelectionRange(event.currentTarget.value.length, event.currentTarget.value.length)}
+                onChange={event => {
+                  const uploadKey = event.target.value;
+                  update(() => ({ uploadKey, invalidUploadPaste: false }));
+                }} onPaste={event => {
+                  if (!/[\r\n]/.test(event.clipboardData.getData("text/plain"))) return;
+                  event.preventDefault();
+                  update(() => ({ invalidUploadPaste: true }));
+                }} onDrop={event => {
+                  // 끌어 놓은 텍스트는 줄바꿈이 조용히 지워지므로 받지 않는다.
+                  event.preventDefault();
+                }} /></label>
+              <div className="s3-popover-target"><Database aria-hidden="true" />{location.bucket}<span>{location.region}</span></div>
+              {view.invalidUploadPaste && <p role="alert" className="s3-inline-error">줄바꿈이 포함된 키는 붙여넣을 수 없습니다</p>}
+              <div className="s3-popover-actions">
+                <button type="button" className="ui-button ghost" onClick={() => closeUpload(true)}>취소</button>
+                <button type="submit" className="ui-button primary" disabled={!view.uploadKey || view.uploadKey.endsWith("/") || !canTransfer}><Upload aria-hidden="true" />파일 선택</button>
+              </div>
+            </form>}
+          </span>
+          <IconButton icon={Download} label="다운로드" disabled={selectedKey === null || !canTransfer} onClick={() => void transfer("download", selectedKey)} />
+          <IconButton icon={HardDriveDownload} label="로컬 폴더로 다운로드" disabled={selectedKey === null || !canLocalTransfer} onClick={() => downloadLocal(selectedKey)} />
+          <IconButton icon={FilePen} label="편집" disabled={!canEdit || !approvedRowId(selectedKey)} onClick={() => { if (selectedKey !== null) void edit(selectedKey); }} />
+          <span className="s3-toolbar-sep" role="separator" aria-orientation="vertical" />
+          <IconButton icon={List} label="목록 보기" aria-pressed={fileView === "list"} onClick={() => setFileView("list")} />
+          <IconButton icon={LayoutGrid} label="아이콘 보기" aria-pressed={fileView === "icons"} onClick={() => setFileView("icons")} />
+          <div className="s3-badges">
+            <span className="s3-badge" title={compatible ? "별칭" : "SSO 프로필"}><KeyRound aria-hidden="true" />{session.profile}</span>
+            {compatible && <span className="s3-badge" title="서비스 ID"><Server aria-hidden="true" />{compatible.serviceId}</span>}
+            {compatible && <span className="s3-badge wide" title="HTTPS 출처"><Link aria-hidden="true" />{session.endpoint}</span>}
+            {compatible && <span className="s3-badge" title="주소 방식">{compatible.addressing === "path" ? "경로" : "가상 호스트"}</span>}
+            <span className="s3-badge" title={compatible ? "서명 리전" : "리전"}><Globe aria-hidden="true" />{session.region}</span>
+          </div>
+        </div>
+
+        {editing ? <form className="s3-address" data-editing="" onSubmit={event => {
+          event.preventDefault();
+          if (input.bucket && input.region && navigable) open(input);
+        }} onKeyDown={event => {
+          if (event.key !== "Escape" || !listing) return;
+          event.preventDefault();
+          update(() => ({ editing: false, input: listing.location }));
+        }}>
+          <Database className="s3-address-icon" aria-hidden="true" />
+          {fixedBucket !== undefined ? <span className="s3-address-fixed">{fixedBucket}</span> :
+            <label className="s3-address-field bucket"><span className="sr-only">버킷</span><input className="ui-field mono" placeholder="버킷" value={input.bucket}
+              spellCheck={false} disabled={!navigable} onChange={event => {
+                const value = event.target.value;
+                editAttempt.current = null;
+                update(() => ({ input: { ...input, bucket: value }, confirmed: false }));
+              }} /></label>}
+          <span className="s3-address-sep" aria-hidden="true">/</span>
+          <label className="s3-address-field"><span className="sr-only">접두어</span><input className="ui-field mono" placeholder="접두어" value={input.prefix}
+            spellCheck={false} disabled={!navigable} onChange={event => {
+              const value = event.target.value;
+              editAttempt.current = null;
+              update(() => ({ input: { ...input, prefix: value }, confirmed: false }));
+            }} /></label>
+          <span className="s3-chip" title={compatible ? "서명 리전" : "리전"}><MapPin aria-hidden="true" />{input.region}</span>
+          <button type="submit" className="ui-button primary" disabled={!input.bucket || !input.region || !navigable}>{fixedLocation ? "접두어 열기" : "버킷 열기"}</button>
+          {listing && <IconButton icon={X} label="편집 취소" onClick={() => update(() => ({ editing: false, input: listing.location }))} />}
+        </form> : <div className="s3-address" onClick={event => {
+          if (event.target === event.currentTarget) update(() => ({ editing: true }));
+        }}>
+          <nav aria-label="위치" className="s3-crumbs">
+            <ol>
+              <li><button type="button" className="s3-crumb bucket" title={input.bucket} aria-current={input.prefix === "" ? "location" : undefined}
+                disabled={!navigable} onClick={() => open({ ...input, prefix: "" })}><Database aria-hidden="true" />{input.bucket}</button></li>
+              {prefixSegments(input.prefix).map(segment => <li key={segment.prefix}>
+                <span className="s3-crumb-sep" aria-hidden="true">/</span>
+                <button type="button" className="s3-crumb" title={segment.prefix} aria-current={segment.prefix === input.prefix ? "location" : undefined}
+                  disabled={!navigable} onClick={() => open({ ...input, prefix: segment.prefix })}>{segment.label || "/"}</button>
+              </li>)}
+            </ol>
+          </nav>
+          <span className="s3-chip" title={compatible ? "서명 리전" : "리전"}><MapPin aria-hidden="true" />{input.region}</span>
+          <IconButton icon={TextCursorInput} label="주소 편집" disabled={!navigable} onClick={() => update(() => ({ editing: true }))} />
+        </div>}
+
+        {showBanner && <div className="s3-banner">
+          {view.problem && <StorageProblem problem={view.problem} session={session} />}
+          {view.editError && <p role="alert" className="storage-problem">파일 열기 실패: {view.editError}</p>}
+          {!view.problem && !view.editError && expired && <p className="storage-problem">SSO 로그인 만료</p>}
+          <div className="s3-banner-actions">
+            {detectedRegion && <button type="button" className="ui-button" disabled={!navigable} onClick={() => {
+              editAttempt.current = null;
+              update(() => ({ input: { ...input, region: detectedRegion }, confirmed: false, problem: undefined, editing: true }));
+            }}><MapPin aria-hidden="true" />{detectedRegion} 선택</button>}
+            {expired && onRelogin && <button type="button" className="ui-button primary" disabled={!navigable} onClick={onRelogin}>
+              <LogIn aria-hidden="true" />SSO 재로그인</button>}
+            {(view.problem || view.editError) && <IconButton small icon={X} label="오류 닫기"
+              onClick={() => update(() => ({ problem: undefined, editError: undefined }))} />}
+          </div>
+        </div>}
+
+        <div className="s3-body">
+          <div className="s3-tree-pane" style={{ width: treeWidth }}>
+            <S3Tree buckets={treeBuckets} current={location ?? undefined} tree={view.tree} disabled={!navigable}
+              canList={!fixedLocation} loadMore={!fixedLocation && !!view.buckets && view.buckets.nextToken !== null}
+              onOpen={target => open(target)} onListBuckets={() => void load(null)}
+              onLoadMore={() => void load(null, { token: view.buckets?.nextToken ?? null })} />
+          </div>
+          <div className="s3-resizer" role="separator" aria-orientation="vertical" aria-label="폴더 창 크기" tabIndex={0}
+            aria-valuemin={160} aria-valuemax={480} aria-valuenow={treeWidth} onPointerDown={resize}
+            onKeyDown={event => {
+              const delta = event.key === "ArrowLeft" ? -16 : event.key === "ArrowRight" ? 16 : 0;
+              if (!delta) return;
+              event.preventDefault();
+              setTreeWidth(width => Math.max(160, Math.min(480, width + delta)));
+            }} />
+          <div className="s3-files" data-drop={dropping ? "" : undefined}
+            onDragOver={event => {
+              if (!acceptsLocal(event)) return;
+              event.preventDefault();
+              event.dataTransfer.dropEffect = "copy";
+              setDropping(true);
+            }}
+            onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDropping(false); }}
+            onDrop={event => {
+              setDropping(false);
+              if (!acceptsLocal(event)) return;
+              event.preventDefault();
+              const data = readDrag<LocalDrag>(event, LOCAL_DRAG_TYPE);
+              if (data?.sessionId !== sessionId || data.rootId !== localRoot?.rootId || typeof data.path !== "string" || typeof data.name !== "string") return;
+              uploadLocal(data.path, data.name, typeof data.bytes === "number" ? data.bytes : null);
+            }}>
+            {listing ? <FileBrowser label="객체 목록" entries={entries} selected={selected} view={fileView} busy={view.loading}
+              columns={["size", "modified", "class"]} empty="빈 폴더"
+              onSelect={entry => update(() => ({ selected: { kind: entry.kind, key: entry.key } }))}
+              onOpen={openEntry} onParent={parent === null ? undefined : goUp} menuItems={menuItems}
+              onDragStart={(entry, event) => {
+                if (entry.kind !== "file") {
+                  event.preventDefault();
+                  return;
+                }
+                const data: S3Drag = { sessionId, key: entry.key };
+                event.dataTransfer.setData(S3_DRAG_TYPE, JSON.stringify(data));
+                event.dataTransfer.effectAllowed = "copy";
+              }}
+              footer={listing.nextToken !== null && <button type="button" className="ui-button ghost"
+                disabled={view.loading || transferring || !view.confirmed} onClick={() => void load(listing.location, { token: listing.nextToken })}>더 불러오기</button>} />
+              : <p className="s3-placeholder">{view.loading ? "목록 요청 중" : "열린 버킷 없음"}</p>}
+          </div>
+        </div>
       </div>
     </div>
 

@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { S3Actions, S3Result, S3Session } from "./s3";
+import type { LocalFileActions, S3Actions, S3Result, S3Session } from "./s3";
 
 export function openStorage(targetId: string, attemptId: string) {
   return invoke<S3Result<S3Session>>("storage_open", { request: { targetId, id: attemptId } });
@@ -33,4 +33,10 @@ export const storageActions: S3Actions = {
   selectLocalFile: request => invoke("storage_select_local_file", { request }),
   upload: request => useApproval("storage_upload", request),
   download: request => useApproval("storage_download", request),
+};
+
+export const localFileActions: LocalFileActions = {
+  openRoot: request => invoke("storage_local_open_root", { request }),
+  list: request => invoke("storage_local_list", { request }),
+  select: request => invoke("storage_local_select", { request }),
 };

@@ -155,6 +155,38 @@
 .s3-banner-actions { display: flex; flex: none; align-items: center; gap: 6px; }
 .storage-problem code { font-size: 11.5px; white-space: pre-wrap; }
 
+/* 2단: 로컬 창 | S3 창. 좁은 폭에서는 위아래로 쌓는다. */
+.s3-split { display: flex; flex: 1; min-width: 0; min-height: 0; }
+.s3-remote { display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; }
+.s3-local {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  width: var(--local-width, 360px);
+  max-width: 60%;
+  min-width: 0;
+  min-height: 0;
+  background: var(--bg-panel);
+}
+.s3-local-head {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  min-height: 38px;
+  padding: 0 8px;
+  border-block-end: 1px solid var(--border);
+  background: var(--bg-chrome);
+}
+.s3-local-tools { display: flex; flex: none; align-items: center; gap: 2px; margin-inline-start: auto; }
+.s3-local-body { display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; }
+.s3-local-start { align-items: center; justify-content: center; }
+.s3-local-title { display: inline-flex; align-items: center; gap: 6px; color: var(--text-muted); font-size: 12px; font-weight: 600; }
+.s3-local-title svg { width: 14px; height: 14px; }
+.s3-local[data-drop] .s3-local-body, .s3-files[data-drop] { box-shadow: inset 0 0 0 2px var(--accent); background: var(--accent-soft); }
+.s3-split[data-stacked] { flex-direction: column; }
+.s3-split[data-stacked] .s3-local { width: auto; max-width: none; flex: 0 0 40%; border-block-end: 1px solid var(--border-strong); }
+
 /* 본문: 트리 + 목록 */
 .s3-body { display: flex; flex: 1; min-height: 0; }
 .s3-tree-pane { display: flex; flex: none; flex-direction: column; min-width: 0; background: var(--bg-chrome); }
@@ -249,11 +281,11 @@
 tr[data-state="running"] .transfer-state { color: var(--accent); }
 tr[data-state="running"] .transfer-state svg { animation: file-spin .9s linear infinite; }
 tr:is([data-state="uploaded"], [data-state="downloaded"]) .transfer-state { color: var(--accent); }
-tr[data-state="failed"] .transfer-state, tr[data-state="failed"] .transfer-result { color: var(--danger); }
+tr:is([data-state="failed"], [data-state="rejected"]) :is(.transfer-state, .transfer-result) { color: var(--danger); }
 tr:is([data-state="cancelled"], [data-state="denied"]) .transfer-state { color: var(--text-faint); }
 tr[data-state="selecting"] .transfer-state { color: var(--warning); }
 .transfer-result { font-size: 11.5px; }
-tr[data-state="failed"] .transfer-result { white-space: normal; }
+tr:is([data-state="failed"], [data-state="rejected"]) .transfer-result { white-space: normal; }
 
 /* 상태 줄 */
 .s3-status {

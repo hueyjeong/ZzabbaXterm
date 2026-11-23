@@ -219,6 +219,13 @@ impl CompatibleS3 {
             .map_err(|err| self.with_target(err))
     }
 
+    pub(crate) async fn object_exists(&self, bucket: &str, key: &str) -> Result<bool, CompatibleError> {
+        self.operations
+            .object_exists(bucket, key)
+            .await
+            .map_err(|err| self.with_target(err))
+    }
+
     fn with_target(&self, operation: Error) -> CompatibleError {
         CompatibleError {
             target: Arc::clone(&self.target),

@@ -63,6 +63,7 @@ pub(crate) enum Stage {
     HeadBucket,
     ListObjects,
     UploadSource,
+    HeadObject,
     PutObject,
     GetObject,
     DownloadBody,
@@ -264,6 +265,10 @@ impl AwsS3 {
         self.operations().download(bucket, key, target, closed).await
     }
 
+    pub(crate) async fn object_exists(&self, bucket: &str, key: &str) -> Result<bool, Error> {
+        self.operations().object_exists(bucket, key).await
+    }
+
     fn operations(&self) -> S3Operations<&Client> {
         S3Operations { client: &self.client, compatible: false }
     }
@@ -401,6 +406,19 @@ impl<C: std::borrow::Borrow<Client>> S3Operations<C> {
     ) -> Result<Downloaded, Error> {
         check_bucket(bucket, Stage::GetObject)?;
         download::download(self, bucket, key, target, closed).await
+    }
+
+    /// 업로드 전에 같은 키의 객체가 있는지 확인한다. 404만 없음으로 보고 나머지 오류는 그대로 돌려준다.
+    async fn object_exists(&self, bucket: &str, key: &str) -> Result<bool, Error> {
+        let stage = Stage::HeadObject;
+        check_bucket(bucket, stage)?;
+        match self.client.borrow().head_object().bucket(bucket).key(key)
+            .customize().config_override(single_attempt()).send().await
+        {
+            Ok(_) => Ok(true),
+            Err(error) if error.raw_response().is_some_and(|response| response.status().as_u16() == 404) => Ok(false),
+            Err(error) => Err(self.sdk_error(stage, error)),
+        }
     }
 }
 

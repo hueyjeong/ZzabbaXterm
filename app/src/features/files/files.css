@@ -103,6 +103,7 @@
 .file-icon:is([data-type="video"], [data-type="audio"]) { color: var(--file-media); }
 .file-icon[data-type="sheet"] { color: var(--file-sheet); }
 .file-icon[data-type="key"] { color: var(--file-key); }
+.file-icon[data-type="link"] { color: var(--text-faint); }
 
 .file-more { height: auto; padding-block: 4px; }
 .file-more .file-cell { grid-column: 1 / -1; }
