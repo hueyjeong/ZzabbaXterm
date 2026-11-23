@@ -133,7 +133,7 @@ export function Workspace() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [aiOpen, setAiOpen] = useState(true);
   const [quickOpen, setQuickOpen] = useState(false);
-  const [desktopOpening, setDesktopOpening] = useState<{ label: string; controller: AbortController }>();
+  const [desktopOpening, setDesktopOpening] = useState<{ id: string; label: string; controller: AbortController }>();
   // Windows Terminal과 같은 Ctrl+Shift+P로 빠른 열기를 연다. 셸이 쓰는 Ctrl+K·Ctrl+P는 가로채지 않는다.
   useEffect(() => {
     const open = (event: KeyboardEvent) => {
@@ -146,13 +146,14 @@ export function Workspace() {
       if (!closingWindow.current) setQuickOpen(true);
     };
     window.addEventListener("keydown", open, true);
-    // 어디에 놓든, 끌기가 어떻게 끝나든 드롭 영역을 걷어 낸다.
+    // 어디에 놓든, 끌기가 어떻게 끝나든 드롭 영역을 걷어 낸다. drop은 React 루트의 처리(이동·분할)가 끝난 뒤인
+    // window 버블 단계에서 받는다. 캡처에서 지우면 드롭 영역이 먼저 사라져 onDrop이 실행되지 않는다.
     const endDrag = () => { setDragging(null); setDropTarget(undefined); };
-    window.addEventListener("drop", endDrag, true);
+    window.addEventListener("drop", endDrag);
     window.addEventListener("dragend", endDrag, true);
     return () => {
       window.removeEventListener("keydown", open, true);
-      window.removeEventListener("drop", endDrag, true);
+      window.removeEventListener("drop", endDrag);
       window.removeEventListener("dragend", endDrag, true);
     };
   }, []);
@@ -519,14 +520,14 @@ export function Workspace() {
 
   /** 저장된 RDP·VNC 프로필의 경로를 연 뒤 입력칸을 채운 화면 탭을 만든다. 서비스 연결은 탭에서 사용자가 시작한다. */
   async function openDesktopTarget(target: DesktopProfile, split?: Placement) {
-    if (desktopOpening?.label === target.displayName) return;
+    if (desktopOpening?.id === target.id) return;
     setWindowError("");
-    const pending = { label: target.displayName, controller: new AbortController() };
+    const pending = { id: target.id, label: target.displayName, controller: new AbortController() };
     desktopOpening?.controller.abort();
     setDesktopOpening(pending);
     try {
       const opened = await openDesktopProfile(target, { signal: pending.controller.signal });
-      if (closingWindow.current) {
+      if (closingWindow.current || pending.controller.signal.aborted) {
         await opened.close();
         return;
       }
