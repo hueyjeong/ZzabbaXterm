@@ -44,3 +44,19 @@ Windows의 시험과 저장 대상 열기는 일반 드라이브 절대 경로�
 ## CLI 연결 등록
 
 [`zzabba register`](../06-ai/01-proposals.md)는 앱 창이나 연결 시험 없이 새 연결 설정을 저장한다. 직접 SSH의 `hostKeyFingerprint`에는 별도로 확인한 기대 지문을 넣는다. 저장 후 앱에서 해당 대상 행의 **호스트 키 등록**을 선택하면, 앱이 저장된 호스트·포트·기대 지문을 다시 읽어 실제 호스트 키와 대조한다. 호스트 키 미등록 또는 불일치 상태에서는 SSH 접속이 중단된다. 접속 동작으로 호스트 키를 자동 승인하거나 교체할 수 없다.
+
+## 원격 화면 프로필
+
+`defaultMethod`가 `"rdp"` 또는 `"vnc"`인 대상은 원격 화면 탭을 연다. 저장 파일 버전은 그대로 1이고, 기존 파일은 변환 없이 읽는다. 비밀번호와 계정은 저장하지 않으며 연결할 때 서비스 인증에서 받는다.
+
+- `rdp: { host, port, tlsOnly, route }`, `vnc: { host, port, route }`. 기본 포트는 3389와 5900이다. `tlsOnly`는 RDP의 **NLA를 지원하지 않는 서버(TLS 전용) 허용** 값이다.
+- `route`는 `{ kind: "direct" }`, `{ kind: "ssh", targetId }`, `{ kind: "ssm", profile, region, instanceId }` 중 하나다.
+
+| 경로 | 전달 목적지 | RDP `host` | VNC `host` |
+|---|---|---|---|
+| `direct` | `host:port` | 서버 DNS 이름(TLS 인증 이름) | DNS 이름 또는 IP |
+| `ssh` | SSH 서버의 `127.0.0.1:port` | TLS 인증 DNS 이름 | 빈 값 |
+| `ssm` | `host`가 비면 노드 자신의 `port`, 있으면 노드에서 접속하는 `host:port` | 빈 값, DNS 이름 또는 IP | 빈 값 |
+
+- `ssh` 경로의 `targetId`는 Agent 또는 키 파일 인증을 쓰는 저장된 직접 SSH 대상이어야 한다. Rust가 저장할 때와 터널을 열 때 각각 확인한다.
+- 원격 화면 프로필은 연결 시험 없이 저장한다. `connection_test_start`는 거부하고, `connection_save`가 스키마와 SSH 참조를 검증한다. 서버 인증서와 터널 승인은 열 때 확인한다.

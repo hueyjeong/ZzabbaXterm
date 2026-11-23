@@ -12,6 +12,7 @@ pub(super) fn launch(config: &Path, id: &str) -> Result<Launch, String> {
         MethodRef::Ssm { profile, region, instance_id } => remote::Target::new(profile, region, instance_id).map(Launch::Ssm),
         MethodRef::Ssh { ssh } => crate::ssh::terminal::saved(config, ssh).map(Launch::Ssh),
         MethodRef::S3 { .. } => Err("S3 연결은 스토리지 탭에서 열 수 있습니다".into()),
+        MethodRef::Desktop { .. } => Err("원격 화면 연결은 RDP·VNC 탭에서 열 수 있습니다".into()),
     })
 }
 
@@ -28,6 +29,7 @@ pub(super) fn launch_interactive(
         MethodRef::Ssm { profile, region, instance_id } => remote::Target::new(profile, region, instance_id).map(Launch::Ssm),
         MethodRef::Ssh { ssh } => crate::ssh::terminal::saved_interactive(config, ssh, owner, document, confirm).map(Launch::Ssh),
         MethodRef::S3 { .. } => Err("S3 연결은 스토리지 탭에서 열 수 있습니다".into()),
+        MethodRef::Desktop { .. } => Err("원격 화면 연결은 RDP·VNC 탭에서 열 수 있습니다".into()),
     })
 }
 

@@ -760,7 +760,7 @@ fn verified_selection(directory: &std::path::Path, target_id: &str) -> Result<Ve
             MethodRef::S3 { s3 } => (s3.profile.as_str(), s3.region.as_str(), Some(SavedLocation {
                 bucket: s3.bucket.clone(), prefix: s3.prefix.clone(), region: s3.region.clone(),
             })),
-            MethodRef::Local { .. } | MethodRef::Ssh { .. } => return Err("SSO 연결이 아닙니다".into()),
+            MethodRef::Local { .. } | MethodRef::Ssh { .. } | MethodRef::Desktop { .. } => return Err("SSO 연결이 아닙니다".into()),
         };
         Ok((Scope::new(profile.to_owned(), region.to_owned()), account.map(str::to_owned), location))
     })

@@ -197,6 +197,81 @@ fn f01_rejects_ambiguous_ssh_methods_and_non_reference_values() {
     }
 }
 
+pub(crate) fn desktop_draft(dir: &Path, method: &str, settings: Value) -> Value {
+    let mut value = draft(dir, "work", &format!("{method}-desktop"));
+    value["target"] = json!({
+        "id": format!("{method}-desktop"), "groupId": "work", "displayName": "원격 화면", "defaultMethod": method,
+    });
+    value["target"][method] = settings;
+    value
+}
+
+#[test]
+fn desktop_profiles_extend_existing_v1_files_without_migration() {
+    let dir = TestDir::new();
+    let local = draft(dir.path(), "work", "local-shell");
+    let ssh = ssh_draft(dir.path());
+    let mut file = json!({
+        "version": 1,
+        "groups": [{"revision": 3, "profile": local["group"]}],
+        "targets": [{"revision": 4, "profile": local["target"]}, {"revision": 5, "profile": ssh["target"]}],
+    });
+    fs::write(dir.file(), serde_json::to_vec(&file).unwrap()).unwrap();
+    let store = Store::new(dir.path());
+    let ssm = json!({"kind": "ssm", "profile": "company-sso", "region": "ap-northeast-2", "instanceId": "i-0123456789abcdef0"});
+    for input in [
+        desktop_draft(dir.path(), "rdp", json!({"host": "win.example.test", "port": 3389, "tlsOnly": false, "route": {"kind": "direct"}})),
+        desktop_draft(dir.path(), "vnc", json!({"host": "", "port": 5900, "route": ssm})),
+    ] {
+        let mut input = input;
+        input["groupRevision"] = json!(3);
+        assert_eq!(save(&store, input.clone()).unwrap(), SaveStatus::Saved);
+        file["targets"].as_array_mut().unwrap().push(json!({"revision": 1, "profile": input["target"]}));
+    }
+    assert_eq!(serde_json::to_value(store.load().unwrap()).unwrap(), file);
+    assert!(matches!(store.load().unwrap().targets[3].profile.method(),
+        super::profile::MethodRef::Desktop { route: super::profile::DesktopRoute::Ssm(_) }));
+}
+
+#[test]
+fn desktop_profiles_reject_secrets_unsafe_hosts_and_plaintext_routes() {
+    let dir = TestDir::new();
+    let checked = |value: Value| serde_json::from_value::<Draft>(value).unwrap().validate().is_ok();
+    let rdp = |host: &str, route: Value| desktop_draft(dir.path(), "rdp", json!({"host": host, "port": 3389, "tlsOnly": true, "route": route}));
+    let vnc = |host: &str, route: Value| desktop_draft(dir.path(), "vnc", json!({"host": host, "port": 5900, "route": route}));
+    let ssm = json!({"kind": "ssm", "profile": "company-sso", "region": "ap-northeast-2", "instanceId": "i-0123456789abcdef0"});
+    let ssh = json!({"kind": "ssh", "targetId": "ssh-server"});
+    let direct = json!({"kind": "direct"});
+    for valid in [
+        rdp("win.example.test", direct.clone()), rdp("xrdp.example.test", ssh.clone()), rdp("", ssm.clone()),
+        rdp("10.0.1.25", ssm.clone()), rdp("rdp.internal.example", ssm.clone()),
+        vnc("vnc.example.test", direct.clone()), vnc("192.0.2.10", direct.clone()), vnc("", ssh.clone()), vnc("", ssm.clone()),
+    ] {
+        assert!(checked(valid.clone()), "{valid}");
+    }
+    for (pointer, key) in [("/target", "ssh"), ("/target/rdp", "password"), ("/target/rdp/route", "profile"), ("/target/rdp", "account")] {
+        let mut input = rdp("win.example.test", direct.clone());
+        input.pointer_mut(pointer).unwrap()[key] = json!("forbidden");
+        assert!(serde_json::from_value::<Draft>(input).is_err(), "{pointer}/{key}");
+    }
+    let mut tls = vnc("vnc.example.test", direct.clone());
+    tls["target"]["vnc"]["tlsOnly"] = json!(true);
+    assert!(serde_json::from_value::<Draft>(tls).is_err());
+    let mut bad_ssm = ssm.clone();
+    bad_ssm["profile"] = json!("--profile");
+    let mut zero = rdp("win.example.test", direct.clone());
+    zero["target"]["rdp"]["port"] = json!(0);
+    for invalid in [
+        zero, rdp("", direct.clone()), rdp("10.0.1.25", direct.clone()), rdp("win.example.test
+other", direct.clone()),
+        rdp("127.0.0.1", ssh.clone()), rdp("a,b", ssm.clone()), rdp("host=other", ssm.clone()), rdp("host name", ssm.clone()),
+        rdp("win.example.test", bad_ssm), rdp("win.example.test", json!({"kind": "ssh", "targetId": "--other"})),
+        vnc("", direct.clone()), vnc("127.0.0.1", ssh.clone()), vnc("vnc.internal.example", ssm.clone()),
+    ] {
+        assert!(!checked(invalid.clone()), "{invalid}");
+    }
+}
+
 pub(crate) fn s3_draft(dir: &Path) -> Value {
     let mut value = draft(dir, "work", "s3-bucket");
     value["target"] = json!({

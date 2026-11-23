@@ -1,13 +1,15 @@
 import { useImperativeHandle, useLayoutEffect, useRef, useState, type Ref, type SubmitEvent } from "react";
 import { RemoteDesktopView } from "../remoteDesktop/RemoteDesktopView";
+import type { DesktopPreset } from "../remoteDesktop/desktopProfile";
 import type { DesktopTunnelSource } from "../tunnels/tunnelIpc";
 import { CLOSE_UNCONFIRMED, closeOwner, connect, createOwner, type Connection, type Owner } from "./session";
 
 export interface VncTabActions { requestClose(): Promise<boolean> }
 
-export function VncView({ active, source, ref }: {
+export function VncView({ active, source, preset, ref }: {
   readonly active: boolean;
   readonly source?: DesktopTunnelSource;
+  readonly preset?: DesktopPreset;
   readonly ref?: Ref<VncTabActions>;
 }) {
   const owner = useRef<Promise<Owner> | null>(null);
@@ -125,8 +127,8 @@ export function VncView({ active, source, ref }: {
   return <section className="remote-desktop-view" aria-label="VNC" hidden={!active} inert={!active}>
     <form className="remote-desktop-toolbar" onSubmit={(event) => void open(event)}>
       {source ? <span>SSH 터널 · [{source.destination.host}]:{source.destination.port}</span> : <>
-        <label>TLS 호스트 <input name="host" maxLength={253} required autoComplete="off" disabled={connecting || cleanupBlocked} /></label>
-        <label>TLS 포트 <input name="port" type="number" min={1} max={65535} defaultValue={5900} required disabled={connecting || cleanupBlocked} /></label>
+        <label>TLS 호스트 <input name="host" maxLength={253} required autoComplete="off" defaultValue={preset?.host} disabled={connecting || cleanupBlocked} /></label>
+        <label>TLS 포트 <input name="port" type="number" min={1} max={65535} defaultValue={preset?.port ?? 5900} required disabled={connecting || cleanupBlocked} /></label>
       </>}
       <label>서비스 인증 <select name="auth" defaultValue="password" disabled={connecting || cleanupBlocked}>
         <option value="password">VNC 비밀번호</option>

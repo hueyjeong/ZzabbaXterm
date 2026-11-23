@@ -23,6 +23,23 @@ type SsmMethod<T = SsmTarget> = Readonly<{ defaultMethod: "ssm"; ssm: T; local?:
 type SshMethod<T = SshSettings> = Readonly<{ defaultMethod: "ssh"; ssh: T; local?: never; ssm?: never; s3?: never }>;
 type S3Method = Readonly<{ defaultMethod: "s3"; s3: S3Settings; local?: never; ssm?: never; ssh?: never }>;
 type S3Settings = Readonly<{ profile: string; region: string; bucket: string; prefix: string }>;
+type RdpMethod<T = RdpSettings> = Readonly<{ defaultMethod: "rdp"; rdp: T; local?: never; ssm?: never; ssh?: never; s3?: never; vnc?: never }>;
+type VncMethod<T = VncSettings> = Readonly<{ defaultMethod: "vnc"; vnc: T; local?: never; ssm?: never; ssh?: never; s3?: never; rdp?: never }>;
+
+// ssh는 저장된 직접 SSH 대상의 서버 루프백, ssm은 host가 비면 노드 자신, 있으면 노드에서 본 원격 호스트로 전달한다.
+export type DesktopRoute =
+  | Readonly<{ kind: "direct" }>
+  | Readonly<{ kind: "ssh"; targetId: string }>
+  | (Readonly<{ kind: "ssm" }> & SsmTarget);
+export type RdpSettings = Readonly<{ host: string; port: number; tlsOnly: boolean; route: DesktopRoute }>;
+export type VncSettings = Readonly<{ host: string; port: number; route: DesktopRoute }>;
+export type DesktopInput = Readonly<{
+  host: string;
+  port: string;
+  tlsOnly: boolean;
+  route: DesktopRoute | Readonly<{ kind: "ssm"; profile?: never; region?: never; instanceId?: never }>;
+}>;
+type DesktopKind = "rdp" | "vnc";
 
 export type SshTransport = Readonly<{ kind: "direct" }> | (Readonly<{ kind: "ssm" }> & SsmTarget);
 export type SshAuth =
@@ -44,9 +61,10 @@ export type SshInput = Omit<SshSettings, "port" | "transport" | "auth"> & Readon
   transport: SshTransport | Readonly<{ kind: "ssm"; profile?: never; region?: never; instanceId?: never }>;
 }>;
 export type LocalProfileDraft = ProfileDraft<TargetIdentity & LocalMethod>;
-export type InitialWizardDraft = ProfileDraft<TargetIdentity & (LocalMethod | SsmMethod | S3Method)>;
-export type ConnectionProfileDraft = ProfileDraft<TargetIdentity & (LocalMethod | SsmMethod | SshMethod | S3Method)>;
-type WizardDraft = ProfileDraft<TargetIdentity & (LocalMethod | SsmMethod<SsmTarget | null> | SshMethod<SshInput> | S3Method)>;
+export type InitialWizardDraft = ProfileDraft<TargetIdentity & (LocalMethod | SsmMethod | S3Method | RdpMethod | VncMethod)>;
+export type ConnectionProfileDraft = ProfileDraft<TargetIdentity & (LocalMethod | SsmMethod | SshMethod | S3Method | RdpMethod | VncMethod)>;
+type WizardDraft = ProfileDraft<TargetIdentity & (LocalMethod | SsmMethod<SsmTarget | null> | SshMethod<SshInput> | S3Method
+  | RdpMethod<DesktopInput> | VncMethod<DesktopInput>)>;
 export type SshHostApproval = Readonly<{
   host: string;
   port: number;
@@ -106,6 +124,45 @@ function completeS3({ profile, region, bucket }: S3Settings) {
   return !!(profile.trim() && region.trim() && bucket.trim());
 }
 
+const dnsLabel = /^(?!-)[A-Za-z0-9-]{1,63}(?<!-)$/;
+const ipLiteral = (host: string) => /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || (host.includes(":") && /^[0-9A-Fa-f:.]+$/.test(host));
+const dnsName = (host: string) => host.length <= 253 && !ipLiteral(host) && host.split(".").every(label => dnsLabel.test(label));
+
+export const desktopPorts = { rdp: 3389, vnc: 5900 } as const;
+
+// Rust 검증과 같은 규칙이다. RDP는 TLS 인증서 이름이 필요하고 평문 RFB는 터널 끝 호스트의 서비스만 연다.
+export function completeDesktop(kind: "rdp", input: DesktopInput): RdpSettings | null;
+export function completeDesktop(kind: "vnc", input: DesktopInput): VncSettings | null;
+export function completeDesktop(kind: DesktopKind, input: DesktopInput): RdpSettings | VncSettings | null;
+export function completeDesktop(kind: DesktopKind, input: DesktopInput): RdpSettings | VncSettings | null {
+  const { route, tlsOnly } = input;
+  const host = input.host.trim();
+  const port = Number(input.port);
+  if (!/^\d+$/.test(input.port) || port < 1 || port > 65535) return null;
+  if (route.kind === "ssm" && !route.instanceId) return null;
+  if (route.kind === "ssh" && !/^[A-Za-z0-9_][A-Za-z0-9_-]*$/.test(route.targetId)) return null;
+  const address = ipLiteral(host) || dnsName(host);
+  const valid = kind === "rdp" ? (route.kind === "ssm" ? !host || address : dnsName(host))
+    : route.kind === "direct" ? address : !host;
+  if (!valid) return null;
+  return kind === "rdp" ? { host, port, tlsOnly, route } : { host, port, route };
+}
+
+function desktopInput(settings: RdpSettings | VncSettings): DesktopInput {
+  return { host: settings.host, port: String(settings.port), tlsOnly: "tlsOnly" in settings && settings.tlsOnly, route: settings.route };
+}
+
+function toWizardDraft(initial: InitialWizardDraft): WizardDraft {
+  const { target } = initial;
+  if (target.defaultMethod === "rdp") return { ...initial, target: { ...target, rdp: desktopInput(target.rdp) } };
+  if (target.defaultMethod === "vnc") return { ...initial, target: { ...target, vnc: desktopInput(target.vnc) } };
+  return { ...initial, target };
+}
+
+function desktopOf(target: WizardDraft["target"]): [DesktopKind, DesktopInput] | null {
+  return target.defaultMethod === "rdp" ? ["rdp", target.rdp] : target.defaultMethod === "vnc" ? ["vnc", target.vnc] : null;
+}
+
 const steps = ["target", "method", "auth", "verify"] as const;
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 // 기본 빌드에는 승인·askpass 경로가 없다. 앱 정보 응답으로 확인한 값만 저장을 허용한다.
@@ -123,6 +180,8 @@ export interface LocalConnectionWizardState {
   editSsh(change: Partial<SshInput>): void;
   canReviewS3(): boolean;
   editS3(field: keyof S3Settings, value: string): void;
+  canReviewDesktop(selection: SsmTarget | null): boolean;
+  editDesktop(change: Partial<DesktopInput>): void;
   verifySshHost(actions: LocalConnectionActions): Promise<void>;
   invalidateSsmSelection(): void;
   selectGroup(group: LocalProfileDraft["group"], revision: number | null): void;
@@ -135,7 +194,7 @@ export interface LocalConnectionWizardState {
 }
 
 export function createLocalConnectionWizard(draftId: string, initialDraft: InitialWizardDraft): LocalConnectionWizardState {
-  let state: State = { step: "target", draft: initialDraft, status: { kind: "idle" }, sshPin: { kind: "idle" } };
+  let state: State = { step: "target", draft: toWizardDraft(initialDraft), status: { kind: "idle" }, sshPin: { kind: "idle" } };
   let local: LocalMethod["local"] = initialDraft.target.local ?? {
     shell: /Windows/.test(navigator.userAgent) ? "powerShell" : "bash",
     startDirectory: "",
@@ -164,6 +223,12 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Initi
     } : ssh;
   }
 
+  function desktopWithSelection(input: DesktopInput, selection?: SsmTarget | null): DesktopInput {
+    return input.route.kind === "ssm" && selection ? {
+      ...input, route: { kind: "ssm", profile: selection.profile, region: selection.region, instanceId: selection.instanceId },
+    } : input;
+  }
+
   function go(delta: -1 | 1, selection?: SsmTarget | null) {
     if (locked()) return;
     const { draft } = state;
@@ -186,6 +251,17 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Initi
       }
     }
     if (delta === 1 && state.step === "auth" && draft.target.defaultMethod === "s3" && !completeS3(draft.target.s3)) return;
+    const desktop = desktopOf(draft.target);
+    if (delta === 1 && state.step === "auth" && desktop) {
+      const [kind, input] = desktop;
+      if (input.route.kind === "ssm" && !selection) return;
+      const next = desktopWithSelection(input, selection);
+      if (!completeDesktop(kind, next)) return;
+      const previous = input.route;
+      if (previous.kind === "ssm" && selection && (previous.profile !== selection.profile || previous.region !== selection.region || previous.instanceId !== selection.instanceId)) {
+        updateDesktop(next);
+      }
+    }
     const step = steps[steps.indexOf(state.step) + delta];
     if (step) {
       pinCheck?.abort();
@@ -222,10 +298,13 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Initi
     if (locked() || state.step !== "method" || draft.target.defaultMethod === defaultMethod) return;
     if (initialDraft.targetRevision !== null && initialDraft.target.defaultMethod === "s3") return;
     const { id, groupId, displayName } = draft.target;
-    const method: LocalMethod | SsmMethod<null> | SshMethod<SshInput> | S3Method = defaultMethod === "local" ? { defaultMethod, local }
+    const desktop = (kind: DesktopKind): DesktopInput => ({ host: "", port: String(desktopPorts[kind]), tlsOnly: false, route: { kind: "direct" } });
+    const method: LocalMethod | SsmMethod<null> | SshMethod<SshInput> | S3Method | RdpMethod<DesktopInput> | VncMethod<DesktopInput> = defaultMethod === "local" ? { defaultMethod, local }
       : defaultMethod === "ssm" ? { defaultMethod, ssm: null }
         : defaultMethod === "s3" ? { defaultMethod, s3: { profile: "", region: "", bucket: "", prefix: "" } }
-          : {
+          : defaultMethod === "rdp" ? { defaultMethod, rdp: desktop("rdp") }
+            : defaultMethod === "vnc" ? { defaultMethod, vnc: desktop("vnc") }
+              : {
             defaultMethod, ssh: {
               host: "", port: "22", account: "", hostKeyFingerprint: "",
               transport: { kind: "direct" }, auth: null,
@@ -238,6 +317,19 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Initi
     const { draft, step } = state;
     if (locked() || draft.target.defaultMethod !== "ssh" || (step !== "method" && step !== "auth")) return;
     updateDraft({ ...draft, target: { ...draft.target, ssh: { ...draft.target.ssh, ...change } } });
+  }
+
+  function updateDesktop(input: DesktopInput) {
+    const { draft } = state;
+    const { target } = draft;
+    if (target.defaultMethod === "rdp") updateDraft({ ...draft, target: { ...target, rdp: input } });
+    if (target.defaultMethod === "vnc") updateDraft({ ...draft, target: { ...target, vnc: input } });
+  }
+
+  function editDesktop(change: Partial<DesktopInput>) {
+    const desktop = desktopOf(state.draft.target);
+    if (locked() || !desktop || (state.step !== "method" && state.step !== "auth")) return;
+    updateDesktop({ ...desktop[1], ...change });
   }
 
   function editS3(field: keyof S3Settings, value: string) {
@@ -277,6 +369,8 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Initi
     if (target.defaultMethod === "ssh" && target.ssh.transport.kind === "ssm" && target.ssh.transport.instanceId) {
       updateDraft({ ...draft, target: { ...target, ssh: { ...target.ssh, transport: { kind: "ssm" } } } });
     }
+    const desktop = desktopOf(target);
+    if (desktop && desktop[1].route.kind === "ssm" && desktop[1].route.instanceId) updateDesktop({ ...desktop[1], route: { kind: "ssm" } });
   }
 
   function selectGroup(group: LocalProfileDraft["group"], groupRevision: number | null) {
@@ -304,6 +398,14 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Initi
   function completedDraft() {
     const { target } = state.draft;
     const ssh = target.defaultMethod === "ssh" && state.sshPin.kind === "verified" ? completeSsh(target.ssh) : null;
+    if (target.defaultMethod === "rdp") {
+      const rdp = completeDesktop("rdp", target.rdp);
+      return rdp && { ...target, rdp };
+    }
+    if (target.defaultMethod === "vnc") {
+      const vnc = completeDesktop("vnc", target.vnc);
+      return vnc && { ...target, vnc };
+    }
     return target.defaultMethod === "local" ? target
       : target.defaultMethod === "ssm" ? target.ssm && { ...target, ssm: target.ssm }
         : target.defaultMethod === "s3" ? completeS3(target.s3) && target
@@ -311,7 +413,7 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Initi
   }
 
   async function test(actions: LocalConnectionActions) {
-    if (locked() || state.step !== "verify" || state.status.kind === "testing" || state.remoteCleanup) return;
+    if (locked() || state.step !== "verify" || state.status.kind === "testing" || state.remoteCleanup || desktopOf(state.draft.target)) return;
     const { draft } = state;
     const complete = completedDraft();
     if (!complete) return;
@@ -345,7 +447,9 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Initi
     const stored = storedAuthAvailable && state.draft.target.defaultMethod === "ssh" && state.draft.target.ssh.auth?.kind === "storedPassword";
     const passed = status.kind === "passed" || status.kind === "saveFailed";
     // 저장 암호는 승인 기반 로그인이라 연결 시험 대신 호스트 키 확인 뒤 참조만 저장한다.
-    if (state.step !== "verify" || (!passed && !(stored && state.sshPin.kind === "verified"))) return;
+    // 원격 화면은 비밀 없이 경로만 저장하고 서버 신원·터널은 열 때 확인한다.
+    const untested = (stored && state.sshPin.kind === "verified") || !!desktopOf(state.draft.target);
+    if (state.step !== "verify" || (!passed && !untested) || locked()) return;
     let attempt: ConnectionTestDraft;
     let request: ConnectionRequest;
     if (passed) {
@@ -445,6 +549,12 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Initi
       return target.defaultMethod === "s3" && completeS3(target.s3);
     },
     editS3,
+    canReviewDesktop(selection) {
+      const desktop = desktopOf(state.draft.target);
+      return !!desktop && (desktop[1].route.kind !== "ssm" || !!selection)
+        && completeDesktop(desktop[0], desktopWithSelection(desktop[1], selection)) !== null;
+    },
+    editDesktop,
     verifySshHost,
     invalidateSsmSelection,
     selectGroup,
