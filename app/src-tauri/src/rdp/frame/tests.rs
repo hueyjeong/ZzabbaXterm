@@ -204,18 +204,62 @@ fn clipboard_fragments_cannot_exceed_the_declared_and_bounded_message() {
 }
 
 #[test]
-fn xrdp_compressed_bitmap_may_round_the_source_width_up() {
-    let image = DecodedImage::new(PixelFormat::RgbA32, 1024, 768);
+fn xrdp_compressed_bitmap_crops_source_stride_without_shear() {
+    use ironrdp::graphics::rdp6::{BitmapStreamEncoder, RgbChannels};
+
+    let (source_width, height) = (8usize, 3usize);
+    let mut rgb = vec![0u8; source_width * height * 3];
+    for y in 0..height {
+        for x in 0..source_width {
+            let index = (y * source_width + x) * 3;
+            rgb[index] = (x as u8) * 10;
+        }
+    }
+    let mut encoded = vec![0u8; source_width * height * 4 + 2];
+    let written = BitmapStreamEncoder::new(source_width, height)
+        .encode_bitmap::<RgbChannels>(&rgb, &mut encoded, true)
+        .unwrap();
     let bitmap = BitmapUpdateData {
         rectangles: vec![BitmapData {
-            rectangle: InclusiveRectangle { left: 367, top: 389, right: 373, bottom: 403 },
+            rectangle: InclusiveRectangle { left: 0, top: 0, right: 6, bottom: 2 },
             width: 8,
-            height: 15,
+            height: 3,
             bits_per_pixel: 32,
             compression_flags: Compression::BITMAP_COMPRESSION | Compression::NO_BITMAP_COMPRESSION_HDR,
             compressed_data_header: None,
-            bitmap_data: &[0; 193],
+            bitmap_data: &encoded[..written],
         }],
     };
-    assert_eq!(super::check_bitmaps(bitmap, &image), Ok(true));
+    let data = encode_vec(&bitmap).unwrap();
+    let update = encode_vec(&FastPathUpdatePdu {
+        fragmentation: Fragmentation::Single,
+        update_code: UpdateCode::Bitmap,
+        compression_flags: None,
+        compression_type: None,
+        data: &data,
+    }).unwrap();
+    let mut pdu = encode_vec(&FastPathHeader::new(EncryptionFlags::empty(), update.len())).unwrap();
+    pdu.extend_from_slice(&update);
+
+    let (action, normalized) = super::normalize_bitmap(Action::FastPath, &pdu).unwrap().unwrap();
+    assert_eq!(action, Action::FastPath);
+    let mut input = ReadCursor::new(&normalized);
+    let header: FastPathHeader = decode_cursor(&mut input).unwrap();
+    assert_eq!(header.data_length, input.remaining().len());
+    let update: FastPathUpdatePdu = decode_cursor(&mut input).unwrap();
+    let out: BitmapUpdateData = decode_cursor(&mut ReadCursor::new(update.data)).unwrap();
+    let rect = &out.rectangles[0];
+    assert_eq!((rect.width, rect.height, rect.bits_per_pixel), (7, 3, 32));
+    assert_eq!(rect.compression_flags, Compression::empty());
+    assert_eq!(rect.bitmap_data.len(), 7 * 3 * 4);
+    for y in 0..3 {
+        for x in 0..7 {
+            let index = (y * 7 + x) * 4;
+            assert_eq!(
+                &rect.bitmap_data[index..index + 4],
+                &[0, 0, (x as u8) * 10, 0],
+                "row {y} column {x} shifted"
+            );
+        }
+    }
 }

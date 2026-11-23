@@ -500,6 +500,8 @@ impl Verified {
         }
         if !matches!(self.selected, SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX) {
             // TLS 전용에는 CredSSP가 없으므로 계정은 검증된 TLS 위의 Client Info로 전달된다.
+            // 자동 로그온을 켜야 xrdp가 sesman 로그인 창 대신 세션을 시작한다.
+            self.connector.config.autologon = true;
             self.connector.config.credentials = Credentials::UsernamePassword {
                 username: account.username,
                 password: std::mem::take(&mut *account.password),

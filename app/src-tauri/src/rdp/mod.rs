@@ -259,6 +259,10 @@ impl Session {
                         next = connect::read_bounded(&mut transport, &ironrdp::pdu::RDP_HINT, Error::Transport, None), if pending.is_empty() => {
                             let pdu = next?;
                             let action = ironrdp::pdu::find_size(&pdu).map_err(|_| Error::Protocol)?.ok_or(Error::Protocol)?.action;
+                            let (action, pdu) = match frame::normalize_bitmap(action, &pdu)? {
+                                Some(replaced) => replaced,
+                                None => (action, pdu),
+                            };
                             let pixels = inbound.check(action, &pdu, &graphics.image)?;
                             let outputs = active.process(&mut graphics.image, action, &pdu).map_err(|_| Error::Protocol)?;
                             let mut dirty = None;
