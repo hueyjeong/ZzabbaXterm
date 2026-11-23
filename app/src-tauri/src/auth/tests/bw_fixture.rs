@@ -30,6 +30,9 @@ fn main() {
             eprint!("Not found.");
             std::process::exit(1);
         }
-        print!("only-a-fixture-password");
+        match std::fs::read_to_string(home.join("password")) {
+            Ok(password) => print!("{}", password.trim_end()),
+            Err(_) => print!("only-a-fixture-password"),
+        }
     }
 }

@@ -36,6 +36,11 @@ it("승격 정보는 구조로만 검증하고 셸 문자열로 다시 합치지
   expect(parseArguments("-u\n\n id \n")).toEqual(["-u", "id"]);
   expect(approvalFields({ program: "/usr/bin/id", args: ["a b", "c"], item: ITEM }).map(field => field.label))
     .toEqual(["대상", "실행 계정", "실행 파일", "인자 1", "인자 2", "금고 항목"]);
+  expect(approvalFields({
+    program: "/usr/bin/id", args: ["-u"], item: ITEM,
+    target: "demo@server:22", account: "demo", targetId: "saved-ssh",
+  }).map(field => field.label))
+    .toEqual(["대상", "호출 계정", "실행 계정", "실행 파일", "인자 1", "금고 항목"]);
   expect(validateElevationRequest({ program: "id", args: [], item: ITEM })).toBe("실행 파일은 절대 경로여야 합니다");
   expect(validateElevationRequest({ program: "/usr/bin/id", args: ["a\nb"], item: ITEM }))
     .toBe("인자에 제어 문자를 넣을 수 없습니다");

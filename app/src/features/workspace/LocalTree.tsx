@@ -2,10 +2,11 @@ import { useLayoutEffect, useRef, useState, type KeyboardEvent } from "react";
 import type { SavedConnections } from "../connections/connectionIpc";
 
 type OpenTarget = (target?: SavedConnections["targets"][number]["profile"], options?: { readonly remoteEditor?: true }) => void;
+type ElevateTarget = (target?: SavedConnections["targets"][number]["profile"]) => void;
 type MenuTarget = { method: string; open: () => void; sshTargetId?: string; s3TargetId?: string; openTunnel?: () => void; openRemoteEditor?: () => void; elevate?: () => void };
 
-export function LocalTree({ profiles, onOpen, onElevate, onRegisterSshHost, onRetestS3, onOpenTunnel }: {
-  profiles?: SavedConnections; onOpen: OpenTarget; onElevate?: () => void;
+export function LocalTree({ profiles, onOpen, onElevate, onLocalElevate, onRegisterSshHost, onRetestS3, onOpenTunnel }: {
+  profiles?: SavedConnections; onOpen: OpenTarget; onElevate?: ElevateTarget; onLocalElevate?: () => void;
   onRegisterSshHost: (targetId: string) => void;
   onRetestS3?: (targetId: string) => void;
   onOpenTunnel: (targetId: string, name: string, method: "ssh" | "ssm") => void;
@@ -21,7 +22,7 @@ export function LocalTree({ profiles, onOpen, onElevate, onRegisterSshHost, onRe
   const term = query.trim().toLocaleLowerCase();
   const matches = (name: string) => name.toLocaleLowerCase().includes(term);
   const groups = [
-    { key: "local", name: "로컬", id: "", targets: [{ key: "pc", name: "내 PC", id: "", method: "로컬", open: () => onOpen(), elevate: onElevate }] },
+    { key: "local", name: "로컬", id: "", targets: [{ key: "pc", name: "내 PC", id: "", method: "로컬", open: () => onOpen(), elevate: onLocalElevate }] },
     ...(profiles?.groups.map(({ profile }) => ({
       key: `group:${profile.id}`, name: profile.displayName, id: profile.id,
       targets: profiles.targets.filter(({ profile: target }) => target.groupId === profile.id).map(({ profile: target }) => ({
@@ -35,6 +36,7 @@ export function LocalTree({ profiles, onOpen, onElevate, onRegisterSshHost, onRe
         s3TargetId: target.defaultMethod === "s3" && onRetestS3 ? target.id : undefined,
         openTunnel: target.defaultMethod === "ssm" || (target.defaultMethod === "ssh" && target.ssh.transport.kind === "direct")
           ? () => onOpenTunnel(target.id, target.displayName, target.defaultMethod) : undefined,
+        elevate: onElevate && target.defaultMethod === "ssh" ? () => onElevate(target) : undefined,
       })),
     })) ?? []),
   ].flatMap((group) => {

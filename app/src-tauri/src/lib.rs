@@ -113,7 +113,19 @@ pub fn run() {
                 }
                 #[cfg(not(all(feature = "stored-auth", any(windows, target_os = "linux"))))]
                 {
-                    false
+                    invoke.resolver.reject("이 빌드에서는 저장 인증 기반 sudo 승격을 사용할 수 없습니다");
+                    true
+                }
+            } else if invoke.message.command() == "elevation_open_remote" {
+                #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+                {
+                    elevation_open_remote(invoke);
+                    true
+                }
+                #[cfg(not(all(feature = "stored-auth", any(windows, target_os = "linux"))))]
+                {
+                    invoke.resolver.reject("이 빌드에서는 저장 인증 기반 sudo 승격을 사용할 수 없습니다");
+                    true
                 }
             } else if ai::session_selection::handles(invoke.message.command()) {
                 ai::session_selection::dispatch(invoke);

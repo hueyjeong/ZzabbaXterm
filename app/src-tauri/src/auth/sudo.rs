@@ -147,6 +147,8 @@ pub(crate) fn failure(error: Error) -> Option<&'static str> {
         Error::ItemMissing => Some("저장한 sudo 암호 항목을 찾을 수 없습니다"),
         Error::InvalidPassword => Some("저장한 sudo 암호가 올바르지 않습니다"),
         Error::Expired => Some("sudo 승인 시간이 만료되었습니다"),
+        Error::ChannelUnavailable => Some("승격 채널이 끊겼습니다. 결과 미확인"),
+        Error::ResponseUnknown => Some("승격 응답을 확인할 수 없습니다. 결과 미확인"),
         _ => None,
     }
 }

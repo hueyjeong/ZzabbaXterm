@@ -162,17 +162,7 @@ impl Approval {
         let listener = transport::Listener::bind().map_err(|_| Error::ChannelUnavailable)?;
 
         command.get_argv_mut()[0] = program.path().as_os_str().to_owned();
-        for key in [
-            "BW_SESSION",
-            "SSH_ASKPASS_PROMPT",
-            "SSH_AUTH_SOCK",
-            "LD_PRELOAD",
-            "LD_LIBRARY_PATH",
-            "LD_AUDIT",
-            "PATHEXT",
-        ] {
-            command.env_remove(key);
-        }
+        remove_ssh_inherited(&mut command);
         command.env("SSH_ASKPASS", helper.path());
         command.env("SSH_ASKPASS_REQUIRE", "force");
         command.env(ENDPOINT_ENV, listener.address());
@@ -192,6 +182,23 @@ impl Approval {
             exchange(listener, root, program, helper, &vault, item, &sent).await
         });
         Ok((child, exchange))
+    }
+}
+
+/// SSH askpass 자식은 상속 환경의 sudo 승격·금고 변수를 받지 않는다.
+fn remove_ssh_inherited(command: &mut CommandBuilder) {
+    for key in [
+        "BW_SESSION",
+        "SSH_ASKPASS_PROMPT",
+        "SSH_AUTH_SOCK",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "LD_AUDIT",
+        "PATHEXT",
+        "SUDO_ASKPASS",
+        sudo::MODE_ENV,
+    ] {
+        command.env_remove(key);
     }
 }
 

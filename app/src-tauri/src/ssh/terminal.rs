@@ -135,6 +135,72 @@ pub(crate) fn restrict_fixture_key(path: &Path) {
 }
 
 
+/// 원격 sudo 승격은 배치 로그인이 가능한 직접 SSH(Agent·키 파일)에서만 연다.
+pub(crate) fn remote_plan(config: &Path, ssh: &Ssh) -> Result<Arc<ConnectionPlan>, String> {
+    if !matches!(ssh.transport, SshTransport::Direct {}) {
+        return Err("원격 sudo 승격은 직접 SSH 연결에서만 사용할 수 있습니다".into());
+    }
+    if !matches!(ssh.auth, SshAuth::Agent { .. } | SshAuth::KeyFile { .. }) {
+        return Err("원격 sudo 승격은 SSH Agent 또는 키 파일 연결에서만 사용할 수 있습니다".into());
+    }
+    let launch = saved(config, ssh)?;
+    let (_, plan) = launch.into_parts();
+    Ok(plan)
+}
+
+/// 같은 계획에서 승격 run·bridge·확인 채널을 만든다. 원격 인자는 고정 ASCII 토큰만 받는다.
+pub(crate) struct RemoteChannel {
+    pub(crate) terminal: CommandBuilder,
+    pub(crate) piped: std::process::Command,
+}
+
+pub(crate) fn remote_channel(plan: &Arc<ConnectionPlan>, remote: &[String]) -> Result<RemoteChannel, String> {
+    if remote.is_empty()
+        || !remote.iter().all(|token| {
+            !token.is_empty()
+                && token.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"/._:-".contains(&byte))
+        })
+    {
+        return Err("원격 승격 인자가 올바르지 않습니다".into());
+    }
+    let invocation = plan.invocation(Client::Ssh).map_err(pin_error)?;
+    let mut terminal = CommandBuilder::new(invocation.program);
+    terminal.get_argv_mut().insert(1, "-T".into());
+    terminal.args(invocation.args.iter().cloned());
+    terminal.args(remote.iter().cloned());
+    for &(name, value) in invocation.environment {
+        match value {
+            Some(value) => terminal.env(name, value),
+            None => terminal.env_remove(name),
+        };
+    }
+    let mut piped = std::process::Command::new(invocation.program);
+    piped.arg("-T");
+    piped.args(invocation.args.iter().cloned());
+    piped.args(remote.iter());
+    for &(name, value) in invocation.environment {
+        match value {
+            Some(value) => piped.env(name, value),
+            None => piped.env_remove(name),
+        };
+    }
+    terminal.env_remove("BW_SESSION");
+    piped.env_remove("BW_SESSION");
+    for name in ["ZZABBA_ASKPASS_ENDPOINT", "ZZABBA_ASKPASS_BROKER_PID", "ZZABBA_ASKPASS_MODE"] {
+        terminal.env_remove(name);
+        piped.env_remove(name);
+    }
+    terminal.env("TERM", "xterm-256color");
+    piped.env("TERM", "xterm-256color");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        piped.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+        terminal.env_remove("PATHEXT");
+    }
+    Ok(RemoteChannel { terminal, piped })
+}
+
 pub(crate) fn saved(config: &Path, ssh: &Ssh) -> Result<DirectLaunch, String> {
     if !matches!(ssh.transport, SshTransport::Direct {}) {
         return Err("SSH-over-SSM을 사용할 수 없습니다".into());

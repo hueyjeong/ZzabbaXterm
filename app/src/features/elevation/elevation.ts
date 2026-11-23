@@ -3,6 +3,10 @@ export type ElevationRequest = Readonly<{
   program: string;
   args: readonly string[];
   item: string;
+  /** 원격 승격이면 저장된 SSH 대상 ID와 표시용 서버·계정이다. */
+  targetId?: string;
+  target?: string;
+  account?: string;
 }>;
 
 export type ElevationField = Readonly<{ label: string; value: string }>;
@@ -10,7 +14,8 @@ export type ElevationField = Readonly<{ label: string; value: string }>;
 /** 승인 화면은 인자 경계를 합치지 않고 하나씩 표시한다. */
 export function approvalFields(request: ElevationRequest): readonly ElevationField[] {
   return [
-    { label: "대상", value: "내 PC" },
+    { label: "대상", value: request.target ?? "내 PC" },
+    ...(request.account === undefined ? [] : [{ label: "호출 계정", value: request.account }]),
     { label: "실행 계정", value: "root" },
     { label: "실행 파일", value: request.program },
     ...request.args.map((argument, index) => ({ label: `인자 ${index + 1}`, value: argument })),

@@ -11,6 +11,8 @@ use std::{
 use portable_pty::{Child, SlavePty};
 use tokio::time::Instant;
 
+pub(crate) mod remote;
+
 pub(crate) use crate::local_auth::Error;
 
 /// 승인 30초. 승인 뒤 교환은 `sudo -A`의 askpass 시작을 별도로 기다린다.
@@ -33,6 +35,8 @@ pub(crate) struct Request {
     pub(crate) program: PathBuf,
     pub(crate) args: Vec<String>,
     pub(crate) item: String,
+    /// 원격 실행 파일은 POSIX 절대 경로이며 로컬 파일로 정규화하지 않는다.
+    pub(crate) remote: bool,
 }
 
 impl Request {
@@ -44,6 +48,25 @@ impl Request {
             program,
             args,
             item,
+            remote: false,
+        }
+    }
+
+    pub(crate) fn new_remote(
+        target: String,
+        caller: String,
+        program: PathBuf,
+        args: Vec<String>,
+        item: String,
+    ) -> Self {
+        Self {
+            target,
+            caller,
+            run_as: "root".into(),
+            program,
+            args,
+            item,
+            remote: true,
         }
     }
 }
@@ -236,7 +259,11 @@ pub(crate) fn validate_request(request: &Request) -> Result<(), Error> {
         .into_iter()
         .any(|value| !valid_text(value))
         || request.run_as != "root"
-        || !request.program.is_absolute()
+        || !if request.remote {
+            request.program.to_string_lossy().starts_with('/')
+        } else {
+            request.program.is_absolute()
+        }
         || !valid_text(&request.program.to_string_lossy())
         || request.args.len() > 256
         || request
@@ -308,6 +335,14 @@ pub(crate) fn request_id() -> Option<String> {
         write!(id, "{byte:02x}").ok()?;
     }
     Some(id)
+}
+
+/// 원격 실행 파일은 로컬에서 열지 않고 POSIX 절대 경로만 고정한다.
+pub(crate) fn remote_program(program: &str) -> Option<PathBuf> {
+    if !program.starts_with('/') || program.contains('\0') || program.chars().any(char::is_control) {
+        return None;
+    }
+    Some(PathBuf::from(program))
 }
 
 /// 실행 파일은 절대 경로로 고정한다. 표시와 실행이 같은 경로를 쓰도록 정규화한다.

@@ -140,7 +140,7 @@ impl Bitwarden {
     }
 
     #[cfg(test)]
-    pub(super) fn fixture(program: TrustedFile, session: Zeroizing<String>) -> Self {
+    pub(crate) fn fixture(program: TrustedFile, session: Zeroizing<String>) -> Self {
         Self {
             program,
             session: Some(session),

@@ -13,6 +13,7 @@
     "allow-terminal-resize",
     "allow-terminal-ack",
     "allow-terminal-close",
-    "allow-elevation-open"
+    "allow-elevation-open",
+    "allow-elevation-open-remote"
   ]
 }

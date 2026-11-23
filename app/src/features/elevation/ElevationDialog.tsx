@@ -3,7 +3,8 @@ import { ElevationApproval } from "./ElevationApproval";
 import { parseArguments, validateElevationRequest, type ElevationRequest } from "./elevation";
 
 /** 승격 실행은 실행 파일과 인자를 구조로 받는다. 셸 문자열을 다시 해석하지 않는다. */
-export function ElevationDialog({ onClose, onSubmit }: {
+export function ElevationDialog({ context, onClose, onSubmit }: {
+  readonly context?: Readonly<{ targetId?: string; target?: string; account?: string }>;
   readonly onClose: () => void;
   readonly onSubmit: (request: ElevationRequest) => void;
 }) {
@@ -22,6 +23,7 @@ export function ElevationDialog({ onClose, onSubmit }: {
     program: program.trim(),
     args: parseArguments(argumentsText),
     item: item.trim(),
+    ...context,
   };
   const approve = () => {
     if (submitted.current) return;
@@ -39,7 +41,7 @@ export function ElevationDialog({ onClose, onSubmit }: {
     onClose();
   }}>
     <form method="dialog" onSubmit={(event) => { event.preventDefault(); approve(); }}>
-      <h2>sudo 승격 실행</h2>
+      <h2>{context?.targetId ? "원격 sudo 승격 실행" : "sudo 승격 실행"}</h2>
       <label>실행 파일 절대 경로
         <input value={program} onChange={(event) => setProgram(event.target.value)} />
       </label>

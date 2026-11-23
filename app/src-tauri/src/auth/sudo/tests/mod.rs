@@ -323,7 +323,7 @@ fn elevation_rejects_a_helper_outside_the_sudo_child_lineage() {
     });
 }
 
-async fn finish(mut run: Running) -> String {
+async fn finish(run: Running) -> String {
     drop(run.master);
     run.reader.join().unwrap()
 }

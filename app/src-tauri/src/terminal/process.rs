@@ -41,6 +41,8 @@ struct Flow {
     stored: Option<CancellationToken>,
     #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
     elevation: Option<CancellationToken>,
+    #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+    remote_elevation: Option<Arc<crate::elevation::remote::State>>,
     sent: u64,
     acked: u64,
     ack_deadline: Option<std::time::Instant>,
@@ -87,6 +89,8 @@ pub(crate) enum Launch {
     Ssh(DirectLaunch),
     #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
     Elevated(crate::elevation::Launch),
+    #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+    RemoteElevated(crate::elevation::remote::Launch),
 }
 
 impl Launch {
@@ -252,6 +256,8 @@ impl Session {
             Launch::Local(_) | Launch::Ssh(_) => None,
             #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
             Launch::Elevated(_) => None,
+            #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+            Launch::RemoteElevated(_) => None,
         };
         if self.flow.lock().unwrap().stop.is_some() {
             return Err(stage("open", CLOSED));
@@ -315,6 +321,14 @@ impl Session {
                         Some(Stop::Disconnected(error)) => Some(Event::Disconnected(error.clone())),
                         None => event,
                     };
+                    #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+                    if let Some(state) = &self.flow.lock().unwrap().remote_elevation
+                        && state.unconfirmed()
+                    {
+                        event = Some(Event::Disconnected(
+                            "결과 미확인: 원격 승격 채널이 단절되었습니다".into(),
+                        ));
+                    }
                     if let Some(error) = self.close_result().warning() {
                         event = Some(Event::Disconnected(match event {
                             Some(Event::Disconnected(reason)) => format!("{reason}; {error}"),
@@ -343,11 +357,19 @@ impl Session {
                 Saved(crate::ssh::terminal::DirectLaunch),
                 #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
                 Elevated(crate::elevation::Launch),
+                #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+                RemoteElevated(crate::elevation::remote::Launch),
             }
             #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
             let mut stored_exchange = None;
             #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
             let mut elevation_exchange = None;
+            #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+            let mut remote_state = None;
+            #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+            let mut remote_frame = None;
+            #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+            let mut remote_bridge = None;
             let mut notice = None;
             let mut editor = None;
             let prepared = match command {
@@ -374,6 +396,8 @@ impl Session {
                 }
                 #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
                 Launch::Elevated(launch) => Prepared::Elevated(launch),
+                #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+                Launch::RemoteElevated(launch) => Prepared::RemoteElevated(launch),
             };
             let mut child = match prepared {
                 Prepared::Remote => remote_child.take().unwrap(),
@@ -428,11 +452,40 @@ impl Session {
                         }
                     }
                 }
+                #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+                Prepared::RemoteElevated(launch) => {
+                    if self.flow.lock().unwrap().stop.is_some() {
+                        self.teardown(pair, writer, event_tx, drain);
+                        return Err(stage("open", CLOSED));
+                    }
+                    let crate::elevation::remote::Launch { command, frame, bridge, state } = launch;
+                    match pair.slave.spawn_command(command) {
+                        Ok(child) => {
+                            remote_state = Some(Arc::clone(&state));
+                            remote_frame = Some(frame);
+                            remote_bridge = Some((bridge, state));
+                            child
+                        }
+                        Err(error) => {
+                            self.teardown(pair, writer, event_tx, drain);
+                            return Err(stage("원격 sudo", format_args!("{error:#}")));
+                        }
+                    }
+                }
             };
             self.close_result.lock().unwrap().local = LocalClose::Unconfirmed;
             drop(pair.slave);
             *self.writer.lock().unwrap() = Some(writer);
             *self.master.lock().unwrap() = Some(pair.master);
+            #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+            if let Some(frame) = remote_frame.take() {
+                let mut writer = self.writer.lock().unwrap();
+                if let Some(writer) = writer.as_mut()
+                    && let Err(error) = writer.write_all(&frame).and_then(|_| writer.flush())
+                {
+                    self.stop(Stop::Disconnected(stage("원격 승격 요청", error)));
+                }
+            }
             {
                 let mut flow = self.flow.lock().unwrap();
                 flow.attached = true;
@@ -459,9 +512,22 @@ impl Session {
                         let _ = thread::Builder::new().name("elevation-auth".into())
                             .spawn(move || watch_elevation(exchange, cancel, events));
                     }
+                    #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+                    if let Some(state) = remote_state.take() {
+                        flow.remote_elevation = Some(state);
+                    }
                 }
                 if !ssm { flow.start_deadline = Some(std::time::Instant::now() + START_TIMEOUT); }
                 self.wake.notify_all();
+            }
+            #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+            if let Some((bridge, state)) = remote_bridge.take() {
+                let events = Arc::clone(&send);
+                let _ = thread::Builder::new().name("remote-elevation".into()).spawn(move || {
+                    crate::elevation::remote::watch(bridge, state, |message| {
+                        let _ = (events.lock().unwrap())(Event::Notice(message.into()));
+                    });
+                });
             }
             if !ssm { let _ = ready.send(Ok(())); }
             if let Some(notice) = notice
@@ -670,6 +736,10 @@ impl Session {
             match child_ready(child) {
                 Ok(true) => {
                     flow.child_exited = true;
+                    #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+                    if let Some(state) = &flow.remote_elevation {
+                        state.run_done.cancel();
+                    }
                     self.wake.notify_all();
                     drop(flow);
                     return Some(match child.wait() {
@@ -962,6 +1032,8 @@ impl Session {
         if let Some(cancel) = flow.stored.take() { cancel.cancel(); }
         #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
         if let Some(cancel) = flow.elevation.take() { cancel.cancel(); }
+        #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
+        if let Some(state) = &flow.remote_elevation { state.cancel.cancel(); }
         if flow.stop.is_none() || matches!(reason, Stop::Closed) {
             flow.stop = Some(reason);
         }

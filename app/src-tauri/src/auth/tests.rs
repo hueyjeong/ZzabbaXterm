@@ -106,6 +106,18 @@ fn approval_is_bound_to_document_target_user_and_item() {
 }
 
 #[test]
+fn ssh_askpass_ignores_inherited_sudo_environment() {
+    let mut command = CommandBuilder::new("ssh");
+    command.env("SUDO_ASKPASS", "/tmp/zzabba-elevate");
+    command.env(super::sudo::MODE_ENV, "sudo");
+    command.env("BW_SESSION", "inherited-session");
+    super::remove_ssh_inherited(&mut command);
+    assert_eq!(command.get_env("SUDO_ASKPASS"), None);
+    assert_eq!(command.get_env(super::sudo::MODE_ENV), None);
+    assert_eq!(command.get_env("BW_SESSION"), None);
+}
+
+#[test]
 fn an_unacknowledged_response_is_not_cancelled() {
     let root = tempfile::tempdir().unwrap();
     let plan = plan(&root.path().join("trust"), 2222, "fixture-user", KEY, ITEM);

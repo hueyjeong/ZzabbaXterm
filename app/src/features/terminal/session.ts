@@ -26,9 +26,14 @@ const tauriIpc: LocalTerminalIpc = {
       ...size, output: new Channel(receive), ...(targetId === undefined ? {} : { targetId }),
       ...(remoteEditor === true ? { remoteEditor } : {}),
     })
-    : invoke("elevation_open", {
-      ...size, output: new Channel(receive), program: elevation.program, args: [...elevation.args], item: elevation.item,
-    }),
+    : elevation.targetId === undefined
+      ? invoke("elevation_open", {
+        ...size, output: new Channel(receive), program: elevation.program, args: [...elevation.args], item: elevation.item,
+      })
+      : invoke("elevation_open_remote", {
+        ...size, output: new Channel(receive), targetId: elevation.targetId,
+        program: elevation.program, args: [...elevation.args], item: elevation.item,
+      }),
   start: (id) => invoke("terminal_start", { id }),
   input: (id, bytes) => invoke("terminal_input", { id, bytes: Array.from(bytes) }),
   resize: (id, size) => invoke("terminal_resize", { id, ...size }),

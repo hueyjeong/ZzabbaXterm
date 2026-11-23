@@ -121,7 +121,8 @@ export function Workspace() {
   const [profileLoad, setProfileLoad] = useState<ProfileLoad>({ kind: "loading" });
   const [hostRegistration, setHostRegistration] = useState<{ kind: "status" | "alert"; message: string }>();
   const [wizard, setWizard] = useState<WizardRequest>();
-  const [elevationOpen, setElevationOpen] = useState(false);
+  const [elevationContext, setElevationContext] = useState<Readonly<{ targetId?: string; target?: string; account?: string }>>();
+  const [storedAuth, setStoredAuth] = useState(false);
   const [treeWidth, setTreeWidth] = useState(280);
   const [aiWidth, setAiWidth] = useState(360);
   const [bodyWidth, setBodyWidth] = useState(1200);
@@ -294,6 +295,14 @@ export function Workspace() {
       window.removeEventListener("pagehide", unsubscribe);
       unsubscribe();
     };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    void connections.capabilities().then((value) => {
+      if (active) setStoredAuth(value.storedAuth === true);
+    }, () => { /* 비 Tauri 미리보기와 구 빌드에서는 승격 메뉴를 숨긴다. */ });
+    return () => { active = false; };
   }, []);
 
   useEffect(() => {
@@ -657,7 +666,16 @@ export function Workspace() {
             <div role="alert">연결 불러오기 실패: {profileLoad.error}</div>
             <button onClick={reloadProfiles}>다시 불러오기</button>
           </div>}
-          <LocalTree profiles={profileLoad.profiles} onOpen={openTab} onElevate={/Windows/i.test(navigator.userAgent) ? undefined : () => setElevationOpen(true)}
+          <LocalTree profiles={profileLoad.profiles} onOpen={openTab}
+            onLocalElevate={storedAuth ? () => setElevationContext({}) : undefined}
+            onElevate={storedAuth ? (target) => {
+              if (target?.defaultMethod !== "ssh") return;
+              setElevationContext({
+                targetId: target.id,
+                target: `${target.ssh.account}@${target.ssh.host}:${target.ssh.port}`,
+                account: target.ssh.account,
+              });
+            } : undefined}
             onRegisterSshHost={(targetId) => void registerSavedSshHost(targetId)}
             onRetestS3={retestStorageTarget} onOpenTunnel={(targetId, name, method) => {
               setWindowError("");
@@ -841,8 +859,8 @@ export function Workspace() {
         {fileError && <span role="alert">{fileError}</span>}
         {hostRegistration && <span role={hostRegistration.kind}>{hostRegistration.message}</span>}
       </footer>
-      {elevationOpen && <ElevationDialog onClose={() => setElevationOpen(false)} onSubmit={(request) => {
-        setElevationOpen(false);
+      {elevationContext && <ElevationDialog context={elevationContext} onClose={() => setElevationContext(undefined)} onSubmit={(request) => {
+        setElevationContext(undefined);
         openElevation(request);
       }} />}
       {wizard && <LocalConnectionWizard {...wizard} groups={profileLoad.profiles?.groups ?? []}
