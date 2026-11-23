@@ -30,10 +30,14 @@ export function TunnelTab({ tab, targetId, method, closeState, onShare, onOpenDe
   // 이 탭에서 시작한 요청이다. SSO 로그인 뒤 같은 요청으로 다시 시작한다.
   const requests = useRef(new Map<string, TunnelRequest>());
   const retry = useRef<TunnelRequest | undefined>(undefined);
+  // 다른 작업 중에 로그인이 끝나면 그 작업이 끝난 뒤 다시 시작한다.
+  const queued = useRef<TunnelRequest | undefined>(undefined);
   const login = useSsoLogin(targetId, () => {
     const request = retry.current;
     retry.current = undefined;
-    if (request) void run(() => begin(request));
+    if (!request) return;
+    if (busy.current) queued.current = request;
+    else void run(() => begin(request));
   }, ssoIpc);
 
   useEffect(() => {
@@ -41,9 +45,15 @@ export function TunnelTab({ tab, targetId, method, closeState, onShare, onOpenDe
     let stopped = false;
     let timer: number | undefined;
     async function observe() {
+      // 조회 중에 시작한 요청은 이번 스냅샷에 없을 수 있으므로 조회 전에 알던 ID만 정리한다.
+      const known = [...requests.current.keys()];
       try {
         const snapshot = await tunnelIpc.status(tab);
-        if (!stopped) { setTunnels(snapshot); setStatusError(""); }
+        if (stopped) return;
+        const live = new Set(snapshot.map(tunnel => tunnel.id));
+        for (const id of known) if (!live.has(id)) requests.current.delete(id);
+        setTunnels(snapshot);
+        setStatusError("");
       } catch (failure) {
         if (!stopped) setStatusError(String(failure));
       } finally {
@@ -60,7 +70,13 @@ export function TunnelTab({ tab, targetId, method, closeState, onShare, onOpenDe
     setPending(true);
     setError("");
     try { await action(); } catch (failure) { setError(String(failure)); }
-    finally { busy.current = false; setPending(false); }
+    finally {
+      busy.current = false;
+      setPending(false);
+      const next = queued.current;
+      queued.current = undefined;
+      if (next) void run(() => begin(next));
+    }
   }
 
   async function begin(request: TunnelRequest) {

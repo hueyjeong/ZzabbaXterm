@@ -207,9 +207,19 @@ export function Workspace() {
   const [windowError, setWindowError] = useState("");
   // SSO 만료로 열지 못한 원격 화면 프로필이다. 로그인에 성공하면 같은 위치로 다시 연다.
   const [desktopRetry, setDesktopRetry] = useState<{ target: DesktopProfile; split?: Placement; error: string }>();
-  const desktopLogin = useSsoLogin(desktopRetry?.target.id, () => {
-    if (desktopRetry) void openDesktopTarget(desktopRetry.target, desktopRetry.split);
+  // 로그인을 시작할 때의 재시도 대상이다. 성공하면 이 대상만 다시 연다.
+  const desktopLoginRetry = useRef<typeof desktopRetry>(undefined);
+  const desktopLogin = useSsoLogin(desktopRetry?.target.id, targetId => {
+    const retry = desktopLoginRetry.current;
+    desktopLoginRetry.current = undefined;
+    if (retry?.target.id === targetId) void openDesktopTarget(retry.target, retry.split);
   });
+  const cancelDesktopLogin = desktopLogin.cancel;
+  // 다른 열기 시도가 재시도 대상을 바꾸면 진행 중인 로그인을 취소한다.
+  useEffect(() => {
+    desktopLoginRetry.current = undefined;
+    cancelDesktopLogin();
+  }, [desktopRetry, cancelDesktopLogin]);
   const [closeError, setCloseError] = useState("");
   const [loadVersion, setLoadVersion] = useState(0);
   const [profileLoad, setProfileLoad] = useState<ProfileLoad>({ kind: "loading" });
@@ -1065,7 +1075,7 @@ export function Workspace() {
         {closeBlock && <span role="status">{closeBlock.message}</span>}
         {closeError && <span role="alert">{closeError}</span>}
         {windowError && <span role="alert">{windowError}</span>}
-        {desktopRetry?.error === windowError && <SsoLoginAction login={desktopLogin} />}
+        {desktopRetry?.error === windowError && <SsoLoginAction login={desktopLogin} onStart={() => { desktopLoginRetry.current = desktopRetry; }} />}
         {fileError && <span role="alert">{fileError}</span>}
         {hostRegistration && <span role={hostRegistration.kind}>{hostRegistration.message}</span>}
         {desktopOpening && <span role="status" className="workspace-status-pending">{desktopOpening.label} 경로 여는 중

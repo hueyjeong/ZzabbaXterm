@@ -60,7 +60,12 @@ export function TerminalView({ active, focusRequested, label, targetId, ipc, rem
     statusListener.current?.(opening);
     setGeneration(value => value + 1);
   }
-  const ssoLogin = useSsoLogin(targetId, reopen, ssoIpc);
+  const closingNow = useRef(closing);
+  useLayoutEffect(() => { closingNow.current = closing; }, [closing]);
+  // 닫히는 탭은 로그인에 성공해도 다시 열지 않는다.
+  const ssoLogin = useSsoLogin(targetId, () => { if (!closingNow.current) reopen(); }, ssoIpc);
+  const cancelSsoLogin = ssoLogin.cancel;
+  useLayoutEffect(() => { if (closing) cancelSsoLogin(); }, [closing, cancelSsoLogin]);
 
   useLayoutEffect(() => {
     const element = host.current;

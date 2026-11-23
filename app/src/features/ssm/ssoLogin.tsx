@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { LogIn } from "lucide-react";
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { IconButton } from "../ui/controls";
 
 /** Rust `start_error(CliError::SsoLoginRequired)`가 만드는 문자열이다. */
@@ -20,14 +20,24 @@ export const ssoLoginIpc: SsoLoginIpc = {
 
 export type SsoLoginState = { kind: "idle" } | { kind: "pending" } | { kind: "failed"; error: string };
 
-export type SsoLogin = Readonly<{ state: SsoLoginState; start(): void }>;
+export type SsoLogin = Readonly<{ state: SsoLoginState; start(): void; cancel(): void }>;
 
-/** 저장 대상의 SSO 로그인을 실행하고, 성공하면 onSuccess로 같은 대상을 다시 연다. 언마운트하면 취소한다. */
-export function useSsoLogin(targetId: string | undefined, onSuccess: () => void, ipc: SsoLoginIpc = ssoLoginIpc): SsoLogin {
+/**
+ * 저장 대상의 SSO 로그인을 실행하고, 성공하면 시작할 때의 대상 ID로 onSuccess를 부른다.
+ * cancel이나 언마운트는 진행 중인 로그인을 취소하고 onSuccess를 부르지 않는다.
+ */
+export function useSsoLogin(targetId: string | undefined, onSuccess: (targetId: string) => void, ipc: SsoLoginIpc = ssoLoginIpc): SsoLogin {
   const [state, setState] = useState<SsoLoginState>({ kind: "idle" });
   const running = useRef<string | undefined>(undefined);
   const success = useRef(onSuccess);
   useLayoutEffect(() => { success.current = onSuccess; });
+  const cancel = useCallback(() => {
+    const requestId = running.current;
+    running.current = undefined;
+    if (!requestId) return;
+    setState({ kind: "idle" });
+    void ipc.cancel(requestId).catch(() => { });
+  }, [ipc]);
   useEffect(() => () => {
     const requestId = running.current;
     running.current = undefined;
@@ -36,14 +46,15 @@ export function useSsoLogin(targetId: string | undefined, onSuccess: () => void,
 
   function start() {
     if (!targetId || running.current) return;
+    const target = targetId;
     const requestId = crypto.randomUUID();
     running.current = requestId;
     setState({ kind: "pending" });
-    ipc.login(targetId, requestId).then(() => {
+    ipc.login(target, requestId).then(() => {
       if (running.current !== requestId) return;
       running.current = undefined;
       setState({ kind: "idle" });
-      success.current();
+      success.current(target);
     }, (error: unknown) => {
       if (running.current !== requestId) return;
       running.current = undefined;
@@ -51,7 +62,7 @@ export function useSsoLogin(targetId: string | undefined, onSuccess: () => void,
     });
   }
 
-  return { state, start };
+  return { state, start, cancel };
 }
 
 export function SsoLoginButton({ login, disabled, onStart }: { readonly login: SsoLogin; readonly disabled?: boolean; readonly onStart?: () => void }) {
@@ -67,6 +78,6 @@ export function SsoLoginStatus({ login }: { readonly login: SsoLogin }) {
   </>;
 }
 
-export function SsoLoginAction({ login, disabled }: { readonly login: SsoLogin; readonly disabled?: boolean }) {
-  return <><SsoLoginButton login={login} disabled={disabled} /><SsoLoginStatus login={login} /></>;
+export function SsoLoginAction({ login, disabled, onStart }: { readonly login: SsoLogin; readonly disabled?: boolean; readonly onStart?: () => void }) {
+  return <><SsoLoginButton login={login} disabled={disabled} onStart={onStart} /><SsoLoginStatus login={login} /></>;
 }

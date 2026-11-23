@@ -103,6 +103,21 @@ it("로그인 중에 탭을 닫으면 같은 요청을 취소한다", async () =
   expect(sso.cancel).toHaveBeenCalledWith(vi.mocked(sso.login).mock.calls[0][1]);
 });
 
+it("닫히는 탭은 진행 중인 로그인을 취소하고 로그인이 끝나도 다시 열지 않는다", async () => {
+  const open = vi.fn<LocalTerminalIpc["open"]>().mockRejectedValue("SSM: SSO 재로그인 필요");
+  const pending = deferred<"loggedIn">();
+  const sso: SsoLoginIpc = { login: vi.fn().mockReturnValue(pending.promise), cancel: vi.fn().mockResolvedValue(null) };
+  const ipc = terminalIpc(open);
+  const render = (closing: boolean) => root.render(<TerminalView active focusRequested={false} label="SSM 셸" targetId="ssm-node"
+    remote ipc={ipc} ssoIpc={sso} closing={closing} />);
+  await act(async () => { render(false); });
+  await act(async () => { button("SSO 로그인")!.click(); });
+  await act(async () => { render(true); });
+  expect(sso.cancel).toHaveBeenCalledWith(vi.mocked(sso.login).mock.calls[0][1]);
+  await act(async () => { pending.resolve("loggedIn"); });
+  expect(open).toHaveBeenCalledTimes(1);
+});
+
 it("SSO 외 사유로 실패한 탭은 다시 연결하고 저장 대상이 없으면 SSO 로그인을 보이지 않는다", async () => {
   const open = vi.fn<LocalTerminalIpc["open"]>()
     .mockRejectedValueOnce("SSM: SSO 재로그인 필요")
