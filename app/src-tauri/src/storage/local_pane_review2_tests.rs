@@ -21,6 +21,7 @@ async fn storage_upload_condition_failures_are_classified_by_condition() {
         put_error(412, "PreconditionFailed"),
         put_error(412, "PreconditionFailed"),
         put_error(412, "PreconditionFailed"),
+        put_error(404, "NoSuchBucket"),
     ]);
     let s3: AwsS3 = client(&reply);
     let dir = tempfile::tempdir().unwrap();
@@ -33,6 +34,7 @@ async fn storage_upload_condition_failures_are_classified_by_condition() {
         async move { s3.upload_if("selected-bucket", "k", file, &condition).await.unwrap_err().failure }
     };
     let changed = Failure::PreconditionFailed;
+    let matching_bucket_gone = || UploadCondition::Matches("\"etag\"".into());
     // If-Match: 지워진 객체(404 NoSuchKey)와 동시 조건부 쓰기(409)는 바뀐 객체로 본다. 다른 409는 일반 오류다.
     assert_eq!(put(matching.clone()).await, changed);
     assert_eq!(put(matching.clone()).await, changed);
@@ -42,6 +44,8 @@ async fn storage_upload_condition_failures_are_classified_by_condition() {
     assert_eq!(put(matching).await, changed);
     assert_eq!(put(UploadCondition::Absent).await, Failure::AlreadyExists);
     assert_eq!(put(UploadCondition::None).await, Failure::Service { status: 412, code: Some("PreconditionFailed".into()) });
+    // If-Match라도 NoSuchKey가 아닌 404(버킷 삭제 등)는 일반 오류다.
+    assert_eq!(put(matching_bucket_gone()).await, Failure::Service { status: 404, code: Some("NoSuchBucket".into()) });
     let conditions: Vec<_> = reply.actual_requests().map(|request| (
         request.headers().get("if-none-match").map(str::to_owned),
         request.headers().get("if-match").map(str::to_owned),
@@ -49,7 +53,7 @@ async fn storage_upload_condition_failures_are_classified_by_condition() {
     let etag = || Some("\"etag\"".to_owned());
     let star = || Some("*".to_owned());
     assert_eq!(conditions, [
-        (None, etag()), (None, etag()), (None, etag()), (star(), None), (None, etag()), (star(), None), (None, None),
+        (None, etag()), (None, etag()), (None, etag()), (star(), None), (None, etag()), (star(), None), (None, None), (None, etag()),
     ]);
 }
 

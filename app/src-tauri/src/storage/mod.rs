@@ -431,7 +431,9 @@ impl<C: std::borrow::Borrow<Client>> S3Operations<C> {
                 match (condition, status) {
                     (UploadCondition::Absent, Some(412)) => Error::at(Stage::PutObject, Failure::AlreadyExists),
                     // 확인한 객체가 바뀌었거나(412) 지워졌거나(404) 동시 조건부 쓰기와 겹쳤다(409).
-                    (UploadCondition::Matches(_), Some(412 | 404)) => Error::at(Stage::PutObject, Failure::PreconditionFailed),
+                    (UploadCondition::Matches(_), Some(412)) => Error::at(Stage::PutObject, Failure::PreconditionFailed),
+                    (UploadCondition::Matches(_), Some(404)) if code == Some("NoSuchKey") =>
+                        Error::at(Stage::PutObject, Failure::PreconditionFailed),
                     (UploadCondition::Absent | UploadCondition::Matches(_), Some(409)) if code == Some("ConditionalRequestConflict") =>
                         Error::at(Stage::PutObject, Failure::PreconditionFailed),
                     _ => self.sdk_error(Stage::PutObject, err),
