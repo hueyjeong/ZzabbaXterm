@@ -9,6 +9,34 @@ pub(super) async fn confirm(window: WebviewWindow, description: String, live: Ca
     if approved { Ok(()) } else { Err(Error::Closed) }
 }
 
+pub(super) async fn trust(window: WebviewWindow, request: super::trust::Request, live: CancellationToken, approval: Arc<()>) -> Result<bool, Error> {
+    let changed = request.changed;
+    let text = request.text;
+    dialog(window, live, approval, move |window| {
+        if changed { confirm_change_native(&window, &text) } else { confirm_native(&window, &text) }
+    }).await
+}
+
+#[cfg(windows)]
+fn confirm_change_native(window: &WebviewWindow, description: &str) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        IDOK, MB_DEFBUTTON2, MB_ICONWARNING, MB_OKCANCEL, MessageBoxW,
+    };
+    let wide = |text: &str| text.encode_utf16().chain([0]).collect::<Vec<_>>();
+    let text = wide(description);
+    let title = wide("RDP 서버 인증서 변경");
+    let Ok(hwnd) = window.hwnd() else { return false; };
+    // 취소를 기본 버튼으로 두어 Enter가 지문 교체를 승인하지 않게 한다.
+    unsafe {
+        MessageBoxW(hwnd.0 as _, text.as_ptr(), title.as_ptr(), MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2) == IDOK
+    }
+}
+
+#[cfg(not(windows))]
+fn confirm_change_native(window: &WebviewWindow, description: &str) -> bool {
+    confirm_native(window, description)
+}
+
 pub(super) async fn account(window: WebviewWindow, target: String, live: CancellationToken, approval: Arc<()>) -> Result<Account, Error> {
     dialog(window, live, approval, move |window| account_native(&window, &target)).await?.ok_or(Error::Credentials)
 }

@@ -3,7 +3,7 @@ import type { RemoteDesktopEvent, RemoteDesktopIdentity, RemoteDesktopSession } 
 import type { DesktopTunnelSource } from "../tunnels/tunnelIpc";
 import { scanCode } from "./keys";
 
-interface Draft { readonly host: string; readonly port: number; readonly source?: DesktopTunnelSource }
+interface Draft { readonly host: string; readonly port: number; readonly tlsOnly?: boolean; readonly source?: DesktopTunnelSource }
 export interface Capabilities { readonly copy: boolean; readonly paste: boolean; readonly resize: boolean }
 export interface Connection extends RemoteDesktopSession {
   clipboard(action: "copy" | "paste"): void;

@@ -214,3 +214,17 @@ it("종료 실패 후 다시 확인하면 같은 세션으로만 요청한다", 
   expect(f.calls("rdp_prepare")).toHaveLength(1);
   expect(f.calls("rdp_connect")).toHaveLength(1);
 });
+
+it("TLS 전용 opt-in을 연결 초안에 전달한다", async () => {
+  vi.stubGlobal("__ZZABBA_RDP_DOCUMENT__", { proof });
+  const ended = vi.fn();
+  invoke.mockImplementation((name) => {
+    if (name === "rdp_prepare") return Promise.resolve(id);
+    if (name === "rdp_connect") return Promise.withResolvers<void>().promise;
+    return Promise.resolve();
+  });
+  connect({ host: "rdp.example.invalid", port: 3389, tlsOnly: true }, vi.fn(), vi.fn(), vi.fn(), vi.fn(), ended);
+  await vi.waitFor(() => expect(invoke.mock.calls.map(([name]) => name)).toContain("rdp_connect"));
+  const draft = invoke.mock.calls.find(([name]) => name === "rdp_connect")?.[1]?.draft;
+  expect(draft).toEqual({ host: "rdp.example.invalid", port: 3389, tlsOnly: true });
+});

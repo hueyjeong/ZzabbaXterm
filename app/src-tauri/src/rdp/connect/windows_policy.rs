@@ -46,21 +46,31 @@ fn reject_disallowed(cert: &CertContext, stores: [&CertStore; 2]) -> Result<(), 
     Ok(())
 }
 
-pub(super) fn verify(name: &str, peer: &[CertificateDer<'_>]) -> Result<(), Error> {
-    let (leaf, intermediates) = peer.split_first().ok_or(Error::TlsIdentity)?;
+/// 고정(pin)으로 체인 검증을 대체한 경우에도 Windows Disallowed 저장소는 확인한다.
+pub(super) fn verify_disallowed(peer: &[CertificateDer<'_>]) -> Result<(), Error> {
     let mut builder = CertStoreBuilder::new();
     builder.read_only();
     let user = builder.open_current_user("Disallowed").map_err(|_| Error::TlsIdentity)?;
     let machine = builder.open_local_machine("Disallowed").map_err(|_| Error::TlsIdentity)?;
     let disallowed = [&user, &machine];
     let mut presented = Memory::new().map_err(|_| Error::TlsIdentity)?;
-    let leaf = presented.add_encoded_certificate(leaf.as_ref()).map_err(|_| Error::TlsIdentity)?;
-    // Check every presented certificate even if Windows can build an alternate path.
-    reject_disallowed(&leaf, disallowed)?;
-    for cert in intermediates {
+    for cert in peer {
         let cert = presented.add_encoded_certificate(cert.as_ref()).map_err(|_| Error::TlsIdentity)?;
         reject_disallowed(&cert, disallowed)?;
     }
+    Ok(())
+}
+
+pub(super) fn verify(name: &str, peer: &[CertificateDer<'_>]) -> Result<(), Error> {
+    let (leaf, intermediates) = peer.split_first().ok_or(Error::TlsIdentity)?;
+    let mut builder = CertStoreBuilder::new();
+    builder.read_only();
+    let mut presented = Memory::new().map_err(|_| Error::TlsIdentity)?;
+    let leaf = presented.add_encoded_certificate(leaf.as_ref()).map_err(|_| Error::TlsIdentity)?;
+    for cert in intermediates {
+        presented.add_encoded_certificate(cert.as_ref()).map_err(|_| Error::TlsIdentity)?;
+    }
+    verify_disallowed(peer)?;
     let presented = presented.into_store();
     let mut server_auth = szOID_PKIX_KP_SERVER_AUTH.cast_mut();
     let params = CERT_CHAIN_PARA {

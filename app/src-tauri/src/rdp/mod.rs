@@ -4,6 +4,7 @@ mod frame;
 pub(crate) mod ipc;
 mod native;
 pub(crate) mod route;
+mod trust;
 
 use std::{
     collections::VecDeque,
@@ -56,6 +57,8 @@ struct Target {
     endpoint: route::Endpoint,
     server_name: String,
     size: DesktopSize,
+    /// 사용자가 승인한 경우에만 NLA 없는 서버에 TLS 전용으로 한 번 재연결한다.
+    tls_only: bool,
 }
 
 /// Local authentication data; never serialized or sent to the renderer.
@@ -77,6 +80,7 @@ pub enum Error {
     InvalidForwardDestination,
     Tcp,
     Negotiation,
+    TlsOnlyRequired,
     TrustStore,
     TlsIdentity,
     Authentication,
@@ -160,15 +164,18 @@ impl Session {
     /// Resolve the NLA account only after TLS verifies the remote DNS identity.
     /// A successful return starts event delivery; the first Frame is the display-ready signal.
     /// `approved_roots` adds Rust-approved DER CAs to the platform roots, never WebView input.
-    async fn open<F, Fut>(
+    async fn open<F, Fut, A, AFut>(
         target: Target,
         approved_roots: rustls::RootCertStore,
+        trust: trust::Trust<A>,
         resolve: F,
         auth: ipc::AuthIo<'_>,
     ) -> Result<Self, Error>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Account, Error>>,
+        A: FnOnce(trust::Request) -> AFut,
+        AFut: Future<Output = Result<bool, Error>>,
     {
         frame::frame_len(target.size.width, target.size.height)?;
         if !route::dns_name(&target.server_name) {
@@ -178,13 +185,14 @@ impl Session {
             .map_err(|_| Error::InvalidServerName)?;
         let permit = SLOTS.try_acquire().map_err(|_| Error::Busy)?;
         let roots = connect::trusted_roots(approved_roots)?;
-        Self::open_with_tls(target, name, connect::tls_config(roots), resolve, permit, auth).await
+        Self::open_with_tls(target, name, connect::tls_config(roots), trust, resolve, permit, auth).await
     }
 
-    async fn open_with_tls<F, Fut>(
+    async fn open_with_tls<F, Fut, A, AFut>(
         target: Target,
         name: ServerName<'static>,
-        tls: Arc<rustls::ClientConfig>,
+        tls: connect::Tls,
+        trust: trust::Trust<A>,
         resolve: F,
         permit: tokio::sync::SemaphorePermit<'static>,
         auth: ipc::AuthIo<'_>,
@@ -192,6 +200,8 @@ impl Session {
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Account, Error>>,
+        A: FnOnce(trust::Request) -> AFut,
+        AFut: Future<Output = Result<bool, Error>>,
     {
         let area = Arc::new(AtomicU64::new(0));
         let display = DisplayControlClient::new({
@@ -201,7 +211,7 @@ impl Session {
                 Ok(Vec::new())
             }
         });
-        let (result, mut transport) = connect::connect(target, name, tls, resolve, display, auth).await?;
+        let (result, mut transport) = connect::connect(target, name, tls, trust, resolve, display, auth).await?;
         let id = SessionId(
             NEXT_ID
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
@@ -235,6 +245,7 @@ impl Session {
                 let mut channels = Channels::default();
                 let mut pending = VecDeque::new();
                 let mut display_generation = 1_u64;
+                let mut normalizer = frame::Normalizer::default();
                 loop {
                     let clipboard_deadline = clipboard::deadline(&mut active);
                     tokio::select! {
@@ -249,29 +260,41 @@ impl Session {
                         next = connect::read_bounded(&mut transport, &ironrdp::pdu::RDP_HINT, Error::Transport, None), if pending.is_empty() => {
                             let pdu = next?;
                             let action = ironrdp::pdu::find_size(&pdu).map_err(|_| Error::Protocol)?.ok_or(Error::Protocol)?.action;
-                            let pixels = inbound.check(action, &pdu, &graphics.image)?;
-                            let outputs = active.process(&mut graphics.image, action, &pdu).map_err(|_| Error::Protocol)?;
-                            let mut dirty = None;
-                            for output in outputs {
-                                match output {
-                                    ActiveStageOutput::ResponseFrame(data) => write(&mut transport, &data).await?,
-                                    ActiveStageOutput::GraphicsUpdate(rect) if pixels => {
-                                        use ironrdp::pdu::geometry::{InclusiveRectangle, Rectangle as _};
-                                        dirty = Some(dirty.map_or_else(|| rect.clone(), |previous: InclusiveRectangle| previous.union(&rect)));
+                            let pdus = match normalizer.normalize(action, &pdu, &graphics.image)? {
+                                frame::Normalized::Pass => vec![(action, pdu)],
+                                frame::Normalized::Drop => Vec::new(),
+                                frame::Normalized::Replace(pdus) => pdus,
+                            };
+                            for (action, pdu) in pdus {
+                                let pixels = inbound.check(action, &pdu, &graphics.image)?;
+                                let outputs = active.process(&mut graphics.image, action, &pdu).map_err(|_| Error::Protocol)?;
+                                let mut dirty = None;
+                                for output in outputs {
+                                    match output {
+                                        ActiveStageOutput::ResponseFrame(data) => write(&mut transport, &data).await?,
+                                        ActiveStageOutput::GraphicsUpdate(rect) if pixels => {
+                                            use ironrdp::pdu::geometry::{InclusiveRectangle, Rectangle as _};
+                                            dirty = Some(dirty.map_or_else(|| rect.clone(), |previous: InclusiveRectangle| previous.union(&rect)));
+                                        }
+                                        ActiveStageOutput::DeactivateAll => {
+                                            graphics = timeout(IO_TIMEOUT, reactivate(&mut transport, &mut active, &result.activation_factory))
+                                                .await.map_err(|_| Error::Timeout)??;
+                                            display_generation += 1;
+                                            inbound.reset_graphics();
+                                            normalizer = frame::Normalizer::default();
+                                            dirty = None;
+                                        }
+                                        ActiveStageOutput::Terminate(_) => return Ok(()),
+                                        _ => {}
                                     }
-                                    ActiveStageOutput::DeactivateAll => {
-                                        graphics = timeout(IO_TIMEOUT, reactivate(&mut transport, &mut active, &result.activation_factory))
-                                            .await.map_err(|_| Error::Timeout)??;
-                                        display_generation += 1;
-                                        inbound.reset_graphics();
-                                        dirty = None;
-                                    }
-                                    ActiveStageOutput::Terminate(_) => return Ok(()),
-                                    _ => {}
                                 }
-                            }
-                            if let Some(dirty) = dirty {
-                                if let Some(frame) = graphics.update(id, &dirty)? { pending.push_back(Event::Frame(frame)); }
+                                if let Some(dirty) = dirty {
+                                    if let Some(frame) = graphics.update(id, &dirty)? {
+                                        pending.push_back(Event::Frame(frame));
+                                        // 같은 PDU에서 나뉜 나머지 밴드는 전체 프레임이 아니라 패치로 보낸다.
+                                        graphics.ready = true;
+                                    }
+                                }
                             }
                             let next_channels = channel_state(&mut active, inbound.clipboard_id, &area);
                             if next_channels != channels {

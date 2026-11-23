@@ -1,16 +1,17 @@
-use std::{future::poll_fn, pin::Pin, sync::Arc, task::Poll};
+use std::{future::poll_fn, pin::Pin, sync::{Arc, Mutex}, task::Poll};
 
 use ironrdp::{
     connector::{
         self, ClientConnector, ClientConnectorState, ConnectionResult, Credentials, DesktopSize,
         Sequence, credssp::CredsspSequence, sspi::generator::GeneratorState,
     },
-    core::WriteBuf,
+    core::{WriteBuf, decode},
     pdu::{
         PduHint,
         gcc::KeyboardType,
-        nego::SecurityProtocol,
+        nego::{ConnectionConfirm, SecurityProtocol},
         rdp::capability_sets::{BitmapCodecs, MajorPlatformType},
+        x224::X224,
     },
 };
 use ironrdp_tokio::{FramedWrite as _, TokioFramed, bytes::Bytes};
@@ -18,21 +19,28 @@ use tokio::{io::{AsyncRead, AsyncReadExt as _, AsyncWrite}, net::TcpStream};
 use tokio_rustls::{
     TlsConnector,
     client::TlsStream,
-    rustls::{self, pki_types::ServerName},
+    rustls::{
+        self,
+        client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+        crypto::CryptoProvider,
+        pki_types::{CertificateDer, ServerName, UnixTime},
+        DigitallySignedStruct, SignatureScheme,
+    },
 };
 use x509_cert::{Certificate, der::Decode as _};
 
-use super::{Account, Error, Target, clipboard::TextClipboard, ipc::AuthIo, route::Endpoint};
+use super::{Account, Error, Target, clipboard::TextClipboard, ipc::AuthIo, route::Endpoint, trust};
 
 pub(super) type Transport = TokioFramed<TlsStream<TcpStream>>;
 
-fn config(size: DesktopSize) -> connector::Config {
+fn config(size: DesktopSize, tls_only: bool) -> connector::Config {
     connector::Config {
         desktop_size: size,
         desktop_scale_factor: 0,
-        // PROTOCOL_SSL is TLS-only; NLA uses TLS under HYBRID or HYBRID_EX.
-        enable_tls: false,
-        enable_credssp: true,
+        // NLA-first requests HYBRID|HYBRID_EX only, so the server cannot downgrade to TLS.
+        // TLS-only requests PROTOCOL_SSL and skips CredSSP; the caller must opt in.
+        enable_tls: tls_only,
+        enable_credssp: !tls_only,
         // Smart-card variant with no identity emits no pre-TLS username cookie.
         credentials: Credentials::SmartCard {
             pin: String::new(),
@@ -44,7 +52,7 @@ fn config(size: DesktopSize) -> connector::Config {
         keyboard_type: KeyboardType::IbmEnhanced,
         keyboard_subtype: 0,
         keyboard_functional_keys_count: 12,
-        keyboard_layout: 0,
+        keyboard_layout: 0x0000_0409,
         ime_file_name: String::new(),
         bitmap: Some(connector::BitmapConfig {
             lossy_compression: false,
@@ -110,16 +118,136 @@ pub(super) fn trusted_roots(
     Ok(approved)
 }
 
-pub(super) fn tls_config(roots: rustls::RootCertStore) -> Arc<rustls::ClientConfig> {
-    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .expect("ring supports the default TLS versions")
-    .with_root_certificates(roots)
-    .with_no_client_auth();
+#[derive(Debug)]
+struct Capture {
+    inner: Arc<rustls::client::WebPkiServerVerifier>,
+    seen: Arc<Mutex<Option<CertificateDer<'static>>>>,
+}
+
+impl ServerCertVerifier for Capture {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        *self.seen.lock().unwrap() = Some(CertificateDer::from(end_entity.as_ref().to_vec()));
+        self.inner.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+    }
+
+    fn verify_tls12_signature(&self, message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(&self, message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+#[derive(Debug)]
+struct Pinned {
+    inner: Arc<rustls::client::WebPkiServerVerifier>,
+    fingerprint: String,
+}
+
+impl ServerCertVerifier for Pinned {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: &ServerName<'_>,
+        _: &[u8],
+        _: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        if trust::fingerprint(end_entity.as_ref()) == self.fingerprint {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(&self, message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(&self, message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+/// 체인 검증은 rustls에 맡기고, 실패하면 제시된 인증서를 승인·고정에 쓴다.
+#[derive(Clone)]
+pub(super) struct Tls {
+    roots: Arc<rustls::RootCertStore>,
+    provider: Arc<CryptoProvider>,
+    config: Arc<rustls::ClientConfig>,
+    seen: Arc<Mutex<Option<CertificateDer<'static>>>>,
+}
+
+impl Tls {
+    fn verifier(&self) -> Arc<rustls::client::WebPkiServerVerifier> {
+        rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::clone(&self.roots), Arc::clone(&self.provider))
+            .build()
+            .expect("a non-empty root store builds a verifier")
+    }
+
+    fn build(&self, verifier: Arc<dyn ServerCertVerifier>) -> Arc<rustls::ClientConfig> {
+        let mut config = rustls::ClientConfig::builder_with_provider(Arc::clone(&self.provider))
+            .with_safe_default_protocol_versions()
+            .expect("ring supports the default TLS versions")
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth();
+        config.resumption = rustls::client::Resumption::disabled();
+        Arc::new(config)
+    }
+
+    fn connector(&self) -> TlsConnector {
+        TlsConnector::from(Arc::clone(&self.config))
+    }
+
+    fn pinned(&self, fingerprint: &str) -> TlsConnector {
+        TlsConnector::from(self.build(Arc::new(Pinned {
+            inner: self.verifier(),
+            fingerprint: fingerprint.into(),
+        })))
+    }
+
+    fn seen(&self) -> Option<CertificateDer<'static>> {
+        self.seen.lock().unwrap().take()
+    }
+}
+
+pub(super) fn tls_config(roots: rustls::RootCertStore) -> Tls {
+    let roots = Arc::new(roots);
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let seen = Arc::new(Mutex::new(None));
+    let verifier = Arc::new(Capture {
+        inner: rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::clone(&roots), Arc::clone(&provider))
+            .build()
+            .expect("a non-empty root store builds a verifier"),
+        seen: Arc::clone(&seen),
+    });
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+        .with_safe_default_protocol_versions()
+        .expect("ring supports the default TLS versions")
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
     config.resumption = rustls::client::Resumption::disabled();
-    Arc::new(config)
+    Tls { roots, provider, config: Arc::new(config), seen }
 }
 
 struct Verified {
@@ -158,45 +286,165 @@ fn verify_peer_policy(
     }
 }
 
-async fn verify(
-    target: Target,
-    server_name: ServerName<'static>,
-    tls: Arc<rustls::ClientConfig>,
-) -> Result<Verified, Error> {
-    let stream = match target.endpoint {
-        Endpoint::Direct(port) => TcpStream::connect((target.server_name.as_str(), port))
-            .await
-            .map_err(|_| Error::Tcp)?,
-        Endpoint::Forwarded(stream) => stream,
-    };
+enum Negotiated {
+    Upgraded(TokioFramed<TcpStream>, ClientConnector, SecurityProtocol),
+    NlaUnavailable,
+}
+
+async fn open_stream(endpoint: &mut Endpoint, host: &str) -> Result<TcpStream, Error> {
+    match endpoint {
+        Endpoint::Direct(port) => TcpStream::connect((host, *port)).await.map_err(|_| Error::Tcp),
+        Endpoint::Forwarded { stream, listen } => match stream.take() {
+            Some(stream) => Ok(stream),
+            // 같은 승인된 로컬 전달에 다시 연결해 TLS 전용 협상을 반복한다.
+            None => TcpStream::connect(*listen).await.map_err(|_| Error::Tcp),
+        },
+    }
+}
+
+async fn negotiate(target: &mut Target, credssp: bool) -> Result<Negotiated, Error> {
+    let stream = open_stream(&mut target.endpoint, &target.server_name).await?;
     let local = stream.local_addr().map_err(|_| Error::Tcp)?;
     stream.set_nodelay(true).map_err(|_| Error::Tcp)?;
     let mut framed = TokioFramed::new(stream);
-    let mut connector = ClientConnector::new(config(target.size), local);
-    while !connector.should_perform_security_upgrade() {
-        step(&mut framed, &mut connector, Error::Negotiation).await?;
-    }
-    let ClientConnectorState::EnhancedSecurityUpgrade {
-        selected_protocol: selected,
-    } = connector.state
-    else {
-        return Err(Error::Negotiation);
+    let mut connector = ClientConnector::new(config(target.size, !credssp), local);
+    // 연결 요청만 보내고, 선택된 프로토콜을 직접 읽어 TLS 전용 선택을 구분한다.
+    step(&mut framed, &mut connector, Error::Negotiation).await?;
+    let hint = connector.next_pdu_hint().ok_or(Error::Negotiation)?;
+    let pdu = read_bounded(&mut framed, hint, Error::Negotiation, None).await?;
+    let selected = match decode::<X224<ConnectionConfirm>>(&pdu).map_err(|_| Error::Negotiation)?.0 {
+        ConnectionConfirm::Response { protocol, .. } => protocol,
+        ConnectionConfirm::Failure { .. } => return Err(Error::Negotiation),
     };
-    if !matches!(selected, SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX) {
+    if credssp {
+        // xrdp는 HYBRID를 모르면 SSL이 아니라 RDP(표준 보안)를 고른다. NLA가 아닌 선택은
+        // 모두 NLA 미지원으로 보고, opt-in이면 SSL 요청으로 한 번만 다시 협상한다.
+        if !matches!(selected, SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX) {
+            return Ok(Negotiated::NlaUnavailable);
+        }
+    } else if selected != SecurityProtocol::SSL {
         return Err(Error::Negotiation);
     }
+    let mut output = WriteBuf::new();
+    connector.step(&pdu, &mut output).map_err(|_| Error::Negotiation)?;
+    if !output.filled().is_empty() {
+        framed.write_all(output.filled()).await.map_err(|_| Error::Negotiation)?;
+    }
+    Ok(Negotiated::Upgraded(framed, connector, selected))
+}
+
+fn failure_reason(error: &std::io::Error) -> &'static str {
+    use rustls::CertificateError;
+    let Some(rustls::Error::InvalidCertificate(certificate)) = error.get_ref().and_then(|error| error.downcast_ref::<rustls::Error>()) else {
+        return "체인 검증 실패";
+    };
+    match certificate {
+        CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. } => "이름 불일치",
+        CertificateError::Expired | CertificateError::ExpiredContext { .. } => "만료",
+        CertificateError::NotValidYet | CertificateError::NotValidYetContext { .. } => "유효 기간 전",
+        CertificateError::UnknownIssuer => "알 수 없는 CA",
+        _ => "체인 검증 실패",
+    }
+}
+
+fn describe(dns: &str, endpoint: &str, cert: &CertificateDer<'_>, fingerprint: &str, previous: Option<&str>, reason: &str) -> trust::Request {
+    use x509_cert::ext::pkix::{SubjectAltName, name::GeneralName};
+    let subject = Certificate::from_der(cert.as_ref())
+        .map(|cert| format!("{}", cert.tbs_certificate.subject))
+        .unwrap_or_else(|_| "알 수 없음".into());
+    let san = Certificate::from_der(cert.as_ref())
+        .ok()
+        .and_then(|cert| cert.tbs_certificate.get::<SubjectAltName>().ok().flatten())
+        .map(|(_, san)| {
+            san.0.iter().filter_map(|name| match name {
+                GeneralName::DnsName(name) => Some(name.to_string()),
+                _ => None,
+            }).collect::<Vec<_>>().join(", ")
+        })
+        .filter(|san| !san.is_empty())
+        .unwrap_or_else(|| "없음".into());
+    let text = if let Some(previous) = previous {
+        format!(
+            "RDP 서버 인증서가 바뀌었습니다\n\n원격 DNS: {dns}\n대상: {endpoint}\n주체: {subject}\nSAN: {san}\n사유: {reason}\n이전 SHA-256: {previous}\n새 SHA-256: {fingerprint}\n\n새 지문으로 교체하고 연결합니까?"
+        )
+    } else {
+        format!(
+            "RDP 서버 인증서를 신뢰합니까?\n\n원격 DNS: {dns}\n대상: {endpoint}\n주체: {subject}\nSAN: {san}\n사유: {reason}\nSHA-256: {fingerprint}\n\n이 지문을 저장하고 연결합니다."
+        )
+    };
+    trust::Request { text, changed: previous.is_some() }
+}
+
+async fn negotiate_rdp(target: &mut Target) -> Result<(TokioFramed<TcpStream>, ClientConnector, SecurityProtocol), Error> {
+    match negotiate(target, true).await? {
+        Negotiated::Upgraded(framed, connector, selected) => Ok((framed, connector, selected)),
+        Negotiated::NlaUnavailable => {
+            if !target.tls_only {
+                return Err(Error::TlsOnlyRequired);
+            }
+            match negotiate(target, false).await? {
+                Negotiated::Upgraded(framed, connector, selected) => Ok((framed, connector, selected)),
+                Negotiated::NlaUnavailable => Err(Error::Negotiation),
+            }
+        }
+    }
+}
+
+async fn verify<A, AFut>(
+    mut target: Target,
+    server_name: ServerName<'static>,
+    tls: Tls,
+    trust: trust::Trust<A>,
+) -> Result<Verified, Error>
+where
+    A: FnOnce(trust::Request) -> AFut,
+    AFut: Future<Output = Result<bool, Error>>,
+{
+    let name = server_name.to_str().into_owned();
+    let (framed, mut connector, mut selected) = tokio::time::timeout(super::CONNECT_TIMEOUT, negotiate_rdp(&mut target))
+        .await.map_err(|_| Error::Timeout)??;
     let (stream, leftover) = framed.into_inner();
     if !leftover.is_empty() {
         return Err(Error::Negotiation);
     }
-    let name = server_name.to_str().into_owned();
-    let stream = TlsConnector::from(tls)
-        .connect(server_name, stream)
-        .await
-        .map_err(|_| Error::TlsIdentity)?;
+    let stream = match tokio::time::timeout(super::CONNECT_TIMEOUT, tls.connector().connect(server_name.clone(), stream))
+        .await.map_err(|_| Error::Timeout)? {
+        Ok(stream) => {
+            let peer = stream.get_ref().1.peer_certificates().ok_or(Error::TlsIdentity)?;
+            verify_peer_policy(&name, peer)?;
+            stream
+        }
+        Err(error) => {
+            let cert = tls.seen().ok_or(Error::TlsIdentity)?;
+            let fingerprint = trust::fingerprint(cert.as_ref());
+            let stored = trust::load(&trust.path, &trust.dns, &trust.endpoint);
+            let known = stored.as_deref() == Some(fingerprint.as_str());
+            if !known {
+                let request = describe(&trust.dns, &trust.endpoint, &cert, &fingerprint, stored.as_deref(), failure_reason(&error));
+                if !(trust.approve)(request).await? {
+                    return Err(Error::TlsIdentity);
+                }
+                trust::save(&trust.path, &trust.dns, &trust.endpoint, &fingerprint)?;
+            }
+            // 같은 대상에 다시 협상한 뒤 저장된 지문으로만 TLS를 완료한다.
+            let (framed, next, next_selected) = tokio::time::timeout(super::CONNECT_TIMEOUT, negotiate_rdp(&mut target))
+                .await.map_err(|_| Error::Timeout)??;
+            connector = next;
+            selected = next_selected;
+            let (stream, leftover) = framed.into_inner();
+            if !leftover.is_empty() {
+                return Err(Error::Negotiation);
+            }
+            let stream = tokio::time::timeout(super::CONNECT_TIMEOUT, tls.pinned(&fingerprint).connect(server_name, stream))
+                .await.map_err(|_| Error::Timeout)?.map_err(|_| Error::TlsIdentity)?;
+            let peer = stream.get_ref().1.peer_certificates().ok_or(Error::TlsIdentity)?;
+            #[cfg(windows)]
+            windows_policy::verify_disallowed(peer)?;
+            stream
+        }
+    };
     let peer = stream.get_ref().1.peer_certificates().ok_or(Error::TlsIdentity)?;
     let cert = peer.first().ok_or(Error::TlsIdentity)?;
-    verify_peer_policy(&name, peer)?;
     let cert = Certificate::from_der(cert.as_ref()).map_err(|_| Error::TlsIdentity)?;
     let public_key = cert.tbs_certificate
         .subject_public_key_info
@@ -214,10 +462,11 @@ async fn verify(
     })
 }
 
-pub(super) async fn connect<F, Fut>(
+pub(super) async fn connect<F, Fut, A, AFut>(
     target: Target,
     name: ServerName<'static>,
-    tls: Arc<rustls::ClientConfig>,
+    tls: Tls,
+    trust: trust::Trust<A>,
     resolve: F,
     display: ironrdp::displaycontrol::client::DisplayControlClient,
     auth: AuthIo<'_>,
@@ -225,9 +474,11 @@ pub(super) async fn connect<F, Fut>(
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<Account, Error>>,
+    A: FnOnce(trust::Request) -> AFut,
+    AFut: Future<Output = Result<bool, Error>>,
 {
-    let mut verified = tokio::time::timeout(super::CONNECT_TIMEOUT, verify(target, name, tls))
-        .await.map_err(|_| Error::Timeout)??;
+    // 인증서 승인은 사용자 입력을 기다리므로 연결 타임아웃에 넣지 않는다.
+    let mut verified = verify(target, name, tls, trust).await?;
     let account = resolve().await?;
     tokio::time::timeout(super::CONNECT_TIMEOUT, verified.authenticate(account, &auth))
         .await.map_err(|_| Error::Timeout)??;
@@ -272,6 +523,17 @@ impl Verified {
                 .any(|field| field.len() > 1024 || field.contains('\0'))
         {
             return Err(Error::Credentials);
+        }
+        if !matches!(self.selected, SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX) {
+            // TLS 전용에는 CredSSP가 없으므로 계정은 검증된 TLS 위의 Client Info로 전달된다.
+            // 자동 로그온을 켜야 xrdp가 sesman 로그인 창 대신 세션을 시작한다.
+            self.connector.config.autologon = true;
+            self.connector.config.credentials = Credentials::UsernamePassword {
+                username: account.username,
+                password: std::mem::take(&mut *account.password),
+            };
+            self.connector.config.domain = account.domain;
+            return Ok(());
         }
         let (mut sequence, mut request) = CredsspSequence::init(
             Credentials::UsernamePassword {

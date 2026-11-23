@@ -17,17 +17,19 @@ pub(super) fn dns_name(name: &str) -> bool {
 
 pub(super) enum Endpoint {
     Direct(u16),
-    Forwarded(TcpStream),
+    /// 첫 소켓을 쓰고 나서도 `listen`으로 같은 로컬 전달에 다시 연결할 수 있다.
+    Forwarded { stream: Option<TcpStream>, listen: std::net::SocketAddr },
 }
 
-pub(super) fn direct(dns: String, port: u16, size: DesktopSize) -> Target {
-    Target { endpoint: Endpoint::Direct(port), server_name: dns, size }
+pub(super) fn direct(dns: String, port: u16, size: DesktopSize, tls_only: bool) -> Target {
+    Target { endpoint: Endpoint::Direct(port), server_name: dns, size, tls_only }
 }
 
-pub(super) fn forwarded(dns: String, destination: &Destination, size: DesktopSize, lease: &mut DesktopLease) -> Result<Target, Error> {
+pub(super) fn forwarded(dns: String, destination: &Destination, size: DesktopSize, lease: &mut DesktopLease, tls_only: bool) -> Result<Target, Error> {
     if lease.protocol() != Protocol::Rdp || lease.destination() != destination { return Err(Error::Tcp); }
     let stream = lease.take_stream().map_err(|_| Error::Transport)?;
     stream.set_nonblocking(true).map_err(|_| Error::Tcp)?;
     let stream = TcpStream::from_std(stream).map_err(|_| Error::Tcp)?;
-    Ok(Target { endpoint: Endpoint::Forwarded(stream), server_name: dns, size })
+    let listen = stream.peer_addr().map_err(|_| Error::Tcp)?;
+    Ok(Target { endpoint: Endpoint::Forwarded { stream: Some(stream), listen }, server_name: dns, size, tls_only })
 }

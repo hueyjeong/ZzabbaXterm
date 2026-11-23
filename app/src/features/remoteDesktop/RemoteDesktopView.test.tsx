@@ -193,3 +193,21 @@ it("비활성 탭은 포커스와 클립보드 버튼을 잠그고 활성 탭에
   expect(copy.disabled).toBe(true);
   expect(session.setActive).toHaveBeenLastCalledWith(false);
 });
+
+it("Shift keydown 없이 온 shiftKey=true를 실제 키보다 먼저 보낸다", () => {
+  const { session, emit } = fakeSession();
+  act(() => root.render(<RemoteDesktopView session={session} active label="원격 데스크톱" />));
+  act(() => emit(full(1)));
+  const canvas = host.querySelector("canvas")!;
+  canvas.focus();
+  const event = new KeyboardEvent("keydown", { bubbles: true, code: "KeyX", key: "X", shiftKey: true });
+  // jsdom의 공개 dispatchEvent는 isTrusted를 지우므로 구현을 직접 호출한다.
+  const impl = Object.getOwnPropertySymbols(event).find(symbol => symbol.description === "impl")!;
+  const state = Reflect.get(event, impl);
+  state.isTrusted = true;
+  Reflect.get(canvas, impl)._dispatch(state);
+  expect(session.send.mock.calls.map(([input]) => input.kind === "key" ? [input.code, input.down] : [input.kind, false])).toEqual([
+    ["ShiftLeft", true],
+    ["KeyX", true],
+  ]);
+});
