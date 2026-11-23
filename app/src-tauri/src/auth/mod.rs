@@ -27,6 +27,8 @@ pub use vault::Bitwarden;
 use crate::ssh::ConnectionPlan;
 
 const TTL: Duration = Duration::from_secs(30);
+// 승인 뒤 실제 askpass 교환은 금고 조회·OpenSSH 시작을 포함하므로 승인 창과 분리해 잰다.
+const EXCHANGE_TTL: Duration = Duration::from_secs(60);
 const ACK: u8 = 1;
 const MAX_PASSWORD: usize = 1022; // OpenSSH의 1024바이트 askpass 버퍼에서 개행과 NUL을 제외한다.
 const HELPER: &str = if cfg!(windows) {
@@ -148,7 +150,7 @@ impl Approval {
         helper: peer::TrustedFile,
     ) -> Result<(Box<dyn Child + Send + Sync>, Exchange), Error> {
         self.0.check(current, plan)?;
-        let Pending { plan, expires, .. } = self.0;
+        let Pending { plan, .. } = self.0;
         let invocation = plan.stored_ssh_invocation().map_err(|_| Error::InvalidApproval)?;
         let program = peer::TrustedFile::check(invocation.program, peer::SSH)?;
         let mut command = crate::ssh::terminal::command(invocation);
@@ -181,7 +183,7 @@ impl Approval {
             let _ = child.wait();
             return Err(Error::ChildUnavailable);
         };
-        let exchange = Exchange::start(expires, plan, move |plan, sent| async move {
+        let exchange = Exchange::start(Instant::now() + EXCHANGE_TTL, plan, move |plan, sent| async move {
             let item = &plan.stored().expect("stored SSH plan required").item;
             exchange(listener, root, program, helper, &vault, item, &sent).await
         });

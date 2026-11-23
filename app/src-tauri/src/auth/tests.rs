@@ -439,3 +439,23 @@ fn regular_path(path: &Path) -> PathBuf {
     }
     path.to_owned()
 }
+
+// 금고 오류 매핑은 실제 대화형 세션 없이 fixture 모드로 고정한다.
+#[tokio::test]
+async fn vault_reports_locked_and_missing_items_from_bw_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let bw = dir.path().join(if cfg!(windows) { "bw.exe" } else { "bw" });
+    compile_fixture(&bw);
+    let mode = dir.path().join("mode");
+    for (value, expected) in [
+        ("locked", Error::VaultLocked),
+        ("missing", Error::ItemMissing),
+    ] {
+        fs::write(&mode, value).unwrap();
+        let vault = Bitwarden::fixture(
+            peer::TrustedFile::fixture(&bw),
+            Zeroizing::new("isolated-fixture-session".into()),
+        );
+        assert_eq!(vault.password(ITEM).await, Err(expected), "{value}");
+    }
+}
