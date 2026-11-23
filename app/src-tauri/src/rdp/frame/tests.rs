@@ -202,3 +202,20 @@ fn clipboard_fragments_cannot_exceed_the_declared_and_bounded_message() {
         .check(&data(4, Flags::FLAG_LAST, &[3, 4]), 1024)
         .unwrap();
 }
+
+#[test]
+fn xrdp_compressed_bitmap_may_round_the_source_width_up() {
+    let image = DecodedImage::new(PixelFormat::RgbA32, 1024, 768);
+    let bitmap = BitmapUpdateData {
+        rectangles: vec![BitmapData {
+            rectangle: InclusiveRectangle { left: 367, top: 389, right: 373, bottom: 403 },
+            width: 8,
+            height: 15,
+            bits_per_pixel: 32,
+            compression_flags: Compression::BITMAP_COMPRESSION | Compression::NO_BITMAP_COMPRESSION_HDR,
+            compressed_data_header: None,
+            bitmap_data: &[0; 193],
+        }],
+    };
+    assert_eq!(super::check_bitmaps(bitmap, &image), Ok(true));
+}

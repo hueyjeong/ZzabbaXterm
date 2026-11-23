@@ -4,6 +4,7 @@ mod frame;
 pub(crate) mod ipc;
 mod native;
 pub(crate) mod route;
+mod trust;
 
 use std::{
     collections::VecDeque,
@@ -163,15 +164,18 @@ impl Session {
     /// Resolve the NLA account only after TLS verifies the remote DNS identity.
     /// A successful return starts event delivery; the first Frame is the display-ready signal.
     /// `approved_roots` adds Rust-approved DER CAs to the platform roots, never WebView input.
-    async fn open<F, Fut>(
+    async fn open<F, Fut, A, AFut>(
         target: Target,
         approved_roots: rustls::RootCertStore,
+        trust: trust::Trust<A>,
         resolve: F,
         auth: ipc::AuthIo<'_>,
     ) -> Result<Self, Error>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Account, Error>>,
+        A: FnOnce(String) -> AFut,
+        AFut: Future<Output = Result<bool, Error>>,
     {
         frame::frame_len(target.size.width, target.size.height)?;
         if !route::dns_name(&target.server_name) {
@@ -181,13 +185,14 @@ impl Session {
             .map_err(|_| Error::InvalidServerName)?;
         let permit = SLOTS.try_acquire().map_err(|_| Error::Busy)?;
         let roots = connect::trusted_roots(approved_roots)?;
-        Self::open_with_tls(target, name, connect::tls_config(roots), resolve, permit, auth).await
+        Self::open_with_tls(target, name, connect::tls_config(roots), trust, resolve, permit, auth).await
     }
 
-    async fn open_with_tls<F, Fut>(
+    async fn open_with_tls<F, Fut, A, AFut>(
         target: Target,
         name: ServerName<'static>,
-        tls: Arc<rustls::ClientConfig>,
+        tls: connect::Tls,
+        trust: trust::Trust<A>,
         resolve: F,
         permit: tokio::sync::SemaphorePermit<'static>,
         auth: ipc::AuthIo<'_>,
@@ -195,6 +200,8 @@ impl Session {
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Account, Error>>,
+        A: FnOnce(String) -> AFut,
+        AFut: Future<Output = Result<bool, Error>>,
     {
         let area = Arc::new(AtomicU64::new(0));
         let display = DisplayControlClient::new({
@@ -204,7 +211,7 @@ impl Session {
                 Ok(Vec::new())
             }
         });
-        let (result, mut transport) = connect::connect(target, name, tls, resolve, display, auth).await?;
+        let (result, mut transport) = connect::connect(target, name, tls, trust, resolve, display, auth).await?;
         let id = SessionId(
             NEXT_ID
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))

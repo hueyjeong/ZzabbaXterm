@@ -99,6 +99,15 @@ fn credssp_does_not_resume_write_or_flush_after_revocation() {
 
 const REMOTE: &str = "rdp.example.test";
 
+fn no_trust() -> trust::Trust<impl FnOnce(String) -> std::future::Ready<Result<bool, Error>>> {
+    trust::Trust {
+        path: std::path::PathBuf::new(),
+        dns: "fixture".into(),
+        endpoint: "fixture".into(),
+        approve: |_| std::future::ready(Ok(false)),
+    }
+}
+
 fn root() -> CertifiedIssuer<'static, KeyPair> {
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -205,6 +214,7 @@ async fn exercise(
         target,
         name,
         tls_config(roots),
+        no_trust(),
         || async {
             calls.fetch_add(1, Ordering::Relaxed);
             Ok(Account {
@@ -430,6 +440,7 @@ async fn tls_only_retries_once_and_activates_with_client_info_credentials() {
             fixture_target(&listener, size, true, REMOTE).await,
             REMOTE.try_into().unwrap(),
             tls_config(roots),
+            no_trust(),
             || async {
                 Ok(Account {
                     username: "fixture".into(),
@@ -485,6 +496,7 @@ async fn tls_only_stops_before_credentials_when_the_certificate_name_differs() {
         fixture_target(&listener, size, true, "wrong.example.test").await,
         "wrong.example.test".try_into().unwrap(),
         tls_config(roots),
+        no_trust(),
         || async {
             calls.fetch_add(1, Ordering::Relaxed);
             Ok(Account {
@@ -699,7 +711,8 @@ async fn activates_and_delivers_pixels_and_key_input_only_for_the_authenticated_
             let mut session = TEST_PEER_POLICY.scope(fixture_policy, Session::open_with_tls(
                 fixture_target(&listener, size, false, REMOTE).await,
                 REMOTE.try_into().unwrap(),
-                Arc::clone(&tls),
+                tls.clone(),
+                no_trust(),
                 || async {
                     Ok(Account {
                         username: "fixture".into(),
@@ -772,4 +785,72 @@ async fn activates_and_delivers_pixels_and_key_input_only_for_the_authenticated_
             assert!(!server_activated);
         }
     }
+}
+
+
+#[tokio::test]
+async fn unknown_certificate_requires_one_time_approval_and_is_pinned() {
+    let listener = listener();
+    let ca = root();
+    let unknown = root();
+    let key = KeyPair::generate().unwrap();
+    let cert = CertificateParams::new(vec![REMOTE.to_owned()]).unwrap().signed_by(&key, &ca).unwrap();
+    let tls_server = tls_server(key, cert.der().clone());
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(unknown.der().clone()).unwrap();
+    let fingerprint = trust::fingerprint(cert.der());
+    let approval_path = std::env::temp_dir().join(format!("zzabba-rdp-pin-{}", std::process::id()));
+    let _ = std::fs::remove_file(&approval_path);
+
+    let server = async {
+        for _ in 0..2 {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut framed = TokioFramed::new(socket);
+            let (_, bytes) = framed.read_pdu().await.unwrap();
+            assert_eq!(decode::<X224<ConnectionRequest>>(&bytes).unwrap().0.protocol,
+                SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX);
+            framed.write_all(&encode_vec(&X224(ConnectionConfirm::Response {
+                flags: ResponseFlags::empty(), protocol: SecurityProtocol::HYBRID,
+            })).unwrap()).await.unwrap();
+            let (mut socket, leftover) = framed.into_inner();
+            assert!(leftover.is_empty());
+            let Ok(mut tls) = TlsAcceptor::from(tls_server.clone()).accept(socket).await else { continue; };
+            let mut first = [0u8; 1];
+            if tls.read_exact(&mut first).await.is_err() { continue; }
+        }
+    };
+    let calls = AtomicUsize::new(0);
+    let approvals = Arc::new(AtomicUsize::new(0));
+    let approve = Arc::clone(&approvals);
+    let path = approval_path.clone();
+    let slot = Slot::new(1);
+    let size = DesktopSize { width: 800, height: 600 };
+    let client = connect(
+        fixture_target(&listener, size, false, REMOTE).await,
+        REMOTE.try_into().unwrap(),
+        tls_config(roots),
+        trust::Trust {
+            path: path.clone(),
+            dns: REMOTE.into(),
+            endpoint: "fixture".into(),
+            approve: move |_| {
+                approve.fetch_add(1, Ordering::Relaxed);
+                std::future::ready(Ok(true))
+            },
+        },
+        || async {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok(Account { username: "fixture".into(), domain: None,
+                password: zeroize::Zeroizing::new("fixture-only".into()) })
+        },
+        ironrdp::displaycontrol::client::DisplayControlClient::new(|_| Ok(Vec::new())),
+        AuthIo::new(&slot, None),
+    );
+    let client = TEST_PEER_POLICY.scope(fixture_policy, client);
+    let (result, ()) = timeout(Duration::from_secs(5), async { tokio::join!(client, server) }).await.unwrap();
+    assert!(matches!(result, Err(Error::Authentication | Error::Transport)));
+    assert_eq!(calls.load(Ordering::Relaxed), 1, "승인 뒤에만 자격 증명을 조회한다");
+    assert_eq!(approvals.load(Ordering::Relaxed), 1);
+    assert_eq!(trust::load(&path, REMOTE, "fixture").as_deref(), Some(fingerprint.as_str()));
+    let _ = std::fs::remove_file(path);
 }

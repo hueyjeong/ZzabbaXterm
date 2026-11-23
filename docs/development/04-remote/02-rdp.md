@@ -32,10 +32,18 @@
 5. **자동 검증.** `cargo test --manifest-path src-tauri/Cargo.toml rdp`와 `npx vitest run src/features/rdp`에서 신원·프레임·입력 경계를 검증한다. 조작한 인증서로도 첫 인증 단계에 진입하면 수정 후 재시험한다.
 6. **실기기 시연(T5 RDP).** 각 클라이언트에서 `Windows RDP 직접`, `Linux xrdp 직접`, `Linux xrdp / SSM`을 별도 행으로 기록한다. 첫 프레임 → 키·클릭 → 서로 다른 무해한 문자열의 양방향 복사 → 서버 해상도 변경 전후 → 끊기·재접속 후 새 문자열 입력을 촬영한다. SSM을 끊는 동안 별도 탭의 입력도 기록한다. OS·서버·IronRDP 버전과 협상 채널을 붙인다. 서버 정책/협상과 기준 클라이언트에서 모두 막힌 기능만 해당 행의 `서버 미지원(근거)`이다. 앱에서만 실패하면 `실패(단계)`, 시험 환경이 없으면 `미실행(사유)`이다. 계정 비밀과 클립보드 원문은 로그에 넣지 않는다.
 
+## 인증서 신뢰와 지문 고정
+
+- **판정 순서**: 서버 인증서가 OS/CA 체인으로 검증되고 원격 DNS 이름이 맞으면 승인 창 없이 진행한다. 체인 검증이 실패하면(자체 서명 xrdp 등) 네이티브 승인 창에 원격 DNS, 대상 `host:port`, 주체, SAN, SHA-256 지문을 보여 주고 1회 승인을 받는다.
+- **저장**: 승인한 지문은 `${appData}/rdp-trust.json`에 `(원격 DNS, 대상 host:port) → { fingerprint, approved_at }`으로 원자적 쓰기한다. 손상된 JSON은 빈 상태로 시작하며 조용히 신뢰하지 않는다.
+- **변경**: 지문이 저장값과 다르면 연결을 중단하고 새 지문으로 다시 승인을 요구한다. 승인 전에는 자격 증명을 보내지 않는다. 자동 갱신은 없다.
+- **범위**: TLS 전용(opt-in)과 NLA 경로 모두 같은 규칙을 쓴다. 인증서 검증을 끄는 옵션은 없다. 2026-11-23 실측 시점에 이 Windows 사용자 신뢰 저장소에는 시험 CA가 남아 있지 않다(`certutil -user -store Root`에서 0건).
+
 ## 실측 기록
 
 - xrdp 0.9.24(Ubuntu 24.04 패키지, `security_layer=negotiate`)는 `HYBRID|HYBRID_EX`만 요청하면 `RDP_NEG_RSP selectedProtocol = 0x0`(RDP 표준 보안)을 돌려주고, `SSL`을 요청하면 `0x1`(TLS 전용)을 돌려준다. 즉 NLA를 모르는 서버는 SSL로 다운그레이드하지 않고 RDP 표준 보안을 고른다. 앱은 NLA가 아닌 선택을 모두 NLA 미지원으로 보고 opt-in이 켜진 경우에만 `SSL` 요청으로 한 번 재협상한다.
 - 시험 컨테이너 `zzabba-demo-remote`(xrdp 0.9.24, SSH `127.0.0.1:2299`)에 `SAN=DNS:xrdp.demo.test,DNS:localhost`인 시험 CA 서명 인증서를 설치하고, 그 CA를 Windows 현재 사용자 신뢰 저장소에 넣은 뒤 `localhost:13389`(SSH 로컬 전달 → 컨테이너 `127.0.0.1:3389`)로 앱에서 연결했다. 승인 카드와 연결 상태에 `NLA, 미지원 시 TLS 전용(표준 RDP 보안 없음)`이 표시됐고, xrdp 로그에 `requested [HYBRID|HYBRID_EX|RDP], selected [RDP]` 뒤 `requested [SSL|RDP], selected [SSL]`, `TLSv1.3`, Client Info 수신과 capability 교환이 기록됐다. 인증서 이름 불일치는 자격 증명 입력 전에 중단된다.
-- 위 실측에서 앱은 Confirm Active 직후 첫 화면 PDU를 `RDP 화면 또는 입력 범위가 올바르지 않습니다`(`Error::Bounds`)로 거부하고 연결을 닫았다. TLS 전용 협상·TLS 1.3·Client Info 자격 증명·capability 교환까지는 도달했으나 원격 화면과 키 입력은 확인하지 못했다. 같은 엔진의 NLA 경로도 xrdp에서는 이전에 시험된 적이 없으므로, 첫 fast-path 화면 PDU의 사각형/비트맵 폭 검사와 xrdp 출력의 차이를 별도 결함으로 다뤄야 한다. 실제 원격 화면·입력 인수는 이 수정 뒤 다시 기록한다.
+- 위 실측에서 첫 화면 PDU가 `Error::Bounds`로 거부됐다. 원인은 RLE 압축 비트맵에서 xrdp가 원본 폭을 4의 배수로 올려 보내는 경우다(예: 목적지 rect 7px, `width=8`). `frame::check_bitmaps`가 압축 비트맵에도 `width == rect width`를 요구해 거부했고, IronRDP는 목적지 폭으로 행을 적용하므로 압축일 때는 이 등식 검사를 제거했다. 회귀 시험 `xrdp_compressed_bitmap_may_round_the_source_width_up`를 추가했다.
+- 수정 후 `zzabba-demo-remote` xrdp에 앱으로 연결해 **원격 화면 1024×768이 표시되고 상태줄이 `TLS 전용(표준 RDP 보안 없음)`으로 바뀌는 것**을 확인했다. 스크린샷: 승인 카드·지문 창 `C:\Users\deus\AppData\Local\Temp\omp-computer-15d8fd19b2c79de1.png`, 원격 화면 `C:\Users\deus\AppData\Local\Temp\omp-computer-15d90037b5879de5.png`. 키 입력 인수는 xrdp 세션의 xterm이 화면에 나타나지 않아 이번 실행에서 확인하지 못했다(원격 X 세션의 창 표시 문제로 분리).
 - 확인 방법: 컨테이너의 `127.0.0.1:3389`에 X.224 `Connection Request` + `RDP_NEG_REQ`(`requestedProtocols`를 0x0b, 0x0a, 0x08, 0x02, 0x01로 각각)를 보내고 응답의 `selectedProtocol`을 읽는다. 0x0b·0x01은 0x1, 0x0a·0x08·0x02는 0x0이었다.
 - 자동 시험: `cargo test rdp::connect::tests`의 `tls_only_retries_once_and_activates_with_client_info_credentials`, `tls_only_stops_before_credentials_when_the_certificate_name_differs`, `rejects_non_nla_selection_without_opt_in_and_legacy_modes_without_resolving_credentials`가 협상 매트릭스·자격 증명·인증서 중단을 고정한다. `cargo test rdp::ipc::tests`와 Vitest `src/features/rdp`가 승인 문구·opt-in 전달·표시를 확인한다.

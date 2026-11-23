@@ -310,12 +310,11 @@ fn check_bitmaps(bitmap: BitmapUpdateData<'_>, image: &DecodedImage) -> Result<b
         frame_len(width, height)?;
         let row = row_bytes(width, bits_per_pixel)?;
         let draw_row = row_bytes(rect.right - rect.left + 1, bits_per_pixel)?;
-        if compression_flags.contains(Compression::BITMAP_COMPRESSION) {
-            // IronRDP decodes bitmap source dimensions but applies rows using the destination width.
-            if row != draw_row {
-                return Err(Error::Bounds);
-            }
-        } else if bitmap_data.len() != ((row + 3) & !3) * usize::from(height) || row != draw_row {
+        // xrdp rounds a compressed source width up to a multiple of 4 (예: 7px rect, width 8)
+        // while IronRDP applies rows at the destination width. Only uncompressed rows must match.
+        if !compression_flags.contains(Compression::BITMAP_COMPRESSION)
+            && (bitmap_data.len() != ((row + 3) & !3) * usize::from(height) || row != draw_row)
+        {
             return Err(Error::Bounds);
         }
     }

@@ -379,8 +379,9 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
     let _prompt_lifetime = prompt.clone().drop_guard();
     let dns = draft.host.to_ascii_lowercase();
     let description = draft.approval_text(&dns).map_err(message)?;
+    let trust_path = window.path().app_config_dir().map_err(|error| error.to_string())?.join("rdp-trust.json");
     let size = DesktopSize { width: 1024, height: 768 };
-    let (target, loss, target_name) = if let Some(source) = draft.source {
+    let (target, loss, target_name, endpoint) = if let Some(source) = draft.source {
         let directory = window.path().app_config_dir().map_err(|error| error.to_string())?;
         let load_directory = directory.clone();
         let target_id = source.target_id.clone();
@@ -407,12 +408,14 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
         let lease = lease.insert(issued);
         if life.is_cancelled() { return Err(CLOSED.into()); }
         let loss = lease.loss();
-        let target = route::forwarded(dns, &approved_destination, size, lease, draft.tls_only).map_err(message)?;
-        (target, Some(loss), target_name)
+        let target = route::forwarded(dns.clone(), &approved_destination, size, lease, draft.tls_only).map_err(message)?;
+        let endpoint = format!("{}:{}", approved_destination.host, approved_destination.port);
+        (target, Some(loss), target_name, endpoint)
     } else {
         native::confirm(window.clone(), description, prompt.clone(), approval.clone()).await.map_err(message)?;
         let target_name = format!("{dns}:{}", draft.port);
-        (route::direct(dns, draft.port, size, draft.tls_only), None, target_name)
+        let endpoint = target_name.clone();
+        (route::direct(dns.clone(), draft.port, size, draft.tls_only), None, target_name, endpoint)
     };
     let stopped = async {
         tokio::select! { biased;
@@ -421,12 +424,28 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
         }
     };
     tokio::pin!(stopped);
+    let trust = super::trust::Trust {
+        path: trust_path,
+        dns: dns.clone(),
+        endpoint,
+        approve: {
+            let window = window.clone();
+            let live = prompt.clone();
+            let approval = approval.clone();
+            move |text| {
+                let window = window.clone();
+                let live = live.clone();
+                let approval = approval.clone();
+                async move { native::trust(window, text, live, approval).await }
+            }
+        },
+    };
     let mut session = tokio::select! { biased;
         error = &mut stopped => {
             prompt.cancel();
             return Err(message(error).into());
         },
-        session = Session::open(target, tokio_rustls::rustls::RootCertStore::empty(),
+        session = Session::open(target, tokio_rustls::rustls::RootCertStore::empty(), trust,
             || native::account(window.clone(), target_name, prompt.clone(), approval.clone()), AuthIo::new(slot, lease.as_ref())) => session.map_err(message)?,
     };
     drop(approval);

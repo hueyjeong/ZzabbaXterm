@@ -9,6 +9,10 @@ pub(super) async fn confirm(window: WebviewWindow, description: String, live: Ca
     if approved { Ok(()) } else { Err(Error::Closed) }
 }
 
+pub(super) async fn trust(window: WebviewWindow, description: String, live: CancellationToken, approval: Arc<()>) -> Result<bool, Error> {
+    dialog(window, live, approval, move |window| confirm_native(&window, &description)).await
+}
+
 pub(super) async fn account(window: WebviewWindow, target: String, live: CancellationToken, approval: Arc<()>) -> Result<Account, Error> {
     dialog(window, live, approval, move |window| account_native(&window, &target)).await?.ok_or(Error::Credentials)
 }
