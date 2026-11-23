@@ -682,11 +682,12 @@ impl Session {
                 }
             };
             let bytes = &buffer[..count];
+            if let Some(output) = &mut diagnostic { output.record(bytes); }
             if let Some(filter) = &mut startup {
                 filter.filter(bytes, |part| self.send_output(part, send));
-                if !filter.pending() { startup = None; }
+                // 시작 서명이 다시 보이면 다른 세션이 로그인을 가로챈 것으로 보고 세션을 끝낸다.
+                if filter.hijacked() { return Err("원격 편집 시작 서명이 다시 관측되었습니다".into()); }
             } else {
-                if let Some(output) = &mut diagnostic { output.record(bytes); }
                 self.send_output(bytes, send);
             }
         }

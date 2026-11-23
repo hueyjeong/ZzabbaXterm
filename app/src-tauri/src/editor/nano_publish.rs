@@ -31,11 +31,9 @@ pub(super) enum Error {
 impl From<io::Error> for Error {
     fn from(error: io::Error) -> Self {
         match error.kind() {
-            io::ErrorKind::AlreadyExists
-            | io::ErrorKind::NotFound
-            | io::ErrorKind::NotADirectory
-            | io::ErrorKind::Unsupported
-            | io::ErrorKind::PermissionDenied => Self::Conflict,
+            // 이름이 이미 생긴 경우만 충돌이다. 권한·미지원·사라진 경로는
+            // 다시 불러오기로 풀리지 않으므로 충돌 대화상자로 반복시키지 않는다.
+            io::ErrorKind::AlreadyExists => Self::Conflict,
             _ => Self::Io(error),
         }
     }
@@ -159,6 +157,11 @@ impl GuardedFile {
 
     pub(super) fn recovery_name(&self, path: &Path) -> Option<String> {
         Some(format!("{}/original", self.check_recovery(path)?))
+    }
+
+    // 결과를 확정하지 못한 파일은 비교·재로드가 성립하지 않는다.
+    pub(super) fn unresolved(&self) -> bool {
+        self.unknown.is_some()
     }
 
     fn check_recovery<'a>(&self, path: &'a Path) -> Option<&'a str> {

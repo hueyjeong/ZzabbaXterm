@@ -6,7 +6,7 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::editor::{
-    nano_bridge::{self, BridgeRequest, PUBLICATION_IO_LIMIT, PublicationReply, PublicationWork, PublishError},
+    nano_bridge::{self, BridgeRequest, PUBLICATION_IO_LIMIT, PublicationOperation, PublicationReply, PublicationWork, PublishError, transfer_allowance},
     nano_wire::{CHALLENGE_LEN, Lease, MAX_PAYLOAD, NO_PROOF, PROOF_LEN, PTY_FRAME_LEN, PTY_PREFIX, Ready, Response, STARTUP_LIMIT, decode_len,
         publication::{ActiveOpen, MAX_OPEN_PAYLOAD, OperationKind, Outcome, PeerFrame, decode_peer_prefix}},
 };
@@ -115,14 +115,19 @@ pub(crate) struct Startup {
     proof: Option<oneshot::Sender<Zeroizing<[u8; PROOF_LEN]>>>,
     remaining: usize,
     active: bool,
+    armed: bool,
+    hijacked: bool,
 }
 
 impl Startup {
     fn new(proof: oneshot::Sender<Zeroizing<[u8; PROOF_LEN]>>) -> Self {
-        Self { pending: Zeroizing::new([0; PTY_FRAME_LEN]), len: 0, proof: Some(proof), remaining: PTY_STARTUP_BYTES, active: true }
+        Self { pending: Zeroizing::new([0; PTY_FRAME_LEN]), len: 0, proof: Some(proof), remaining: PTY_STARTUP_BYTES, active: true, armed: true, hijacked: false }
     }
 
     pub(crate) fn pending(&self) -> bool { self.active }
+
+    // 세션 동안 두 번째 시작 서명이 나타나면 다른 세션이 로그인을 가로챈 것이다.
+    pub(crate) fn hijacked(&self) -> bool { self.hijacked }
 
     // 예약된 시작 프레임 한 건만 소비하고 나머지 바이트는 그대로 전달한다.
     pub(crate) fn filter(&mut self, input: &[u8], mut emit: impl FnMut(&[u8])) {
@@ -130,7 +135,7 @@ impl Startup {
         let mut offset = 0;
         while offset < input.len() && self.pending() {
             // 64 KiB 뒤에는 권한만 철회한다. 지연된 시작 응답은 처음 한 건까지 숨긴다.
-            if self.remaining == 0 && self.len < PTY_PREFIX.len() { self.proof.take(); }
+            if self.remaining == 0 && self.len < PTY_PREFIX.len() && self.armed { self.proof.take(); }
             self.remaining = self.remaining.saturating_sub(1);
             let byte = input[offset];
             if self.len < PTY_PREFIX.len() {
@@ -157,10 +162,17 @@ impl Startup {
                 offset += 1;
                 run = offset;
                 if end {
-                    if let Some(tx) = self.proof.take() {
-                        let _ = tx.send(self.decode());
+                    if self.armed {
+                        if let Some(tx) = self.proof.take() {
+                            let _ = tx.send(self.decode());
+                        }
+                        self.armed = false;
+                        self.remaining = 0;
+                    } else {
+                        // 두 번째 서명은 화면에 남기지 않고 세션 종료 근거로만 쓴다.
+                        self.hijacked = true;
+                        self.active = false;
                     }
-                    self.active = false;
                     self.len = 0;
                     self.pending.zeroize();
                 }
@@ -366,7 +378,11 @@ async fn transport(
                         let op = active.last_op.checked_add(1).ok_or(io::ErrorKind::InvalidData)?;
                         let frame = work.operation.encode(active.id, op)?;
                         let total = frame.header.len() + frame.fragment.len();
-                        let expires = Instant::now() + limit;
+                        let body = match &work.operation {
+                            PublicationOperation::Save { text, .. } => text.len() as u64,
+                            _ => 0,
+                        };
+                        let expires = Instant::now() + limit + transfer_allowance(body);
                         let deadline = sleep_until(expires);
                         tokio::pin!(deadline);
                         loop {
@@ -494,13 +510,13 @@ mod startup_tests {
     }
 
     #[test]
-    fn startup_hides_only_the_first_frame_across_every_read_split() {
+    fn startup_hides_the_first_frame_and_ends_the_session_on_a_second_one() {
         let proof = [0x5a; PROOF_LEN];
         let frame = startup_frame(proof);
         let before = "한글\x1b[6n\x1b]0;제목\x07\x1b".as_bytes();
         let after = "입력\r\n".as_bytes();
         let input = [before, frame.as_slice(), after, frame.as_slice()].concat();
-        let expected = [before, after, frame.as_slice()].concat();
+        let expected = [before, after].concat();
         for split in 0..=input.len() {
             let (tx, mut rx) = oneshot::channel();
             let mut startup = Startup::new(tx);
@@ -510,8 +526,23 @@ mod startup_tests {
             }
             assert_eq!(output, expected);
             assert_eq!(*rx.try_recv().unwrap(), proof);
+            assert!(startup.hijacked());
             assert!(!startup.pending());
         }
+    }
+
+    #[test]
+    fn startup_keeps_passing_output_after_the_first_frame() {
+        let (tx, mut rx) = oneshot::channel();
+        let mut startup = Startup::new(tx);
+        let mut output = Vec::new();
+        startup.filter(&startup_frame([3; PROOF_LEN]), |part| output.extend_from_slice(part));
+        assert!(output.is_empty());
+        assert!(startup.pending());
+        startup.filter(b"$ ls\r\n", |part| output.extend_from_slice(part));
+        assert_eq!(output, b"$ ls\r\n");
+        assert!(!startup.hijacked());
+        assert_eq!(*rx.try_recv().unwrap(), [3; PROOF_LEN]);
     }
 
     #[test]
@@ -531,7 +562,7 @@ mod startup_tests {
         output.clear();
         startup.filter(&input, |part| output.extend_from_slice(part));
         assert_eq!(output, &input[..PTY_STARTUP_BYTES]);
-        assert!(!startup.pending());
+        assert!(startup.pending());
         assert!(rx.try_recv().is_err());
     }
 }

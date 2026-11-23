@@ -10,7 +10,9 @@ const VERSION: u8 = 3;
 const MAX_PATH: usize = 4096;
 const CANCEL: u8 = 3;
 pub(crate) const MAX_PAYLOAD: usize = 2 + 8 + MAX_PATH;
-pub(crate) const STARTUP_LIMIT: std::time::Duration = std::time::Duration::from_secs(12);
+// 앱의 기한은 PTY를 띄운 뒤부터 세고, helper의 기한은 Ready를 보낸 뒤부터 센다.
+// 그 사이에 Agent 승인 같은 대화형 인증이 끼면 helper가 먼저 포기해 연동이 조용히 꺼진다.
+pub(crate) const STARTUP_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 pub(crate) const REGISTER: [u8; 2] = [VERSION, 8];
 pub(crate) const ADMITTED: [u8; 2] = [VERSION, 9];
 pub(crate) const ADMIT_NANO: [u8; 2] = [VERSION, 12];

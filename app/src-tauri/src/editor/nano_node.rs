@@ -22,7 +22,8 @@ const ORIGINAL_NANO: &str = "/usr/bin/nano";
 const DIRECTORY_PREFIX: &str = "zzabba-editor-";
 const SOCKET_NAME: &str = "session.sock";
 const IO: Duration = Duration::from_secs(2);
-const CANCEL: Duration = Duration::from_secs(5);
+// 앱은 게시 요청(10초)과 SFTP 재검증(10초)을 마친 뒤에야 취소 응답을 정리한다.
+const CANCEL: Duration = Duration::from_secs(30);
 static STOPPING: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn stop(_: libc::c_int) {
@@ -274,21 +275,45 @@ fn connected(login: &Login, peer: &(UnixStream, Peer), input: RawFd, output: Raw
         && !STOPPING.load(Ordering::Relaxed)
 }
 
-struct DeadlineReader<'a, T>(&'a mut T, Instant);
+// 한 프레임 전체에 고정 기한을 걸면 느린 회선의 큰 저장이 중간에 끊긴다.
+// 수신이 이어지는 동안에는 기한을 연장하고, 취소 대기 같은 상한만 지킨다.
+struct IdleReader<'a, T> {
+    stream: &'a mut T,
+    idle: Duration,
+    deadline: Instant,
+    hard: Option<Instant>,
+}
 
-impl<T: Read + AsRawFd> Read for DeadlineReader<'_, T> {
+impl<'a, T: Read + AsRawFd> IdleReader<'a, T> {
+    fn new(stream: &'a mut T, idle: Duration, hard: Option<Instant>) -> Self {
+        Self { stream, idle, deadline: Instant::now() + idle, hard }
+    }
+}
+
+impl<T: Read + AsRawFd> Read for IdleReader<'_, T> {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        if !bytes.is_empty() {
-            read_exact(self.0, bytes, Some(self.1)).map_err(|error| {
-                // Read::read_exact retries Interrupted; STOPPING must abort instead.
-                if error.kind() == io::ErrorKind::Interrupted {
-                    io::ErrorKind::ConnectionAborted.into()
-                } else {
-                    error
+        if bytes.is_empty() { return Ok(0); }
+        loop {
+            let limit = self.hard.map_or(self.deadline, |hard| self.deadline.min(hard));
+            match poll(&mut [pollfd(self.stream.as_raw_fd(), libc::POLLIN)], Some(limit)) {
+                Ok(()) => {}
+                // Read::read_exact가 Interrupted를 재시도하므로 STOPPING은 다른 오류로 돌린다.
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    return Err(io::ErrorKind::ConnectionAborted.into());
                 }
-            })?;
+                Err(_) => return Err(io::ErrorKind::TimedOut.into()),
+            }
+            match self.stream.read(bytes) {
+                Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                // 받은 바이트가 있으면 기한을 연장한다. 취소 상한은 다음 수신에서만 적용한다.
+                Ok(n) => {
+                    self.deadline = Instant::now() + self.idle;
+                    return Ok(n);
+                }
+                Err(error) if matches!(error.kind(), io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock) => {}
+                Err(error) => return Err(error),
+            }
         }
-        Ok(bytes.len())
     }
 }
 
@@ -297,8 +322,8 @@ enum RemoteFrame {
     Operation(u64, Operation),
 }
 
-fn remote_frame(input: &mut (impl Read + AsRawFd), id: u64, ids: &mut OpIds, deadline: Instant) -> io::Result<RemoteFrame> {
-    let mut reader = DeadlineReader(input, deadline);
+fn remote_frame(input: &mut (impl Read + AsRawFd), id: u64, ids: &mut OpIds, hard: Option<Instant>) -> io::Result<RemoteFrame> {
+    let mut reader = IdleReader::new(input, PUBLICATION_IO_LIMIT, hard);
     let mut prefix = [0; 6];
     reader.read_exact(&mut prefix)?;
     if is_operation_kind(prefix[5]) {
@@ -358,7 +383,6 @@ fn relay(listener: UnixListener, mut input: impl Read + AsRawFd, mut output: imp
             return Err(io::ErrorKind::NotConnected.into());
         }
         if fds[0].revents != 0 {
-            let deadline = Instant::now() + PUBLICATION_IO_LIMIT;
             let current = active.as_mut().ok_or_else(|| {
                 if fds[0].revents & libc::POLLHUP != 0 {
                     io::Error::from(io::ErrorKind::UnexpectedEof)
@@ -366,8 +390,7 @@ fn relay(listener: UnixListener, mut input: impl Read + AsRawFd, mut output: imp
                     invalid()
                 }
             })?;
-            let deadline = current.cancel_deadline.map_or(deadline, |end| end.min(deadline));
-            match remote_frame(&mut input, current.id, &mut current.ops, deadline)? {
+            match remote_frame(&mut input, current.id, &mut current.ops, current.cancel_deadline)? {
                 RemoteFrame::Close(response) => {
                     let current = active.take().ok_or_else(invalid)?;
                     if let Some((mut peer, _)) = current.peer {
@@ -386,7 +409,15 @@ fn relay(listener: UnixListener, mut input: impl Read + AsRawFd, mut output: imp
                         connected(&login, peer, input.as_raw_fd(), output.as_raw_fd())
                     });
                     let outcome = operate(&mut current.file, operation, still_connected);
+                    // 결과를 확정할 수 없는 파일은 다시 읽어도 풀리지 않는다. 앱이 같은
+                    // 실패를 반복하지 않도록 이 연동을 취소하고 복구 경로만 남긴다.
+                    let terminate = matches!(outcome, Outcome::Unavailable) && current.file.unresolved();
                     send(&mut output, &outcome.encode(current.id, op)?)?;
+                    if terminate {
+                        if let Some(current) = active.take() {
+                            send(&mut output, &Request::Cancel { id: current.id }.encode()?)?;
+                        }
+                    }
                 }
             }
         }
@@ -400,27 +431,34 @@ fn relay(listener: UnixListener, mut input: impl Read + AsRawFd, mut output: imp
         }
         if fds[1].revents != 0 {
             let Ok((mut peer, _)) = listener.accept() else { continue };
-            let Ok(identity) = admit_nano(&login, &mut peer) else { continue };
-            let deadline = Some(Instant::now() + IO);
-            let Ok(Request::Open { id: 1, path }) = receive(&mut peer, deadline).and_then(|payload| Request::decode(&payload)) else {
-                continue;
-            };
-            if active.is_some() {
-                let _ = send(&mut peer, &Response::Busy { id: 1 }.encode()?);
-                continue;
+            match admit_nano(&login, &mut peer) {
+                Ok(identity) => {
+                    let deadline = Some(Instant::now() + IO);
+                    let Ok(Request::Open { id: 1, path }) = receive(&mut peer, deadline).and_then(|payload| Request::decode(&payload)) else {
+                        continue;
+                    };
+                    if active.is_some() {
+                        let _ = send(&mut peer, &Response::Busy { id: 1 }.encode()?);
+                        continue;
+                    }
+                    let mut peer = (peer, identity);
+                    let still_connected = |peer| connected(&login, peer, input.as_raw_fd(), output.as_raw_fd());
+                    let prepared = std::str::from_utf8(&path).ok().filter(|_| still_connected(&peer))
+                        .and_then(|path| GuardedFile::prepare(Path::new(path)).ok());
+                    let Some((file, snapshot)) = prepared.filter(|_| still_connected(&peer)) else {
+                        let _ = send(&mut peer.0, &Response::Unattached { id: 1 }.encode()?);
+                        continue;
+                    };
+                    let id = next_id;
+                    next_id = next_id.checked_add(1).ok_or_else(invalid)?;
+                    send(&mut output, &ActiveOpen { id, path, snapshot }.encode()?)?;
+                    active = Some(Active { id, peer: Some(peer), cancel_deadline: None, file, ops: OpIds::default() });
+                }
+                // 등록은 한 번뿐이다. 두 번째 등록 시도는 다른 세션이 로그인을
+                // 가로채려 한 경우일 수 있으므로 이 세션을 끝낸다.
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Err(error),
+                Err(_) => continue,
             }
-            let mut peer = (peer, identity);
-            let still_connected = |peer| connected(&login, peer, input.as_raw_fd(), output.as_raw_fd());
-            let prepared = std::str::from_utf8(&path).ok().filter(|_| still_connected(&peer))
-                .and_then(|path| GuardedFile::prepare(Path::new(path)).ok());
-            let Some((file, snapshot)) = prepared.filter(|_| still_connected(&peer)) else {
-                let _ = send(&mut peer.0, &Response::Unattached { id: 1 }.encode()?);
-                continue;
-            };
-            let id = next_id;
-            next_id = next_id.checked_add(1).ok_or_else(invalid)?;
-            send(&mut output, &ActiveOpen { id, path, snapshot }.encode()?)?;
-            active = Some(Active { id, peer: Some(peer), cancel_deadline: None, file, ops: OpIds::default() });
         }
     }
 }
@@ -429,7 +467,11 @@ fn admit_nano(login: &Login, stream: &mut UnixStream) -> io::Result<Peer> {
     let peer = Peer::from_socket(stream)?;
     if !login.admits(&peer) { return Err(io::ErrorKind::PermissionDenied.into()); }
     stream.set_nonblocking(true)?;
-    expect_marker(stream, ADMIT_NANO, Some(Instant::now() + IO))?;
+    let mut marker = [0; 2];
+    read_exact(stream, &mut marker, Some(Instant::now() + IO))?;
+    // 등록 표식이 다시 오면 이 로그인은 이미 결속된 세션이다.
+    if marker == REGISTER { return Err(io::ErrorKind::AlreadyExists.into()); }
+    if marker != ADMIT_NANO { return Err(invalid()); }
     if !login.admits(&peer) { return Err(io::ErrorKind::PermissionDenied.into()); }
     send(stream, &ADMITTED)?;
     Ok(peer)
@@ -644,7 +686,7 @@ mod tests {
     }
 
     fn wait_child(mut child: std::process::Child) {
-        let deadline = Instant::now() + CANCEL;
+        let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if let Some(status) = child.try_wait().unwrap() {
                 assert!(status.success());

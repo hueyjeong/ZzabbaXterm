@@ -14,7 +14,7 @@ use super::{
 };
 
 mod publication;
-pub(crate) use publication::{PUBLICATION_IO_LIMIT, PublicationOperation, PublicationReply, PublicationWork, PublishError, Publisher};
+pub(crate) use publication::{PUBLICATION_IO_LIMIT, PublicationOperation, PublicationReply, PublicationWork, PublishError, Publisher, transfer_allowance};
 
 const OFFER_TIMEOUT: Duration = Duration::from_secs(30);
 

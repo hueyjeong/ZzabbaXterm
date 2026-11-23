@@ -1,3 +1,4 @@
+use std::time::Duration;
 use tokio::{sync::{mpsc, oneshot}, time::timeout};
 use tokio_util::sync::CancellationToken;
 
@@ -39,6 +40,22 @@ pub(crate) enum PublishError {
     Conflict,
     Unavailable,
     Unknown(Option<String>),
+}
+
+// 본문 크기만큼 전송 시간을 더 준다. 느린 회선(초당 512 KiB)에서도 8 MiB 저장이
+// 결과 미확인으로 끝나지 않게 하는 하한이며, 실제 처리 지연에는 별도 상한이 없다.
+const MIN_TRANSFER_RATE: u64 = 512 * 1024;
+
+pub(crate) fn transfer_allowance(body: u64) -> Duration {
+    Duration::from_secs(body.div_ceil(MIN_TRANSFER_RATE))
+}
+
+fn publication_limit(operation: &PublicationOperation) -> Duration {
+    let body = match operation {
+        PublicationOperation::Save { text, .. } => text.len() as u64,
+        _ => 0,
+    };
+    PUBLICATION_IO_LIMIT + transfer_allowance(body)
 }
 
 impl Publisher {
@@ -84,6 +101,7 @@ impl Publisher {
             return Err(PublishError::Unavailable);
         }
         let operation = operation();
+        let limit = publication_limit(&operation);
         if self.request.is_cancelled() || self.work.is_closed() {
             return Err(PublishError::Unavailable);
         }
@@ -91,7 +109,7 @@ impl Publisher {
         permit.send(PublicationWork { open_id: self.open_id, request: self.request.clone(), operation, reply });
 
         // 큐에 넣은 뒤에는 활성 요청이 취소되어도 워커의 확정 응답을 기다린다.
-        match timeout(PUBLICATION_IO_LIMIT, &mut received).await {
+        match timeout(limit, &mut received).await {
             Ok(result) => result.unwrap_or(Err(lost)),
             Err(_) => {
                 received.close();
@@ -168,6 +186,18 @@ mod tests {
             drop(work);
         });
         assert_eq!(saved, Err(PublishError::Unknown(None)));
+    }
+
+    #[test]
+    fn save_deadline_grows_with_the_payload() {
+        let compare = PublicationOperation::Compare;
+        assert_eq!(publication_limit(&compare), PUBLICATION_IO_LIMIT);
+        let empty = PublicationOperation::Save { token: SNAPSHOT.token, text: String::new() };
+        assert_eq!(publication_limit(&empty), PUBLICATION_IO_LIMIT);
+        let small = PublicationOperation::Save { token: SNAPSHOT.token, text: "한글".into() };
+        assert_eq!(publication_limit(&small), PUBLICATION_IO_LIMIT + Duration::from_secs(1));
+        let large = PublicationOperation::Save { token: SNAPSHOT.token, text: "x".repeat(MAX_CONTENT) };
+        assert_eq!(publication_limit(&large), PUBLICATION_IO_LIMIT + Duration::from_secs(16));
     }
 
     #[tokio::test]
