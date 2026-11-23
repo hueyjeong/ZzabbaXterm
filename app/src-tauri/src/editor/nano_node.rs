@@ -790,7 +790,7 @@ mod tests {
             writer.write_all(bytes).unwrap();
             drop(writer);
             let mut ids = OpIds::default();
-            assert!(matches!(remote_frame(&mut input, 3, &mut ids, Instant::now() + IO), Err(error) if error.kind() == kind));
+            assert!(matches!(remote_frame(&mut input, 3, &mut ids, Some(Instant::now() + IO)), Err(error) if error.kind() == kind));
             assert_eq!(ids.next_id().unwrap(), 1);
         }
     }
@@ -804,9 +804,9 @@ mod tests {
         writer.write_all(&frame.header).unwrap();
         let mut ids = OpIds::default();
         let deadline = Instant::now() + IO;
-        assert!(matches!(remote_frame(&mut input, 7, &mut ids, deadline), Ok(RemoteFrame::Operation(1, Operation::Compare))));
-        assert!(matches!(remote_frame(&mut input, 7, &mut ids, deadline), Ok(RemoteFrame::Close(Response::Closed { id: 7 }))));
-        assert!(matches!(remote_frame(&mut input, 7, &mut ids, deadline), Err(error) if error.kind() == io::ErrorKind::InvalidData));
+        assert!(matches!(remote_frame(&mut input, 7, &mut ids, Some(deadline)), Ok(RemoteFrame::Operation(1, Operation::Compare))));
+        assert!(matches!(remote_frame(&mut input, 7, &mut ids, Some(deadline)), Ok(RemoteFrame::Close(Response::Closed { id: 7 }))));
+        assert!(matches!(remote_frame(&mut input, 7, &mut ids, Some(deadline)), Err(error) if error.kind() == io::ErrorKind::InvalidData));
     }
 
     #[test]
