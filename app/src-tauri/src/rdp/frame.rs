@@ -392,6 +392,10 @@ fn decode_rect(update: &BitmapData<'_>) -> Result<(u16, Vec<u8>), Error> {
         BitmapStreamDecoder::default()
             .decode_bitmap_stream_to_rgb24(update.bitmap_data, &mut rgb, source, height)
             .map_err(|_| Error::Protocol)?;
+        // 원격 스트림이 선언한 행 수보다 짧으면 잘라 내기 전에 거부한다.
+        if rgb.len() != source * height * 3 {
+            return Err(Error::Bounds);
+        }
         let mut out = Vec::with_capacity(dest * height * 4);
         for row in rgb.chunks_exact(source * 3) {
             for pixel in row[..dest * 3].chunks_exact(3) {
