@@ -1,5 +1,6 @@
 import { useLayoutEffect, useRef, useState, type KeyboardEvent, type PointerEvent } from "react";
 import { createRemoteDesktopViewSession, type RemoteDesktopSession, type RemoteDesktopStatus, type RemoteDesktopViewSession } from "./session";
+import { modifierEvents, releasedModifiers, type ModifierState } from "./input";
 import "./remoteDesktop.css";
 
 interface RemoteDesktopViewProps {
@@ -22,16 +23,21 @@ export function RemoteDesktopView({ session, active, label }: RemoteDesktopViewP
   const bound = useRef<RemoteDesktopViewSession>(null);
   const [status, setStatus] = useState<RemoteDesktopStatus>({ kind: "waiting" });
   const keys = useRef(new Map<string, string>());
+  const modifiers = useRef<ModifierState>({ shift: false, ctrl: false, alt: false, meta: false });
   const pointer = useRef<number | null>(null);
 
   function release() {
     const id = pointer.current;
     pointer.current = null;
+    const connection = bound.current;
+    const released = releasedModifiers(modifiers.current);
+    modifiers.current = released.state;
+    for (const event of released.events) connection?.send({ kind: "key", ...event, repeat: false });
     const held = keys.current.size > 0 || id !== null;
     keys.current.clear();
     const element = canvas.current;
     if (id !== null && element?.hasPointerCapture(id)) element.releasePointerCapture(id);
-    if (held) bound.current?.send({ kind: "release-input" });
+    if (held) connection?.send({ kind: "release-input" });
   }
 
   useLayoutEffect(() => {
@@ -79,6 +85,14 @@ export function RemoteDesktopView({ session, active, label }: RemoteDesktopViewP
     } else {
       keys.current.delete(id);
     }
+    // 자동화·IME는 Shift keydown 없이 shiftKey=true만 보낼 수 있다. 서버의 수식 키 상태를
+    // 먼저 맞춰야 문자가 올바른 대소문자로 도착한다.
+    const synchronized = modifierEvents(modifiers.current, {
+      code: event.code, down,
+      shiftKey: event.shiftKey, ctrlKey: event.ctrlKey, altKey: event.altKey, metaKey: event.metaKey,
+    });
+    modifiers.current = synchronized.state;
+    for (const modifier of synchronized.events) connection.send({ kind: "key", ...modifier, repeat: false });
     connection.send({ kind: "key", down, code: event.code, key: pressed ?? event.key, location: event.location, repeat: event.repeat });
   }
 

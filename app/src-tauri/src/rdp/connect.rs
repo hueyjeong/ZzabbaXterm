@@ -52,7 +52,7 @@ fn config(size: DesktopSize, tls_only: bool) -> connector::Config {
         keyboard_type: KeyboardType::IbmEnhanced,
         keyboard_subtype: 0,
         keyboard_functional_keys_count: 12,
-        keyboard_layout: 0,
+        keyboard_layout: 0x0000_0409,
         ime_file_name: String::new(),
         bitmap: Some(connector::BitmapConfig {
             lossy_compression: false,
@@ -380,12 +380,14 @@ where
     AFut: Future<Output = Result<bool, Error>>,
 {
     let name = server_name.to_str().into_owned();
-    let (framed, mut connector, mut selected) = negotiate_rdp(&mut target).await?;
+    let (framed, mut connector, mut selected) = tokio::time::timeout(super::CONNECT_TIMEOUT, negotiate_rdp(&mut target))
+        .await.map_err(|_| Error::Timeout)??;
     let (stream, leftover) = framed.into_inner();
     if !leftover.is_empty() {
         return Err(Error::Negotiation);
     }
-    let stream = match tls.connector().connect(server_name.clone(), stream).await {
+    let stream = match tokio::time::timeout(super::CONNECT_TIMEOUT, tls.connector().connect(server_name.clone(), stream))
+        .await.map_err(|_| Error::Timeout)? {
         Ok(stream) => {
             let peer = stream.get_ref().1.peer_certificates().ok_or(Error::TlsIdentity)?;
             verify_peer_policy(&name, peer)?;
@@ -403,14 +405,16 @@ where
                 trust::save(&trust.path, &trust.dns, &trust.endpoint, &fingerprint)?;
             }
             // 같은 대상에 다시 협상한 뒤 저장된 지문으로만 TLS를 완료한다.
-            let (framed, next, next_selected) = negotiate_rdp(&mut target).await?;
+            let (framed, next, next_selected) = tokio::time::timeout(super::CONNECT_TIMEOUT, negotiate_rdp(&mut target))
+                .await.map_err(|_| Error::Timeout)??;
             connector = next;
             selected = next_selected;
             let (stream, leftover) = framed.into_inner();
             if !leftover.is_empty() {
                 return Err(Error::Negotiation);
             }
-            let stream = tls.pinned(&fingerprint).connect(server_name, stream).await.map_err(|_| Error::TlsIdentity)?;
+            let stream = tokio::time::timeout(super::CONNECT_TIMEOUT, tls.pinned(&fingerprint).connect(server_name, stream))
+                .await.map_err(|_| Error::Timeout)?.map_err(|_| Error::TlsIdentity)?;
             let peer = stream.get_ref().1.peer_certificates().ok_or(Error::TlsIdentity)?;
             #[cfg(windows)]
             windows_policy::verify_disallowed(peer)?;
@@ -451,8 +455,8 @@ where
     A: FnOnce(String) -> AFut,
     AFut: Future<Output = Result<bool, Error>>,
 {
-    let mut verified = tokio::time::timeout(super::CONNECT_TIMEOUT, verify(target, name, tls, trust))
-        .await.map_err(|_| Error::Timeout)??;
+    // 인증서 승인은 사용자 입력을 기다리므로 연결 타임아웃에 넣지 않는다.
+    let mut verified = verify(target, name, tls, trust).await?;
     let account = resolve().await?;
     tokio::time::timeout(super::CONNECT_TIMEOUT, verified.authenticate(account, &auth))
         .await.map_err(|_| Error::Timeout)??;

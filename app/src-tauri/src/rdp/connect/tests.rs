@@ -854,3 +854,4 @@ async fn unknown_certificate_requires_one_time_approval_and_is_pinned() {
     assert_eq!(trust::load(&path, REMOTE, "fixture").as_deref(), Some(fingerprint.as_str()));
     let _ = std::fs::remove_file(path);
 }
+
