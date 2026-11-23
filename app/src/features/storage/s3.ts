@@ -58,3 +58,21 @@ export type S3Actions = Readonly<{
   upload(request: ApprovedTransfer): Promise<S3Result<number>>;
   download(request: ApprovedTransfer): Promise<S3Result<Downloaded>>;
 }>;
+
+// 로컬 창 경로는 네이티브 폴더 대화상자로 승인한 루트 기준 상대 경로("a/b")다. 빈 문자열이 루트다.
+export type LocalRoot = Readonly<{ rootId: string; label: string }>;
+export type LocalRootApproval = (Readonly<{ kind: "approved" }> & LocalRoot) | Readonly<{ kind: "cancelled" | "denied" }>;
+export type LocalEntry = Readonly<{ name: string; kind: "folder" | "file" | "link"; bytes: number | null; modified: number | null }>;
+export type LocalListing = Readonly<{ entries: readonly LocalEntry[]; truncated: boolean }>;
+export type LocalFailure =
+  | Readonly<{ kind: "denied" | "invalidPath" | "link" | "notFound" }>
+  | Readonly<{ kind: "localIo"; errorKind: string }>;
+export type LocalResult<T> = Readonly<{ ok: true; value: T }> | Readonly<{ ok: false; error: LocalFailure }>;
+export type LocalSelection = ObjectTarget & Readonly<{ rootId: string; path: string; direction: "upload" | "download" }>;
+
+export type LocalFileActions = Readonly<{
+  openRoot(request: Readonly<{ sessionId: string }>): Promise<LocalRootApproval>;
+  list(request: Readonly<{ sessionId: string; rootId: string; path: string }>): Promise<LocalResult<LocalListing>>;
+  /** 업로드는 path가 파일, 다운로드는 path가 폴더이고 이름은 키의 마지막 구간이다. */
+  select(request: LocalSelection): Promise<LocalFileApproval>;
+}>;

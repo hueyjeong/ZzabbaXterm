@@ -53,7 +53,10 @@ impl Location {
 }
 
 pub(crate) fn open_upload(path: &Path) -> io::Result<File> {
-    let location = Location::open(path)?;
+    upload_at(&Location::open(path)?)
+}
+
+fn upload_at(location: &Location) -> io::Result<File> {
     let file = location.open_file()?.ok_or(io::ErrorKind::NotFound)?;
     location.check_file(&os::file_id(&file)?)?;
     Ok(file)
@@ -66,7 +69,10 @@ pub(crate) struct DownloadTarget {
 
 impl DownloadTarget {
     pub(crate) fn open(path: &Path) -> io::Result<Self> {
-        let location = Location::open(path)?;
+        Self::at(Location::open(path)?)
+    }
+
+    fn at(location: Location) -> io::Result<Self> {
         let original = if let Some(mut file) = location.open_file()? {
             let version = version(&mut file)?;
             location.check_file(&version.id)?;
@@ -143,6 +149,159 @@ fn version(file: &mut File) -> io::Result<Version> {
         return Err(changed());
     }
     Ok(Version { id, digest: hash.finalize().into() })
+}
+
+/// 네이티브 폴더 대화상자로 승인한 S3 로컬 창의 루트다. 경로는 정규화한 절대 경로다.
+pub(crate) struct LocalRoot {
+    directory: os::Directory,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum LocalKind {
+    Folder,
+    File,
+    Link,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LocalEntry {
+    pub(crate) name: String,
+    pub(crate) kind: LocalKind,
+    pub(crate) bytes: Option<u64>,
+    pub(crate) modified: Option<u64>,
+}
+
+/// 루트 밖을 가리키는 링크·재분석 지점 또는 경로 별칭을 거부할 때의 오류 원인이다.
+#[derive(Debug)]
+pub(crate) struct OutsideRoot;
+
+impl std::fmt::Display for OutsideRoot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("link or path outside the approved root")
+    }
+}
+
+impl std::error::Error for OutsideRoot {}
+
+pub(crate) fn outside_root() -> io::Error { io::Error::new(io::ErrorKind::PermissionDenied, OutsideRoot) }
+
+pub(crate) fn is_outside_root(error: &io::Error) -> bool {
+    error.get_ref().is_some_and(|source| source.is::<OutsideRoot>())
+}
+
+/// 루트 기준 상대 경로의 한 구간이다. 구분자·드라이브·대체 데이터 스트림·NUL·`.`·`..`를 거부한다.
+pub(crate) fn valid_local_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".."
+        && !name.contains(['/', '\\', ':', '\0'])
+        && !(cfg!(windows) && (name.ends_with('.') || name.ends_with(' ')))
+        && os::valid_name(name.as_ref())
+}
+
+/// `a/b/c` 형식의 상대 경로를 구간으로 나눈다. 빈 문자열은 루트다.
+pub(crate) fn local_names(relative: &str) -> io::Result<Vec<&str>> {
+    if relative.is_empty() { return Ok(Vec::new()); }
+    if relative.len() > 4096 { return Err(io::ErrorKind::InvalidInput.into()); }
+    let names: Vec<_> = relative.split('/').collect();
+    if !names.iter().all(|name| valid_local_name(name)) { return Err(io::ErrorKind::InvalidInput.into()); }
+    Ok(names)
+}
+
+fn is_link(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 { return true; }
+    }
+    metadata.file_type().is_symlink()
+}
+
+impl LocalRoot {
+    pub(crate) fn open(path: &Path) -> io::Result<Self> {
+        if !path.is_absolute() { return Err(io::ErrorKind::InvalidInput.into()); }
+        let canonical = fs::canonicalize(path)?;
+        if !os::valid_path(&canonical) { return Err(io::ErrorKind::InvalidInput.into()); }
+        Ok(Self { directory: os::Directory::open(canonical)? })
+    }
+
+    pub(crate) fn path(&self) -> &Path { &self.directory.path }
+
+    fn check(&self) -> io::Result<()> {
+        if !self.directory.still_at_path()? { return Err(changed()); }
+        Ok(())
+    }
+
+    /// 모든 구간이 링크가 아닌 실제 디렉터리이고 정규화 결과가 같은 경로일 때만 반환한다.
+    fn directory(&self, names: &[&str]) -> io::Result<PathBuf> {
+        self.check()?;
+        let mut path = self.directory.path.clone();
+        for name in names {
+            path.push(name);
+            let metadata = fs::symlink_metadata(&path)?;
+            if is_link(&metadata) { return Err(outside_root()); }
+            if !metadata.is_dir() { return Err(io::ErrorKind::NotADirectory.into()); }
+        }
+        // 짧은 이름·대소문자 별칭과 검사 뒤 바뀐 상위 구간도 정규화 비교로 거부한다.
+        if fs::canonicalize(&path)? != path || !path.starts_with(&self.directory.path) { return Err(outside_root()); }
+        Ok(path)
+    }
+
+    fn locate(&self, directory: &Path, name: &str) -> io::Result<Location> {
+        if !valid_local_name(name) { return Err(io::ErrorKind::InvalidInput.into()); }
+        let location = Location::open(&directory.join(name))?;
+        if location.parent.path != directory { return Err(outside_root()); }
+        self.check()?;
+        Ok(location)
+    }
+
+    pub(crate) fn list(&self, relative: &str, limit: usize) -> io::Result<(Vec<LocalEntry>, bool)> {
+        let directory = self.directory(&local_names(relative)?)?;
+        let mut entries = Vec::new();
+        let mut truncated = false;
+        for entry in fs::read_dir(&directory)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str().filter(|name| valid_local_name(name)) else { continue };
+            // 항목 자체의 정보만 읽고 링크는 따라가지 않는다.
+            let Ok(metadata) = entry.metadata() else { continue };
+            let kind = if is_link(&metadata) {
+                LocalKind::Link
+            } else if metadata.is_dir() {
+                LocalKind::Folder
+            } else if metadata.is_file() {
+                LocalKind::File
+            } else {
+                continue;
+            };
+            if entries.len() == limit {
+                truncated = true;
+                break;
+            }
+            let modified = metadata.modified().ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|time| u64::try_from(time.as_millis()).ok());
+            entries.push(LocalEntry { name: name.into(), kind, bytes: (kind == LocalKind::File).then(|| metadata.len()), modified });
+        }
+        if fs::canonicalize(&directory)? != directory { return Err(outside_root()); }
+        self.check()?;
+        Ok((entries, truncated))
+    }
+
+    /// 루트 안의 일반 파일을 링크를 따라가지 않고 연다.
+    pub(crate) fn open_upload(&self, relative: &str) -> io::Result<File> {
+        let names = local_names(relative)?;
+        let (name, parent) = names.split_last().ok_or(io::ErrorKind::InvalidInput)?;
+        let location = self.locate(&self.directory(parent)?, name)?;
+        upload_at(&location)
+    }
+
+    /// 루트 안의 폴더에 같은 게시 규칙으로 내려받을 대상을 연다.
+    pub(crate) fn download_target(&self, folder: &str, name: &str) -> io::Result<DownloadTarget> {
+        let directory = self.directory(&local_names(folder)?)?;
+        DownloadTarget::at(self.locate(&directory, name)?)
+    }
 }
 
 fn changed() -> io::Error { io::Error::new(io::ErrorKind::AlreadyExists, "selected file or directory changed") }

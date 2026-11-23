@@ -4,7 +4,9 @@ import { IconButton } from "../ui/controls";
 import type { Downloaded, S3Error, S3Session } from "./s3";
 
 export type Problem = S3Error | "unavailable";
-export type Transfer = Readonly<{ id: string; direction: "upload" | "download"; bucket: string; region: string; key: string; size: number | null }> & (
+export type Transfer = Readonly<{
+  id: string; direction: "upload" | "download"; bucket: string; region: string; key: string; size: number | null; local?: string;
+}> & (
   | Readonly<{ state: "selecting" | "running" | "cancelled" | "denied" }>
   | Readonly<{ state: "failed"; problem: Problem }>
   | Readonly<{ state: "uploaded"; bytes: number }>
@@ -114,7 +116,7 @@ export function TransferQueue({ transfers, session, open, onToggle }: {
             <td className="transfer-direction" data-direction={transfer.direction}>
               <Direction aria-label={transfer.direction === "upload" ? "업로드" : "다운로드"} role="img" />
             </td>
-            <td className="transfer-key" title={`${transfer.bucket} · ${transfer.region}`}><code>{transfer.key}</code></td>
+            <td className="transfer-key" title={`${transfer.bucket} · ${transfer.region}${transfer.local ? ` · ${transfer.local}` : ""}`}><code>{transfer.key}</code></td>
             <td className="transfer-size" title={size === null ? undefined : exactBytes(size)}>{size === null ? "" : formatBytes(size)}</td>
             <td className="transfer-state"><StateIcon aria-hidden="true" />{label}</td>
             <td className="transfer-result">{result(transfer, session)}</td>

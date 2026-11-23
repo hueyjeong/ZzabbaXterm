@@ -1,0 +1,260 @@
+// @vitest-environment jsdom
+import { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { S3StoragePanel } from "./S3StoragePanel";
+import { LOCAL_DRAG_TYPE, S3_DRAG_TYPE } from "./LocalPane";
+import type { LocalFileActions, LocalListing, S3Actions, S3Session } from "./s3";
+import { control, dblclick, fileRow, findControl } from "../files/testing";
+import { TAB_DRAG_TYPE } from "../workspace/TabStrip";
+
+const session: S3Session = { sessionId: "local-session", profile: "dev-sso", region: "ap-northeast-2", endpoint: "https://s3.ap-northeast-2.amazonaws.com" };
+const objectKey = "원격 폴더/받을 파일 +%.txt";
+const rootListing: LocalListing = {
+  truncated: false,
+  entries: [
+    { name: "하위 폴더", kind: "folder", bytes: null, modified: null },
+    { name: "올릴 파일.txt", kind: "file", bytes: 12, modified: Date.UTC(2026, 0, 2, 3, 4) },
+    { name: "바깥 링크", kind: "link", bytes: null, modified: null },
+  ],
+};
+const childListing: LocalListing = { truncated: true, entries: [{ name: "깊은 파일.bin", kind: "file", bytes: 3, modified: null }] };
+let host: HTMLDivElement;
+let root: Root;
+
+beforeEach(() => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  host = document.body.appendChild(document.createElement("div"));
+  root = createRoot(host);
+});
+
+afterEach(async () => {
+  await act(async () => root.unmount());
+  host.remove();
+  vi.unstubAllGlobals();
+});
+
+function unused(): never { throw new Error("예상하지 않은 작업"); }
+
+function s3Actions(overrides: Partial<S3Actions> = {}): S3Actions {
+  return {
+    listBuckets: unused,
+    listObjects: vi.fn<S3Actions["listObjects"]>().mockResolvedValue({
+      ok: true, value: { rows: [{ kind: "object", key: objectKey, bytes: 9 }], nextToken: null },
+    }),
+    selectLocalFile: unused,
+    upload: vi.fn<S3Actions["upload"]>().mockResolvedValue({ ok: true, value: 12 }),
+    download: vi.fn<S3Actions["download"]>().mockResolvedValue({ ok: true, value: { bytes: 9, integrity: "lengthOnly" } }),
+    ...overrides,
+  };
+}
+
+function localActions(overrides: Partial<LocalFileActions> = {}): LocalFileActions {
+  return {
+    openRoot: vi.fn<LocalFileActions["openRoot"]>().mockResolvedValue({ kind: "approved", rootId: "root-1", label: "C:\\작업 폴더" }),
+    list: vi.fn<LocalFileActions["list"]>(async ({ path }) => ({ ok: true, value: path ? childListing : rootListing })),
+    select: vi.fn<LocalFileActions["select"]>().mockResolvedValue({ kind: "approved", approvalId: "local-approval" }),
+    ...overrides,
+  };
+}
+
+function render(actions: S3Actions, local: LocalFileActions) {
+  return act(async () => root.render(<S3StoragePanel session={session} actions={actions} localActions={local} />));
+}
+
+function localPane() {
+  return host.querySelector<HTMLElement>(".s3-local")!;
+}
+
+function click(name: string, scope: ParentNode = host) {
+  return act(async () => (control(scope, name) as HTMLButtonElement).click());
+}
+
+function fill(label: string, value: string) {
+  const node = Array.from(host.querySelectorAll("label")).find(node => node.textContent === label)?.querySelector("input");
+  if (!node) throw new Error(`입력란 없음: ${label}`);
+  return act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(node, value);
+    node.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+}
+
+async function openBucket() {
+  await fill("버킷", "local-bucket");
+  await fill("접두어", "원격 폴더/");
+  await click("버킷 열기");
+}
+
+/** jsdom에는 DataTransfer가 없으므로 끌기에 필요한 부분만 흉내 낸다. */
+function transfer(initial: Record<string, string> = {}) {
+  const data = new Map(Object.entries(initial));
+  return {
+    get types() { return [...data.keys()]; },
+    setData: (type: string, value: string) => { data.set(type, value); },
+    getData: (type: string) => data.get(type) ?? "",
+    dropEffect: "none",
+    effectAllowed: "all",
+  };
+}
+
+async function drag(node: Element, type: string, data: ReturnType<typeof transfer>) {
+  const event = new Event(type, { bubbles: true, cancelable: true });
+  Object.defineProperty(event, "dataTransfer", { value: data });
+  await act(async () => { node.dispatchEvent(event); });
+  return event;
+}
+
+it("루트 미승인 상태에서는 로컬 폴더 열기 단추만 보이고 승인 뒤 상대 경로로 목록을 연다", async () => {
+  const local = localActions();
+  await render(s3Actions(), local);
+  expect(Array.from(localPane().querySelectorAll("button")).map(button => button.getAttribute("aria-label"))).toEqual(["로컬 폴더 열기"]);
+  expect(localPane().querySelector('[role="grid"]')).toBeNull();
+  expect(local.list).not.toHaveBeenCalled();
+
+  await click("로컬 폴더 열기", localPane());
+  expect(local.openRoot).toHaveBeenCalledExactlyOnceWith({ sessionId: session.sessionId });
+  expect(local.list).toHaveBeenCalledExactlyOnceWith({ sessionId: session.sessionId, rootId: "root-1", path: "" });
+  expect(fileRow(host, "올릴 파일.txt").querySelector(".file-name")?.textContent).toBe("올릴 파일.txt");
+  expect(fileRow(host, "바깥 링크").querySelector('.file-icon[data-type="link"]')).not.toBeNull();
+  expect(localPane().querySelector('[aria-label="로컬 위치"]')?.textContent).toBe("작업 폴더");
+
+  await dblclick(fileRow(host, "바깥 링크"));
+  expect(local.list).toHaveBeenCalledTimes(1);
+  await dblclick(fileRow(host, "하위 폴더"));
+  expect(local.list).toHaveBeenLastCalledWith({ sessionId: session.sessionId, rootId: "root-1", path: "하위 폴더" });
+  expect(fileRow(host, "깊은 파일.bin")).toBeDefined();
+  expect(localPane().querySelector(".s3-status")?.textContent).toBe("1개 항목 이상");
+  await click("로컬 상위 폴더", localPane());
+  expect(local.list).toHaveBeenLastCalledWith({ sessionId: session.sessionId, rootId: "root-1", path: "" });
+});
+
+it("취소한 루트 선택은 상태를 바꾸지 않고 폐기된 루트는 다시 고르게 한다", async () => {
+  const openRoot = vi.fn<LocalFileActions["openRoot"]>().mockResolvedValueOnce({ kind: "cancelled" })
+    .mockResolvedValueOnce({ kind: "approved", rootId: "root-1", label: "/home/시험" });
+  const list = vi.fn<LocalFileActions["list"]>().mockResolvedValueOnce({ ok: true, value: rootListing })
+    .mockResolvedValueOnce({ ok: false, error: { kind: "denied" } });
+  await render(s3Actions(), localActions({ openRoot, list }));
+  await click("로컬 폴더 열기", localPane());
+  expect(list).not.toHaveBeenCalled();
+  expect(localPane().querySelector('[role="alert"]')).toBeNull();
+  await click("로컬 폴더 열기", localPane());
+  await click("로컬 새로고침", localPane());
+  expect(localPane().querySelector('[role="alert"]')?.textContent).toBe("로컬 폴더: 승인 거부");
+  expect(Array.from(localPane().querySelectorAll(".s3-local-tools button")).map(button => button.getAttribute("aria-label")))
+    .toEqual(["로컬 폴더 열기"]);
+});
+
+it("로컬 파일을 현재 S3 접두어로 올리고 완료 뒤 S3 목록을 새로 읽는다", async () => {
+  const actions = s3Actions();
+  const local = localActions();
+  await render(actions, local);
+  await click("로컬 폴더 열기", localPane());
+  await act(async () => fileRow(host, "바깥 링크").click());
+  expect((control(localPane(), "S3로 업로드") as HTMLButtonElement).disabled).toBe(true);
+  await act(async () => fileRow(host, "올릴 파일.txt").click());
+  expect((control(localPane(), "S3로 업로드") as HTMLButtonElement).disabled).toBe(true);
+  await openBucket();
+  expect(actions.listObjects).toHaveBeenCalledTimes(1);
+  await click("S3로 업로드", localPane());
+  const target = { sessionId: session.sessionId, bucket: "local-bucket", region: session.region, key: "원격 폴더/올릴 파일.txt" };
+  expect(local.select).toHaveBeenCalledExactlyOnceWith({ ...target, rootId: "root-1", path: "올릴 파일.txt", direction: "upload" });
+  expect(actions.upload).toHaveBeenCalledExactlyOnceWith({ ...target, approvalId: "local-approval" });
+  expect(actions.listObjects).toHaveBeenCalledTimes(2);
+  const row = host.querySelector(".transfer-table tbody tr")!;
+  expect(row.textContent).toContain("완료");
+  expect(row.querySelector(".transfer-key")?.getAttribute("title")).toBe("local-bucket · ap-northeast-2 · C:\\작업 폴더/올릴 파일.txt");
+});
+
+it("S3 객체를 현재 로컬 폴더로 내려받고 완료 뒤 로컬 목록을 새로 읽는다", async () => {
+  const actions = s3Actions();
+  const local = localActions();
+  await render(actions, local);
+  await openBucket();
+  await act(async () => fileRow(host, objectKey).click());
+  expect(findControl(host, "로컬 폴더로 다운로드")).toBeDefined();
+  expect((control(host, "로컬 폴더로 다운로드") as HTMLButtonElement).disabled).toBe(true);
+  await click("로컬 폴더 열기", localPane());
+  await dblclick(fileRow(host, "하위 폴더"));
+  expect(local.list).toHaveBeenCalledTimes(2);
+  await click("로컬 폴더로 다운로드");
+  const target = { sessionId: session.sessionId, bucket: "local-bucket", region: session.region, key: objectKey };
+  expect(local.select).toHaveBeenCalledExactlyOnceWith({ ...target, rootId: "root-1", path: "하위 폴더", direction: "download" });
+  expect(actions.download).toHaveBeenCalledExactlyOnceWith({ ...target, approvalId: "local-approval" });
+  expect(local.list).toHaveBeenCalledTimes(3);
+  expect(local.list).toHaveBeenLastCalledWith({ sessionId: session.sessionId, rootId: "root-1", path: "하위 폴더" });
+});
+
+it("교체를 거절한 다운로드는 전송하지 않고 취소로 표시한다", async () => {
+  const actions = s3Actions();
+  const local = localActions({ select: vi.fn<LocalFileActions["select"]>().mockResolvedValue({ kind: "cancelled" }) });
+  await render(actions, local);
+  await openBucket();
+  await click("로컬 폴더 열기", localPane());
+  await act(async () => fileRow(host, objectKey).click());
+  await click("로컬 폴더로 다운로드");
+  expect(actions.download).not.toHaveBeenCalled();
+  expect(host.querySelector(".transfer-table tbody tr")?.textContent).toContain("취소");
+  expect(local.list).toHaveBeenCalledTimes(1);
+});
+
+it("두 창 사이 끌어 놓기는 전용 형식만 받아 업로드와 다운로드를 시작한다", async () => {
+  const actions = s3Actions();
+  const local = localActions();
+  await render(actions, local);
+  await openBucket();
+  await click("로컬 폴더 열기", localPane());
+
+  const fromS3 = transfer();
+  const start = await drag(fileRow(host, objectKey), "dragstart", fromS3);
+  expect(start.defaultPrevented).toBe(false);
+  expect(fromS3.types).toEqual([S3_DRAG_TYPE]);
+  const over = await drag(localPane(), "dragover", fromS3);
+  expect(over.defaultPrevented).toBe(true);
+  expect(localPane().hasAttribute("data-drop")).toBe(true);
+  await drag(localPane(), "drop", fromS3);
+  expect(localPane().hasAttribute("data-drop")).toBe(false);
+  const target = { sessionId: session.sessionId, bucket: "local-bucket", region: session.region };
+  expect(local.select).toHaveBeenCalledExactlyOnceWith({ ...target, key: objectKey, rootId: "root-1", path: "", direction: "download" });
+
+  const fromLocal = transfer();
+  await drag(fileRow(host, "올릴 파일.txt"), "dragstart", fromLocal);
+  expect(fromLocal.types).toEqual([LOCAL_DRAG_TYPE]);
+  const files = host.querySelector(".s3-files")!;
+  expect((await drag(files, "dragover", fromLocal)).defaultPrevented).toBe(true);
+  await drag(files, "drop", fromLocal);
+  expect(local.select).toHaveBeenLastCalledWith({ ...target, key: "원격 폴더/올릴 파일.txt", rootId: "root-1", path: "올릴 파일.txt", direction: "upload" });
+  expect(actions.upload).toHaveBeenCalledTimes(1);
+
+  // 폴더·링크는 끌 수 없고, 다른 형식이나 다른 세션의 항목은 놓지 않는다.
+  expect((await drag(fileRow(host, "바깥 링크"), "dragstart", transfer())).defaultPrevented).toBe(true);
+  expect((await drag(fileRow(host, "하위 폴더"), "dragstart", transfer())).defaultPrevented).toBe(true);
+  for (const foreign of [
+    transfer({ Files: "" }),
+    transfer({ [TAB_DRAG_TYPE]: "1" }),
+    transfer({ "text/plain": objectKey }),
+  ]) {
+    expect((await drag(localPane(), "dragover", foreign)).defaultPrevented).toBe(false);
+    expect((await drag(files, "dragover", foreign)).defaultPrevented).toBe(false);
+  }
+  await drag(localPane(), "drop", transfer({ [S3_DRAG_TYPE]: JSON.stringify({ sessionId: "other", key: objectKey }) }));
+  await drag(files, "drop", transfer({ [LOCAL_DRAG_TYPE]: JSON.stringify({ sessionId: session.sessionId, rootId: "old-root", path: "x", name: "x", bytes: 1 }) }));
+  expect(local.select).toHaveBeenCalledTimes(2);
+});
+
+it("760px보다 좁으면 두 창을 위아래로 쌓고 구분선을 숨긴다", async () => {
+  let notify: ((width: number) => void) | undefined;
+  vi.stubGlobal("ResizeObserver", class {
+    constructor(callback: (entries: { contentRect: { width: number } }[]) => void) {
+      notify = width => callback([{ contentRect: { width } }]);
+    }
+    observe() { notify?.(600); }
+    disconnect() { notify = undefined; }
+  });
+  await render(s3Actions(), localActions());
+  const split = host.querySelector(".s3-split")!;
+  expect(split.hasAttribute("data-stacked")).toBe(true);
+  expect(host.querySelector('[aria-label="로컬 창 크기"]')).toBeNull();
+  await act(async () => notify?.(1200));
+  expect(split.hasAttribute("data-stacked")).toBe(false);
+  expect(host.querySelector('[aria-label="로컬 창 크기"]')).not.toBeNull();
+});

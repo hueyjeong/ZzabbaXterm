@@ -1,12 +1,12 @@
-import { useCallback, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type MouseEvent, type ReactNode } from "react";
+import { useCallback, useLayoutEffect, useMemo, useRef, useState, type DragEvent, type KeyboardEvent, type MouseEvent, type ReactNode } from "react";
 import {
-  ArrowDown, ArrowUp, File, FileArchive, FileAudio, FileCode, FileImage, FileKey, FileSpreadsheet, FileText, FileVideo, Folder,
+  ArrowDown, ArrowUp, File, FileArchive, FileAudio, FileCode, FileImage, FileKey, FileSpreadsheet, FileSymlink, FileText, FileVideo, Folder,
   type LucideIcon,
 } from "lucide-react";
 import { Menu, type MenuItem } from "../ui/controls";
 import "./files.css";
 
-export type FileEntry = Readonly<{ key: string; name?: string; title?: string }> & (
+export type FileEntry = Readonly<{ key: string; name?: string; title?: string; link?: boolean }> & (
   | Readonly<{ kind: "folder" }>
   | Readonly<{ kind: "file"; bytes: number | null; modified?: string | null; storageClass?: string | null }>
 );
@@ -81,8 +81,8 @@ export function fileType(entry: FileEntry): FileType {
 
 export function FileIcon({ entry }: { entry: FileEntry }) {
   const type = fileType(entry);
-  const Icon = typeIcons[type];
-  return <Icon className="file-icon" data-type={type} aria-hidden="true" />;
+  const Icon = entry.link ? FileSymlink : typeIcons[type];
+  return <Icon className="file-icon" data-type={entry.link ? "link" : type} aria-hidden="true" />;
 }
 
 type SortKey = "name" | FileColumn;
@@ -120,7 +120,7 @@ const widths: Record<FileColumn, string> = { size: "6.5em", modified: "9.5rem", 
  */
 export function FileBrowser({
   entries, selected, onSelect, onOpen, onParent, menuItems, label = "파일 목록", columns = ["size"], compact = false,
-  view = "list", footer, empty = "항목 없음", busy = false,
+  view = "list", footer, empty = "항목 없음", busy = false, onDragStart,
 }: {
   entries: readonly FileEntry[];
   selected: EntryRef | null;
@@ -135,6 +135,8 @@ export function FileBrowser({
   footer?: ReactNode;
   empty?: string;
   busy?: boolean;
+  /** 지정하면 항목을 끌 수 있다. 끌지 않을 항목은 event.preventDefault()로 막는다. */
+  onDragStart?(entry: FileEntry, event: DragEvent<HTMLElement>): void;
 }) {
   const [sort, setSort] = useState<Sort>({ key: "name", descending: false });
   const [menu, setMenu] = useState<OpenMenu | null>(null);
@@ -264,6 +266,8 @@ export function FileBrowser({
       onDoubleClick: () => onOpen(entry),
       onContextMenu: (event: MouseEvent<HTMLElement>) => contextMenu(event, entry),
       onKeyDown: (event: KeyboardEvent<HTMLElement>) => keyDown(event, index, entry),
+      draggable: onDragStart ? true : undefined,
+      onDragStart: onDragStart && ((event: DragEvent<HTMLElement>) => onDragStart(entry, event)),
     };
   };
 

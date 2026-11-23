@@ -155,6 +155,35 @@
 .s3-banner-actions { display: flex; flex: none; align-items: center; gap: 6px; }
 .storage-problem code { font-size: 11.5px; white-space: pre-wrap; }
 
+/* 2단: 로컬 창 | S3 창. 좁은 폭에서는 위아래로 쌓는다. */
+.s3-split { display: flex; flex: 1; min-width: 0; min-height: 0; }
+.s3-remote { display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; }
+.s3-local {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  width: var(--local-width, 360px);
+  max-width: 60%;
+  min-width: 0;
+  min-height: 0;
+  background: var(--bg-panel);
+}
+.s3-local-head {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  min-height: 38px;
+  padding: 0 8px;
+  border-block-end: 1px solid var(--border);
+  background: var(--bg-chrome);
+}
+.s3-local-tools { display: flex; flex: none; align-items: center; gap: 2px; margin-inline-start: auto; }
+.s3-local-body { display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; }
+.s3-local[data-drop] .s3-local-body, .s3-files[data-drop] { box-shadow: inset 0 0 0 2px var(--accent); background: var(--accent-soft); }
+.s3-split[data-stacked] { flex-direction: column; }
+.s3-split[data-stacked] .s3-local { width: auto; max-width: none; flex: 0 0 40%; border-block-end: 1px solid var(--border-strong); }
+
 /* 본문: 트리 + 목록 */
 .s3-body { display: flex; flex: 1; min-height: 0; }
 .s3-tree-pane { display: flex; flex: none; flex-direction: column; min-width: 0; background: var(--bg-chrome); }
