@@ -76,6 +76,18 @@ impl SelectionState {
 }
 
 impl State {
+    /// 실행 경로는 확인된 선택과 아직 살아 있는 중앙 세션만 승인 근거로 삼는다.
+    pub(crate) fn confirmed(&self, sessions: &Sessions, document: u64) -> Option<(NonZeroU64, LiveSsmIdentity)> {
+        let state = self.0.lock().unwrap();
+        let selection = state.selected.as_ref()?;
+        if !selection.confirmed || selection.identity.document != document {
+            return None;
+        }
+        sessions.with_live_ssm_session(OWNER, &selection.identity, || {
+            (selection.selection_id, selection.identity.clone())
+        })
+    }
+
     pub(crate) fn document_changed(&self, owner: &str, current_document: u64) {
         if owner != OWNER {
             return;

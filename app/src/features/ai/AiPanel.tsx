@@ -1,11 +1,29 @@
 import { useId, useLayoutEffect, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode, type RefObject } from "react";
-import type { AiPanelProps, ChatMessage, Proposal, ProposalTarget, RecordedDecision } from "./contracts";
+import { executionActive, type AiPanelProps, type ChatMessage, type ExecutionStatus, type Proposal, type ProposalTarget, type RecordedDecision } from "./contracts";
 import { SessionSelection, type SessionSelectionProps } from "./SessionSelection";
 import "./ai.css";
 
 type ChatState = { kind: "idle" } | { kind: "sending" } | { kind: "failed"; message: string };
 type ProposalState = { kind: "idle" } | { kind: "requesting" } | { kind: "failed" };
 type DecisionState = RecordedDecision | "reviewing" | "failed";
+
+const EXECUTION_LABEL: Record<ExecutionStatus["phase"], string> = {
+  starting: "채널 연결 중",
+  pairing: "연결 코드 대기",
+  waitingClaim: "중앙 셸 예약 키 대기",
+  awaitingStart: "작업 시작 대기",
+  running: "실행 중",
+  stopRequested: "중지 요청됨",
+  exited: "종료됨",
+  unconfirmed: "종료 확인 불가",
+  failed: "실행 실패",
+};
+
+function blockText(value: string) {
+  return value.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, (character) =>
+    character === "\n" || character === "\t" ? character
+      : `\\u{${character.codePointAt(0)?.toString(16)}}`);
+}
 
 export type AiTopTabs = Readonly<{
   item: Readonly<{ id: string; label: string; content: ReactNode; hidden?: boolean }>;
@@ -102,6 +120,7 @@ export function AiPanel(props: AiPanelProps & { topTabs?: AiTopTabs; sessionSele
           {props.policyStatus}
           <ProposalReview key={JSON.stringify([selected, !!target, target && props.policyVersion])} model={model} target={target}
             proposals={props.proposals} history={props.history} attempted={attempted.current} settings={proposalSettings}
+            execution={props.execution} onExecuteProposal={props.onExecuteProposal} onStopExecution={props.onStopExecution}
             onRequestProposal={props.onRequestProposal} onDecideProposal={props.onDecideProposal} onReadDecision={props.onReadDecision} />
         </div>
       </section>
@@ -171,8 +190,8 @@ function Chat({ models, model, onModelChange, onSendChat }: Pick<AiPanelProps, "
   </>;
 }
 
-function ProposalReview({ model, target, proposals, history, attempted, settings, onRequestProposal, onDecideProposal, onReadDecision }:
-  Pick<AiPanelProps, "proposals" | "history" | "onRequestProposal" | "onDecideProposal" | "onReadDecision"> & {
+function ProposalReview({ model, target, proposals, history, attempted, settings, execution, onExecuteProposal, onStopExecution, onRequestProposal, onDecideProposal, onReadDecision }:
+  Pick<AiPanelProps, "proposals" | "history" | "execution" | "onExecuteProposal" | "onStopExecution" | "onRequestProposal" | "onDecideProposal" | "onReadDecision"> & {
     model: string;
     target: ProposalTarget | undefined;
     attempted: Set<string>;
@@ -181,6 +200,7 @@ function ProposalReview({ model, target, proposals, history, attempted, settings
   const [request, setRequest] = useState<ProposalState>({ kind: "idle" });
   const [created, setCreated] = useState<Proposal[]>([]);
   const [decisions, setDecisions] = useState<ReadonlyMap<string, DecisionState>>(new Map());
+  const [executing, setExecuting] = useState<string>();
   const pending = useRef<AbortController | null>(null);
   const mounted = useRef(false);
   const proposeButton = useRef<HTMLButtonElement>(null);
@@ -252,6 +272,16 @@ function ProposalReview({ model, target, proposals, history, attempted, settings
     void recordDecision(proposal.id, button, () => onDecideProposal({ proposalId: proposal.id, decision }));
   }
 
+  async function execute(proposal: Proposal) {
+    if (!onExecuteProposal || executing) return;
+    setExecuting(proposal.id);
+    try {
+      await onExecuteProposal(proposal.id, "uptime");
+    } finally {
+      if (mounted.current) setExecuting(undefined);
+    }
+  }
+
   return <>
     {target && (model || request.kind === "requesting") && <div className="a01-actions a01-request">
       <button type="button" className="a01-request-start" ref={proposeButton} disabled={!model} aria-disabled={request.kind === "requesting" || undefined}
@@ -267,6 +297,7 @@ function ProposalReview({ model, target, proposals, history, attempted, settings
     {request.kind === "failed" && <p role="alert">제안 요청 실패</p>}
     {[...cards.values()].map((proposal) => {
       const decision = recorded.get(proposal.id) ?? decisions.get(proposal.id) ?? (attempted.has(proposal.id) ? "closed" : undefined);
+      const active = execution !== undefined && executionActive(execution.phase);
       return <article key={proposal.id} className="a01-proposal" aria-label="조회 제안" tabIndex={-1}>
         <dl>
           {proposal.ssm && <>
@@ -295,6 +326,31 @@ function ProposalReview({ model, target, proposals, history, attempted, settings
             void recordDecision(proposal.id, event.currentTarget, () => onReadDecision(proposal.id));
           }
         }}>결정 다시 조회</button>}
+        {decision === "approved" && proposal.kind === "reviewable" && onExecuteProposal && !active &&
+          targetKey(proposal.target) === key &&
+          <div className="a01-actions">
+            <button type="button" disabled={!!executing} onClick={() => void execute(proposal)}>
+              {executing === proposal.id ? "실행 승인 중" : "실행 승인"}
+            </button>
+          </div>}
+        {execution?.proposalId === proposal.id && <section className="a01-execution" aria-label="실행 상태">
+          <dl>
+            {execution.node && <><dt>대상</dt><dd>{visibleText(execution.node)}</dd></>}
+            {execution.sessionId && <><dt>세션</dt><dd>{visibleText(execution.sessionId)}</dd></>}
+            {execution.program && <><dt>절대 경로</dt><dd><code>{visibleText(execution.program)}</code></dd></>}
+            <dt>인자</dt><dd><code>{execution.args?.length ? execution.args.map(visibleText).join(" ") : "(없음)"}</code></dd>
+            <dt>정책</dt><dd>{execution.policy === "allowed" ? "허용된 조회 작업" : "실행 불가"}</dd>
+            <dt>상태</dt><dd role="status">{EXECUTION_LABEL[execution.phase]}</dd>
+            {execution.jobId && <><dt>작업</dt><dd>{visibleText(execution.jobId)}</dd></>}
+            {execution.pairingCode && <><dt>연결 코드</dt><dd><code>{visibleText(execution.pairingCode)}</code></dd></>}
+          </dl>
+          {execution.error && <p role="alert">{visibleText(execution.error)}</p>}
+          {execution.output && <pre className="a01-execution-output">{blockText(execution.output)}</pre>}
+          {execution.phase === "running" && execution.approvalId && onStopExecution &&
+            <div className="a01-actions">
+              <button type="button" onClick={() => void onStopExecution(execution.approvalId as string)}>중지</button>
+            </div>}
+        </section>}
       </article>;
     })}
   </>;

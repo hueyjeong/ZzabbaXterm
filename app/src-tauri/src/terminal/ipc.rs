@@ -1,4 +1,7 @@
+use std::time::Instant;
+
 use super::{Launch, Sessions, saved, shell, size, stage, validate_size};
+use crate::ai::{execution, session_selection};
 use tauri::{Manager, WebviewWindow, ipc::{Channel, CommandArg, CommandItem, Invoke, InvokeResponseBody}};
 
 async fn blocking<T: Send + 'static>(job: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
@@ -80,7 +83,20 @@ pub(crate) async fn terminal_start(webview: WebviewWindow, id: String) -> Result
 
 #[tauri::command]
 pub(crate) async fn terminal_input(webview: WebviewWindow, id: String, bytes: Vec<u8>) -> Result<(), String> {
-    blocking(move || webview.state::<Sessions>().input(webview.label(), &id, &bytes)).await
+    blocking(move || {
+        let sessions = webview.state::<Sessions>();
+        if webview.label() == "main" && webview.as_ref().window().label() == "main" {
+            let state = webview.state::<execution::State>().inner().clone();
+            let now = Instant::now();
+            if let Some(key) = state.observe_prefix(&id, &bytes, now) {
+                let document = sessions.document("main");
+                let confirmed = webview.state::<session_selection::State>().confirmed(&sessions, document);
+                let selection = confirmed.as_ref().map(|(generation, identity)| (*generation, identity));
+                state.record_key(document, &id, key, selection, now);
+            }
+        }
+        sessions.input(webview.label(), &id, &bytes)
+    }).await
 }
 
 #[tauri::command]

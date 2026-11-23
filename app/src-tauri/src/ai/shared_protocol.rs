@@ -20,6 +20,7 @@ pub(crate) enum Event {
     HelloAck,
     Pairing { code: Zeroizing<String>, expires_in: Duration },
     Paired { uid: u32, shell_generation: NonZeroU64 },
+    Denied,
     Claim { ticket: Ticket },
     Started { job_id: NonZeroU64 },
     Output { job_id: NonZeroU64, stream: WireStream, bytes: Vec<u8> },
@@ -207,6 +208,13 @@ impl SharedProtocol {
             {
                 self.phase = Phase::AwaitPairing;
                 Event::HelloAck
+            }
+            NodeFrame::Denied { channel, seq }
+                if matches!(self.work, Work::Reserved(..) | Work::Claimed(..)) =>
+            {
+                self.accept(channel, seq)?;
+                self.work = Work::Idle;
+                Event::Denied
             }
             NodeFrame::Started { channel, job_id, seq }
                 if matches!(self.work, Work::Granted(id) if id == job_id) =>

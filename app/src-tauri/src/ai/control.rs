@@ -90,15 +90,30 @@ impl ControlTransport {
 
     /// 시작 안내와 노드 프레임의 구분은 프로토콜 소유자가 맡는다.
     pub(crate) fn read(&mut self) -> Result<Output, String> {
-        let result = self.read_output();
+        let result = self.read_output(READ_TIMEOUT);
         if let Err(error) = &result {
             self.session.stop(Stop::Disconnected(error.clone()));
         }
         result
     }
 
-    fn read_output(&mut self) -> Result<Output, String> {
-        let deadline = if self.connected { Instant::now() + READ_TIMEOUT } else { self.open_deadline };
+    /// 연결 뒤에는 프레임이 없을 때 정상 대기로 돌려준다. 연결 전에는 열기 기한이 그대로 적용된다.
+    pub(crate) fn poll(&mut self, timeout: Duration) -> Result<Option<Output>, String> {
+        if !self.connected {
+            return self.read().map(Some);
+        }
+        match self.read_output(timeout) {
+            Err(error) if error == TIMED_OUT => Ok(None),
+            Err(error) => {
+                self.session.stop(Stop::Disconnected(error.clone()));
+                Err(error)
+            }
+            Ok(output) => Ok(Some(output)),
+        }
+    }
+
+    fn read_output(&mut self, timeout: Duration) -> Result<Output, String> {
+        let deadline = if self.connected { Instant::now() + timeout } else { self.open_deadline };
         loop {
             match self.next_event(deadline)? {
                 Event::Connecting => continue,
