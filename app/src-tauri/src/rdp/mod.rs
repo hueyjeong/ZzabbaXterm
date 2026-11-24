@@ -46,6 +46,7 @@ pub use frame::{Frame, Rect};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_LIFETIME: Duration = Duration::from_secs(8 * 60 * 60);
+const INPUT_WAIT: Duration = Duration::from_millis(500);
 static SLOTS: Semaphore = Semaphore::const_new(4);
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -373,7 +374,7 @@ impl Session {
 }
 
 impl InputHandle {
-    /// Takes one bounded command; rejects mismatched IDs and full input queues.
+    /// Takes one bounded command; rejects mismatched IDs and reports `Busy` when the queue stays full.
     pub async fn input(&self, id: SessionId, input: Input) -> Result<(), Error> {
         self.send(id, None, input).await
     }
@@ -388,11 +389,13 @@ impl InputHandle {
             }
         }
         let (tx, rx) = oneshot::channel();
+        // 세션 작업이 잠시 쓰기 중이어도 입력을 버리지 않도록 정해진 시간만 기다린다.
         self.input
-            .try_send((generation, input, tx))
+            .send_timeout((generation, input, tx), INPUT_WAIT)
+            .await
             .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => Error::Busy,
-                mpsc::error::TrySendError::Closed(_) => Error::Closed,
+                mpsc::error::SendTimeoutError::Timeout(_) => Error::Busy,
+                mpsc::error::SendTimeoutError::Closed(_) => Error::Closed,
             })?;
         rx.await.map_err(|_| Error::Closed)?
     }

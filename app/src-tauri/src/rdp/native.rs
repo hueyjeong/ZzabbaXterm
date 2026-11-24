@@ -1,18 +1,21 @@
-use tauri::WebviewWindow;
+use tauri::{WebviewWindow, ipc::Channel};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
-use super::{Account, Error};
+use super::{Account, Error, ipc::{APPROVAL_DONE, APPROVAL_WAITING}};
 
-pub(super) async fn confirm(window: WebviewWindow, description: String, live: CancellationToken, approval: Arc<()>) -> Result<(), Error> {
-    let approved = dialog(window, live, approval, move |window| confirm_native(&window, &description)).await?;
+/// 네이티브 창이 열려 있는 동안 탭에 승인 대기를 표시할 출력 채널이다.
+pub(super) type Notify = Channel<String>;
+
+pub(super) async fn confirm(window: WebviewWindow, description: String, live: CancellationToken, approval: Arc<()>, notify: Notify) -> Result<(), Error> {
+    let approved = dialog(window, live, approval, notify, move |window| confirm_native(&window, &description)).await?;
     if approved { Ok(()) } else { Err(Error::Closed) }
 }
 
-pub(super) async fn trust(window: WebviewWindow, request: super::trust::Request, live: CancellationToken, approval: Arc<()>) -> Result<bool, Error> {
+pub(super) async fn trust(window: WebviewWindow, request: super::trust::Request, live: CancellationToken, approval: Arc<()>, notify: Notify) -> Result<bool, Error> {
     let changed = request.changed;
     let text = request.text;
-    dialog(window, live, approval, move |window| {
+    dialog(window, live, approval, notify, move |window| {
         if changed { confirm_change_native(&window, &text) } else { confirm_native(&window, &text) }
     }).await
 }
@@ -20,7 +23,7 @@ pub(super) async fn trust(window: WebviewWindow, request: super::trust::Request,
 #[cfg(windows)]
 fn confirm_change_native(window: &WebviewWindow, description: &str) -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        IDOK, MB_DEFBUTTON2, MB_ICONWARNING, MB_OKCANCEL, MessageBoxW,
+        IDOK, MB_DEFBUTTON2, MB_ICONWARNING, MB_OKCANCEL, MB_SETFOREGROUND, MessageBoxW,
     };
     let wide = |text: &str| text.encode_utf16().chain([0]).collect::<Vec<_>>();
     let text = wide(description);
@@ -28,7 +31,7 @@ fn confirm_change_native(window: &WebviewWindow, description: &str) -> bool {
     let Ok(hwnd) = window.hwnd() else { return false; };
     // 취소를 기본 버튼으로 두어 Enter가 지문 교체를 승인하지 않게 한다.
     unsafe {
-        MessageBoxW(hwnd.0 as _, text.as_ptr(), title.as_ptr(), MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2) == IDOK
+        MessageBoxW(hwnd.0 as _, text.as_ptr(), title.as_ptr(), MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND) == IDOK
     }
 }
 
@@ -37,27 +40,33 @@ fn confirm_change_native(window: &WebviewWindow, description: &str) -> bool {
     confirm_native(window, description)
 }
 
-pub(super) async fn account(window: WebviewWindow, target: String, live: CancellationToken, approval: Arc<()>) -> Result<Account, Error> {
-    dialog(window, live, approval, move |window| account_native(&window, &target)).await?.ok_or(Error::Credentials)
+pub(super) async fn account(window: WebviewWindow, target: String, live: CancellationToken, approval: Arc<()>, notify: Notify) -> Result<Account, Error> {
+    dialog(window, live, approval, notify, move |window| account_native(&window, &target)).await?.ok_or(Error::Credentials)
 }
 
-async fn dialog<T: Send + 'static>(window: WebviewWindow, live: CancellationToken, approval: Arc<()>,
+async fn dialog<T: Send + 'static>(window: WebviewWindow, live: CancellationToken, approval: Arc<()>, notify: Notify,
     show: impl FnOnce(WebviewWindow) -> T + Send + 'static) -> Result<T, Error> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let parent = window.clone();
     let check = live.clone();
+    let _ = notify.send(APPROVAL_WAITING.into());
     window.run_on_main_thread(move || {
         let _approval = approval;
         if !check.is_cancelled() {
+            // 최소화되었거나 다른 창 뒤에 있으면 모달 창이 주 창 뒤에 숨는다. 먼저 주 창을 앞으로 가져온다.
+            let _ = parent.unminimize();
+            let _ = parent.set_focus();
             let answer = show(parent);
             if !check.is_cancelled() { let _ = tx.send(answer); }
         }
     }).map_err(|_| Error::Closed)?;
-    tokio::select! {
+    let answer = tokio::select! {
         biased;
         () = live.cancelled() => Err(Error::Closed),
         answer = rx => answer.map_err(|_| Error::Closed),
-    }
+    };
+    let _ = notify.send(APPROVAL_DONE.into());
+    answer
 }
 
 #[cfg(any(windows, target_os = "linux"))]
@@ -118,7 +127,22 @@ fn account_native(window: &WebviewWindow, target: &str) -> Option<Account> {
     account
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+fn confirm_native(window: &WebviewWindow, description: &str) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        IDOK, MB_DEFBUTTON2, MB_ICONQUESTION, MB_OKCANCEL, MB_SETFOREGROUND, MessageBoxW,
+    };
+    let wide = |text: &str| text.encode_utf16().chain([0]).collect::<Vec<_>>();
+    let text = wide(description);
+    let title = wide("RDP 연결 승인");
+    let Ok(hwnd) = window.hwnd() else { return false; };
+    // 취소를 기본 버튼으로 두고 창을 앞으로 올려 주 창 뒤에 숨지 않게 한다.
+    unsafe {
+        MessageBoxW(hwnd.0 as _, text.as_ptr(), title.as_ptr(), MB_OKCANCEL | MB_ICONQUESTION | MB_SETFOREGROUND | MB_DEFBUTTON2) == IDOK
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn confirm_native(window: &WebviewWindow, description: &str) -> bool {
     rfd::MessageDialog::new().set_parent(window).set_title("RDP 연결 승인").set_description(description)
         .set_buttons(rfd::MessageButtons::OkCancel).show() == rfd::MessageDialogResult::Ok

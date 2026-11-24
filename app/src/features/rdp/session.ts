@@ -13,6 +13,14 @@ export interface Connection extends RemoteDesktopSession {
 const CHUNK = 256 * 1024;
 const MAX_PIXELS = 3840 * 2160;
 const MAX_CLIPBOARD_BYTES = 64 * 1024;
+const MAX_QUEUE = 512;
+const MAX_BATCH = 64;
+const BUSY_RETRY_MS = 15;
+/** Rust가 승인·계정·인증서 창을 띄우고 닫을 때 출력 채널로 보내는 신호다. */
+const APPROVAL_WAITING = "approval";
+const APPROVAL_DONE = "approval-done";
+export const APPROVAL_NOTICE = "승인 창 확인 필요";
+export const DROPPED_NOTICE = "RDP 입력 일부를 버렸습니다";
 const token = /^[a-f0-9]{32}$/;
 function proof(): string | undefined {
   if (window !== top) return;
@@ -28,6 +36,10 @@ type Action = { kind: "active"; active: boolean } | { kind: "release" } | { kind
 { kind: "pointer"; x: number; y: number; buttons: number } |
 { kind: "paste"; text: string } | { kind: "resize"; width: number; height: number };
 type Frame = Extract<RemoteDesktopEvent, { kind: "full" | "patch" }>;
+type Queued = { action: Action; epoch: number; displayGeneration: number };
+/** 입력 한 건의 결과다. busy는 Rust가 순번을 쓰지 않았으므로 같은 순번으로 다시 보낸다. */
+type Reply = "ok" | "stale" | "busy" | { error: string };
+const pause = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 export function connect(draft: Draft, opened: (connection: Connection) => void,
   caps: (value: Capabilities) => void, ready: (value: boolean) => void, notice: (message: string) => void,
@@ -52,8 +64,9 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
   let serial = 0;
   let lastPacket = 0;
   let lastFrame = 0;
-  const queue: { action: Action; epoch: number; displayGeneration: number }[] = [];
+  const queue: Queued[] = [];
   let sending = false;
+  let dropped = false;
   let closing: Promise<void> | undefined;
   const stop = () => {
     if (done) return;
@@ -86,30 +99,77 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
     if (sending || done || !id) return;
     sending = true;
     try {
-      for (let next = queue.shift(); next && !done; next = queue.shift()) {
+      while (!done) {
+        if (!queue.length) {
+          // 입력을 버린 뒤 큐가 비면 한 번 해제해 눌린 키나 버튼이 남지 않게 한다. 비활성 전환은 Rust가 따로 해제한다.
+          if (!dropped || !active || !displayGeneration) { dropped = false; return; }
+          dropped = false;
+          queue.push({ action: { kind: "release" }, epoch, displayGeneration });
+        }
+        const batch = queue.splice(0, MAX_BATCH);
+        const inputs = batch.map((next, index) => ({ ...next, sequence: serial + index + 1 }));
+        let replies: unknown;
         try {
-          const accepted = await run<boolean>("rdp_input", { id, input: { ...next, sequence: ++serial } });
-          if (accepted === false && next.displayGeneration === displayGeneration) {
-            displayGeneration = 0;
-            queue.length = 0;
-            epoch++;
+          replies = inputs.length === 1
+            ? [await run<Reply>("rdp_input", { id, input: inputs[0] }).catch((error: unknown) => ({ error: String(error) }))]
+            : await run<Reply[]>("rdp_input_batch", { id, inputs });
+        } catch (error) {
+          if (!done) end(String(error));
+          return;
+        }
+        if (done) return;
+        let busy = false;
+        for (const [index, next] of batch.entries()) {
+          const reply: unknown = Array.isArray(replies) ? replies[index] : undefined;
+          if (reply === "busy") {
+            // 적용되지 않은 항목은 같은 순번으로 다시 보낸다. 그 사이 화면이나 활성 상태가 바뀌었으면 버린다.
+            queue.unshift(...batch.slice(index).filter((item) => item.epoch === epoch));
+            busy = true;
+            break;
+          }
+          if (reply !== "ok" && reply !== "stale" && !(record(reply) && typeof reply.error === "string")) {
+            end("RDP 입력 응답 오류"); return;
+          }
+          serial++;
+          if (reply === "stale") {
+            if (next.displayGeneration === displayGeneration) {
+              displayGeneration = 0;
+              queue.length = 0;
+              epoch++;
+            }
+          } else if (reply !== "ok") {
+            const error = String(reply.error);
+            if (next.action.kind === "copy" || next.action.kind === "paste" || next.action.kind === "resize") notice(error);
+            else { end(error); return; }
           }
         }
-        catch (error) {
-          if (done) return;
-          if (next.action.kind === "copy" || next.action.kind === "paste" || next.action.kind === "resize") notice(String(error));
-          else { end(String(error)); return; }
-        }
+        if (busy) await pause(BUSY_RETRY_MS);
       }
     } finally { sending = false; }
+  }
+  /** 버튼 상태가 직전 포인터와 같은 이동은 뒤 이동이 위치를 대신하므로 오래된 것부터 버린다. */
+  function dropMove() {
+    let buttons: number | undefined;
+    for (const [index, { action }] of queue.entries()) {
+      if (action.kind !== "pointer") continue;
+      if (action.buttons === buttons) { queue.splice(index, 1); return true; }
+      buttons = action.buttons;
+    }
+    return false;
   }
   function send(action: Action) {
     if (done || !displayGeneration || (action.kind !== "active" && !active)) return;
     const last = queue[queue.length - 1];
     if (action.kind === "pointer" && last?.action.kind === "pointer" && last.action.buttons === action.buttons) {
       last.action = action;
-    } else if (queue.length < 32) queue.push({ action, epoch, displayGeneration });
-    else { end("RDP 입력 큐가 가득 찼습니다"); return; }
+    } else {
+      if (queue.length >= MAX_QUEUE && action.kind !== "active" && action.kind !== "release" && !dropMove()) {
+        if (!dropped) notice(DROPPED_NOTICE);
+        dropped = true;
+        return;
+      }
+      queue.push({ action, epoch, displayGeneration });
+    }
     void flush();
   }
   function setActive(next: boolean) {
@@ -230,7 +290,11 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
     try {
       const assigned = await prepared;
       if (done) return;
-      output = new Channel<string>((ticket: unknown) => { void packet(ticket); });
+      output = new Channel<string>((ticket: unknown) => {
+        if (ticket === APPROVAL_WAITING) notice(APPROVAL_NOTICE);
+        else if (ticket === APPROVAL_DONE) notice("");
+        else void packet(ticket);
+      });
       const completion = run("rdp_connect", { id, draft, output });
       opened({
         ...assigned,

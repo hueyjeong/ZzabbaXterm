@@ -1,15 +1,39 @@
-import { useImperativeHandle, useLayoutEffect, useRef, useState, type Ref, type SubmitEvent } from "react";
+import { RotateCcw } from "lucide-react";
+import { useEffect, useImperativeHandle, useLayoutEffect, useRef, useState, type Ref, type SubmitEvent } from "react";
 import { RemoteDesktopView } from "../remoteDesktop/RemoteDesktopView";
 import type { DesktopPreset } from "../remoteDesktop/desktopProfile";
 import type { DesktopTunnelSource } from "../tunnels/tunnelIpc";
+import { IconButton } from "../ui/controls";
 import { connect, type Capabilities, type Connection } from "./session";
 
 const noChannels: Capabilities = { copy: false, paste: false, resize: false };
+/** Rust `Error::Transport` 문구다. 터널 경로에서 이 오류가 나면 경로를 다시 열어야 재연결할 수 있다. */
+const TRANSPORT_LOST = "RDP 전송 연결이 끊겼습니다";
+
+type Draft = { host: string; port: number; tlsOnly: boolean; source?: DesktopTunnelSource };
+
+function forwarded(source?: DesktopTunnelSource) {
+  const destination = source?.destination;
+  return destination && `${destination.host.includes(":") ? `[${destination.host}]` : destination.host}:${destination.port}`;
+}
 
 export interface RdpTabActions { requestClose(): Promise<boolean> }
 
-export function RdpTab({ active, label, source, preset, onSecurityMode, ref }: { readonly active: boolean; readonly label: string; readonly source?: DesktopTunnelSource; readonly preset?: DesktopPreset; readonly onSecurityMode?: (tlsOnly: boolean) => void; readonly ref?: Ref<RdpTabActions> }) {
+export function RdpTab({ active, label, source, preset, autoStart, onSecurityMode, onReopenRoute, ref }: {
+  readonly active: boolean; readonly label: string; readonly source?: DesktopTunnelSource; readonly preset?: DesktopPreset;
+  /** 저장 프로필로 연 탭은 입력칸 없이 한 번 바로 연결한다. */
+  readonly autoStart?: boolean;
+  readonly onSecurityMode?: (tlsOnly: boolean) => void;
+  /** 터널 경로가 끊겨 재연결할 때 Workspace가 같은 프로필의 경로를 다시 열어 새 source를 넘긴다. */
+  readonly onReopenRoute?: () => void;
+  readonly ref?: Ref<RdpTabActions>;
+}) {
   const cancel = useRef<(() => Promise<void>) | undefined>(undefined);
+  const last = useRef<Draft>(undefined);
+  const autoStarted = useRef(false);
+  const awaitingRoute = useRef(false);
+  const [editing, setEditing] = useState(!(autoStart && preset));
+  const [routeLost, setRouteLost] = useState(false);
   const [host, setHost] = useState(preset?.host ?? "");
   const [port, setPort] = useState(String(preset?.port ?? 3389));
   const [tlsOnly, setTlsOnly] = useState(preset?.tlsOnly ?? false);
@@ -20,8 +44,7 @@ export function RdpTab({ active, label, source, preset, onSecurityMode, ref }: {
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [closeStatus, setCloseStatus] = useState<"closing" | "unconfirmed">();
-  const destination = source?.destination;
-  const forwardedAddress = destination && `${destination.host.includes(":") ? `[${destination.host}]` : destination.host}:${destination.port}`;
+  const forwardedAddress = forwarded(source);
   const loginMode = opening?.tlsOnly ? "NLA, 미지원 시 TLS 전용(표준 RDP 보안 없음)" : "NLA";
 
   useLayoutEffect(() => () => { void cancel.current?.().catch(() => { }); }, []);
@@ -53,25 +76,73 @@ export function RdpTab({ active, label, source, preset, onSecurityMode, ref }: {
     }
   }
 
-  function submit(event: SubmitEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!event.nativeEvent.isTrusted || !active || cancel.current) return;
+  function draftOf(hostName: string, tls: boolean): Draft {
+    return source ? { host: hostName, port: source.destination.port, tlsOnly: tls, source } : { host: hostName, port: Number(port), tlsOnly: tls };
+  }
+
+  /** 승인·계정·인증서 확인은 Rust 네이티브 창이 맡는다. 여기서는 같은 탭의 중복 연결만 막는다. */
+  function start(draft: Draft) {
+    if (!active || cancel.current) return;
+    last.current = draft;
+    setEditing(false);
+    setRouteLost(false);
     setError("");
-    const hostName = host.trim();
-    const draft = source ? { host: hostName, port: source.destination.port, tlsOnly, source } : { host: hostName, port: Number(port), tlsOnly };
-    setOpening({ host: source ? hostName.toLowerCase() : hostName, port: draft.port, forwardedAddress, tlsOnly });
-    onSecurityMode?.(tlsOnly);
+    setOpening({ host: draft.source ? draft.host.toLowerCase() : draft.host, port: draft.port, forwardedAddress: forwarded(draft.source), tlsOnly: draft.tlsOnly });
+    onSecurityMode?.(draft.tlsOnly);
     cancel.current = connect(draft, setConnection,
       setChannels, setReady, setNotice, (message, closed) => {
         reset();
         if (closed) cancel.current = undefined;
         setCloseStatus(closed ? undefined : "unconfirmed");
         setError(message);
+        setRouteLost(!!draft.source && message === TRANSPORT_LOST);
       });
   }
 
+  useEffect(() => {
+    if (!autoStart || !preset || !active || autoStarted.current) return;
+    let stopped = false;
+    // StrictMode에서 즉시 해제된 첫 마운트는 연결을 시작하지 않는다.
+    void Promise.resolve().then(() => {
+      if (stopped || autoStarted.current) return;
+      autoStarted.current = true;
+      start(draftOf(preset.host, preset.tlsOnly ?? false));
+    });
+    return () => { stopped = true; };
+  }, [autoStart, preset, active]);
+
+  useEffect(() => {
+    const draft = last.current;
+    if (!awaitingRoute.current || !active || !source || !draft || draft.source === source) return;
+    // 다시 연 경로가 준비된 뒤에만 연결한다.
+    awaitingRoute.current = false;
+    start({ ...draft, port: source.destination.port, source });
+  }, [active, source]);
+
+  function submit(event: SubmitEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!event.nativeEvent.isTrusted) return;
+    start(draftOf(host.trim(), tlsOnly));
+  }
+
+  function reconnect() {
+    const draft = last.current;
+    if (!draft) return;
+    if (routeLost && onReopenRoute) {
+      awaitingRoute.current = true;
+      onReopenRoute();
+      return;
+    }
+    start(draft);
+  }
+
+  const idle = !(opening || connection || closeStatus);
   return <section aria-label={label}>
-    {!(opening || connection || closeStatus) && <form className="remote-desktop-toolbar" onSubmit={submit}>
+    {idle && !editing && last.current && <div className="remote-desktop-toolbar">
+      <IconButton icon={RotateCcw} label="다시 연결" small disabled={!active} onClick={reconnect} />
+      <button type="button" onClick={() => setEditing(true)}>연결 설정 편집</button>
+    </div>}
+    {idle && editing && <form className="remote-desktop-toolbar" onSubmit={submit}>
       {forwardedAddress && <span>포워드 목적지: {forwardedAddress}</span>}
       <label>{source ? "TLS 인증 DNS" : "서버 DNS"} <input value={host} onChange={(event) => setHost(event.target.value)} required maxLength={253} /></label>
       {!source && <label>포트 <input type="number" value={port} min={1} max={65535} onChange={(event) => setPort(event.target.value)} required /></label>}

@@ -56,15 +56,18 @@ impl Controls {
 
     pub(super) async fn send(&mut self, life: &CancellationToken, command: Command) -> Result<(), Error> {
         if life.is_cancelled() || command.sequence != self.sequence + 1 || command.sequence > super::MAX_SAFE { return Err(Error::Closed); }
-        self.sequence = command.sequence;
+        let sequence = command.sequence;
+        self.sequence = sequence;
         if command.display_generation == 0 || command.display_generation > self.display_generation { return Err(Error::Closed); }
         if command.display_generation < self.display_generation { return Err(Error::StaleDisplay); }
         let result = async {
             if let Action::Active { active } = command.action {
                 if command.epoch <= self.epoch || command.epoch > super::MAX_SAFE { return Err(Error::Closed); }
+                // 해제가 busy로 끝나면 같은 명령을 다시 받을 수 있게 상태는 해제 뒤에 바꾼다.
+                self.release().await?;
                 self.active = active;
                 self.epoch = command.epoch;
-                return self.release().await;
+                return Ok(());
             }
             if !self.active || self.epoch != command.epoch { return Err(Error::Closed); }
             let Some((_, _, size)) = self.display else { return Err(Error::Busy); };
@@ -104,10 +107,13 @@ impl Controls {
             }
             Ok(())
         };
-        tokio::select! { biased;
+        let reply = tokio::select! { biased;
             () = life.cancelled() => Err(Error::Closed),
             reply = result => reply,
-        }
+        };
+        // busy는 적용되지 않은 입력이므로 같은 순번의 재전송을 받는다. 이미 보낸 일부 이벤트는 재전송해도 같은 상태가 된다.
+        if reply == Err(Error::Busy) { self.sequence = sequence - 1; }
+        reply
     }
 
     async fn write(&self, input: Input) -> Result<(), Error> {

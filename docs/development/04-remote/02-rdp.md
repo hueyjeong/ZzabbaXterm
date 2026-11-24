@@ -40,6 +40,12 @@
 - **체인 실패 후의 범위**: 체인 검증이 실패해 1회 승인한 뒤에는 그 지문만 검증한다. 이름 불일치·만료·알 수 없는 CA 같은 체인/이름/유효기간 문제는 승인 카드의 `사유` 항목으로 표시하며, 승인 후에는 지문 일치가 연결 조건이다.
 - **범위**: TLS 전용(opt-in)과 NLA 경로 모두 같은 규칙을 쓴다. 인증서 검증을 끄는 옵션은 없다. 2026-11-23 실측 시점에 이 Windows 사용자 신뢰 저장소에는 시험 CA가 남아 있지 않다(`certutil -user -store Root`에서 0건).
 
+## 입력 전달과 승인 창
+
+- **입력 큐**: 탭은 입력을 최대 512개까지 쌓고 `rdp_input_batch`로 64개씩 묶어 보낸다. 큐가 넘치면 버튼 상태가 같은 오래된 포인터 이동부터 버리고 연결은 끊지 않는다. 키 입력까지 버리면 `RDP 입력 일부를 버렸습니다`를 표시하고 큐가 빈 뒤 `release`를 한 번 보내 눌린 키를 해제한다.
+- **결과와 순번**: `rdp_input`·`rdp_input_batch`의 항목 결과는 `ok`·`stale`·`busy`(묶음에서는 오류 `{ error }`도 포함)다. Rust는 세션 작업 큐에 최대 500ms 기다려 넣고, 그래도 차 있으면 `busy`로 답하며 그 순번을 쓰지 않는다. 탭은 순번을 `busy`가 아닌 결과에서만 올리고, `busy` 항목은 10~20ms 뒤 같은 순번으로 다시 보낸다.
+- **승인 창**: 연결 승인·계정·인증서 창을 띄우기 직전에 주 창을 복원하고 포커스를 준다. Windows 연결 승인은 `MessageBoxW`(`MB_OKCANCEL | MB_ICONQUESTION | MB_SETFOREGROUND | MB_DEFBUTTON2`)를 쓴다. 창이 열려 있는 동안 출력 채널로 `approval`을, 닫히면 `approval-done`을 보내 탭에 `승인 창 확인 필요`를 표시한다.
+
 ## 실측 기록
 
 - xrdp 0.9.24(Ubuntu 24.04 패키지, `security_layer=negotiate`)는 `HYBRID|HYBRID_EX`만 요청하면 `RDP_NEG_RSP selectedProtocol = 0x0`(RDP 표준 보안)을 돌려주고, `SSL`을 요청하면 `0x1`(TLS 전용)을 돌려준다. 즉 NLA를 모르는 서버는 SSL로 다운그레이드하지 않고 RDP 표준 보안을 고른다. 앱은 NLA가 아닌 선택을 모두 NLA 미지원으로 보고 opt-in이 켜진 경우에만 `SSL` 요청으로 한 번 재협상한다.
@@ -54,4 +60,4 @@
 
 ## 저장 프로필로 열기
 
-연결 트리의 RDP 프로필은 `app/src/features/remoteDesktop/desktopProfile.ts`의 `openDesktopProfile`로 연다. 직접 경로는 입력칸만 미리 채운다. SSH 경로는 저장된 직접 SSH 대상으로 서버 루프백 `-L` 전달을 승인받아 열고, Rust가 준비 완료로 확인한 전달을 탭의 터널 출처로 넘긴다. TLS 인증 DNS와 TLS 전용 허용 값은 프로필에서 채운다. 연결은 사용자가 **직접 연결** 또는 **터널 연결**을 눌러 시작한다. SSM 경로는 프로필 자신을 경로 대상으로 공식 SSM 포트 전달(`AWS-StartPortForwardingSessionToRemoteHost`, 원격 호스트는 프로필의 TLS 인증 DNS 이름)을 승인받아 열고, Rust가 세션 소유권까지 확인한 전달을 같은 방식으로 넘긴다. 승인 창에는 SSM 프로필·리전·관리 노드를 표시한다. 실제 AWS 경로는 미실행이다([R01 SSM 포트 전달](01-tunnels.md#ssm-포트-전달)).
+연결 트리의 RDP 프로필은 `app/src/features/remoteDesktop/desktopProfile.ts`의 `openDesktopProfile`로 연다. 직접 경로는 프로필의 주소로 바로 연결한다. SSH 경로는 저장된 직접 SSH 대상으로 서버 루프백 `-L` 전달을 승인받아 열고, Rust가 준비 완료로 확인한 전달을 탭의 터널 출처로 넘긴다. TLS 인증 DNS와 TLS 전용 허용 값은 프로필에서 채운다. 프로필로 연 탭은 경로가 준비된 뒤 입력칸 없이 한 번 바로 연결을 시작한다. 신뢰 경계는 Rust의 네이티브 연결 승인·계정·인증서 창이며, 빈 **RDP 연결** 메뉴로 연 탭만 입력칸을 보이고 사용자가 **직접 연결** 또는 **터널 연결**을 눌러 시작한다. 연결이 끊기면 오류와 **다시 연결**을 보이고, 입력칸은 **연결 설정 편집**을 눌렀을 때만 보인다. 터널 경로가 `RDP 전송 연결이 끊겼습니다`로 끊기면 **다시 연결**이 같은 프로필의 경로를 다시 열고 새 경로로 연결한다. SSM 경로는 프로필 자신을 경로 대상으로 공식 SSM 포트 전달(`AWS-StartPortForwardingSessionToRemoteHost`, 원격 호스트는 프로필의 TLS 인증 DNS 이름)을 승인받아 열고, Rust가 세션 소유권까지 확인한 전달을 같은 방식으로 넘긴다. 승인 창에는 SSM 프로필·리전·관리 노드를 표시한다. 실제 AWS 경로는 미실행이다([R01 SSM 포트 전달](01-tunnels.md#ssm-포트-전달)).

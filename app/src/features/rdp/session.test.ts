@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 import { afterEach, expect, it, vi } from "vitest";
 import { createRemoteDesktopViewSession } from "../remoteDesktop/session";
-import { connect, type Connection } from "./session";
+import { scanCode } from "./keys";
+import { APPROVAL_NOTICE, connect, DROPPED_NOTICE, type Connection } from "./session";
 
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({
@@ -23,7 +24,9 @@ async function fixture() {
   const caps = vi.fn();
   const clipboard = { readText: vi.fn().mockResolvedValue("격리 문자열"), writeText: vi.fn().mockResolvedValue(undefined) };
   let notify: (ticket: string) => void = () => { throw new Error("output channel missing"); };
-  const sendInput = vi.fn().mockResolvedValue(true);
+  const notice = vi.fn();
+  const sendInput = vi.fn().mockResolvedValue("ok");
+  const sendBatch = vi.fn((inputs: unknown[]) => Promise.resolve(inputs.map(() => "ok")));
   invoke.mockImplementation((name, args) => {
     if (name === "rdp_prepare") return Promise.resolve(id);
     if (name === "rdp_connect") {
@@ -31,13 +34,17 @@ async function fixture() {
       return Promise.withResolvers<void>().promise;
     }
     if (name === "rdp_input") return sendInput();
+    if (name === "rdp_input_batch") return sendBatch(args.inputs);
     return Promise.resolve();
   });
   const fetch = vi.fn();
   vi.stubGlobal("fetch", fetch);
-  const close = connect({ host: "localhost", port: 3389 }, opened.resolve, caps, ready, vi.fn(), ended, clipboard);
+  const close = connect({ host: "localhost", port: 3389 }, opened.resolve, caps, ready, notice, ended, clipboard);
   const connection = await opened.promise;
   const calls = (name: string) => invoke.mock.calls.filter(([command]) => command === name).map(([, args]) => args);
+  /** 단건과 묶음으로 보낸 입력을 보낸 순서대로 펼친다. */
+  const inputs = () => invoke.mock.calls.flatMap(([command, args]) =>
+    command === "rdp_input" ? [args.input] : command === "rdp_input_batch" ? args.inputs : []);
   function packet(value: Record<string, unknown> | ArrayBuffer) {
     const binary = value instanceof ArrayBuffer;
     fetch.mockResolvedValueOnce({
@@ -61,8 +68,92 @@ async function fixture() {
   const draw = vi.fn();
   vi.spyOn(canvas, "getContext").mockReturnValue({ putImageData: draw } as unknown as CanvasRenderingContext2D);
   vi.stubGlobal("ImageData", class { constructor(readonly rgba: Uint8ClampedArray) { } });
-  return { calls, packet, header, pixels, display, sendInput, close, connection, ended, ready, caps, clipboard, canvas, draw };
+  /** 첫 화면을 적용하고 활성 입력(순번 1)까지 보낸 상태로 만든다. */
+  async function live() {
+    const view = createRemoteDesktopViewSession(connection, canvas, vi.fn());
+    connection.setActive(true);
+    header(1, 1);
+    await vi.waitFor(() => expect(calls("rdp_ack")).toHaveLength(1));
+    pixels(1);
+    await vi.waitFor(() => expect(calls("rdp_ack")).toHaveLength(2));
+    display(2);
+    await vi.waitFor(() => expect(inputs()).toHaveLength(1));
+    return view;
+  }
+  return {
+    calls, inputs, live, packet, header, pixels, display, sendInput, sendBatch, close, connection, ended, ready, caps, notice,
+    clipboard, canvas, draw, signal: (ticket: string) => notify(ticket),
+  };
 }
+
+const keys = (count: number) => Array.from({ length: count }, (_, index) => ({
+  ...input, code: `Key${String.fromCharCode(65 + (Math.floor(index / 2) % 26))}`, down: index % 2 === 0,
+}));
+
+it("한 번에 쌓인 입력 100개를 끊지 않고 순서대로 묶어 보낸다", async () => {
+  const f = await fixture();
+  const view = await f.live();
+  const held = Promise.withResolvers<string>();
+  f.sendInput.mockReturnValueOnce(held.promise);
+  const events = keys(100);
+  for (const event of events) view.send(event);
+  held.resolve("ok");
+  await vi.waitFor(() => expect(f.inputs()).toHaveLength(101));
+  expect(f.ended).not.toHaveBeenCalled();
+  const sent = f.inputs().slice(1);
+  expect(sent.map((item) => item.sequence)).toEqual(Array.from({ length: 100 }, (_, index) => index + 2));
+  expect(sent.map((item) => [item.action.code, item.action.down])).toEqual(events.map((event) => [scanCode(event.code)?.code, event.down]));
+  expect(f.calls("rdp_input_batch").map((call) => call.inputs.length)).toEqual([64, 35]);
+  view.dispose();
+});
+
+it("busy 응답을 받은 입력은 같은 순번으로 다시 보내고 세션을 유지한다", async () => {
+  const f = await fixture();
+  const view = await f.live();
+  f.sendInput.mockResolvedValueOnce("busy");
+  view.send(input);
+  await vi.waitFor(() => expect(f.calls("rdp_input")).toHaveLength(3));
+  const [busy, retried] = f.calls("rdp_input").slice(1);
+  expect(busy.input.sequence).toBe(2);
+  expect(retried.input).toEqual(busy.input);
+
+  const held = Promise.withResolvers<string>();
+  f.sendInput.mockReturnValueOnce(held.promise);
+  f.sendBatch.mockResolvedValueOnce(["ok", "busy"]);
+  for (const event of keys(4)) view.send(event);
+  held.resolve("ok");
+  await vi.waitFor(() => expect(f.inputs()).toHaveLength(9));
+  const [partial, rest] = f.calls("rdp_input_batch");
+  expect(partial.inputs.map((item: { sequence: number }) => item.sequence)).toEqual([4, 5, 6]);
+  expect(rest.inputs).toEqual(partial.inputs.slice(1));
+  expect(f.ended).not.toHaveBeenCalled();
+  view.dispose();
+});
+
+it("큐가 넘쳐 키 입력을 버리면 알리고 큐가 빈 뒤 한 번 해제한다", async () => {
+  const f = await fixture();
+  const view = await f.live();
+  const held = Promise.withResolvers<string>();
+  f.sendInput.mockReturnValueOnce(held.promise);
+  for (const event of keys(520)) view.send(event);
+  expect(f.notice).toHaveBeenCalledExactlyOnceWith(DROPPED_NOTICE);
+  held.resolve("ok");
+  await vi.waitFor(() => expect(f.inputs().slice(-1)[0]).toMatchObject({ action: { kind: "release" } }));
+  const sent = f.inputs();
+  expect(sent).toHaveLength(1 + 1 + 512 + 1);
+  expect(sent.filter((item) => item.action.kind === "release")).toHaveLength(1);
+  expect(f.ended).not.toHaveBeenCalled();
+  view.dispose();
+});
+
+it("네이티브 승인 창이 열려 있는 동안 승인 대기를 알린다", async () => {
+  const f = await fixture();
+  f.signal("approval");
+  expect(f.notice).toHaveBeenLastCalledWith(APPROVAL_NOTICE);
+  f.signal("approval-done");
+  expect(f.notice).toHaveBeenLastCalledWith("");
+  expect(f.ended).not.toHaveBeenCalled();
+});
 
 it("Canvas 적용 ACK 뒤에만 키를 전달하고 서버가 보낸 크기와 클립보드 결과를 사용한다", async () => {
   const f = await fixture();
@@ -114,11 +205,11 @@ it("이전 화면 입력은 폐기하고 같은 크기의 새 화면 ACK 후 입
   await vi.waitFor(() => expect(f.calls("rdp_ack")).toHaveLength(2));
   f.display(2);
   await vi.waitFor(() => expect(f.calls("rdp_ack")).toHaveLength(3));
-  const discarded = Promise.withResolvers<boolean>();
+  const discarded = Promise.withResolvers<string>();
   f.sendInput.mockReturnValueOnce(discarded.promise);
   view.send(input);
   view.send(input);
-  discarded.resolve(false);
+  discarded.resolve("stale");
   await discarded.promise;
   view.send(input);
   f.header(3, 2, 1, 2);

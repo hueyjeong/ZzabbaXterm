@@ -577,6 +577,7 @@ describe("중앙 원격 화면", () => {
     let closeAttempts = 0;
     native.invoke.mockImplementation((command, args) => {
       if (command === "rdp_prepare") return Promise.resolve(identity);
+      if (command === "rdp_input") return Promise.resolve("ok");
       if (command === "vnc_create") return Promise.resolve(owner);
       if (command === `${protocol}_connect`) {
         output = args.output;

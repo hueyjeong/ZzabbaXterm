@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act } from "react";
+import { act, StrictMode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, expect, it, vi } from "vitest";
 import { RdpTab } from "./RdpTab";
@@ -68,4 +68,60 @@ it("저장 프로필의 값을 입력칸에 미리 채우고 사용자가 연결
   await act(async () => { dispatchTrusted(host.querySelector("form")!, new Event("submit", { bubbles: true, cancelable: true })); });
   expect(connect).toHaveBeenCalledTimes(1);
   expect((connect.mock.calls[0] as unknown[])[0]).toEqual({ host: "xrdp.example.test", port: 3389, tlsOnly: false, source });
+});
+
+type Ended = (message: string, closed: boolean) => void;
+const ended = (call: number) => (connect.mock.calls[call] as unknown[])[5] as Ended;
+
+it("저장 프로필로 연 탭은 StrictMode에서도 한 번만 바로 연결한다", async () => {
+  const host = document.createElement("div");
+  document.body.appendChild(host);
+  root = createRoot(host);
+  await act(async () => {
+    root!.render(<StrictMode><RdpTab active autoStart label="RDP 1" preset={{ host: "xrdp.example.test", port: 3390, tlsOnly: true }} /></StrictMode>);
+  });
+  expect(connect).toHaveBeenCalledTimes(1);
+  expect((connect.mock.calls[0] as unknown[])[0]).toEqual({ host: "xrdp.example.test", port: 3390, tlsOnly: true });
+  expect(host.querySelector("form")).toBeNull();
+  expect(host.textContent).toContain("xrdp.example.test:3390");
+});
+
+it("연결이 끊기면 오류와 다시 연결을 보이고 같은 초안으로 다시 연결한다", async () => {
+  const host = document.createElement("div");
+  document.body.appendChild(host);
+  root = createRoot(host);
+  await act(async () => { root!.render(<RdpTab active autoStart label="RDP 1" preset={{ host: "xrdp.example.test", port: 3390 }} />); });
+  await act(async () => { ended(0)("RDP 연결이 종료되었습니다", true); });
+  expect(host.querySelector('[role="alert"]')?.textContent).toBe("RDP 연결이 종료되었습니다");
+  expect(host.querySelector("form")).toBeNull();
+  await act(async () => { host.querySelector<HTMLButtonElement>('button[aria-label="다시 연결"]')!.click(); });
+  expect(connect).toHaveBeenCalledTimes(2);
+  expect((connect.mock.calls[1] as unknown[])[0]).toEqual((connect.mock.calls[0] as unknown[])[0]);
+  expect(host.querySelector('[role="alert"]')).toBeNull();
+
+  await act(async () => { ended(1)("RDP 연결이 종료되었습니다", true); });
+  const edit = [...host.querySelectorAll("button")].find((button) => button.textContent === "연결 설정 편집")!;
+  await act(async () => { edit.click(); });
+  expect(host.querySelector<HTMLInputElement>("input:not([type])")?.value).toBe("xrdp.example.test");
+});
+
+it("터널 경로가 끊기면 경로를 다시 열고 새 경로가 준비된 뒤 연결한다", async () => {
+  const host = document.createElement("div");
+  document.body.appendChild(host);
+  root = createRoot(host);
+  const preset = { host: "xrdp.example.test", port: 3389 };
+  const first = { tabHandle: "route-tab", tunnelId: "9", targetId: "ssh-server", destination: { host: "127.0.0.1", port: 3389 } };
+  const onReopenRoute = vi.fn();
+  const render = (source: typeof first) => act(async () => {
+    root!.render(<RdpTab active autoStart label="RDP 1" source={source} preset={preset} onReopenRoute={onReopenRoute} />);
+  });
+  await render(first);
+  await act(async () => { ended(0)("RDP 전송 연결이 끊겼습니다", true); });
+  await act(async () => { host.querySelector<HTMLButtonElement>('button[aria-label="다시 연결"]')!.click(); });
+  expect(onReopenRoute).toHaveBeenCalledOnce();
+  expect(connect).toHaveBeenCalledTimes(1);
+  const second = { ...first, tabHandle: "route-tab-2", tunnelId: "10" };
+  await render(second);
+  expect(connect).toHaveBeenCalledTimes(2);
+  expect((connect.mock.calls[1] as unknown[])[0]).toEqual({ host: "xrdp.example.test", port: 3389, tlsOnly: false, source: second });
 });
