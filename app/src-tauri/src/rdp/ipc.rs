@@ -19,9 +19,8 @@ const MAX_SAFE: u64 = (1 << 53) - 1;
 const CHUNK: usize = 256 * 1024;
 const MAX_JSON: usize = 6 * super::clipboard::MAX_TEXT + 4096;
 const MAX_BATCH: usize = 64;
-/// 승인·계정·인증서 창을 띄우고 닫을 때 출력 채널로 보내는 표시 신호다.
-pub(super) const APPROVAL_WAITING: &str = "approval";
-pub(super) const APPROVAL_DONE: &str = "approval-done";
+/// 묶음 처리 중 이 개수마다 controls 잠금을 놓아 화면 이벤트 처리가 오래 기다리지 않게 한다.
+const LOCK_SPAN: usize = 16;
 
 pub(crate) fn handles(command: &str) -> bool { COMMANDS.contains(&command) }
 
@@ -339,8 +338,8 @@ pub(crate) fn dispatch(invoke: Invoke) {
             let command = read!(Command, "input");
             drop(state);
             invoke.resolver.respond_async(async move {
-                match input_batch(&slot, vec![command]).await.map_err(message)?.pop() {
-                    Some(Reply::Failed(error)) => Err(InvokeError::from(error)),
+                match input_batch(&slot, vec![command]).await.map_err(|error| InvokeError::from(Failure::from(error)))?.pop() {
+                    Some(Reply::Failed(error)) => Err(InvokeError::from(Failure::from(error))),
                     Some(reply) => Ok(reply),
                     None => Err(InvokeError::from(CLOSED)),
                 }
@@ -349,7 +348,7 @@ pub(crate) fn dispatch(invoke: Invoke) {
         "rdp_input_batch" => {
             let commands = read!(Vec<Command>, "inputs");
             drop(state);
-            invoke.resolver.respond_async(async move { input_batch(&slot, commands).await.map_err(|error| InvokeError::from(message(error))) });
+            invoke.resolver.respond_async(async move { input_batch(&slot, commands).await.map_err(|error| InvokeError::from(Failure::from(error))) });
         }
         "rdp_connect" => {
             if !cfg!(any(windows, target_os = "linux")) {
@@ -393,7 +392,7 @@ pub(crate) fn dispatch(invoke: Invoke) {
     }
 }
 
-async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draft: Draft, tunnel_epoch: u64, approval: Arc<()>, lease: &mut Option<DesktopLease>) -> Result<(), String> {
+async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draft: Draft, tunnel_epoch: u64, approval: Arc<()>, lease: &mut Option<DesktopLease>) -> Result<(), Failure> {
     let life = &slot.life;
     let prompt = life.child_token();
     let _prompt_lifetime = prompt.clone().drop_guard();
@@ -467,7 +466,7 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
     let mut session = tokio::select! { biased;
         error = &mut stopped => {
             prompt.cancel();
-            return Err(message(error).into());
+            return Err(error.into());
         },
         session = Session::open(target, tokio_rustls::rustls::RootCertStore::empty(), trust,
             || native::account(window.clone(), target_name, prompt.clone(), approval.clone(), notify.clone()), AuthIo::new(slot, lease.as_ref())) => session.map_err(message)?,
@@ -545,16 +544,44 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
     };
     prompt.cancel();
     if result.is_ok() {
-        session.finish().await.map_err(|error| message(error).into())
+        session.finish().await.map_err(Failure::from)
     } else {
         session.close().await;
-        result.map_err(|error| message(error).into())
+        result.map_err(Failure::from)
     }
+}
+
+/// 연결·입력 실패를 탭에 알리는 값이다. `kind: "transport"`는 전송 연결이 끊긴 경우로, 터널 경로는 다시 열어야 한다.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct Failure { kind: Option<&'static str>, message: String }
+
+impl Serialize for Failure {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(kind) = self.kind { map.serialize_entry("kind", kind)?; }
+        map.serialize_entry("message", &self.message)?;
+        map.end()
+    }
+}
+
+impl From<Error> for Failure {
+    fn from(error: Error) -> Self {
+        Self { kind: (error == Error::Transport).then_some("transport"), message: message(error).into() }
+    }
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Self { Self { kind: None, message } }
+}
+
+impl From<&'static str> for Failure {
+    fn from(message: &'static str) -> Self { message.to_owned().into() }
 }
 
 /// 입력 한 건의 결과다. `busy`는 순번을 쓰지 않았으므로 같은 순번으로 다시 보낸다.
 #[derive(Debug, PartialEq, Eq)]
-enum Reply { Ok, Stale, Busy, Failed(&'static str) }
+enum Reply { Ok, Stale, Busy, Failed(Error) }
 
 impl Serialize for Reply {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -564,8 +591,9 @@ impl Serialize for Reply {
             Self::Stale => serializer.serialize_str("stale"),
             Self::Busy => serializer.serialize_str("busy"),
             Self::Failed(error) => {
-                let mut map = serializer.serialize_map(Some(1))?;
-                map.serialize_entry("error", error)?;
+                let mut map = serializer.serialize_map(None)?;
+                map.serialize_entry("error", message(*error))?;
+                if *error == Error::Transport { map.serialize_entry("kind", "transport")?; }
                 map.end()
             }
         }
@@ -578,7 +606,7 @@ impl From<Result<(), Error>> for Reply {
             Ok(()) => Self::Ok,
             Err(Error::StaleDisplay) => Self::Stale,
             Err(Error::Busy) => Self::Busy,
-            Err(error) => Self::Failed(message(error)),
+            Err(error) => Self::Failed(error),
         }
     }
 }
@@ -586,16 +614,19 @@ impl From<Result<(), Error>> for Reply {
 /// 입력을 순서대로 처리하고 `busy`에서 멈춘다. 남은 항목은 같은 순번으로 다시 보내야 한다.
 async fn input_batch(slot: &Slot, commands: Vec<Command>) -> Result<Vec<Reply>, Error> {
     if commands.is_empty() || commands.len() > MAX_BATCH { return Err(Error::Bounds); }
-    let mut controls = tokio::select! { biased;
-        () = slot.life.cancelled() => return Err(Error::Closed),
-        controls = slot.controls.lock() => controls,
-    };
     let mut replies = Vec::with_capacity(commands.len());
-    for command in commands {
-        let reply = Reply::from(controls.send(&slot.life, command).await);
-        let busy = reply == Reply::Busy;
-        replies.push(reply);
-        if busy { break; }
+    let mut commands = commands.into_iter().peekable();
+    while commands.peek().is_some() {
+        let mut controls = tokio::select! { biased;
+            () = slot.life.cancelled() => return Err(Error::Closed),
+            controls = slot.controls.lock() => controls,
+        };
+        for command in commands.by_ref().take(LOCK_SPAN) {
+            let reply = Reply::from(controls.send(&slot.life, command).await);
+            let busy = reply == Reply::Busy;
+            replies.push(reply);
+            if busy { return Ok(replies); }
+        }
     }
     Ok(replies)
 }
@@ -604,6 +635,7 @@ pub(super) fn message(error: Error) -> &'static str {
     match error {
         Error::Bounds => "RDP 화면 또는 입력 범위가 올바르지 않습니다",
         Error::Busy => "RDP 세션이 작업 중입니다",
+        Error::CopyPending => "RDP 복사가 진행 중입니다",
         Error::ChannelUnavailable => "서버가 이 RDP 채널을 열지 않았습니다",
         Error::Clipboard => "RDP 클립보드 교환 실패",
         Error::Closed => CLOSED,
@@ -652,9 +684,13 @@ mod tests {
     fn rdp_input_replies_map_busy_and_stale_without_failing() {
         assert_eq!(Reply::from(Err(Error::Busy)), Reply::Busy);
         assert_eq!(Reply::from(Err(Error::StaleDisplay)), Reply::Stale);
-        assert_eq!(Reply::from(Err(Error::Transport)), Reply::Failed(message(Error::Transport)));
-        assert_eq!(serde_json::to_value([Reply::Ok, Reply::Stale, Reply::Busy, Reply::Failed("오류")]).unwrap(),
-            serde_json::json!(["ok", "stale", "busy", { "error": "오류" }]));
+        assert_eq!(Reply::from(Err(Error::CopyPending)), Reply::Failed(Error::CopyPending));
+        assert_eq!(serde_json::to_value([Reply::Ok, Reply::Stale, Reply::Busy, Reply::Failed(Error::CopyPending), Reply::Failed(Error::Transport)]).unwrap(),
+            serde_json::json!(["ok", "stale", "busy", { "error": message(Error::CopyPending) },
+                { "error": message(Error::Transport), "kind": "transport" }]));
+        assert_eq!(serde_json::to_value(Failure::from(Error::Transport)).unwrap(),
+            serde_json::json!({ "kind": "transport", "message": message(Error::Transport) }));
+        assert_eq!(serde_json::to_value(Failure::from(CLOSED)).unwrap(), serde_json::json!({ "message": CLOSED }));
     }
 
     #[tokio::test]
@@ -684,7 +720,7 @@ mod tests {
             keys
         });
         assert_eq!(input_batch(&slot, vec![key(2, true), key(3, false)]).await, Ok(vec![Reply::Ok, Reply::Ok]));
-        assert_eq!(input_batch(&slot, vec![key(3, true)]).await, Ok(vec![Reply::Failed(CLOSED)]));
+        assert_eq!(input_batch(&slot, vec![key(3, true)]).await, Ok(vec![Reply::Failed(Error::Closed)]));
         drop(slot);
         drop(sender);
         assert_eq!(written.await.unwrap(), vec![(0x1e, false), (0x1e, true)]);

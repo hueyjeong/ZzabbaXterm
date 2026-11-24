@@ -1,5 +1,5 @@
 import { Channel, convertFileSrc, invoke, type InvokeArgs } from "@tauri-apps/api/core";
-import type { RemoteDesktopEvent, RemoteDesktopIdentity, RemoteDesktopSession } from "../remoteDesktop/session";
+import { approvalSignal, type RemoteDesktopEvent, type RemoteDesktopIdentity, type RemoteDesktopSession } from "../remoteDesktop/session";
 import type { DesktopTunnelSource } from "../tunnels/tunnelIpc";
 import { scanCode } from "./keys";
 
@@ -16,11 +16,12 @@ const MAX_CLIPBOARD_BYTES = 64 * 1024;
 const MAX_QUEUE = 512;
 const MAX_BATCH = 64;
 const BUSY_RETRY_MS = 15;
-/** Rust가 승인·계정·인증서 창을 띄우고 닫을 때 출력 채널로 보내는 신호다. */
-const APPROVAL_WAITING = "approval";
-const APPROVAL_DONE = "approval-done";
-export const APPROVAL_NOTICE = "승인 창 확인 필요";
+/** 같은 입력이 이 시간 넘게 busy면 버리고 큐가 빈 뒤 해제한다. */
+const BUSY_LIMIT_MS = 3000;
 export const DROPPED_NOTICE = "RDP 입력 일부를 버렸습니다";
+export const BUSY_NOTICE = "RDP 세션이 작업 중입니다";
+/** `transport`는 전송 연결이 끊긴 종료다. 터널 경로는 경로를 다시 열어야 재연결할 수 있다. */
+export type EndKind = "transport";
 const token = /^[a-f0-9]{32}$/;
 function proof(): string | undefined {
   if (window !== top) return;
@@ -38,12 +39,19 @@ type Action = { kind: "active"; active: boolean } | { kind: "release" } | { kind
 type Frame = Extract<RemoteDesktopEvent, { kind: "full" | "patch" }>;
 type Queued = { action: Action; epoch: number; displayGeneration: number };
 /** 입력 한 건의 결과다. busy는 Rust가 순번을 쓰지 않았으므로 같은 순번으로 다시 보낸다. */
-type Reply = "ok" | "stale" | "busy" | { error: string };
+type Reply = "ok" | "stale" | "busy" | { error: string; kind?: string };
 const pause = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+/** 사용자 동작이라 묶음에 넣지 않고, busy여도 다시 보내지 않는다. */
+const control = (action: Action) => action.kind === "copy" || action.kind === "paste" || action.kind === "resize";
+/** Rust 실패 값 `{ kind?, message }`와 문자열 거부를 함께 읽는다. */
+function failure(error: unknown): { message: string; kind?: EndKind } {
+  if (record(error) && typeof error.message === "string") return { message: error.message, kind: error.kind === "transport" ? "transport" : undefined };
+  return { message: String(error) };
+}
 
 export function connect(draft: Draft, opened: (connection: Connection) => void,
   caps: (value: Capabilities) => void, ready: (value: boolean) => void, notice: (message: string) => void,
-  ended: (message: string, closed: boolean) => void, clipboard: Pick<Clipboard, "readText" | "writeText"> = navigator.clipboard): () => Promise<void> {
+  ended: (message: string, closed: boolean, kind?: EndKind) => void, clipboard: Pick<Clipboard, "readText" | "writeText"> = navigator.clipboard): () => Promise<void> {
   const document = proof();
   const life = new AbortController();
   let output: Channel<string> | undefined;
@@ -67,6 +75,7 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
   const queue: Queued[] = [];
   let sending = false;
   let dropped = false;
+  let busySince: { item: Queued; at: number } | undefined;
   let closing: Promise<void> | undefined;
   const stop = () => {
     if (done) return;
@@ -90,10 +99,16 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
     }
     return closing;
   };
-  const end = (message: string) => {
+  const end = (message: string, kind?: EndKind) => {
     if (done) return;
-    void close().then(() => ended(message, true), (error: unknown) => ended(String(error), false));
+    const report = (text: string, closed: boolean) => kind ? ended(text, closed, kind) : ended(text, closed);
+    void close().then(() => report(message, true), (error: unknown) => report(String(error), false));
   };
+  /** 버린 입력이 있으면 한 번 알리고, 큐가 빈 뒤 해제를 보내게 표시한다. */
+  function markDropped() {
+    if (!dropped) notice(DROPPED_NOTICE);
+    dropped = true;
+  }
 
   async function flush() {
     if (sending || done || !id) return;
@@ -106,15 +121,22 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
           dropped = false;
           queue.push({ action: { kind: "release" }, epoch, displayGeneration });
         }
-        const batch = queue.splice(0, MAX_BATCH);
+        // copy·paste·resize는 단건으로만 보내 한 항목의 형식 오류가 묶음 전체를 실패시키지 않게 한다.
+        let count = 1;
+        if (!control(queue[0].action)) while (count < queue.length && count < MAX_BATCH && !control(queue[count].action)) count++;
+        const batch = queue.splice(0, count);
         const inputs = batch.map((next, index) => ({ ...next, sequence: serial + index + 1 }));
         let replies: unknown;
         try {
           replies = inputs.length === 1
-            ? [await run<Reply>("rdp_input", { id, input: inputs[0] }).catch((error: unknown) => ({ error: String(error) }))]
+            ? [await run<Reply>("rdp_input", { id, input: inputs[0] }).catch((error: unknown) => {
+              const { message, kind } = failure(error);
+              return { error: message, kind };
+            })]
             : await run<Reply[]>("rdp_input_batch", { id, inputs });
         } catch (error) {
-          if (!done) end(String(error));
+          const { message, kind } = failure(error);
+          if (!done) end(message, kind);
           return;
         }
         if (done) return;
@@ -123,13 +145,28 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
           const reply: unknown = Array.isArray(replies) ? replies[index] : undefined;
           if (reply === "busy") {
             // 적용되지 않은 항목은 같은 순번으로 다시 보낸다. 그 사이 화면이나 활성 상태가 바뀌었으면 버린다.
-            queue.unshift(...batch.slice(index).filter((item) => item.epoch === epoch));
+            const rest = (from: number) => queue.unshift(...batch.slice(from).filter((item) => item.epoch === epoch));
+            if (control(next.action)) {
+              notice(BUSY_NOTICE);
+              rest(index + 1);
+              break;
+            }
+            const now = Date.now();
+            if (busySince?.item !== next) busySince = { item: next, at: now };
+            else if (now - busySince.at >= BUSY_LIMIT_MS) {
+              busySince = undefined;
+              markDropped();
+              rest(index + 1);
+              break;
+            }
+            rest(index);
             busy = true;
             break;
           }
           if (reply !== "ok" && reply !== "stale" && !(record(reply) && typeof reply.error === "string")) {
             end("RDP 입력 응답 오류"); return;
           }
+          if (busySince?.item === next) busySince = undefined;
           serial++;
           if (reply === "stale") {
             if (next.displayGeneration === displayGeneration) {
@@ -139,18 +176,21 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
             }
           } else if (reply !== "ok") {
             const error = String(reply.error);
-            if (next.action.kind === "copy" || next.action.kind === "paste" || next.action.kind === "resize") notice(error);
-            else { end(error); return; }
+            if (control(next.action)) notice(error);
+            else { end(error, reply.kind === "transport" ? "transport" : undefined); return; }
           }
         }
         if (busy) await pause(BUSY_RETRY_MS);
       }
     } finally { sending = false; }
   }
-  /** 버튼 상태가 직전 포인터와 같은 이동은 뒤 이동이 위치를 대신하므로 오래된 것부터 버린다. */
+  /** 버튼 상태가 직전 포인터와 같은 이동은 뒤 이동이 위치를 대신하므로 오래된 것부터 버린다. 마지막 포인터는 최종 위치라 남긴다. */
   function dropMove() {
+    let lastPointer = queue.length - 1;
+    while (lastPointer >= 0 && queue[lastPointer].action.kind !== "pointer") lastPointer--;
     let buttons: number | undefined;
     for (const [index, { action }] of queue.entries()) {
+      if (index >= lastPointer) break;
       if (action.kind !== "pointer") continue;
       if (action.buttons === buttons) { queue.splice(index, 1); return true; }
       buttons = action.buttons;
@@ -164,8 +204,7 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
       last.action = action;
     } else {
       if (queue.length >= MAX_QUEUE && action.kind !== "active" && action.kind !== "release" && !dropMove()) {
-        if (!dropped) notice(DROPPED_NOTICE);
-        dropped = true;
+        markDropped();
         return;
       }
       queue.push({ action, epoch, displayGeneration });
@@ -291,9 +330,7 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
       const assigned = await prepared;
       if (done) return;
       output = new Channel<string>((ticket: unknown) => {
-        if (ticket === APPROVAL_WAITING) notice(APPROVAL_NOTICE);
-        else if (ticket === APPROVAL_DONE) notice("");
-        else void packet(ticket);
+        if (!approvalSignal(ticket, notice)) void packet(ticket);
       });
       const completion = run("rdp_connect", { id, draft, output });
       opened({
@@ -322,7 +359,10 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
       });
       await completion;
       end("RDP 연결이 종료되었습니다");
-    } catch (error) { end(error instanceof Error ? error.message : String(error)); }
+    } catch (error) {
+      const { message, kind } = failure(error);
+      end(message, kind);
+    }
   })();
   return close;
 }

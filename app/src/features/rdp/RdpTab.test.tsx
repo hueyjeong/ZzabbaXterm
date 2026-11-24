@@ -70,7 +70,7 @@ it("저장 프로필의 값을 입력칸에 미리 채우고 사용자가 연결
   expect((connect.mock.calls[0] as unknown[])[0]).toEqual({ host: "xrdp.example.test", port: 3389, tlsOnly: false, source });
 });
 
-type Ended = (message: string, closed: boolean) => void;
+type Ended = (message: string, closed: boolean, kind?: "transport") => void;
 const ended = (call: number) => (connect.mock.calls[call] as unknown[])[5] as Ended;
 
 it("저장 프로필로 연 탭은 StrictMode에서도 한 번만 바로 연결한다", async () => {
@@ -111,12 +111,12 @@ it("터널 경로가 끊기면 경로를 다시 열고 새 경로가 준비된 �
   root = createRoot(host);
   const preset = { host: "xrdp.example.test", port: 3389 };
   const first = { tabHandle: "route-tab", tunnelId: "9", targetId: "ssh-server", destination: { host: "127.0.0.1", port: 3389 } };
-  const onReopenRoute = vi.fn();
+  const onReopenRoute = vi.fn(() => Promise.resolve(true));
   const render = (source: typeof first) => act(async () => {
     root!.render(<RdpTab active autoStart label="RDP 1" source={source} preset={preset} onReopenRoute={onReopenRoute} />);
   });
   await render(first);
-  await act(async () => { ended(0)("RDP 전송 연결이 끊겼습니다", true); });
+  await act(async () => { ended(0)("RDP 전송 연결이 끊겼습니다", true, "transport"); });
   await act(async () => { host.querySelector<HTMLButtonElement>('button[aria-label="다시 연결"]')!.click(); });
   expect(onReopenRoute).toHaveBeenCalledOnce();
   expect(connect).toHaveBeenCalledTimes(1);
@@ -124,4 +124,40 @@ it("터널 경로가 끊기면 경로를 다시 열고 새 경로가 준비된 �
   await render(second);
   expect(connect).toHaveBeenCalledTimes(2);
   expect((connect.mock.calls[1] as unknown[])[0]).toEqual({ host: "xrdp.example.test", port: 3389, tlsOnly: false, source: second });
+});
+
+it("경로 다시 열기가 실패하면 뒤늦게 바뀐 경로로 연결하지 않고 다시 연결을 다시 받는다", async () => {
+  const host = document.createElement("div");
+  document.body.appendChild(host);
+  root = createRoot(host);
+  const preset = { host: "xrdp.example.test", port: 3389 };
+  const first = { tabHandle: "route-tab", tunnelId: "9", targetId: "ssh-server", destination: { host: "127.0.0.1", port: 3389 } };
+  const onReopenRoute = vi.fn(() => Promise.resolve(false));
+  const render = (source: typeof first) => act(async () => {
+    root!.render(<RdpTab active autoStart label="RDP 1" source={source} preset={preset} onReopenRoute={onReopenRoute} />);
+  });
+  await render(first);
+  await act(async () => { ended(0)("RDP 전송 연결이 끊겼습니다", true, "transport"); });
+  const retry = () => act(async () => { host.querySelector<HTMLButtonElement>('button[aria-label="다시 연결"]')!.click(); });
+  await retry();
+  expect(onReopenRoute).toHaveBeenCalledOnce();
+  await render({ ...first, tabHandle: "late-tab" });
+  expect(connect).toHaveBeenCalledTimes(1);
+  await retry();
+  expect(onReopenRoute).toHaveBeenCalledTimes(2);
+});
+
+it("전송 오류라도 종류 코드가 없으면 같은 경로로 다시 연결한다", async () => {
+  const host = document.createElement("div");
+  document.body.appendChild(host);
+  root = createRoot(host);
+  const source = { tabHandle: "route-tab", tunnelId: "9", targetId: "ssh-server", destination: { host: "127.0.0.1", port: 3389 } };
+  const onReopenRoute = vi.fn(() => Promise.resolve(true));
+  await act(async () => {
+    root!.render(<RdpTab active autoStart label="RDP 1" source={source} preset={{ host: "xrdp.example.test", port: 3389 }} onReopenRoute={onReopenRoute} />);
+  });
+  await act(async () => { ended(0)("RDP 전송 연결이 끊겼습니다", true); });
+  await act(async () => { host.querySelector<HTMLButtonElement>('button[aria-label="다시 연결"]')!.click(); });
+  expect(onReopenRoute).not.toHaveBeenCalled();
+  expect(connect).toHaveBeenCalledTimes(2);
 });

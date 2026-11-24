@@ -94,7 +94,7 @@ impl Controls {
                 }
                 Action::Release => self.release().await?,
                 Action::Copy => {
-                    if self.copy.is_some() { return Err(Error::Busy); }
+                    if self.copy.is_some() { return Err(Error::CopyPending); }
                     if !(self.channels.cliprdr_ready && self.channels.remote_clipboard_text) { return Err(Error::ChannelUnavailable); }
                     self.write(Input::ReadClipboardText).await?;
                     self.copy = Some(command.epoch);
@@ -155,5 +155,74 @@ mod tests {
         assert_eq!(controls.send(&life, command(2, 2, Action::Active { active: true })).await, Ok(()));
         assert_eq!(controls.send(&life, command(3, 2, pointer())).await, Err(Error::Bounds));
         assert!(commands.try_recv().is_err());
+    }
+
+    /// 세션 작업 대신 정해 둔 결과로 쓰기 명령에 답하고, 받은 명령을 문자열로 남긴다.
+    fn scripted(replies: Vec<Result<(), Error>>) -> (Controls, tokio::task::JoinHandle<Vec<String>>) {
+        let mut controls = Controls::default();
+        let id = SessionId(1);
+        let (input, mut commands) = tokio::sync::mpsc::channel(1);
+        controls.display(id, InputHandle { id, input }, (640, 480), 1);
+        let task = tokio::spawn(async move {
+            let mut replies = replies.into_iter();
+            let mut log = Vec::new();
+            while let Some((_, input, ack)) = commands.recv().await {
+                log.push(match input {
+                    Input::ScanCode { code, released, .. } => format!("key {code} {}", if released { "up" } else { "down" }),
+                    Input::Pointer { x, y, action: Pointer::Move } => format!("move {x},{y}"),
+                    Input::Pointer { action: Pointer::Button { pressed, .. }, .. } => format!("button {}", if pressed { "down" } else { "up" }),
+                    _ => "other".into(),
+                });
+                let _ = ack.send(replies.next().unwrap_or(Ok(())));
+            }
+            log
+        });
+        (controls, task)
+    }
+
+    fn command(sequence: u64, epoch: u64, action: Action) -> Command {
+        Command { sequence, display_generation: 1, epoch, action }
+    }
+
+    #[tokio::test]
+    async fn pointer_busy_after_move_is_resent_with_the_same_sequence() {
+        let (mut controls, log) = scripted(vec![Ok(()), Err(Error::Busy)]);
+        let life = CancellationToken::new();
+        let press = || Action::Pointer { x: 10, y: 20, buttons: 1 };
+        assert_eq!(controls.send(&life, command(1, 1, Action::Active { active: true })).await, Ok(()));
+        assert_eq!(controls.send(&life, command(2, 1, press())).await, Err(Error::Busy));
+        assert_eq!(controls.pointer, (10, 20, 0));
+        assert_eq!(controls.send(&life, command(2, 1, press())).await, Ok(()));
+        assert_eq!(controls.pointer, (10, 20, 1));
+        assert_eq!(controls.send(&life, command(3, 1, press())).await, Ok(()));
+        drop(controls);
+        assert_eq!(log.await.unwrap(), ["move 10,20", "button down", "move 10,20", "button down", "move 10,20"]);
+    }
+
+    #[tokio::test]
+    async fn active_busy_during_release_keeps_the_old_epoch_until_resent() {
+        let (mut controls, log) = scripted(vec![Ok(()), Err(Error::Busy)]);
+        let life = CancellationToken::new();
+        let key = |down| Action::Key { code: 0x1e, extended: false, down };
+        assert_eq!(controls.send(&life, command(1, 1, Action::Active { active: true })).await, Ok(()));
+        assert_eq!(controls.send(&life, command(2, 1, key(true))).await, Ok(()));
+        assert_eq!(controls.send(&life, command(3, 2, Action::Active { active: false })).await, Err(Error::Busy));
+        assert_eq!((controls.epoch, controls.active, controls.keys.len()), (1, true, 1));
+        assert_eq!(controls.send(&life, command(3, 2, Action::Active { active: false })).await, Ok(()));
+        assert_eq!((controls.epoch, controls.active, controls.keys.len()), (2, false, 0));
+        assert_eq!(controls.send(&life, command(4, 2, key(true))).await, Err(Error::Closed));
+        drop(controls);
+        assert_eq!(log.await.unwrap(), ["key 30 down", "key 30 up", "key 30 up"]);
+    }
+
+    #[tokio::test]
+    async fn pending_copy_is_reported_without_busy() {
+        let (mut controls, _log) = scripted(Vec::new());
+        controls.channels(Channels { cliprdr_ready: true, remote_clipboard_text: true, ..Default::default() });
+        let life = CancellationToken::new();
+        assert_eq!(controls.send(&life, command(1, 1, Action::Active { active: true })).await, Ok(()));
+        assert_eq!(controls.send(&life, command(2, 1, Action::Copy)).await, Ok(()));
+        assert_eq!(controls.send(&life, command(3, 1, Action::Copy)).await, Err(Error::CopyPending));
+        assert_eq!(controls.send(&life, command(4, 1, Action::Key { code: 0x1e, extended: false, down: true })).await, Ok(()));
     }
 }

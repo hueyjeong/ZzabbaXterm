@@ -7,8 +7,6 @@ import { IconButton } from "../ui/controls";
 import { connect, type Capabilities, type Connection } from "./session";
 
 const noChannels: Capabilities = { copy: false, paste: false, resize: false };
-/** Rust `Error::Transport` 문구다. 터널 경로에서 이 오류가 나면 경로를 다시 열어야 재연결할 수 있다. */
-const TRANSPORT_LOST = "RDP 전송 연결이 끊겼습니다";
 
 type Draft = { host: string; port: number; tlsOnly: boolean; source?: DesktopTunnelSource };
 
@@ -24,8 +22,8 @@ export function RdpTab({ active, label, source, preset, autoStart, onSecurityMod
   /** 저장 프로필로 연 탭은 입력칸 없이 한 번 바로 연결한다. */
   readonly autoStart?: boolean;
   readonly onSecurityMode?: (tlsOnly: boolean) => void;
-  /** 터널 경로가 끊겨 재연결할 때 Workspace가 같은 프로필의 경로를 다시 열어 새 source를 넘긴다. */
-  readonly onReopenRoute?: () => void;
+  /** 터널 경로가 끊겨 재연결할 때 Workspace가 같은 프로필의 경로를 다시 열어 새 source를 넘긴다. 실패하면 false다. */
+  readonly onReopenRoute?: () => Promise<boolean>;
   readonly ref?: Ref<RdpTabActions>;
 }) {
   const cancel = useRef<(() => Promise<void>) | undefined>(undefined);
@@ -84,18 +82,19 @@ export function RdpTab({ active, label, source, preset, autoStart, onSecurityMod
   function start(draft: Draft) {
     if (!active || cancel.current) return;
     last.current = draft;
+    awaitingRoute.current = false;
     setEditing(false);
     setRouteLost(false);
     setError("");
     setOpening({ host: draft.source ? draft.host.toLowerCase() : draft.host, port: draft.port, forwardedAddress: forwarded(draft.source), tlsOnly: draft.tlsOnly });
     onSecurityMode?.(draft.tlsOnly);
     cancel.current = connect(draft, setConnection,
-      setChannels, setReady, setNotice, (message, closed) => {
+      setChannels, setReady, setNotice, (message, closed, kind) => {
         reset();
         if (closed) cancel.current = undefined;
         setCloseStatus(closed ? undefined : "unconfirmed");
         setError(message);
-        setRouteLost(!!draft.source && message === TRANSPORT_LOST);
+        setRouteLost(!!draft.source && kind === "transport");
       });
   }
 
@@ -130,7 +129,7 @@ export function RdpTab({ active, label, source, preset, autoStart, onSecurityMod
     if (!draft) return;
     if (routeLost && onReopenRoute) {
       awaitingRoute.current = true;
-      onReopenRoute();
+      void onReopenRoute().then((reopened) => { if (!reopened) awaitingRoute.current = false; });
       return;
     }
     start(draft);
@@ -140,7 +139,7 @@ export function RdpTab({ active, label, source, preset, autoStart, onSecurityMod
   return <section aria-label={label}>
     {idle && !editing && last.current && <div className="remote-desktop-toolbar">
       <IconButton icon={RotateCcw} label="다시 연결" small disabled={!active} onClick={reconnect} />
-      <button type="button" onClick={() => setEditing(true)}>연결 설정 편집</button>
+      <button type="button" onClick={() => { awaitingRoute.current = false; setEditing(true); }}>연결 설정 편집</button>
     </div>}
     {idle && editing && <form className="remote-desktop-toolbar" onSubmit={submit}>
       {forwardedAddress && <span>포워드 목적지: {forwardedAddress}</span>}

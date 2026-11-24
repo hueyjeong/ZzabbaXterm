@@ -1,3 +1,13 @@
+export const APPROVAL_NOTICE = "승인 창 확인 필요";
+
+/** Rust가 네이티브 승인 창을 띄우고 닫을 때 출력 채널로 보내는 신호를 읽는다. 신호가 아니면 false다. */
+export function approvalSignal(ticket: unknown, notice: (message: string) => void) {
+  if (ticket === "approval") notice(APPROVAL_NOTICE);
+  else if (ticket === "approval-done") notice("");
+  else return false;
+  return true;
+}
+
 export interface RemoteDesktopIdentity {
   readonly sessionId: string;
   readonly generation: number;

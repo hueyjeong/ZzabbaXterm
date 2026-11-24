@@ -1,7 +1,7 @@
 import type { DesktopTunnelSource } from "../tunnels/tunnelIpc";
 import { Channel } from "@tauri-apps/api/core";
 import { documentProof, invokeVnc, readPacket } from "./document";
-import type { RemoteDesktopEvent, RemoteDesktopIdentity, RemoteDesktopSession } from "../remoteDesktop/session";
+import { approvalSignal, type RemoteDesktopEvent, type RemoteDesktopIdentity, type RemoteDesktopSession } from "../remoteDesktop/session";
 import { keysym } from "./keys";
 
 export interface Owner { readonly tab: string; readonly document: number }
@@ -233,7 +233,7 @@ export function connect(
     queued.length = 0;
   }
 
-  const output = new Channel<unknown>((ticket) => { void handle(ticket); });
+  const output = new Channel<unknown>((ticket) => { if (!approvalSignal(ticket, notice)) void handle(ticket); });
   async function handle(ticket: unknown) {
     if (done) return;
     try {

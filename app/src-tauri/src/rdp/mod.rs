@@ -73,6 +73,8 @@ struct Account {
 pub enum Error {
     Bounds,
     Busy,
+    /// 앞선 복사 응답을 기다리는 중이다. 다시 보내도 풀리지 않으므로 busy와 나눠 알린다.
+    CopyPending,
     ChannelUnavailable,
     Clipboard,
     Closed,
@@ -314,7 +316,7 @@ impl Session {
                                 continue;
                             }
                             if matches!(command, Input::ReadClipboardText) && !pending.is_empty() {
-                                let _ = ack.send(Err(Error::Busy));
+                                let _ = ack.send(Err(Error::CopyPending));
                                 continue;
                             }
                             let data = encode(&mut active, &graphics, channels, command);

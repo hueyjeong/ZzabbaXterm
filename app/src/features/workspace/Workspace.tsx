@@ -573,14 +573,15 @@ export function Workspace() {
   }
 
   /** 끊긴 프로필 경로를 닫고 같은 프로필로 다시 열어 화면 탭의 source만 바꾼다. 연결은 탭이 새 source로 시작한다. */
-  async function reopenDesktopRoute(id: number) {
+  async function reopenDesktopRoute(id: number): Promise<boolean> {
     const tab = liveTabs.current.find(item => item.id === id);
-    if ((tab?.kind !== "rdp" && tab?.kind !== "vnc") || !tab.targetId || closingTabs.current.has(id)) return;
+    if ((tab?.kind !== "rdp" && tab?.kind !== "vnc") || !tab.targetId || closingTabs.current.has(id)) return false;
     const target = profileLoad.profiles?.targets.find(({ profile }) => profile.id === tab.targetId)?.profile;
-    if (target?.defaultMethod !== "rdp" && target?.defaultMethod !== "vnc") return;
-    if (desktopOpening?.id === target.id) return;
+    if (target?.defaultMethod !== "rdp" && target?.defaultMethod !== "vnc") return false;
+    if (desktopOpening?.id === target.id) return false;
     setWindowError("");
     const pending = { id: target.id, label: target.displayName, controller: new AbortController() };
+    desktopOpening?.controller.abort();
     setDesktopOpening(pending);
     const previous = tab.source;
     const release = tab.release;
@@ -593,15 +594,17 @@ export function Workspace() {
       const opened = await openDesktopProfile(target, { signal: pending.controller.signal });
       if (closingWindow.current || pending.controller.signal.aborted || !liveTabs.current.some(item => item.id === id) || closingTabs.current.has(id)) {
         await opened.close();
-        return;
+        return false;
       }
       setTabs(current => current.map(item => item.id === id && item.kind === tab.kind
         ? { ...item, source: opened.source, release: opened.close } : item));
+      return true;
     } catch (error) {
       if (error instanceof DesktopRouteError) keepUnclosedRoute(error.handle, error.targetId, target.displayName, error.message, error.method);
       if (!pending.controller.signal.aborted || error instanceof DesktopRouteError) {
         setWindowError(`${target.displayName} 경로 다시 열기 실패: ${error instanceof Error ? error.message : String(error)}`);
       }
+      return false;
     } finally {
       setDesktopOpening(current => current === pending ? undefined : current);
     }
@@ -1067,7 +1070,7 @@ export function Workspace() {
                   onOpenDesktop={openDesktop} />
               ) : tab.kind === "rdp" ? (
                 <RdpTab ref={bindDesktopClose} active={visible} label={label} source={tab.source} preset={tab.preset} autoStart={tab.autoStart}
-                  onReopenRoute={tab.targetId && tab.source ? () => void reopenDesktopRoute(id) : undefined}
+                  onReopenRoute={tab.targetId && tab.source ? () => reopenDesktopRoute(id) : undefined}
                   onSecurityMode={(tlsOnly) => setTabs(current => current.map(item => item.id === id && item.kind === "rdp"
                     ? { ...item, tlsOnly } : item))} />
               ) : tab.kind === "vnc" ? (

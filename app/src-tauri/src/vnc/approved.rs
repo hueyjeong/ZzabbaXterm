@@ -1,12 +1,12 @@
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::future::pending;
 use serde::Deserialize;
-use tauri::{Manager, WebviewWindow};
+use tauri::{Manager, WebviewWindow, ipc::Channel};
 use tokio::sync::oneshot;
 use zeroize::Zeroizing;
 use tokio_util::sync::CancellationToken;
 
-use crate::{connections::SavedRoute, tunnels::{Destination, ipc::{Confirmed, DesktopLease, Protocol, TunnelTabs, describe_route, load_route, route_scope, route_title}}};
+use crate::{connections::SavedRoute, desktop_dialog::{Waiting, raise}, tunnels::{Destination, ipc::{Confirmed, DesktopLease, Protocol, TunnelTabs, describe_route, load_route, route_scope, route_title}}};
 
 use super::{Auth, Error, Route, Secrets, Tab, Target, SessionId, lifetime::Lifetime, transport};
 #[cfg(target_os = "linux")]
@@ -52,7 +52,7 @@ enum Password {
 
 impl Draft {
     pub(super) async fn approve(self, window: &WebviewWindow, life: Arc<Lifetime>, epoch: u64,
-                                held: &mut Option<DesktopLease>) -> Result<Approved, String> {
+                                held: &mut Option<DesktopLease>, notify: &Channel<String>) -> Result<Approved, String> {
         let (target, auth, password) = match self {
             Self::Direct { host, port, password } => {
                 let auth = auth_for(password);
@@ -62,14 +62,14 @@ impl Draft {
                 let password = if auth == Auth::VncPassword { Some(Password::prepare(window, &target, &life, None).await?) } else { None };
                 let service = password.as_ref().map_or_else(|| "없음".into(), |source| source.label(&target));
                 let description = format!("대상: [{}]:{}\n경로: 직접 TLS (서버 인증서 이름 확인)\n서비스 인증: {service}", target.host, target.port);
-                if !confirm(window, description, &life, None).await { return Err(CANCELLED.into()); }
+                if !confirm(window, description, &life, None, notify).await { return Err(CANCELLED.into()); }
                 (target, auth, password)
             }
             Self::Routed { source, password } => {
                 let auth = auth_for(password);
                 #[cfg(not(any(windows, target_os = "linux")))]
                 if password { return Err("이 운영체제는 VNC 비밀번호 연결을 지원하지 않습니다".into()); }
-                let lease = source.lease(window, &life, epoch, auth, held).await?;
+                let lease = source.lease(window, &life, epoch, auth, held, notify).await?;
                 let destination = lease.destination();
                 let target = Target { profile_id: routed_scope(lease.route(), destination), host: destination.host.clone(), port: destination.port };
                 let password = if auth == Auth::VncPassword {
@@ -85,7 +85,7 @@ impl Draft {
                     {
                         let Password::Linux(item) = &password;
                         let description = format!("서비스 인증: VNC 비밀번호\n항목 ID: {}", item.id());
-                        if !confirm(window, description, &life, Some(loss.clone())).await {
+                        if !confirm(window, description, &life, Some(loss.clone()), notify).await {
                             return Err(if loss.is_cancelled() { ROUTE_LOST } else { CANCELLED }.into());
                         }
                     }
@@ -110,7 +110,7 @@ fn routed_scope(route: &SavedRoute, destination: &Destination) -> String {
 
 impl Source {
     async fn lease<'a>(self, window: &WebviewWindow, life: &Arc<Lifetime>, epoch: u64, auth: Auth,
-                       held: &'a mut Option<DesktopLease>) -> Result<&'a DesktopLease, String> {
+                       held: &'a mut Option<DesktopLease>, notify: &Channel<String>) -> Result<&'a DesktopLease, String> {
         let Self { tab_handle, tunnel_id, target_id, destination: Remote { host, port } } = self;
         if tab_handle.len() != 32 || !tab_handle.bytes().all(|b| b.is_ascii_hexdigit()) ||
             !tunnel_id.parse::<u64>().is_ok_and(|id| id > 0 && id.to_string() == tunnel_id)
@@ -133,7 +133,7 @@ impl Source {
             describe_route(&snapshot), destination.host, destination.port);
         app.state::<TunnelTabs>().preflight_desktop(epoch, (&tab_handle, &tunnel_id),
             &target_id, &destination, Protocol::Vnc)?;
-        if !confirm(window, description, life, None).await {
+        if !confirm(window, description, life, None, notify).await {
             return Err(CANCELLED.into());
         }
         let grant = life.clone();
@@ -156,13 +156,17 @@ pub(super) async fn route_lost(loss: Option<&CancellationToken>) {
     match loss { Some(loss) => loss.cancelled().await, None => pending().await }
 }
 
-async fn confirm(window: &WebviewWindow, description: String, life: &Arc<Lifetime>, loss: Option<CancellationToken>) -> bool {
+async fn confirm(window: &WebviewWindow, description: String, life: &Arc<Lifetime>, loss: Option<CancellationToken>,
+                 notify: &Channel<String>) -> bool {
     let (answer, result) = oneshot::channel();
     let parent = window.clone();
     let grant = life.clone();
     let dialog_loss = loss.clone();
+    // 창을 띄우지 못하고 빠져나가도 가드가 버려지며 대기 끝 신호가 간다.
+    let _waiting = Waiting::new(notify.clone());
     if window.run_on_main_thread(move || {
         let live = move || active(&grant, dialog_loss.as_ref());
+        if !answer.is_closed() && live() { raise(&parent); }
         let accepted = !answer.is_closed() && live() && confirm_native(&parent, &description, live);
         let _ = answer.send(accepted);
     }).is_err() {
@@ -193,7 +197,13 @@ fn confirm_native(window: &WebviewWindow, description: &str, live: impl Fn() -> 
     accepted
 }
 
-#[cfg(not(target_os = "linux"))]
+/// 취소가 기본 버튼이라 Enter로 승인되지 않는다.
+#[cfg(windows)]
+fn confirm_native(window: &WebviewWindow, description: &str, _: impl Fn() -> bool) -> bool {
+    crate::desktop_dialog::confirm_box(window, "VNC 연결 승인", description, true)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn confirm_native(window: &WebviewWindow, description: &str, _: impl Fn() -> bool) -> bool {
     rfd::MessageDialog::new().set_parent(window).set_title("VNC 연결 승인").set_description(description)
         .set_level(rfd::MessageLevel::Warning).set_buttons(rfd::MessageButtons::OkCancel).show() == rfd::MessageDialogResult::Ok

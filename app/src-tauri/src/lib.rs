@@ -1,6 +1,7 @@
 pub mod ai;
 mod navigation;
 mod connections;
+mod desktop_dialog;
 mod editor;
 #[cfg(all(feature = "stored-auth", any(windows, target_os = "linux")))]
 mod elevation;

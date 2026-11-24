@@ -2,7 +2,8 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { createRemoteDesktopViewSession } from "../remoteDesktop/session";
 import { scanCode } from "./keys";
-import { APPROVAL_NOTICE, connect, DROPPED_NOTICE, type Connection } from "./session";
+import { APPROVAL_NOTICE } from "../remoteDesktop/session";
+import { BUSY_NOTICE, connect, DROPPED_NOTICE, type Connection } from "./session";
 
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({
@@ -318,4 +319,78 @@ it("TLS 전용 opt-in을 연결 초안에 전달한다", async () => {
   await vi.waitFor(() => expect(invoke.mock.calls.map(([name]) => name)).toContain("rdp_connect"));
   const draft = invoke.mock.calls.find(([name]) => name === "rdp_connect")?.[1]?.draft;
   expect(draft).toEqual({ host: "rdp.example.invalid", port: 3389, tlsOnly: true });
+});
+
+it("복사가 busy이거나 진행 중이어도 다시 보내지 않고 뒤 키 입력을 계속 보낸다", async () => {
+  const f = await fixture();
+  const view = await f.live();
+  f.packet({ kind: "channels", sequence: 3, copy: true, paste: true, resize: true });
+  await vi.waitFor(() => expect(f.caps).toHaveBeenCalled());
+  f.sendInput.mockResolvedValueOnce("busy");
+  f.connection.clipboard("copy");
+  view.send(input);
+  await vi.waitFor(() => expect(f.inputs()).toHaveLength(3));
+  expect(f.notice).toHaveBeenCalledWith(BUSY_NOTICE);
+  expect(f.inputs().slice(1).map((item) => [item.action.kind, item.sequence])).toEqual([["copy", 2], ["key", 2]]);
+
+  f.sendInput.mockRejectedValueOnce({ message: "RDP 복사가 진행 중입니다" });
+  f.connection.clipboard("copy");
+  view.send({ ...input, down: false });
+  await vi.waitFor(() => expect(f.inputs()).toHaveLength(5));
+  expect(f.notice).toHaveBeenCalledWith("RDP 복사가 진행 중입니다");
+  expect(f.inputs().slice(3).map((item) => [item.action.kind, item.sequence])).toEqual([["copy", 3], ["key", 4]]);
+  expect(f.calls("rdp_input_batch")).toEqual([]);
+  expect(f.ended).not.toHaveBeenCalled();
+  view.dispose();
+});
+
+it("3초 넘게 busy인 입력은 버리고 큐가 빈 뒤 해제한다", async () => {
+  const f = await fixture();
+  const view = await f.live();
+  let now = 1_000;
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  f.sendInput.mockResolvedValue("busy");
+  view.send(input);
+  await vi.waitFor(() => expect(f.calls("rdp_input").length).toBeGreaterThan(2));
+  now += 3_000;
+  f.sendInput.mockResolvedValue("ok");
+  f.sendInput.mockResolvedValueOnce("busy");
+  await vi.waitFor(() => expect(f.inputs().slice(-1)[0]).toMatchObject({ action: { kind: "release" }, sequence: 2 }));
+  expect(f.notice).toHaveBeenCalledWith(DROPPED_NOTICE);
+  expect(f.inputs().filter((item) => item.action.kind === "key").every((item) => item.sequence === 2)).toBe(true);
+  expect(f.ended).not.toHaveBeenCalled();
+  view.dispose();
+});
+
+it("큐가 넘쳐도 마지막 포인터 위치는 버리지 않는다", async () => {
+  const f = await fixture();
+  const view = await f.live();
+  const held = Promise.withResolvers<string>();
+  f.sendInput.mockReturnValueOnce(held.promise);
+  view.send(input);
+  const pointer = (x: number) => ({ kind: "pointer", x, y: 0, buttons: 0 }) as const;
+  // 버릴 수 있는 이동은 큐의 마지막 포인터뿐이다. 그 위치는 남기고 새 키를 버린다.
+  view.send(pointer(0));
+  for (const event of keys(510)) view.send(event);
+  view.send(pointer(0));
+  view.send({ ...input, code: "Digit1" });
+  expect(f.notice).toHaveBeenCalledExactlyOnceWith(DROPPED_NOTICE);
+  held.resolve("ok");
+  await vi.waitFor(() => expect(f.inputs().slice(-1)[0]).toMatchObject({ action: { kind: "release" } }));
+  expect(f.inputs().filter((item) => item.action.kind === "pointer")).toHaveLength(2);
+  expect(f.inputs().some((item) => item.action.code === scanCode("Digit1")?.code)).toBe(false);
+  expect(f.ended).not.toHaveBeenCalled();
+  view.dispose();
+});
+
+it("연결 종료 이벤트의 전송 끊김 종류를 탭에 넘긴다", async () => {
+  vi.stubGlobal("__ZZABBA_RDP_DOCUMENT__", { proof });
+  const ended = vi.fn();
+  invoke.mockImplementation((name) => {
+    if (name === "rdp_prepare") return Promise.resolve(id);
+    if (name === "rdp_connect") return Promise.reject({ kind: "transport", message: "RDP 전송 연결이 끊겼습니다" });
+    return Promise.resolve();
+  });
+  connect({ host: "rdp.example.invalid", port: 3389 }, vi.fn(), vi.fn(), vi.fn(), vi.fn(), ended);
+  await vi.waitFor(() => expect(ended).toHaveBeenCalledWith("RDP 전송 연결이 끊겼습니다", true, "transport"));
 });
