@@ -1,20 +1,21 @@
 import { useState, useRef, type KeyboardEvent } from "react";
-import { ChevronRight, Database, Monitor, MonitorSmartphone, Folder, FolderOpen, KeyRound, Pencil, RefreshCcw, ShieldAlert, SquareTerminal, Waypoints, type LucideIcon } from "lucide-react";
+import { ChevronRight, Database, Monitor, MonitorSmartphone, Folder, FolderOpen, KeyRound, Pencil, ShieldAlert, SquarePen, SquareTerminal, Trash2, Waypoints, type LucideIcon } from "lucide-react";
 import type { SavedConnections } from "../connections/connectionIpc";
 import { Menu, ProtocolIcon, type MenuItem, type ProtocolKind } from "../ui/controls";
 
 type OpenTarget = (target?: SavedConnections["targets"][number]["profile"], options?: { readonly remoteEditor?: true }) => void;
 type ElevateTarget = (target?: SavedConnections["targets"][number]["profile"]) => void;
 type MenuTarget = {
-  method: string; kind: ProtocolKind; open: () => void; sshTargetId?: string; s3TargetId?: string; openTunnel?: () => void;
+  method: string; kind: ProtocolKind; open: () => void; sshTargetId?: string; openTunnel?: () => void; edit?: () => void; remove?: () => void;
   openRemoteEditor?: () => void; elevate?: () => void; openStorage?: () => void;
 };
 
-export function LocalTree({ profiles, openCounts, onOpen, onElevate, onLocalElevate, onRegisterSshHost, onTrustSshHost, onRetestS3, onOpenTunnel, onOpenStorage }: {
+export function LocalTree({ profiles, openCounts, onOpen, onElevate, onLocalElevate, onRegisterSshHost, onTrustSshHost, onEdit, onDelete, onOpenTunnel, onOpenStorage }: {
   profiles?: SavedConnections; openCounts?: ReadonlyMap<string, number>; onOpen: OpenTarget; onElevate?: ElevateTarget; onLocalElevate?: () => void;
   onRegisterSshHost: (targetId: string) => void;
   onTrustSshHost?: (targetId: string) => void;
-  onRetestS3?: (targetId: string) => void;
+  onEdit?: (targetId: string) => void;
+  onDelete?: (targetId: string) => void;
   onOpenTunnel: (targetId: string, name: string, method: "ssh" | "ssm") => void;
   onOpenStorage?: (targetId: string, name: string) => void;
 }) {
@@ -39,7 +40,8 @@ export function LocalTree({ profiles, openCounts, onOpen, onElevate, onLocalElev
     openRemoteEditor: target.defaultMethod === "ssh" && target.ssh.transport.kind === "direct" &&
       (target.ssh.auth.kind === "agent" || target.ssh.auth.kind === "keyFile")
       ? () => onOpen(target, { remoteEditor: true }) : undefined,
-    s3TargetId: target.defaultMethod === "s3" && onRetestS3 ? target.id : undefined,
+    edit: onEdit ? () => onEdit(target.id) : undefined,
+    remove: onDelete ? () => onDelete(target.id) : undefined,
     openTunnel: target.defaultMethod === "ssm" || (target.defaultMethod === "ssh" && target.ssh.transport.kind === "direct")
       ? () => onOpenTunnel(target.id, target.displayName, target.defaultMethod) : undefined,
     openStorage: target.defaultMethod === "ssm" && onOpenStorage ? () => onOpenStorage(target.id, target.displayName) : undefined,
@@ -88,11 +90,12 @@ export function LocalTree({ profiles, openCounts, onOpen, onElevate, onLocalElev
     add("nano 연동으로 열기", Pencil, target.openRemoteEditor);
     add("승격 실행…", ShieldAlert, target.elevate);
     const sshTargetId = target.sshTargetId;
-    const s3TargetId = target.s3TargetId;
-    if (sshTargetId !== undefined || s3TargetId !== undefined) items.push({ kind: "separator" });
+    if (sshTargetId !== undefined) items.push({ kind: "separator" });
     add("호스트 키 확인…", KeyRound, sshTargetId !== undefined && onTrustSshHost ? () => onTrustSshHost(sshTargetId) : undefined);
     add("호스트 키 등록", KeyRound, sshTargetId !== undefined ? () => onRegisterSshHost(sshTargetId) : undefined);
-    add("연결 재시험", RefreshCcw, s3TargetId !== undefined ? () => onRetestS3?.(s3TargetId) : undefined);
+    if (target.edit || target.remove) items.push({ kind: "separator" });
+    add("편집…", SquarePen, target.edit);
+    add("삭제", Trash2, target.remove);
     return items;
   }
 

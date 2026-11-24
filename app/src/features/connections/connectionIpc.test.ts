@@ -39,3 +39,30 @@ it("호스트 키 확인 명령에 세션 ID만 넘기고 결과를 그대로 �
   await expect(createLocalConnectionIpc().trustSavedSshHost("server")).resolves.toEqual(reply);
   expect(vi.mocked(invoke).mock.calls).toEqual([["trust_saved_ssh_host", { targetId: "server" }]]);
 });
+
+it("저장본 조회에서 그룹과 세션 개정을 그대로 받는다", async () => {
+  const saved = {
+    version: 2, groups: [{ profile: { id: "work", displayName: "회사 개발" }, revision: 2 }],
+    targets: [{ profile: { id: "shell", groupId: "work", displayName: "작업 셸", defaultMethod: "local", local: { shell: "powerShell", startDirectory: "" } }, revision: 3 }],
+  };
+  vi.mocked(invoke).mockResolvedValueOnce(saved);
+  await expect(createLocalConnectionIpc().load()).resolves.toEqual(saved);
+  expect(vi.mocked(invoke)).toHaveBeenCalledExactlyOnceWith("connections_load", {});
+});
+
+it("티켓 저장은 같은 초안의 성공한 시험만 받는다", async () => {
+  const ipc = createLocalConnectionIpc();
+  const draft = { version: 2, targetRevision: null, target: { id: "s3", displayName: "버킷", defaultMethod: "s3",
+    s3: { profile: "company", region: "ap-northeast-2", bucket: "dev", prefix: "" } } } as const;
+  const run = { draftId: "d", draftVersion: 0, runId: "r" };
+  vi.mocked(invoke).mockResolvedValueOnce(run).mockResolvedValueOnce({ ...run, sessionId: null }).mockResolvedValue(null);
+  await expect(ipc.save({ run, draft })).rejects.toThrow("현재 초안의 연결 테스트 성공이 필요합니다");
+  const tested = await ipc.test({ draftId: "d", draftVersion: 0, draft });
+  await expect(ipc.save({ run: tested, draft: { ...draft } })).rejects.toThrow("현재 초안의 연결 테스트 성공이 필요합니다");
+  await ipc.save({ run: tested, draft });
+  expect(vi.mocked(invoke).mock.calls).toEqual([
+    ["connection_test_start", { draftId: "d", draftVersion: 0, draft }],
+    ["connection_test_wait", { run }],
+    ["connection_save", { request: { run, draft } }],
+  ]);
+});

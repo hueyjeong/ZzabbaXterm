@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc, thread};
 use serde::{Deserialize, Serialize};
 
 use crate::terminal::{Sessions, probe::Probe};
-use super::{profile::{Draft, Method, MethodRef, SshAuth, ValidatedDraft}, store::{SaveStatus, Store, StoreError}};
+use super::{profile::{Method, MethodRef, TargetDraft, ValidatedTarget}, store::{SaveStatus, Store, StoreError}};
 
 const UNTESTED: &str = "이 초안의 현재 시험이 없습니다";
 
@@ -27,13 +27,13 @@ pub(crate) struct Passed {
 #[serde(deny_unknown_fields)]
 pub(crate) struct SaveRequest {
     run: RunKey,
-    draft: Draft,
+    draft: TargetDraft,
 }
 
 struct Run {
     key: RunKey,
     session_id: Option<String>,
-    draft: Arc<ValidatedDraft>,
+    draft: Arc<ValidatedTarget>,
     probe: Arc<Probe>,
     confirmed: bool,
 }
@@ -106,13 +106,13 @@ impl Runs {
 }
 
 #[cfg(test)]
-pub(super) fn start(sessions: &Sessions, owner: &str, document: u64, draft_id: String, draft_version: u64, draft: Draft, config: std::path::PathBuf) -> Result<RunKey, String> {
+pub(super) fn start(sessions: &Sessions, owner: &str, document: u64, draft_id: String, draft_version: u64, draft: TargetDraft, config: std::path::PathBuf) -> Result<RunKey, String> {
     start_trusting(sessions, owner, document, draft_id, draft_version, draft, config, None)
 }
 
 /// `trust`는 SSH 시험에서 핀이 없을 때 띄우는 첫 연결 확인 창이다.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn start_trusting(sessions: &Sessions, owner: &str, document: u64, draft_id: String, draft_version: u64, draft: Draft,
+pub(super) fn start_trusting(sessions: &Sessions, owner: &str, document: u64, draft_id: String, draft_version: u64, draft: TargetDraft,
     config: std::path::PathBuf, trust: Option<crate::ssh::host_trust::Confirm>) -> Result<RunKey, String> {
     if draft_id.is_empty() || draft_version > (1 << 53) - 1 {
         return Err("초안 ID 또는 버전이 올바르지 않습니다".into());
@@ -220,16 +220,7 @@ fn remove_run(runs: &mut Runs, owner: &str, document: u64, key: &RunKey) -> Resu
 pub(super) fn save_confirmed(sessions: &Sessions, owner: &str, document: u64, request: SaveRequest, store: &Store) -> Result<(), String> {
     let SaveRequest { run: key, draft } = request;
     let draft = draft.validate().map_err(|error| format!("초안 검증: {error:?}"))?;
-    // 저장 암호 대상은 승인 창을 열 수 있는 빌드에서만 연결 시험 없이 참조를 저장한다.
-    if cfg!(all(feature = "stored-auth", any(windows, target_os = "linux")))
-        && matches!(draft.method(), MethodRef::Ssh { ssh } if matches!(ssh.auth, SshAuth::StoredPassword { .. }))
-    {
-        return saved(store.save_authorized(draft, None, || sessions.with_probes(owner, document, |_| Ok(())), || {}));
-    }
-    // 원격 화면 프로필은 비밀 없이 경로만 저장한다. SSH 경로는 저장소가 확인하고, 서버 신원과 터널은 열 때 다시 확인한다.
-    if matches!(draft.method(), MethodRef::Desktop { .. }) {
-        return saved(store.save_authorized(draft, None, || sessions.with_probes(owner, document, |_| Ok(())), || {}));
-    }
+    // 시험 없이 저장하는 대상(저장 암호 SSH, 원격 화면)은 `connection_target_save`를 쓴다.
     let expected = sessions.with_probes(owner, document, |runs| {
         let run = runs.get(owner, &key)?;
         if !run.confirmed || !run.draft.matches(&draft) {
@@ -275,7 +266,7 @@ fn saved(result: Result<SaveStatus, StoreError>) -> Result<(), String> {
 pub(crate) fn save_ssm_fixture(directory: &std::path::Path, input: serde_json::Value, account: &str) {
     let sessions = Sessions::default();
     let key = RunKey { draft_id: "fixture".into(), draft_version: 1, run_id: sessions.next_id() };
-    let draft = Arc::new(serde_json::from_value::<Draft>(input.clone()).unwrap().validate().unwrap());
+    let draft = Arc::new(serde_json::from_value::<TargetDraft>(input.clone()).unwrap().validate().unwrap());
     let probe = Arc::new(Probe::for_draft("main", &draft));
     probe.finish_ssm_fixture(account);
     sessions.with_probes("main", 0, |runs| {
@@ -295,7 +286,7 @@ pub(crate) fn save_ssm_fixture(directory: &std::path::Path, input: serde_json::V
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connections::tests::{TestDir, draft};
+    use crate::connections::tests::{TestDir, draft, target_draft};
     use std::{sync::mpsc, time::Duration};
 
     #[test]
@@ -306,12 +297,12 @@ mod tests {
         let sessions = Sessions::default();
         let store = Store::new(dir.path());
         let key = RunKey { draft_id: "s3-draft".into(), draft_version: 1, run_id: sessions.next_id() };
-        let mut input = draft(dir.path(), "work", "s3-bucket");
-        input["target"] = json!({
-            "id": "s3-bucket", "groupId": "work", "displayName": "버킷", "defaultMethod": "s3",
+        // 그룹 없는 최상위 대상도 시험 뒤 저장으로 확인 계정을 기록한다.
+        let input = json!({"version": 2, "targetRevision": null, "target": {
+            "id": "s3-bucket", "displayName": "버킷", "defaultMethod": "s3",
             "s3": {"profile": "company-sso", "region": "eu-west-1", "bucket": "selected-bucket", "prefix": "한글//"}
-        });
-        let validate = |value| serde_json::from_value::<Draft>(value).unwrap();
+        }});
+        let validate = |value| serde_json::from_value::<TargetDraft>(value).unwrap();
         let tested = Arc::new(validate(input.clone()).validate().unwrap());
         let probe = Arc::new(Probe::for_draft("main", &tested));
         let account = "012345678901";
@@ -333,7 +324,9 @@ mod tests {
         wrong_run.run.run_id = sessions.next_id();
         assert!(save_confirmed(&sessions, "main", 0, wrong_run, &store).is_err());
         save_confirmed(&sessions, "main", 0, request(), &store).unwrap();
-        assert_eq!(store.load().unwrap().targets[0].tested_account_id.as_deref(), Some(account));
+        let saved = store.load().unwrap();
+        assert!(saved.targets[0].profile.group_id.is_none());
+        assert_eq!(saved.targets[0].tested_account_id.as_deref(), Some(account));
         assert!(save_confirmed(&sessions, "main", 0, request(), &store).is_err());
     }
 
@@ -341,7 +334,7 @@ mod tests {
     fn f01_interactive_trial_requires_the_exact_live_run() {
         let dir = TestDir::new();
         let sessions = Sessions::default();
-        let input = crate::connections::tests::ssh_draft(dir.path());
+        let input = target_draft(&crate::connections::tests::ssh_draft(dir.path()));
         let begin = || start(&sessions, "main", 0, "draft".into(), 1,
             serde_json::from_value(input.clone()).unwrap(), dir.path().into()).unwrap();
         let first = begin();
@@ -386,7 +379,7 @@ mod tests {
         trust.register(&ApprovedHost::confirm(&endpoint, &endpoint, &fingerprint).unwrap(), public).unwrap();
         let sessions = Sessions::default();
         let store = Store::new(dir.path());
-        let mut input = crate::connections::tests::ssh_draft(dir.path());
+        let mut input = target_draft(&crate::connections::tests::ssh_draft(dir.path()));
         input["target"]["ssh"]["host"] = json!("127.0.0.1");
         input["target"]["ssh"]["port"] = json!(port);
         input["target"]["ssh"]["account"] = json!("fixture-user");
@@ -437,7 +430,6 @@ mod tests {
 
         for (index, auth) in [json!({"kind":"manualPassword"}), json!({"kind":"keyFile", "privateKeyPath": key_path})].into_iter().enumerate() {
             if index != 0 {
-                input["groupRevision"] = json!(1);
                 input["targetRevision"] = json!(1);
             }
             input["target"]["ssh"]["auth"] = auth;
@@ -481,7 +473,7 @@ mod tests {
         let dir = TestDir::new();
         let sessions = Sessions::default();
         let key = RunKey { draft_id: "draft".into(), draft_version: 1, run_id: sessions.next_id() };
-        let draft: Draft = serde_json::from_value(draft(dir.path(), "work", "target")).unwrap();
+        let draft: TargetDraft = serde_json::from_value(target_draft(&draft(dir.path(), "work", "target"))).unwrap();
         let draft = Arc::new(draft.validate().unwrap());
         let probe = Arc::new(Probe::new("main"));
         sessions.with_probes("main", 0, |runs| {
@@ -511,55 +503,26 @@ mod tests {
     }
 
     #[test]
-    fn desktop_profile_saves_without_a_probe_and_requires_a_key_based_direct_ssh_route() {
+    fn untested_profiles_cannot_be_saved_through_the_test_save() {
         use crate::connections::tests::{desktop_draft, ssh_draft};
         use serde_json::json;
         let dir = TestDir::new();
         let sessions = Sessions::default();
         let store = Store::new(dir.path());
         let request = |input: serde_json::Value| SaveRequest {
-            run: RunKey { draft_id: "desktop".into(), draft_version: 1, run_id: "unused".into() },
-            draft: serde_json::from_value(input).unwrap(),
+            run: RunKey { draft_id: "untested".into(), draft_version: 1, run_id: "unused".into() },
+            draft: serde_json::from_value(target_draft(&input)).unwrap(),
         };
+        // 원격 화면과 저장 암호 SSH는 `connection_target_save`로 저장한다.
         let rdp = desktop_draft(dir.path(), "rdp", json!({
-            "host": "xrdp.example.test", "port": 3389, "tlsOnly": false, "route": {"kind": "ssh", "targetId": "ssh-server"},
+            "host": "xrdp.example.test", "port": 3389, "tlsOnly": false, "route": {"kind": "direct"},
         }));
-        assert!(start(&sessions, "main", 0, "desktop".into(), 1, serde_json::from_value(rdp.clone()).unwrap(), dir.path().into()).is_err());
-        assert!(save_confirmed(&sessions, "main", 0, request(rdp.clone()), &store).is_err());
-        let mut ssh = ssh_draft(dir.path());
-        store.save(serde_json::from_value::<Draft>(ssh.clone()).unwrap().validate().unwrap()).unwrap();
-        assert!(save_confirmed(&sessions, "main", 0, request(rdp.clone()), &store).is_err());
-        ssh["groupRevision"] = json!(1);
-        ssh["targetRevision"] = json!(1);
-        ssh["target"]["ssh"]["auth"] = json!({"kind": "keyFile", "privateKeyPath": dir.path().join("private-key")});
-        store.save(serde_json::from_value::<Draft>(ssh).unwrap().validate().unwrap()).unwrap();
-        let mut rdp = rdp;
-        rdp["groupRevision"] = json!(1);
-        save_confirmed(&sessions, "main", 0, request(rdp), &store).unwrap();
-        let mut vnc = desktop_draft(dir.path(), "vnc", json!({"host": "vnc.example.test", "port": 5900, "route": {"kind": "direct"}}));
-        vnc["groupRevision"] = json!(1);
-        save_confirmed(&sessions, "main", 0, request(vnc), &store).unwrap();
-        let file = store.load().unwrap();
-        assert_eq!(file.targets.len(), 3);
-        assert!(file.targets.iter().all(|entry| entry.tested_account_id.is_none()));
-    }
-
-    #[test]
-    fn stored_password_profile_saves_without_a_probe_run() {
-        use serde_json::json;
-        let dir = TestDir::new();
-        let sessions = Sessions::default();
-        let store = Store::new(dir.path());
-        let mut input = crate::connections::tests::ssh_draft(dir.path());
-        input["target"]["ssh"]["auth"] = json!({
-            "kind": "storedPassword",
-            "itemId": "21eb36c3-234d-439d-9e1f-1d3cc5ba8125",
-        });
-        let request = SaveRequest {
-            run: RunKey { draft_id: "stored".into(), draft_version: 1, run_id: "unused".into() },
-            draft: serde_json::from_value(input).unwrap(),
-        };
-        save_confirmed(&sessions, "main", 0, request, &store).unwrap();
-        assert_eq!(store.load().unwrap().targets.len(), 1);
+        assert!(start(&sessions, "main", 0, "untested".into(), 1,
+            serde_json::from_value(target_draft(&rdp)).unwrap(), dir.path().into()).is_err());
+        assert!(save_confirmed(&sessions, "main", 0, request(rdp), &store).is_err());
+        let mut stored = ssh_draft(dir.path());
+        stored["target"]["ssh"]["auth"] = json!({"kind": "storedPassword", "itemId": "21eb36c3-234d-439d-9e1f-1d3cc5ba8125"});
+        assert!(save_confirmed(&sessions, "main", 0, request(stored), &store).is_err());
+        assert!(store.load().unwrap().targets.is_empty());
     }
 }

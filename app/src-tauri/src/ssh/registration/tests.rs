@@ -29,22 +29,16 @@ fn request() -> Request {
     }
 }
 
-fn attempt(version: u32) -> Attempt {
-    Attempt { draft_id: "draft".into(), draft_version: version, attempt_id: "1".into() }
-}
-
 fn verify(
     state: &Registration,
     request: Request,
     resolve: impl Fn(&str) -> Option<Endpoint>,
     pick: impl FnOnce() -> Option<PathBuf>,
     confirm: impl FnOnce(&Endpoint, &Fingerprint) -> bool,
-) -> Result<String, Rejection> {
-    let ticket = state.begin(0, Some(attempt(0)))?;
+) -> Result<Prepared, Rejection> {
+    let ticket = state.begin()?;
     let pending = Pending { state, ticket: &ticket };
-    let prepared = pending.verify(request, resolve, || Ok(pick()), |endpoint, sha| Ok(confirm(endpoint, sha)))?;
-    pending.ready(prepared)?;
-    Ok(ticket)
+    pending.verify(request, resolve, || Ok(pick()), |endpoint, sha| Ok(confirm(endpoint, sha)))
 }
 
 fn assert_no_pin(state: &Registration) {
@@ -64,7 +58,7 @@ fn checks_current_target_and_fingerprint_before_opening_the_picker() {
         (Request { host: "host\nInjectedOption".into(), ..request() }, Rejection::InvalidEndpoint),
         (Request { expected_fingerprint: Some("SHA256:invalid".into()), ..request() }, Rejection::InvalidFingerprint),
     ] {
-        assert_eq!(verify(&state, request, target, || panic!("picker"), |_, _| panic!("confirm")), Err(error));
+        assert_eq!(verify(&state, request, target, || panic!("picker"), |_, _| panic!("confirm")).err(), Some(error));
     }
     assert_no_pin(&state);
 }
@@ -82,7 +76,7 @@ fn rejects_non_public_input_and_fingerprint_mismatch_before_confirmation() {
     ] {
         let path = root.path().join(filename);
         fs::write(&path, data).unwrap();
-        assert_eq!(verify(&state, request(), target, || Some(path), |_, _| panic!("confirm")), Err(error));
+        assert_eq!(verify(&state, request(), target, || Some(path), |_, _| panic!("confirm")).err(), Some(error));
     }
     let directory = root.path().join("directory.pub");
     fs::create_dir(&directory).unwrap();
@@ -113,24 +107,25 @@ fn cancellation_navigation_and_changed_selection_cannot_commit_a_pin() {
     let path = root.path().join("host.pub");
     fs::write(&path, KEY).unwrap();
     let pick = || Some(path.clone());
-    assert_eq!(verify(&state, request(), target, || None, |_, _| panic!("confirm")), Err(Rejection::Cancelled));
-    assert_eq!(verify(&state, request(), target, pick, |_, _| false), Err(Rejection::Cancelled));
+    assert_eq!(verify(&state, request(), target, || None, |_, _| panic!("confirm")).err(), Some(Rejection::Cancelled));
+    assert_eq!(verify(&state, request(), target, pick, |_, _| false).err(), Some(Rejection::Cancelled));
     assert_eq!(verify(&state, request(), target, || {
         state.document_changed(OWNER);
-        assert_eq!(state.begin(1, Some(attempt(0))), Err(Rejection::Busy));
+        assert_eq!(state.begin(), Err(Rejection::Busy));
         pick()
-    }, |_, _| panic!("confirm")), Err(Rejection::Cancelled));
+    }, |_, _| panic!("confirm")).err(), Some(Rejection::Cancelled));
     assert_eq!(verify(&state, request(), target, pick, |_, _| {
         state.document_changed(OWNER);
         true
-    }), Err(Rejection::Cancelled));
+    }).err(), Some(Rejection::Cancelled));
     let changed = Cell::new(false);
     assert_eq!(verify(&state, request(), |id| {
         if changed.get() { Endpoint::new("dev.example.invalid", 22).ok() } else { target(id) }
     }, pick, |_, _| {
         changed.set(true);
         true
-    }), Err(Rejection::EndpointMismatch));
+    }).err(), Some(Rejection::EndpointMismatch));
+    assert!(state.pending.lock().unwrap().is_none());
     assert_no_pin(&state);
 }
 
@@ -139,8 +134,7 @@ fn commits_exactly_the_confirmed_key_without_automatic_replacement() {
     let (root, state) = setup();
     let path = root.path().join("host.pub");
     fs::write(&path, format!("{KEY} administrator\r\n")).unwrap();
-    let expected = VerifiedHost { host: request().host, port: 2222, fingerprint: SHA.into(), target_id: "dev".into() };
-    let ticket = verify(&state, request(), target, || Some(path.clone()), |actual, fingerprint| {
+    let prepared = verify(&state, request(), target, || Some(path.clone()), |actual, fingerprint| {
         assert_eq!(actual, &endpoint());
         assert_eq!(fingerprint.to_string(), SHA);
         state.document_changed("another-webview");
@@ -149,33 +143,13 @@ fn commits_exactly_the_confirmed_key_without_automatic_replacement() {
         true
     }).unwrap();
     assert_no_pin(&state);
-    let sessions = Sessions::default();
-    assert_eq!(state.commit(0, &attempt(0), &ticket, &sessions), Ok(expected));
-    assert_eq!(state.commit(0, &attempt(0), &ticket, &sessions), Err(Rejection::Cancelled));
+    assert_eq!(prepared.commit(&state.store), Ok(()));
     let replacement = Request { expected_fingerprint: Some(OTHER_SHA.into()), ..request() };
     let replacement = verify(&state, replacement, target, || Some(path), |_, _| true).unwrap();
-    assert_eq!(state.commit(0, &attempt(0), &replacement, &sessions), Err(Rejection::ExistingPinConflict));
+    assert_eq!(replacement.commit(&state.store), Err(Rejection::ExistingPinConflict));
     let endpoint = endpoint();
     let approved = ApprovedHost::confirm(&endpoint, &endpoint, SHA).unwrap();
     assert_eq!(state.store.pin(&approved).unwrap_or_else(|error| panic!("{error:?}")).0, format!("[dev.example.invalid]:2222 {KEY}\n"));
-}
-
-#[test]
-fn commit_rechecks_cancellation_draft_ticket_and_document_before_writing() {
-    let (root, state) = setup();
-    let path = root.path().join("host.pub");
-    fs::write(&path, KEY).unwrap();
-    let sessions = Sessions::default();
-    let prepare = || verify(&state, request(), target, || Some(path.clone()), |_, _| true).unwrap();
-    let ticket = prepare();
-    assert_eq!(state.commit(0, &attempt(1), &ticket, &sessions), Err(Rejection::Cancelled));
-    assert_eq!(state.commit(0, &attempt(0), "wrong", &sessions), Err(Rejection::Cancelled));
-    state.cancel(0, &attempt(0)).unwrap();
-    assert_eq!(state.commit(0, &attempt(0), &ticket, &sessions), Err(Rejection::Cancelled));
-    let ticket = prepare();
-    sessions.navigate(OWNER);
-    assert_eq!(state.commit(0, &attempt(0), &ticket, &sessions), Err(Rejection::StaleDocument));
-    assert_no_pin(&state);
 }
 
 #[test]
@@ -257,7 +231,7 @@ fn trust_saved_rejects_busy_unknown_targets_and_a_document_changed_during_confir
 
     assert_eq!(trust_saved("other", 0, &refuse), Err(Rejection::InvalidTarget.saved_message().into()));
     // 열려 있는 확인 창이 있으면 새 창을 띄우지 않는다.
-    state.begin(0, None).unwrap();
+    state.begin().unwrap();
     assert_eq!(trust_saved("ssh-server", 0, &refuse), Err(Rejection::Busy.saved_message().into()));
     state.pending.lock().unwrap().take();
     assert_eq!(trust_saved("ssh-server", 1, &refuse), Err(Rejection::StaleDocument.saved_message().into()));

@@ -358,6 +358,11 @@ fn describe(dns: &str, endpoint: &str, cert: &CertificateDer<'_>, fingerprint: &
         .map(|(_, san)| {
             san.0.iter().filter_map(|name| match name {
                 GeneralName::DnsName(name) => Some(name.to_string()),
+                // IP 주소로 연결하는 서버는 IP SAN으로 확인하므로 함께 보여 준다.
+                GeneralName::IpAddress(ip) => match *ip.as_bytes() {
+                    [a, b, c, d] => Some(std::net::Ipv4Addr::new(a, b, c, d).to_string()),
+                    _ => <[u8; 16]>::try_from(ip.as_bytes()).ok().map(|v6| std::net::Ipv6Addr::from(v6).to_string()),
+                },
                 _ => None,
             }).collect::<Vec<_>>().join(", ")
         })
@@ -365,11 +370,11 @@ fn describe(dns: &str, endpoint: &str, cert: &CertificateDer<'_>, fingerprint: &
         .unwrap_or_else(|| "없음".into());
     let text = if let Some(previous) = previous {
         format!(
-            "RDP 서버 인증서가 바뀌었습니다\n\n원격 DNS: {dns}\n대상: {endpoint}\n주체: {subject}\nSAN: {san}\n사유: {reason}\n이전 SHA-256: {previous}\n새 SHA-256: {fingerprint}\n\n새 지문으로 교체하고 연결합니까?"
+            "RDP 서버 인증서가 바뀌었습니다\n\n원격 이름: {dns}\n대상: {endpoint}\n주체: {subject}\nSAN: {san}\n사유: {reason}\n이전 SHA-256: {previous}\n새 SHA-256: {fingerprint}\n\n새 지문으로 교체하고 연결합니까?"
         )
     } else {
         format!(
-            "RDP 서버 인증서를 신뢰합니까?\n\n원격 DNS: {dns}\n대상: {endpoint}\n주체: {subject}\nSAN: {san}\n사유: {reason}\nSHA-256: {fingerprint}\n\n이 지문을 저장하고 연결합니다."
+            "RDP 서버 인증서를 신뢰합니까?\n\n원격 이름: {dns}\n대상: {endpoint}\n주체: {subject}\nSAN: {san}\n사유: {reason}\nSHA-256: {fingerprint}\n\n이 지문을 저장하고 연결합니다."
         )
     };
     trust::Request { text, changed: previous.is_some() }

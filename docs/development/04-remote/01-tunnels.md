@@ -31,7 +31,7 @@
 
 ## SSM 포트 전달
 
-- **시작 지점.** 왼쪽 트리의 저장된 SSM 대상에서 **터널 열기**를 고른 뒤 수신 포트, 원격 호스트(비우면 노드 자신), 목적지 포트, 서비스(TCP·RDP·VNC)를 입력한다. 저장된 RDP·VNC 프로필의 SSM 경로는 프로필 자신을 경로 대상으로 같은 실행 경로를 연다. RDP는 프로필의 TLS 인증 DNS 이름을 노드에서 접속할 원격 호스트로 쓰고(`AWS-StartPortForwardingSessionToRemoteHost`), VNC는 노드 자신의 서비스만 연다(`AWS-StartPortForwardingSession`).
+- **시작 지점.** 왼쪽 트리의 저장된 SSM 대상에서 **터널 열기**를 고른 뒤 수신 포트, 원격 호스트(비우면 노드 자신), 목적지 포트, 서비스(TCP·RDP·VNC)를 입력한다. 저장된 RDP·VNC 프로필의 SSM 경로는 프로필 자신을 경로 대상으로 같은 실행 경로를 연다. RDP는 프로필의 TLS 인증 이름(DNS 이름 또는 IP 주소)을 노드에서 접속할 원격 호스트로 쓰고(`AWS-StartPortForwardingSessionToRemoteHost`), VNC는 노드 자신의 서비스만 연다(`AWS-StartPortForwardingSession`).
 - **승인 범위.** `tunnel_start`의 `{ direction: "ssm", listen, port, host?, protocol? }`는 Rust가 저장 파일에서 다시 읽은 프로필·리전·노드와 대조한다(`SsmPlan`). 원격 화면 프로필에서는 포트·호스트·서비스가 저장 값과 같아야 한다. VNC는 원격 호스트를 받지 않는다. `host`는 DNS 이름 또는 IP 리터럴만 받고 공백·쉼표·`=`·제어 문자를 거부한다. 네이티브 승인 창에 프로필·리전·노드·문서·매개변수·경로를 표시하고, 승인 후 저장 기록이 바뀌었으면 시작하지 않는다.
 - **자격 경계와 실행.** 승인 뒤 기록은 `starting`으로 등록되고 작업자가 C02와 같은 경로로 준비한다: `aws configure export-credentials`로 SSO 자격을 내보내고(만료 시 `SSM: AWS 재로그인 필요`), `describe-instance-information`으로 노드의 `Online`을 확인하고, 공식 플러그인 경로와 버전을 검사한다. 실행은 `aws ssm start-session --region … --output json --target <노드> --reason <요청별 난수> --document-name <문서> --parameters <매개변수>`이며 `--profile`을 넣지 않는다. 자격은 격리한 CLI 홈과 환경 변수로만 전달하고, 엔드포인트·프로필 재정의 환경 변수는 제거한다. 탭이 닫히면 준비를 취소하고 자식을 만들지 않는다.
 - **프로세스 구조.** PTY 대신 파이프(stdin 없음, stdout·stderr 판독)로 실행한다. Windows는 aws.exe를 생성 직후 `KILL_ON_JOB_CLOSE` 작업 개체에 넣어 그 자식인 session-manager-plugin.exe까지 묶는다. Linux·macOS는 aws CLI를 새 프로세스 그룹의 리더로 실행한다.

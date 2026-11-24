@@ -109,9 +109,6 @@ pub(crate) fn handle(invoke: Invoke, other: fn(Invoke) -> bool) -> bool {
                 probe::start_trusting(&caller.state::<Sessions>(), caller.label(), document, draft_id, draft_version, draft, config, trust)
             })
         }),
-        crate::ssh::registration::COMMAND | crate::ssh::registration::COMMIT | crate::ssh::registration::CANCEL => {
-            crate::ssh::registration::dispatch(invoke)
-        }
         "register_saved_ssh_host" => dispatch(invoke, "register_saved_ssh_host", |args| {
             let target_id: String = args.get("targetId")?;
             Ok(move |caller: Webview, document| crate::ssh::registration::register_saved(&caller, document, target_id))
