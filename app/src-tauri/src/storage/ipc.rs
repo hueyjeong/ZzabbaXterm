@@ -608,7 +608,7 @@ impl StorageIpc {
     async fn relogin(&self, document: &Document, id: Uuid, directory: PathBuf) -> Result<(), Error> {
         self.relogin_with(document, id, directory, |current, cancel| async move {
             let cli = AwsCli::probe(&cancel).await?;
-            cli.relogin_saved(&current.scope, &current.config, &cancel).await
+            cli.relogin_saved(&current.scope, &crate::ssm::ProfileAuth::Sso(current.config), &cancel).await
         }).await
     }
 

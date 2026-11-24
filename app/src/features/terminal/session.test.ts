@@ -138,8 +138,8 @@ describe("L01 터미널 세션", () => {
       expect(peer.status).toHaveBeenLastCalledWith({ kind: "connecting" }, "a");
       peer.session.input("준비 전 입력");
       if (result === "running") starting.resolve();
-      else starting.reject("SSM: SSO 재로그인 필요");
-      const expected = result === "running" ? { kind: "running" } : { kind: "failed", value: "SSM: SSO 재로그인 필요" };
+      else starting.reject("SSM: AWS 재로그인 필요");
+      const expected = result === "running" ? { kind: "running" } : { kind: "failed", value: "SSM: AWS 재로그인 필요" };
       await vi.waitFor(() => expect(peer.status).toHaveBeenLastCalledWith(expected, "a"));
       peer.send({ kind: "connecting" });
       expect(peer.status).toHaveBeenLastCalledWith(expected, "a");

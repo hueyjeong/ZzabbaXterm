@@ -431,7 +431,7 @@ fn f01_ssm_ssh_forward_failure_reaches_the_tab() {
         let config = tempfile::tempdir().unwrap();
         let marker = config.path().join("ssh started");
         let expected = super::remote::start_error(crate::ssm::CliError::SsoLoginRequired);
-        assert_eq!(expected, "SSM: SSO 재로그인 필요");
+        assert_eq!(expected, "SSM: AWS 재로그인 필요");
         let failure = expected.clone();
         let launch = forward_launch(config.path(), &marker, move |_| Err(failure));
         let sessions = Sessions::default();

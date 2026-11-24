@@ -10,10 +10,14 @@ use std::{
 use tempfile::TempDir;
 use zeroize::Zeroizing;
 
-pub(super) struct CliHome(
-    #[cfg(not(windows))] TempDir,
-    #[cfg(windows)] std::path::PathBuf,
-);
+pub(super) struct CliHome {
+    #[cfg(not(windows))]
+    dir: TempDir,
+    #[cfg(windows)]
+    dir: std::path::PathBuf,
+    // `aws login` 갱신은 새 갱신 토큰을 캐시에 다시 쓴다. 사본이 아니라 사용자 캐시를 직접 가리킨다.
+    login_cache: Option<std::path::PathBuf>,
+}
 
 impl CliHome {
     #[cfg(not(windows))]
@@ -27,7 +31,7 @@ impl CliHome {
         builder
             .prefix("zzabba-aws-")
             .tempdir()
-            .map(Self)
+            .map(|dir| Self { dir, login_cache: None })
             .map_err(|_| CliError::ProcessIo)
     }
 
@@ -47,14 +51,18 @@ impl CliHome {
         getrandom::fill(&mut nonce).map_err(|_| CliError::RandomUnavailable)?;
         let path = parent.join(format!("zzabba-aws-{:032x}", u128::from_ne_bytes(nonce)));
         super::windows_acl::private_dir(&path).map_err(|_| CliError::ProcessIo)?;
-        Ok(Self(path))
+        Ok(Self { dir: path, login_cache: None })
     }
 
     pub(super) fn path(&self) -> &Path {
         #[cfg(windows)]
-        return &self.0;
+        return &self.dir;
         #[cfg(not(windows))]
-        self.0.path()
+        self.dir.path()
+    }
+
+    pub(super) fn use_login_cache(&mut self, cache: std::path::PathBuf) {
+        self.login_cache = Some(cache);
     }
 
     pub(super) fn import_sso_token(&self, source_home: &Path, key: &str) -> Result<(), CliError> {
@@ -101,13 +109,16 @@ impl CliHome {
         ] {
             set(name, self.path().as_os_str());
         }
+        if let Some(cache) = &self.login_cache {
+            set("AWS_LOGIN_CACHE_DIRECTORY", cache.as_os_str());
+        }
     }
 }
 
 #[cfg(windows)]
 impl Drop for CliHome {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        let _ = fs::remove_dir_all(&self.dir);
     }
 }
 

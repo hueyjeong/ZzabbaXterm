@@ -409,7 +409,7 @@ pub(crate) fn start_error(error: CliError) -> String {
         CliError::TargetNotConnected => "노드 연결 불가",
         CliError::InvalidSessionDocument => "세션 문서 사용 불가",
         CliError::AccessDenied => "권한 거부",
-        CliError::SsoLoginRequired => "SSO 재로그인 필요",
+        CliError::SsoLoginRequired => "AWS 재로그인 필요",
         CliError::CredentialsExpired => "자격 증명 만료",
         CliError::Cancelled => "시작 취소",
         CliError::CallerChanged => "AWS 프로필의 신원이 바뀌었습니다",

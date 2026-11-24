@@ -1,7 +1,7 @@
 import type { SsmSelection } from "./ssm";
 
 const failureText = {
-  SsoLoginRequired: "SSO 로그인 만료",
+  SsoLoginRequired: "AWS 로그인 만료",
   AccessDenied: "IAM 권한 거부",
   PluginMissing: "Session Manager 플러그인 없음",
   InvalidConfiguration: "AWS 구성 또는 설치 오류. Linux에서는 AWS CLI v2와 Session Manager 플러그인의 관리자 관리 시스템 설치가 필요합니다.",
@@ -61,11 +61,11 @@ export function SsmSelectionView({ state }: { state: SsmSelection }) {
       </div>
       {step.kind === "nodes-loading" && <p role="status">온라인 노드 조회 중</p>}
       {step.kind === "nodes-ready" && step.nodes.length === 0 && <p role="status">온라인 노드 없음</p>}
-      {step.kind === "logging-in" && <p role="status">{profile}: SSO 재로그인 중</p>}
+      {step.kind === "logging-in" && <p role="status">{profile}: AWS 재로그인 중</p>}
       {step.kind === "nodes-error" && (
         <>
           <p role="alert">{profile}: {failureText[step.error]}</p>
-          {step.error === "SsoLoginRequired" && <button type="button" onClick={requestRelogin}>SSO 재로그인</button>}
+          {step.error === "SsoLoginRequired" && <button type="button" onClick={requestRelogin}>AWS 재로그인</button>}
         </>
       )}
     </fieldset>

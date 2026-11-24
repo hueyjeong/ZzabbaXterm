@@ -2564,7 +2564,7 @@ describe("현재 SSH 세션의 SFTP", () => {
 });
 
 describe("SSO 만료로 열지 못한 원격 화면", () => {
-  it("SSO 로그인 뒤 같은 RDP 프로필의 SSM 경로를 다시 열고 로그인 실패를 표시한다", async () => {
+  it("AWS 로그인 뒤 같은 RDP 프로필의 SSM 경로를 다시 열고 로그인 실패를 표시한다", async () => {
     loadProfiles = async () => ({
       version: 1,
       groups: [{ revision: 1, profile: { id: "work", displayName: "작업" } }],
@@ -2586,7 +2586,7 @@ describe("SSO 만료로 열지 못한 원격 화면", () => {
       if (command === "tunnel_tab_close") return null;
       if (command === "tunnel_status") return [{
         id: "forward", endpoint: "dev · ap-northeast-2", route: "SSM", owners: [], state: ready ? "ready" : "failed",
-        error: ready ? null : "SSM: SSO 재로그인 필요",
+        error: ready ? null : "SSM: AWS 재로그인 필요",
         desktop: { protocol: "rdp", targetId: "rdp-ssm", destination: { host: "win.example.invalid", port: 3389 } },
       }];
       throw new Error(command);
@@ -2599,22 +2599,22 @@ describe("SSO 만료로 열지 못한 원격 화면", () => {
     native.invoke.mockImplementation(async (command, args) => command === "ssm_target_relogin" ? login(args) : base(command, args));
     await restartWorkspace();
     await key(treeTarget("윈도 서버"), "Enter");
-    await vi.waitFor(() => expect(status()).toContain("윈도 서버 열기 실패: SSM: SSO 재로그인 필요"));
+    await vi.waitFor(() => expect(status()).toContain("윈도 서버 열기 실패: SSM: AWS 재로그인 필요"));
     expect(connectionCalls("tunnel_tab_open")).toHaveLength(1);
 
-    await press("SSO 로그인");
-    await vi.waitFor(() => expect(status()).toContain("SSO 로그인 실패: SSM: 권한 거부"));
+    await press("AWS 로그인");
+    await vi.waitFor(() => expect(status()).toContain("AWS 로그인 실패: SSM: 권한 거부"));
     expect(login).toHaveBeenCalledWith({ targetId: "rdp-ssm", requestId: expect.any(String) });
     expect(connectionCalls("tunnel_tab_open")).toHaveLength(1);
 
-    await press("SSO 로그인");
+    await press("AWS 로그인");
     await vi.waitFor(() => expect(connectionCalls("tunnel_tab_open")).toHaveLength(2));
     await vi.waitFor(() => expect(button("윈도 서버")).toBeDefined());
     expect(status()).not.toContain("열기 실패");
-    expect(button("SSO 로그인")).toBeUndefined();
+    expect(button("AWS 로그인")).toBeUndefined();
   });
 
-  it("다른 열기 시도가 시작되면 진행 중인 SSO 로그인을 취소하고 그 로그인으로 다시 열지 않는다", async () => {
+  it("다른 열기 시도가 시작되면 진행 중인 AWS 로그인을 취소하고 그 로그인으로 다시 열지 않는다", async () => {
     loadProfiles = async () => ({
       version: 1,
       groups: [{ revision: 1, profile: { id: "work", displayName: "작업" } }],
@@ -2635,7 +2635,7 @@ describe("SSO 만료로 열지 못한 원격 화면", () => {
       if (command === "tunnel_tab_close") return null;
       if (command === "tunnel_status") return [{
         id: "forward", endpoint: "dev · ap-northeast-2", route: "SSM", owners: [], state: "failed",
-        error: "SSM: SSO 재로그인 필요",
+        error: "SSM: AWS 재로그인 필요",
         desktop: { protocol: "rdp", targetId: "rdp-ssm", destination: { host: "win.example.invalid", port: 3389 } },
       }];
       throw new Error(command);
@@ -2648,8 +2648,8 @@ describe("SSO 만료로 열지 못한 원격 화면", () => {
       : command === "ssm_target_relogin_cancel" ? cancel(args) : base(command, args));
     await restartWorkspace();
     await key(treeTarget("윈도 서버"), "Enter");
-    await vi.waitFor(() => expect(status()).toContain("윈도 서버 열기 실패: SSM: SSO 재로그인 필요"));
-    await press("SSO 로그인");
+    await vi.waitFor(() => expect(status()).toContain("윈도 서버 열기 실패: SSM: AWS 재로그인 필요"));
+    await press("AWS 로그인");
     expect(login).toHaveBeenCalledTimes(1);
     const requestId = (native.invoke.mock.calls.find(([command]) => command === "ssm_target_relogin")![1] as { requestId: string }).requestId;
 

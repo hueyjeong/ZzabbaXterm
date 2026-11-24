@@ -44,21 +44,30 @@ JS는 문서에서 `window.__ZZABBA_SSM_DOCUMENT__`를 읽는다. 아직 값이 
 
 격리 시험: `cargo test --manifest-path app/src-tauri/Cargo.toml ssm::ipc::tests`.
 
-### 저장 대상의 SSO 재로그인
+### 저장 대상의 AWS 재로그인
 
-SSM 셸, SSH-over-SSM, SSM 경로의 RDP·VNC, SSM 포트 전달을 열다가 `SSM: SSO 재로그인 필요`로 실패하면 해당 위치에 `SSO 로그인` 단추(`LogIn`)를 표시한다. 터미널 탭은 탭 아래 상태 줄에, 원격 화면 프로필은 작업 공간 상태 줄에, SSM 터널은 실패한 터널 행에 단추를 둔다. 판별 문자열은 `app/src/features/ssm/ssoLogin.tsx`의 `SSO_LOGIN_REQUIRED` 한 곳에서 정의한다. Rust의 `start_error(CliError::SsoLoginRequired)`와 같은 값인지 Rust 시험이 확인한다.
+SSM 셸, SSH-over-SSM, SSM 경로의 RDP·VNC, SSM 포트 전달을 열다가 `SSM: AWS 재로그인 필요`로 실패하면 해당 위치에 `AWS 로그인` 단추(`LogIn`)를 표시한다. SSO 프로필과 `aws login` 프로필이 같은 단추를 쓴다. 터미널 탭은 탭 아래 상태 줄에, 원격 화면 프로필은 작업 공간 상태 줄에, SSM 터널은 실패한 터널 행에 단추를 둔다. 판별 문자열은 `app/src/features/ssm/ssoLogin.tsx`의 `SSO_LOGIN_REQUIRED` 한 곳에서 정의한다. Rust의 `start_error(CliError::SsoLoginRequired)`와 같은 값인지 Rust 시험이 확인한다.
 
-호출 형식은 `invoke("ssm_target_relogin", { targetId, requestId })`이다. `requestId`는 프런트가 만든 UUID이며 성공 값은 `"valid"` 또는 `"loggedIn"`이다. Rust는 `targetId`로 연결 저장소를 읽어 SSM 대상의 범위, SSH 대상의 `transport: ssm`, RDP·VNC의 `route: ssm`에서만 프로필과 리전을 고른다. 그 밖의 대상은 확인 호출 전에 거부한다. 직접 SSO 프로필이 아니면 `SsoLoginNotApplicable`로 거부한다.
+호출 형식은 `invoke("ssm_target_relogin", { targetId, requestId })`이다. `requestId`는 프런트가 만든 UUID이며 성공 값은 `"valid"` 또는 `"loggedIn"`이다. Rust는 `targetId`로 연결 저장소를 읽어 SSM 대상의 범위, SSH 대상의 `transport: ssm`, RDP·VNC의 `route: ssm`에서만 프로필과 리전을 고른다. 그 밖의 대상은 확인 호출 전에 거부한다. 직접 SSO 프로필이나 `aws login` 프로필이 아니면 `SsoLoginNotApplicable`로 거부한다.
 
-1. 선택한 직접 SSO 설정을 읽는다.
+1. 선택한 프로필의 로그인 설정(직접 SSO 설정 또는 `login_session`)을 읽는다.
 2. 그 설정으로 `aws configure export-credentials`와 `aws sts get-caller-identity`를 실행해 신원을 확인한다. 노드 조회는 하지 않는다.
-3. 확인 결과가 `SsoLoginRequired`일 때만 `relogin_saved`로 `aws sso login --profile <profile>`을 실행한다. 1단계의 설정이 바뀌었으면 로그인하지 않는다. 확인이 성공하면 로그인 없이 `"valid"`를 반환하고, 다른 오류는 그대로 반환한다.
+3. 확인 결과가 `SsoLoginRequired`일 때만 `relogin_saved`로 SSO는 `aws sso login --profile <profile>`, `aws login` 프로필은 `aws login --profile <profile> --region <region>`을 실행한다. 1단계의 설정이 바뀌었으면 로그인하지 않는다. 확인이 성공하면 로그인 없이 `"valid"`를 반환하고, 다른 오류는 그대로 반환한다.
 
-같은 대상의 로그인은 하나만 실행한다. 진행 중에 다시 요청하면 `SSO 로그인 진행 중`으로 거부한다. `invoke("ssm_target_relogin_cancel", { requestId })`는 해당 요청만 취소한다. 기본 창의 문서 전환·창 종료·앱 종료에서는 Rust가 모든 로그인을 취소한다. 두 명령은 로컬 `main` 웹뷰의 `local-ssm-login` 권한에만 등록한다.
+같은 프로필이나 같은 로그인 세션(SSO 세션 또는 시작 URL, `login_session`)의 로그인은 하나만 실행한다. 진행 중에 다시 요청하면 `AWS 로그인 진행 중`으로 거부한다. `invoke("ssm_target_relogin_cancel", { requestId })`는 해당 요청만 취소한다. 기본 창의 문서 전환·창 종료·앱 종료에서는 Rust가 모든 로그인을 취소한다. 두 명령은 로컬 `main` 웹뷰의 `local-ssm-login` 권한에만 등록한다.
 
-성공하면 같은 대상을 다시 연다. 터미널은 세션 세대를 올려 새 세션을 시작하고, 원격 화면은 같은 프로필의 경로를 같은 위치에 다시 열고, 터널은 그 탭에서 시작한 같은 요청을 다시 승인받아 시작한다. 진행 중에는 `SSO 로그인 중`, 실패하면 `SSO 로그인 실패: <오류>`를 표시한다. SSO 외 사유로 열기에 실패한 터미널 탭에는 `다시 연결` 단추(`RotateCcw`)를 둔다. sudo 승격 탭은 제외한다.
+성공하면 같은 대상을 다시 연다. 터미널은 세션 세대를 올려 새 세션을 시작하고, 원격 화면은 같은 프로필의 경로를 같은 위치에 다시 열고, 터널은 그 탭에서 시작한 같은 요청을 다시 승인받아 시작한다. 진행 중에는 `AWS 로그인 중`, 실패하면 `AWS 로그인 실패: <오류>`를 표시한다. 로그인 외 사유로 열기에 실패한 터미널 탭에는 `다시 연결` 단추(`RotateCcw`)를 둔다. sudo 승격 탭은 제외한다.
 
 격리 시험: `cargo test --manifest-path app/src-tauri/Cargo.toml ssm::target_login`, `npx vitest run src/features/terminal/TerminalView.sso.test.tsx src/features/tunnels/TunnelTab.test.tsx`.
+
+### `aws login` 프로필
+
+AWS CLI 2.32 이상의 `aws login`이 만든 프로필(`login_session`과 선택적 `region`만 있는 프로필)을 SSM 셸, SSH-over-SSM, SSM 경로의 RDP·VNC, SSM 포트 전달에서 쓴다. `login_session`이 `arn:`으로 시작하지 않거나, `aws_*`·`sso_*`·`credential_process`·`credential_source`·`source_profile`·`role_arn`·`web_identity_token_file` 키가 함께 있으면 지원하지 않는 프로필로 거부한다. S3 저장소는 SSO 토큰을 직접 쓰므로 SSO 프로필만 받는다.
+
+- **자격 내보내기.** 임시 홈의 스냅샷은 `login_session`과 `region`만 담는다. 프로필에 리전이 없으면 대상 리전을 넣는다. CLI는 자격을 갱신할 때 새 갱신 토큰을 캐시에 다시 쓰므로, 캐시를 복사하지 않고 `AWS_LOGIN_CACHE_DIRECTORY`로 사용자 로그인 캐시(`AWS_LOGIN_CACHE_DIRECTORY` 설정값, 없으면 `~/.aws/login/cache`)를 가리킨다. 앱 안의 `aws login` 프로필 내보내기는 한 번에 하나씩 실행해 같은 갱신 토큰으로 동시에 갱신하지 않는다.
+- **만료 판정.** `Error loading login session token: Unable to load a existing login session ...`, `Your session has expired. Please reauthenticate using 'aws login'.`, 암호 변경 오류를 `SsoLoginRequired`로 분류한다.
+- **재로그인.** 같은 스냅샷과 사용자 로그인 캐시로 `aws login --profile <profile> --region <region>`을 실행한다. 리전을 넘겨 CLI의 대화형 리전 질문을 막는다. 다른 계정으로 로그인하면 CLI가 프로필 덮어쓰기를 묻고, 입력이 닫혀 있으므로 저장 없이 실패한다.
+- **실기 확인(2026-11-24).** 루트 `aws login` 프로필이 만료된 상태에서 앱 경로가 `LoggedIn`과 이어지는 `Valid`를 반환했다. 같은 프로필로 `tunnels::ssm::tests::live`의 두 시험이 앱 내보내기 경로로 통과했다.
 
 ### 연결 프로필과 시험 자격
 

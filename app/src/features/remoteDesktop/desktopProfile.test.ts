@@ -58,7 +58,7 @@ describe("저장 RDP·VNC 프로필 열기", () => {
 
   it.each([
     ["승인 거절", [], null, "SSM 터널 승인이 취소되었습니다"],
-    ["SSO 만료", [[tunnel("failed", { error: "SSM: SSO 재로그인 필요" })]], "7", "SSM: SSO 재로그인 필요"],
+    ["SSO 만료", [[tunnel("failed", { error: "SSM: AWS 재로그인 필요" })]], "7", "SSM: AWS 재로그인 필요"],
     ["문서 실행 거부", [[tunnel("starting")], [tunnel("failed", { error: "SSM: 포트 전달 문서 실행 권한 거부" })]], "7", "SSM: 포트 전달 문서 실행 권한 거부"],
     ["준비 뒤 끊김", [[tunnel("disconnected", { error: "터널 프로세스가 종료되었습니다" })]], "7", "터널 프로세스가 종료되었습니다"],
   ] as const)("SSM 경로 %s이면 경로 탭을 닫고 Rust 오류를 그대로 돌려준다", async (_, statuses, start, message) => {

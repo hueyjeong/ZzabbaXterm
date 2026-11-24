@@ -1,6 +1,13 @@
 use super::*;
 use crate::ssm::{CancellationToken, OnlineNode, Scope, filter_profiles, tests::fixture_cli};
 
+fn sso(profiles: &Profiles, name: &str) -> DirectSsoConfig {
+    match profiles.auth(name).unwrap() {
+        ProfileAuth::Sso(config) => config,
+        ProfileAuth::Login(_) => panic!("SSO 프로필이어야 한다"),
+    }
+}
+
 #[test]
 fn profile_fixture() {
     if env::var_os("ZZABBA_SSM_PROFILE_FIXTURE").is_none() {
@@ -13,15 +20,15 @@ fn profile_fixture() {
         ["direct team", "default"]
     );
     assert_eq!(
-        profiles.export_config("direct team").unwrap().cli_ini(),
+        sso(&profiles, "direct team").cli_ini(),
         "[default]\nsso_account_id = 123456789012\nsso_role_name = Fixture\nsso_session = corp\n[sso-session \"corp\"]\nsso_region = us-east-1\nsso_start_url = https://example.invalid/start\n"
     );
     assert_eq!(
-        profiles.export_config("direct team").unwrap().cache_key(),
+        sso(&profiles, "direct team").cache_key(),
         "corp"
     );
     assert_eq!(
-        profiles.export_config("default").unwrap().cache_key(),
+        sso(&profiles, "default").cache_key(),
         "https://example.invalid/start"
     );
     for name in [
@@ -181,4 +188,39 @@ fn duplicate_aliases_and_ambiguous_sso_sections_reject_only_dependents() {
         Err(CliError::UnsupportedProfile)
     );
     assert_eq!(profiles.require("independent"), Ok(()));
+}
+
+#[test]
+fn aws_login_profiles_export_only_their_login_session() {
+    let root = "arn:aws:iam::123456789012:root";
+    let config = [
+        format!("[default]\nlogin_session = {root}\nregion = ap-northeast-1\n"),
+        "[profile no-region]\nlogin_session = arn:aws:sts::123456789012:assumed-role/Admin/dev@example.com\n".into(),
+        format!("[profile with-keys]\nlogin_session = {root}\n"),
+        format!("[profile with-sso]\nlogin_session = {root}\nsso_session = corp\n"),
+        format!("[profile with-role]\nlogin_session = {root}\nrole_arn = arn:aws:iam::123456789012:role/x\n"),
+        "[profile not-arn]\nlogin_session = root\n".into(),
+        "[profile spaced]\nlogin_session = arn:aws:iam::1 :root\n".into(),
+        format!("[profile bad-region]\nlogin_session = {root}\nregion = not a region\n"),
+    ]
+    .concat();
+    let mut profiles = Profiles::parse(&config, "[with-keys]\naws_access_key_id = synthetic\n").unwrap();
+    let ProfileAuth::Login(default) = profiles.auth("default").unwrap() else { panic!("aws login 프로필") };
+    assert_eq!((default.session.as_str(), default.region.as_deref()), (root, Some("ap-northeast-1")));
+    assert_eq!(
+        ProfileAuth::Login(default.clone()).cli_ini_for("default", "us-west-2"),
+        format!("[default]\nlogin_session = {root}\nregion = ap-northeast-1\n")
+    );
+    let ProfileAuth::Login(no_region) = profiles.auth("no-region").unwrap() else { panic!("aws login 프로필") };
+    // 갱신에 필요한 리전은 대상 리전으로 채운다.
+    assert_eq!(
+        ProfileAuth::Login(no_region).cli_ini_for("no-region", "us-west-2"),
+        "[profile \"no-region\"]\nlogin_session = arn:aws:sts::123456789012:assumed-role/Admin/dev@example.com\nregion = us-west-2\n"
+    );
+    assert_eq!(ProfileAuth::Login(default).lock_key(), root);
+    for name in ["with-keys", "with-sso", "with-role", "not-arn", "spaced", "bad-region"] {
+        assert_eq!(profiles.require(name), Err(CliError::UnsupportedProfile), "{name}");
+    }
+    // S3처럼 SSO 토큰을 직접 쓰는 기능은 aws login 프로필을 받지 않는다.
+    assert_eq!(profiles.take_sso_config("default").err(), Some(CliError::UnsupportedProfile));
 }

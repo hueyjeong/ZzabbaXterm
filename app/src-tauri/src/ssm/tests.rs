@@ -1,5 +1,12 @@
 use super::*;
 
+fn fixture_sso() -> DirectSsoConfig {
+    DirectSsoConfig {
+        account: "123456789012".into(), role: "Fixture".into(), region: "us-east-1".into(),
+        start_url: "https://example.invalid/start".into(), session: None,
+    }
+}
+
 pub(super) fn fixture_cli() -> AwsCli {
     AwsCli(Arc::from(std::env::current_exe().unwrap()))
 }
@@ -175,8 +182,20 @@ fn discovery_commands_use_literal_arguments_and_never_fallback() {
             ],
         ),
         (
-            cli.login_command(profile),
+            cli.login_command(&scope, &ProfileAuth::Sso(fixture_sso())),
             vec!["sso", "login", "--profile", profile],
+        ),
+        (
+            cli.login_command(&scope, &ProfileAuth::Login(profile::LoginConfig {
+                session: "arn:aws:iam::123456789012:root".into(), region: None,
+            })),
+            vec!["login", "--profile", profile, "--region", "us-west-2"],
+        ),
+        (
+            cli.login_command(&scope, &ProfileAuth::Login(profile::LoginConfig {
+                session: "arn:aws:iam::123456789012:root".into(), region: Some("ap-northeast-1".into()),
+            })),
+            vec!["login", "--profile", profile, "--region", "ap-northeast-1"],
         ),
     ] {
         assert_eq!(spec.program(), cli.0.as_ref());

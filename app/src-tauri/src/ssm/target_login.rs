@@ -1,4 +1,4 @@
-//! 저장된 연결 대상의 SSM 경로로 SSO 세션을 확인하고, 실제로 만료된 경우에만 로그인한다.
+//! 저장된 연결 대상의 SSM 경로로 SSO 또는 `aws login` 세션을 확인하고, 실제로 만료된 경우에만 로그인한다.
 //! 프로필과 리전은 프런트 인자가 아니라 연결 저장소에서 읽는다.
 
 use std::{collections::HashMap, path::Path, sync::Mutex};
@@ -6,15 +6,15 @@ use std::{collections::HashMap, path::Path, sync::Mutex};
 use serde::Serialize;
 use tauri::{Manager, Webview};
 
-use super::{AwsCli, CancellationToken, CliError, DirectSsoConfig, Scope};
+use super::{AwsCli, CancellationToken, CliError, ProfileAuth, Scope};
 use crate::{
     connections::{profile::{DesktopRoute, MethodRef, SshTransport}, with_saved_method},
     terminal::remote::start_error,
 };
 
 const NOT_SSM: &str = "SSM 경로가 없는 연결 대상입니다";
-const IN_PROGRESS: &str = "SSO 로그인 진행 중";
-const CANCELLED: &str = "SSO 로그인 취소";
+const IN_PROGRESS: &str = "AWS 로그인 진행 중";
+const CANCELLED: &str = "AWS 로그인 취소";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -30,10 +30,15 @@ pub(crate) enum Relogin {
 #[derive(Default)]
 pub(crate) struct TargetLogins(Mutex<HashMap<String, (Option<[String; 2]>, CancellationToken)>>);
 
-/// 잠금 키는 AWS 프로필과 SSO 세션(없으면 시작 URL)이다.
-fn login_keys(scope: &Scope, config: &DirectSsoConfig) -> [String; 2] {
-    let sso = config.session.as_deref().map_or_else(|| format!("url:{}", config.start_url), |session| format!("session:{session}"));
-    [format!("profile:{}", scope.profile()), format!("sso:{sso}")]
+/// 잠금 키는 AWS 프로필과 로그인 세션이다. SSO는 세션 이름(없으면 시작 URL), `aws login`은 login_session이다.
+fn login_keys(scope: &Scope, auth: &ProfileAuth) -> [String; 2] {
+    let session = match auth {
+        ProfileAuth::Sso(config) => format!(
+            "sso:{}", config.session.as_deref().map_or_else(|| format!("url:{}", config.start_url), |session| format!("session:{session}")),
+        ),
+        ProfileAuth::Login(config) => format!("login:{}", config.session),
+    };
+    [format!("profile:{}", scope.profile()), session]
 }
 
 impl TargetLogins {
@@ -106,41 +111,41 @@ fn saved_scope(directory: &Path, target_id: &str) -> Result<Scope, String> {
 
 fn message(error: CliError) -> String {
     match error {
-        CliError::UnsupportedProfile | CliError::SsoLoginNotApplicable => "SSM: 직접 SSO 프로필이 아님".into(),
-        CliError::TimedOut => "SSM: SSO 로그인 시간 초과".into(),
+        CliError::UnsupportedProfile | CliError::SsoLoginNotApplicable => "SSM: SSO 또는 aws login 프로필이 아님".into(),
+        CliError::TimedOut => "SSM: AWS 로그인 시간 초과".into(),
         CliError::Cancelled => CANCELLED.into(),
         error => start_error(error),
     }
 }
 
 trait Sso {
-    fn config(&self, scope: &Scope) -> Result<DirectSsoConfig, CliError>;
-    fn check(&self, scope: &Scope, config: &DirectSsoConfig) -> impl Future<Output = Result<(), CliError>> + Send;
-    fn login(&self, scope: &Scope, config: &DirectSsoConfig) -> impl Future<Output = Result<(), CliError>> + Send;
+    fn config(&self, scope: &Scope) -> Result<ProfileAuth, CliError>;
+    fn check(&self, scope: &Scope, config: &ProfileAuth) -> impl Future<Output = Result<(), CliError>> + Send;
+    fn login(&self, scope: &Scope, config: &ProfileAuth) -> impl Future<Output = Result<(), CliError>> + Send;
 }
 
 struct Cli<'a>(&'a CancellationToken);
 
 impl Sso for Cli<'_> {
-    fn config(&self, scope: &Scope) -> Result<DirectSsoConfig, CliError> {
-        scope.direct_sso_config().map_err(|error| match error {
+    fn config(&self, scope: &Scope) -> Result<ProfileAuth, CliError> {
+        scope.auth().map_err(|error| match error {
             CliError::UnsupportedProfile => CliError::SsoLoginNotApplicable,
             error => error,
         })
     }
 
-    async fn check(&self, scope: &Scope, config: &DirectSsoConfig) -> Result<(), CliError> {
+    async fn check(&self, scope: &Scope, config: &ProfileAuth) -> Result<(), CliError> {
         AwsCli::probe(self.0).await?.check_identity(scope, config, self.0).await
     }
 
-    async fn login(&self, scope: &Scope, config: &DirectSsoConfig) -> Result<(), CliError> {
-        // 확인 시점의 SSO 설정이 그대로일 때만 로그인 창을 연다.
+    async fn login(&self, scope: &Scope, config: &ProfileAuth) -> Result<(), CliError> {
+        // 확인 시점의 로그인 설정이 그대로일 때만 로그인 창을 연다.
         AwsCli::probe(self.0).await?.relogin_saved(scope, config, self.0).await
     }
 }
 
 /// 저장 대상에서 범위와 SSO 설정을 읽는다. 잠금 키도 이 값으로 정한다.
-fn resolve(directory: &Path, target_id: &str, sso: &impl Sso) -> Result<(Scope, DirectSsoConfig), String> {
+fn resolve(directory: &Path, target_id: &str, sso: &impl Sso) -> Result<(Scope, ProfileAuth), String> {
     let scope = saved_scope(directory, target_id)?;
     let config = sso.config(&scope).map_err(message)?;
     Ok((scope, config))
@@ -152,7 +157,7 @@ async fn relogin_target(directory: &Path, target_id: &str, sso: &impl Sso) -> Re
     relogin(&scope, &config, sso).await
 }
 
-async fn relogin(scope: &Scope, config: &DirectSsoConfig, sso: &impl Sso) -> Result<Relogin, String> {
+async fn relogin(scope: &Scope, config: &ProfileAuth, sso: &impl Sso) -> Result<Relogin, String> {
     // 로그인 권한은 프런트의 오류 문자열이 아니라 이 확인 결과에서 발급한다.
     match sso.check(scope, config).await {
         Ok(()) => Ok(Relogin::Valid),
@@ -167,7 +172,7 @@ fn valid_request_id(id: &str) -> bool {
 
 fn main_document(webview: &Webview) -> Result<(), String> {
     if webview.label() != "main" || webview.window_ref().label() != "main" {
-        return Err("앱의 로컬 기본 창에서만 SSO 로그인을 실행할 수 있습니다".into());
+        return Err("앱의 로컬 기본 창에서만 AWS 로그인을 실행할 수 있습니다".into());
     }
     Ok(())
 }
@@ -216,6 +221,7 @@ pub(crate) fn ssm_target_relogin_cancel(webview: Webview, request_id: String) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ssm::DirectSsoConfig;
     use crate::connections::{profile::Draft, save_test_profile, tests::{TestDir, desktop_draft, draft, ssh_draft, ssm_draft}};
     use serde_json::{Value, json};
     use std::sync::Mutex;
@@ -240,26 +246,30 @@ mod tests {
         }
     }
 
-    fn config() -> DirectSsoConfig {
+    fn sso() -> DirectSsoConfig {
         DirectSsoConfig {
             account: "123456789012".into(), role: "Dev".into(), region: "us-east-1".into(),
             start_url: "https://example.awsapps.com/start".into(), session: None,
         }
     }
 
+    fn config() -> ProfileAuth {
+        ProfileAuth::Sso(sso())
+    }
+
     impl Sso for Fake {
-        fn config(&self, scope: &Scope) -> Result<DirectSsoConfig, CliError> {
+        fn config(&self, scope: &Scope) -> Result<ProfileAuth, CliError> {
             self.record("config", scope);
             Ok(config())
         }
 
-        async fn check(&self, scope: &Scope, current: &DirectSsoConfig) -> Result<(), CliError> {
+        async fn check(&self, scope: &Scope, current: &ProfileAuth) -> Result<(), CliError> {
             assert!(*current == config());
             self.record("check", scope);
             self.check.lock().unwrap().take().expect("확인 호출은 한 번만 한다")
         }
 
-        async fn login(&self, scope: &Scope, current: &DirectSsoConfig) -> Result<(), CliError> {
+        async fn login(&self, scope: &Scope, current: &ProfileAuth) -> Result<(), CliError> {
             assert!(*current == config());
             self.record("login", scope);
             self.login.lock().unwrap().take().expect("로그인은 한 번만 한다")
@@ -345,9 +355,9 @@ mod tests {
     #[test]
     fn one_login_per_profile_or_sso_session_and_cancel_by_request_id() {
         let scope = |profile: &str| Scope::new(profile.into(), "us-west-2".into()).unwrap();
-        let session = |name: Option<&str>, url: &str| DirectSsoConfig {
-            session: name.map(Into::into), start_url: url.into(), ..config()
-        };
+        let session = |name: Option<&str>, url: &str| ProfileAuth::Sso(DirectSsoConfig {
+            session: name.map(Into::into), start_url: url.into(), ..sso()
+        });
         let a = "https://a.awsapps.com/start";
         let b = "https://b.awsapps.com/start";
         // 서로 다른 대상이라도 같은 프로필이면 같은 키다.
@@ -370,6 +380,14 @@ mod tests {
         logins.cancel_all();
         assert!(again.is_cancelled() && other.is_cancelled());
         assert!(logins.begin(shared, "f").is_ok());
+        // `aws login` 프로필은 같은 login_session끼리 기다린다. SSO 키와는 섞이지 않는다.
+        let login = |arn: &str| ProfileAuth::Login(crate::ssm::profile::LoginConfig { session: arn.into(), region: None });
+        let root = "arn:aws:iam::123456789012:root";
+        let held = logins.begin(login_keys(&scope("default"), &login(root)), "g").unwrap();
+        assert_eq!(logins.begin(login_keys(&scope("other"), &login(root)), "h").unwrap_err(), IN_PROGRESS);
+        assert!(logins.begin(login_keys(&scope("admin"), &login("arn:aws:iam::123456789012:user/admin")), "i").is_ok());
+        assert!(logins.begin(login_keys(&scope("ops"), &session(None, "arn:aws:iam::123456789012:root")), "j").is_ok());
+        assert!(!held.is_cancelled());
         assert!(valid_request_id("0b7c-41") && !valid_request_id("") && !valid_request_id("a b") && !valid_request_id(&"a".repeat(65)));
     }
 
@@ -377,16 +395,16 @@ mod tests {
     struct CancelDuringConfig<'a>(&'a TargetLogins, &'a Fake);
 
     impl Sso for CancelDuringConfig<'_> {
-        fn config(&self, scope: &Scope) -> Result<DirectSsoConfig, CliError> {
+        fn config(&self, scope: &Scope) -> Result<ProfileAuth, CliError> {
             self.0.cancel("late");
             self.1.config(scope)
         }
 
-        async fn check(&self, scope: &Scope, current: &DirectSsoConfig) -> Result<(), CliError> {
+        async fn check(&self, scope: &Scope, current: &ProfileAuth) -> Result<(), CliError> {
             self.1.check(scope, current).await
         }
 
-        async fn login(&self, scope: &Scope, current: &DirectSsoConfig) -> Result<(), CliError> {
+        async fn login(&self, scope: &Scope, current: &ProfileAuth) -> Result<(), CliError> {
             self.1.login(scope, current).await
         }
     }
@@ -407,8 +425,8 @@ mod tests {
     }
 
     #[test]
-    fn start_error_matches_frontend_sso_marker() {
-        // app/src/features/ssm/ssoLogin.ts의 SSO_LOGIN_REQUIRED와 같은 값이어야 한다.
-        assert_eq!(start_error(CliError::SsoLoginRequired), "SSM: SSO 재로그인 필요");
+    fn start_error_matches_frontend_login_marker() {
+        // app/src/features/ssm/ssoLogin.tsx의 SSO_LOGIN_REQUIRED와 같은 값이어야 한다.
+        assert_eq!(start_error(CliError::SsoLoginRequired), "SSM: AWS 재로그인 필요");
     }
 }

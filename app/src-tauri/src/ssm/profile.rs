@@ -25,8 +25,7 @@ impl DirectSsoConfig {
 
     pub(super) fn cli_ini_for(&self, profile: &str) -> String {
         let Self { account, role, region, start_url, session } = self;
-        let section = if profile == "default" { "default".to_owned() } else { format!("profile \"{}\"", profile.replace('"', "\\\"")) };
-        let mut config = format!("[{section}]\nsso_account_id = {account}\nsso_role_name = {role}\n");
+        let mut config = format!("[{}]\nsso_account_id = {account}\nsso_role_name = {role}\n", section(profile));
         if let Some(name) = session {
             config.push_str(&format!("sso_session = {name}\n[sso-session \"{name}\"]\n"));
         }
@@ -39,9 +38,60 @@ impl DirectSsoConfig {
     }
 }
 
+fn section(profile: &str) -> String {
+    if profile == "default" { "default".to_owned() } else { format!("profile \"{}\"", profile.replace('"', "\\\"")) }
+}
+
+/// `aws login`으로 만든 프로필. 자격은 로그인 캐시의 `login_session` 항목에서 나온다.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct LoginConfig {
+    pub(crate) session: String,
+    pub(crate) region: Option<String>,
+}
+
+/// 앱이 내보낼 수 있는 프로필 인증 방식.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum ProfileAuth {
+    Sso(DirectSsoConfig),
+    Login(LoginConfig),
+}
+
+impl ProfileAuth {
+    /// 자격 갱신에는 리전이 필요하다. 프로필에 리전이 없으면 대상 리전을 쓴다.
+    pub(super) fn cli_ini_for(&self, profile: &str, fallback_region: &str) -> String {
+        match self {
+            Self::Sso(config) => config.cli_ini_for(profile),
+            Self::Login(config) => format!(
+                "[{}]\nlogin_session = {}\nregion = {}\n",
+                section(profile), config.session, config.login_region(fallback_region),
+            ),
+        }
+    }
+
+    /// 같은 로그인 창을 공유하는 요청을 묶는 키.
+    pub(crate) fn lock_key(&self) -> &str {
+        match self {
+            Self::Sso(config) => config.cache_key(),
+            Self::Login(config) => &config.session,
+        }
+    }
+}
+
+impl LoginConfig {
+    pub(super) fn login_region<'a>(&'a self, fallback: &'a str) -> &'a str {
+        self.region.as_deref().unwrap_or(fallback)
+    }
+}
+
+/// 사용자 AWS CLI와 같은 로그인 캐시 디렉터리.
+pub(super) fn login_cache_dir() -> Result<PathBuf, CliError> {
+    path("AWS_LOGIN_CACHE_DIRECTORY", "login/cache")
+}
+
 pub(super) struct Profiles {
     known: HashSet<String>,
     direct: HashMap<String, DirectSsoConfig>,
+    login: HashMap<String, LoginConfig>,
 }
 
 impl Profiles {
@@ -52,7 +102,7 @@ impl Profiles {
     }
 
     pub(super) fn require(&self, name: &str) -> Result<(), CliError> {
-        if self.direct.contains_key(name) {
+        if self.direct.contains_key(name) || self.login.contains_key(name) {
             Ok(())
         } else if self.known.contains(name) {
             Err(CliError::UnsupportedProfile)
@@ -61,14 +111,18 @@ impl Profiles {
         }
     }
 
-    pub(super) fn export_config(&self, name: &str) -> Result<&DirectSsoConfig, CliError> {
+    pub(super) fn auth(&self, name: &str) -> Result<ProfileAuth, CliError> {
         self.require(name)?;
-        Ok(&self.direct[name])
+        Ok(match self.direct.get(name) {
+            Some(config) => ProfileAuth::Sso(config.clone()),
+            None => ProfileAuth::Login(self.login[name].clone()),
+        })
     }
 
-    pub(super) fn take_export_config(&mut self, name: &str) -> Result<DirectSsoConfig, CliError> {
+    /// S3처럼 SSO 토큰을 직접 쓰는 기능은 SSO 프로필만 받는다.
+    pub(super) fn take_sso_config(&mut self, name: &str) -> Result<DirectSsoConfig, CliError> {
         self.require(name)?;
-        Ok(self.direct.remove(name).expect("required direct profile"))
+        self.direct.remove(name).ok_or(CliError::UnsupportedProfile)
     }
 
     fn parse(config: &str, credentials: &str) -> Result<Self, CliError> {
@@ -107,6 +161,7 @@ impl Profiles {
         }
         let mut known = HashSet::new();
         let mut direct = HashMap::new();
+        let mut login = HashMap::new();
         for (name, mut profile) in profiles {
             if let Some(shared) = credentials.get(name.as_str()) {
                 profile.unsupported |= shared.unsupported;
@@ -122,11 +177,16 @@ impl Profiles {
                 && let Some(config) = direct_config(&profile.options, &sessions)
             {
                 direct.insert(name.clone(), config);
+            } else if !profile.unsupported
+                && !name.contains(['#', '\\'])
+                && let Some(config) = login_config(&profile.options)
+            {
+                login.insert(name.clone(), config);
             }
             known.insert(name);
         }
         known.extend(credentials.keys().map(|name| (*name).to_owned()));
-        Ok(Self { known, direct })
+        Ok(Self { known, direct, login })
     }
 }
 
@@ -191,6 +251,33 @@ fn direct_config(
         start_url: (*url).to_owned(),
         session: name.map(str::to_owned),
     })
+}
+
+fn login_config(options: &Options<'_>) -> Option<LoginConfig> {
+    // 다른 자격 공급자 키가 함께 있으면 CLI가 고르는 공급자를 앱이 재현하지 않는다.
+    if options.keys().any(|key| {
+        key.starts_with("aws_")
+            || key.starts_with("sso_")
+            || matches!(
+                key.as_str(),
+                "credential_process" | "credential_source" | "source_profile" | "role_arn" | "web_identity_token_file"
+            )
+    }) {
+        return None;
+    }
+    let session = options.get("login_session")?;
+    let valid = session.strip_prefix("arn:").is_some_and(|rest| !rest.is_empty())
+        && session.len() <= 2048
+        && session.bytes().all(|b| b.is_ascii_alphanumeric() || b"/:+=,.@_-".contains(&b));
+    if !valid {
+        return None;
+    }
+    let region = match options.get("region") {
+        Some(region) if valid_region(region) => Some((*region).to_owned()),
+        Some(_) => return None,
+        None => None,
+    };
+    Some(LoginConfig { session: (*session).to_owned(), region })
 }
 
 type Options<'a> = HashMap<String, &'a str>;
