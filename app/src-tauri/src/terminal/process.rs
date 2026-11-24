@@ -692,7 +692,7 @@ impl Session {
             }
         }
         let mut request = self.unconfirmed.lock().unwrap();
-        if request.as_ref().is_some_and(remote::Remote::recheck_closed) {
+        if request.as_mut().is_some_and(remote::Remote::recheck_closed) {
             request.take();
             self.close_result.lock().unwrap().remote = remote::RemoteClose::Confirmed;
         }

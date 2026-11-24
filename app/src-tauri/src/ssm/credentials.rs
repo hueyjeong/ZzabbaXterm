@@ -63,6 +63,11 @@ impl Credentials {
         self.expires = SystemTime::UNIX_EPOCH;
     }
 
+    /// 남은 수명이 `margin`보다 짧으면 참이다.
+    pub(super) fn expires_within(&self, margin: std::time::Duration) -> bool {
+        self.expires <= SystemTime::now() + margin
+    }
+
     pub(super) fn require_current(&self) -> Result<(), CliError> {
         if self.expires <= SystemTime::now() {
             return Err(CliError::CredentialsExpired);

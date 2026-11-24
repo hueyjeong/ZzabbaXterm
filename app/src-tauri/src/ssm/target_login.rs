@@ -227,6 +227,7 @@ mod tests {
     use std::sync::Mutex;
 
     struct Fake {
+        auth: ProfileAuth,
         check: Mutex<Option<Result<(), CliError>>>,
         login: Mutex<Option<Result<(), CliError>>>,
         calls: Mutex<Vec<String>>,
@@ -234,7 +235,7 @@ mod tests {
 
     impl Fake {
         fn new(check: Result<(), CliError>, login: Result<(), CliError>) -> Self {
-            Self { check: Mutex::new(Some(check)), login: Mutex::new(Some(login)), calls: Mutex::default() }
+            Self { auth: config(), check: Mutex::new(Some(check)), login: Mutex::new(Some(login)), calls: Mutex::default() }
         }
 
         fn record(&self, step: &str, scope: &Scope) {
@@ -249,7 +250,7 @@ mod tests {
     fn sso() -> DirectSsoConfig {
         DirectSsoConfig {
             account: "123456789012".into(), role: "Dev".into(), region: "us-east-1".into(),
-            start_url: "https://example.awsapps.com/start".into(), session: None,
+            start_url: "https://example.awsapps.com/start".into(), session: None, scopes: None,
         }
     }
 
@@ -260,17 +261,17 @@ mod tests {
     impl Sso for Fake {
         fn config(&self, scope: &Scope) -> Result<ProfileAuth, CliError> {
             self.record("config", scope);
-            Ok(config())
+            Ok(self.auth.clone())
         }
 
         async fn check(&self, scope: &Scope, current: &ProfileAuth) -> Result<(), CliError> {
-            assert!(*current == config());
+            assert!(*current == self.auth);
             self.record("check", scope);
             self.check.lock().unwrap().take().expect("확인 호출은 한 번만 한다")
         }
 
         async fn login(&self, scope: &Scope, current: &ProfileAuth) -> Result<(), CliError> {
-            assert!(*current == config());
+            assert!(*current == self.auth);
             self.record("login", scope);
             self.login.lock().unwrap().take().expect("로그인은 한 번만 한다")
         }
@@ -322,6 +323,22 @@ mod tests {
             assert_eq!(run(dir.path(), id, &fake), Ok(Relogin::LoggedIn), "{id}");
             assert_eq!(fake.calls(), [format!("config {scope}"), format!("check {scope}"), format!("login {scope}")], "{id}");
         }
+    }
+
+    #[test]
+    fn aws_login_profile_follows_the_same_check_then_login_flow() {
+        let dir = saved_targets();
+        let login = ProfileAuth::Login(crate::ssm::profile::LoginConfig {
+            session: "arn:aws:iam::123456789012:root".into(), region: None,
+        });
+        let expired = Fake { auth: login.clone(), ..Fake::new(Err(CliError::SsoLoginRequired), Ok(())) };
+        assert_eq!(run(dir.path(), "ssm-node", &expired), Ok(Relogin::LoggedIn));
+        assert_eq!(expired.calls(), [
+            "config company-sso ap-northeast-2", "check company-sso ap-northeast-2", "login company-sso ap-northeast-2",
+        ]);
+        let valid = Fake { auth: login, ..Fake::new(Ok(()), Ok(())) };
+        assert_eq!(run(dir.path(), "ssm-node", &valid), Ok(Relogin::Valid));
+        assert!(!valid.calls().iter().any(|call| call.starts_with("login")));
     }
 
     #[test]

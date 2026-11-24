@@ -3,12 +3,12 @@ use super::*;
 fn fixture_sso() -> DirectSsoConfig {
     DirectSsoConfig {
         account: "123456789012".into(), role: "Fixture".into(), region: "us-east-1".into(),
-        start_url: "https://example.invalid/start".into(), session: None,
+        start_url: "https://example.invalid/start".into(), session: None, scopes: None,
     }
 }
 
 pub(super) fn fixture_cli() -> AwsCli {
-    AwsCli(Arc::from(std::env::current_exe().unwrap()))
+    AwsCli(Arc::from(std::env::current_exe().unwrap()), true)
 }
 
 pub(super) const EXPORT: &str = r#"{"Version":1,"AccessKeyId":"fixture-key","SecretAccessKey":"fixture-secret","SessionToken":"fixture-token","Expiration":"2099-01-01T00:00:00Z"}"#;
@@ -227,4 +227,34 @@ fn discovery_commands_use_literal_arguments_and_never_fallback() {
         Scope::new(profile.into(), "other.example".into()).err(),
         Some(CliError::InvalidRegion)
     );
+}
+
+#[tokio::test]
+async fn aws_login_refresh_lock_is_per_session_and_cancellable() {
+    let auth = |arn: &str| ProfileAuth::Login(profile::LoginConfig { session: arn.into(), region: None });
+    let first = auth("arn:aws:iam::111111111111:user/lock-fixture");
+    let cancel = CancellationToken::new();
+    let held = export_home(&first, &cancel).await.unwrap();
+    // 다른 login_session은 기다리지 않는다.
+    let other = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        export_home(&auth("arn:aws:iam::222222222222:user/lock-fixture"), &cancel),
+    )
+    .await
+    .expect("다른 세션은 막히지 않는다");
+    assert!(other.is_ok());
+    // 같은 세션은 기다리고, 기다리는 중의 취소는 바로 반영된다.
+    let waiting = CancellationToken::new();
+    let pending = tokio::spawn({
+        let first = first.clone();
+        let waiting = waiting.clone();
+        async move { export_home(&first, &waiting).await.map(drop) }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(!pending.is_finished());
+    waiting.cancel();
+    assert_eq!(pending.await.unwrap(), Err(CliError::Cancelled));
+    // 홈을 버리면 같은 세션의 다음 내보내기가 진행된다.
+    drop(held);
+    assert!(tokio::time::timeout(std::time::Duration::from_secs(5), export_home(&first, &cancel)).await.unwrap().is_ok());
 }

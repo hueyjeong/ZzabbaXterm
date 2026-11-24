@@ -794,8 +794,11 @@ fn verified_selection(directory: &std::path::Path, target_id: &str) -> Result<Ve
         CliError::InvalidRegion => Failure::InvalidRegion,
         _ => Failure::InvalidSsoProfile,
     }))?;
-    let config = scope.direct_sso_config()
-        .map_err(|_| Error::at(Stage::Profile, Failure::InvalidSsoProfile))?;
+    let config = scope.direct_sso_config().map_err(|error| Error::at(Stage::Profile, match error {
+        // aws login 같은 다른 지원 프로필은 S3에서 쓰지 않는다.
+        CliError::UnsupportedProfile if scope.auth().is_ok() => Failure::SsoProfileRequired,
+        _ => Failure::InvalidSsoProfile,
+    }))?;
     if config.account != account {
         return Err(Error::at(Stage::Profile, Failure::AccountMismatch));
     }

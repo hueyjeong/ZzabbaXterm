@@ -17,6 +17,8 @@ pub(super) struct CliHome {
     dir: std::path::PathBuf,
     // `aws login` 갱신은 새 갱신 토큰을 캐시에 다시 쓴다. 사본이 아니라 사용자 캐시를 직접 가리킨다.
     login_cache: Option<std::path::PathBuf>,
+    // 같은 login_session의 갱신 잠금. 내보내기가 끝나 홈을 버리면 풀린다.
+    _refresh: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 impl CliHome {
@@ -31,7 +33,7 @@ impl CliHome {
         builder
             .prefix("zzabba-aws-")
             .tempdir()
-            .map(|dir| Self { dir, login_cache: None })
+            .map(|dir| Self { dir, login_cache: None, _refresh: None })
             .map_err(|_| CliError::ProcessIo)
     }
 
@@ -51,7 +53,7 @@ impl CliHome {
         getrandom::fill(&mut nonce).map_err(|_| CliError::RandomUnavailable)?;
         let path = parent.join(format!("zzabba-aws-{:032x}", u128::from_ne_bytes(nonce)));
         super::windows_acl::private_dir(&path).map_err(|_| CliError::ProcessIo)?;
-        Ok(Self { dir: path, login_cache: None })
+        Ok(Self { dir: path, login_cache: None, _refresh: None })
     }
 
     pub(super) fn path(&self) -> &Path {
@@ -61,8 +63,9 @@ impl CliHome {
         self.dir.path()
     }
 
-    pub(super) fn use_login_cache(&mut self, cache: std::path::PathBuf) {
+    pub(super) fn use_login_cache(&mut self, cache: std::path::PathBuf, refresh: tokio::sync::OwnedMutexGuard<()>) {
         self.login_cache = Some(cache);
+        self._refresh = Some(refresh);
     }
 
     pub(super) fn import_sso_token(&self, source_home: &Path, key: &str) -> Result<(), CliError> {
@@ -147,6 +150,29 @@ pub(crate) fn user_home() -> Result<std::path::PathBuf, CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn only_login_homes_point_at_the_user_login_cache() {
+        let names = |home: &CliHome| {
+            let mut found = Vec::new();
+            home.env(|name, value| found.push((name.to_owned(), value.to_owned())));
+            found
+        };
+        let sso = CliHome::new().unwrap();
+        assert!(!names(&sso).iter().any(|(name, _)| name == "AWS_LOGIN_CACHE_DIRECTORY"));
+        let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        let mut login = CliHome::new().unwrap();
+        let cache = std::path::PathBuf::from("fixture-login-cache");
+        login.use_login_cache(cache.clone(), lock.clone().lock_owned().await);
+        let env = names(&login);
+        assert!(env.contains(&("AWS_LOGIN_CACHE_DIRECTORY".to_owned(), cache.into_os_string())));
+        // 격리 홈은 그대로 임시 디렉터리를 가리킨다.
+        assert!(env.contains(&("HOME".to_owned(), login.path().as_os_str().to_owned())));
+        // 갱신 잠금은 홈을 버릴 때 풀린다.
+        assert!(lock.try_lock().is_err());
+        drop(login);
+        assert!(lock.try_lock().is_ok());
+    }
 
     #[test]
     fn only_selected_cache_entry_crosses_the_home_boundary() {

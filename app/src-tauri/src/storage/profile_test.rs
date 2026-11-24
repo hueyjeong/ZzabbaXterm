@@ -47,7 +47,7 @@ mod tests {
             let clock = Clock::default();
             let transport = replay([role_credentials("fixture-key", &clock, 3600), caller_identity(account), listing]);
             let config = DirectSsoConfig { account: account.into(), role: "ReadOnly".into(),
-                region: "us-east-1".into(), start_url: "https://fixture.invalid/start".into(), session: Some("probe-session".into()) };
+                region: "us-east-1".into(), start_url: "https://fixture.invalid/start".into(), session: Some("probe-session".into()), scopes: None };
             let verified = AwsS3::verified_with_account(&s3.region, config, home.path().to_owned(),
                 SharedHttpClient::new(transport.clone()), SharedTimeSource::new(clock)).await.unwrap();
             assert_eq!(confirm_prefix(verified, &s3).await, expected);

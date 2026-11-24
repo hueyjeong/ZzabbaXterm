@@ -41,6 +41,33 @@ fn exit_and_service_code_rows_are_distinct() {
         ),
         (
             255,
+            "aws: [ERROR]: Unable to retrieve credentials: Your session has expired. Please reauthenticate using 'aws login'.",
+            SsoLoginRequired,
+        ),
+        (
+            255,
+            "aws: [ERROR]: Error loading login session token: Unable to load a existing login session for session arn:aws:iam::123456789012:root, Please reauthenticate with 'aws login'.",
+            SsoLoginRequired,
+        ),
+        (
+            255,
+            "Unable to refresh login credentials because of a change in your password. Please reauthenticate with your new password using 'aws login'.",
+            SsoLoginRequired,
+        ),
+        (
+            255,
+            "Error loading login session token: Failed to load access token from token cache, missing one or more required fields.",
+            SsoLoginRequired,
+        ),
+        (
+            255,
+            "Unable to create or refresh login credentials due to insufficient permissions. You may be missing permission for the 'signin:CreateOAuth2Token' action.",
+            CommandFailed {
+                exit_code: Some(255),
+            },
+        ),
+        (
+            255,
             "Error when retrieving token from sso: unrelated I/O error",
             CommandFailed {
                 exit_code: Some(255),

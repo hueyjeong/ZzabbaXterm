@@ -202,13 +202,20 @@ fn aws_login_profiles_export_only_their_login_session() {
         "[profile not-arn]\nlogin_session = root\n".into(),
         "[profile spaced]\nlogin_session = arn:aws:iam::1 :root\n".into(),
         format!("[profile bad-region]\nlogin_session = {root}\nregion = not a region\n"),
+        format!("[profile via-process]\nlogin_session = {root}\ncredential_process = never-run\n"),
+        format!("[profile via-source]\nlogin_session = {root}\ncredential_source = Environment\n"),
+        format!("[profile via-profile]\nlogin_session = {root}\nsource_profile = default\n"),
+        format!("[profile via-web]\nlogin_session = {root}\nweb_identity_token_file = fixture\n"),
+        "[profile shared-login]\nregion = us-east-1\n".into(),
     ]
     .concat();
-    let mut profiles = Profiles::parse(&config, "[with-keys]\naws_access_key_id = synthetic\n").unwrap();
+    // CLI는 login_session을 설정 파일에서만 읽는다.
+    let credentials = format!("[with-keys]\naws_access_key_id = synthetic\n[shared-login]\nlogin_session = {root}\n");
+    let mut profiles = Profiles::parse(&config, &credentials).unwrap();
     let ProfileAuth::Login(default) = profiles.auth("default").unwrap() else { panic!("aws login 프로필") };
     assert_eq!((default.session.as_str(), default.region.as_deref()), (root, Some("ap-northeast-1")));
     assert_eq!(
-        ProfileAuth::Login(default.clone()).cli_ini_for("default", "us-west-2"),
+        ProfileAuth::Login(default).cli_ini_for("default", "us-west-2"),
         format!("[default]\nlogin_session = {root}\nregion = ap-northeast-1\n")
     );
     let ProfileAuth::Login(no_region) = profiles.auth("no-region").unwrap() else { panic!("aws login 프로필") };
@@ -217,10 +224,33 @@ fn aws_login_profiles_export_only_their_login_session() {
         ProfileAuth::Login(no_region).cli_ini_for("no-region", "us-west-2"),
         "[profile \"no-region\"]\nlogin_session = arn:aws:sts::123456789012:assumed-role/Admin/dev@example.com\nregion = us-west-2\n"
     );
-    assert_eq!(ProfileAuth::Login(default).lock_key(), root);
-    for name in ["with-keys", "with-sso", "with-role", "not-arn", "spaced", "bad-region"] {
+    for name in [
+        "with-keys", "with-sso", "with-role", "not-arn", "spaced", "bad-region",
+        "via-process", "via-source", "via-profile", "via-web", "shared-login",
+    ] {
         assert_eq!(profiles.require(name), Err(CliError::UnsupportedProfile), "{name}");
     }
     // S3처럼 SSO 토큰을 직접 쓰는 기능은 aws login 프로필을 받지 않는다.
     assert_eq!(profiles.take_sso_config("default").err(), Some(CliError::UnsupportedProfile));
+}
+
+#[test]
+fn sso_session_registration_scopes_survive_the_snapshot() {
+    let profiles = Profiles::parse(
+        "[profile scoped]\nsso_session = corp\nsso_account_id = 123456789012\nsso_role_name = Fixture\n\
+         [sso-session corp]\nsso_region = us-east-1\nsso_start_url = https://example.invalid/start\n\
+         sso_registration_scopes = sso:account:access\n\
+         [profile odd]\nsso_session = odd\nsso_account_id = 123456789012\nsso_role_name = Fixture\n\
+         [sso-session odd]\nsso_region = us-east-1\nsso_start_url = https://example.invalid/start\n\
+         sso_registration_scopes = sso:account:access\"injected\n",
+        "",
+    )
+    .unwrap();
+    assert_eq!(
+        sso(&profiles, "scoped").cli_ini_for("scoped"),
+        "[profile \"scoped\"]\nsso_account_id = 123456789012\nsso_role_name = Fixture\nsso_session = corp\n\
+         [sso-session \"corp\"]\nsso_registration_scopes = sso:account:access\n\
+         sso_region = us-east-1\nsso_start_url = https://example.invalid/start\n"
+    );
+    assert_eq!(profiles.require("odd"), Err(CliError::UnsupportedProfile));
 }

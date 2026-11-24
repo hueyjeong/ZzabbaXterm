@@ -30,7 +30,10 @@ use std::{path::Path, sync::Arc};
 #[cfg(test)]
 pub(crate) static LIVE_EXPORT_PROFILE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-pub struct AwsCli(Arc<Path>);
+/// 두 번째 값은 `aws login` 프로필 지원 여부(AWS CLI 2.32.0 이상)다.
+pub struct AwsCli(Arc<Path>, bool);
+
+const LOGIN_CLI_MINIMUM: &str = "2.32.0";
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct Scope {
@@ -93,19 +96,27 @@ impl AwsCli {
         let result = CommandSpec::version(Tool::Aws, program.clone())
             .capture(cancel)
             .await?;
-        let supported = [&result.stdout, &result.stderr].into_iter().any(|output| {
+        let version = [&result.stdout, &result.stderr].into_iter().find_map(|output| {
             std::str::from_utf8(output)
                 .ok()
                 .and_then(|line| line.trim().strip_prefix("aws-cli/"))
                 .and_then(|line| line.split_ascii_whitespace().next())
                 .and_then(plugin::numeric_version)
-                .is_some_and(|version| version[0] == 2 && version >= [2, 31, 0, 0])
+                .filter(|version| version[0] == 2 && *version >= [2, 31, 0, 0])
         });
         result.success()?;
-        if !supported {
+        let Some(version) = version else {
             return Err(CliError::AwsCliNotV2);
+        };
+        Ok(Self(program, version >= [2, 32, 0, 0]))
+    }
+
+    /// `aws login` 프로필은 `login_session`을 아는 CLI에서만 내보내거나 로그인할 수 있다.
+    fn require_auth_support(&self, auth: &ProfileAuth) -> Result<(), CliError> {
+        match auth {
+            ProfileAuth::Login(_) if !self.1 => Err(CliError::AwsCliUpgradeRequired { minimum: LOGIN_CLI_MINIMUM }),
+            _ => Ok(()),
         }
-        Ok(Self(program))
     }
 
     pub async fn check_plugin(&self, cancel: &CancellationToken) -> Result<(), CliError> {
@@ -127,7 +138,7 @@ impl AwsCli {
         cancel: &CancellationToken,
     ) -> Result<Option<String>, CliError> {
         validate_profile(profile)?;
-        require_direct_profile(profile)?;
+        require_supported_profile(profile)?;
         parse_region(self.region_command(profile).capture(cancel).await?)
     }
 
@@ -147,8 +158,8 @@ impl AwsCli {
             }).await;
         }
         let auth = scope.auth()?;
-        let _refresh = login_refresh(&auth).await;
-        let home = export_home(&auth)?;
+        self.require_auth_support(&auth)?;
+        let home = export_home(&auth, cancel).await?;
         self.online_nodes_with(scope, &auth.cli_ini_for("default", scope.region()), Arc::new(home), |spec| async move {
             spec.capture(cancel).await
         })
@@ -162,8 +173,8 @@ impl AwsCli {
         auth: &ProfileAuth,
         cancel: &CancellationToken,
     ) -> Result<(), CliError> {
-        let _refresh = login_refresh(auth).await;
-        let home = export_home(auth)?;
+        self.require_auth_support(auth)?;
+        let home = export_home(auth, cancel).await?;
         let mut capture = |spec: CommandSpec| async move { spec.capture(cancel).await };
         self.caller_with(scope, &auth.cli_ini_for("default", scope.region()), Arc::new(home), &mut capture).await.map(drop)
     }
@@ -219,12 +230,14 @@ impl AwsCli {
         .with_config(snapshot.path(), home.clone());
         let credentials = Arc::new(Credentials::parse(capture(export).await?)?);
         drop(snapshot);
+        // 마지막 참조이므로 `aws login` 갱신 잠금도 여기서 풀린다. 신원 조회는 잠금 밖에서 한다.
         drop(home);
         let identity = session::identity_command(&self.0, scope, &credentials);
         let (owner, role) = session::captured_caller(capture(identity).await?)?;
         Ok((credentials, owner, role))
     }
 
+    #[cfg(test)]
     pub fn relogin_command(&self, scope: &Scope, cause: CliError) -> Result<CommandSpec, CliError> {
         if cause != CliError::SsoLoginRequired {
             return Err(CliError::SsoLoginNotApplicable);
@@ -250,6 +263,7 @@ impl AwsCli {
         use std::io::Write;
 
         if scope.auth()? != *approved { return Err(CliError::CallerChanged); }
+        self.require_auth_support(approved)?;
         let mut snapshot = tempfile::NamedTempFile::new().map_err(|_| CliError::ProcessIo)?;
         snapshot.write_all(approved.cli_ini_for(scope.profile(), scope.region()).as_bytes()).map_err(|_| CliError::ProcessIo)?;
         let cache = match approved {
@@ -295,28 +309,35 @@ fn filter_profiles(profiles: &Profiles, output: &[u8]) -> Result<Vec<String>, Cl
         .map(str::to_owned)
         .collect())
 }
-fn require_direct_profile(profile: &str) -> Result<(), CliError> {
+fn require_supported_profile(profile: &str) -> Result<(), CliError> {
     Profiles::load()?.require(profile)
 }
 
 /// 내보내기용 격리 홈. SSO는 선택한 토큰만 복사하고, `aws login`은 사용자 로그인 캐시를 가리킨다.
-fn export_home(auth: &ProfileAuth) -> Result<home::CliHome, CliError> {
+///
+/// `aws login` 갱신은 갱신 토큰을 바꿔 캐시에 다시 쓴다. 앱 안의 내보내기끼리 같은 토큰으로 동시에
+/// 갱신하지 않도록 login_session별 잠금을 홈에 담는다. 잠금은 내보내기가 끝나 홈을 버릴 때 풀린다.
+async fn export_home(auth: &ProfileAuth, cancel: &CancellationToken) -> Result<home::CliHome, CliError> {
     let mut home = home::CliHome::new()?;
     match auth {
         ProfileAuth::Sso(config) => home.import_sso_token(&home::user_home()?, config.cache_key())?,
-        ProfileAuth::Login(_) => home.use_login_cache(profile::login_cache_dir()?),
+        ProfileAuth::Login(config) => {
+            let lock = login_refresh_lock(&config.session);
+            let guard = tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Err(CliError::Cancelled),
+                guard = lock.lock_owned() => guard,
+            };
+            home.use_login_cache(profile::login_cache_dir()?, guard);
+        }
     }
     Ok(home)
 }
 
-/// `aws login` 갱신은 갱신 토큰을 바꿔 캐시에 다시 쓴다. 앱 안의 내보내기와 로그인이 같은 토큰으로
-/// 동시에 갱신하지 않도록 한 번에 하나씩 실행한다.
-async fn login_refresh(auth: &ProfileAuth) -> Option<tokio::sync::MutexGuard<'static, ()>> {
-    static REFRESH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    match auth {
-        ProfileAuth::Sso(_) => None,
-        ProfileAuth::Login(_) => Some(REFRESH.lock().await),
-    }
+fn login_refresh_lock(session: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+        std::sync::LazyLock::new(Default::default);
+    LOCKS.lock().unwrap().entry(session.to_owned()).or_default().clone()
 }
 
 pub(crate) fn validate_profile(profile: &str) -> Result<(), CliError> {

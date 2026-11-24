@@ -29,6 +29,7 @@ pub enum CliError {
     AwsCliNotV2,
     PluginMissing,
     PluginUpgradeRequired { minimum: &'static str },
+    AwsCliUpgradeRequired { minimum: &'static str },
     InvalidProfile,
     ProfileNotFound,
     UnsupportedProfile,
@@ -445,7 +446,8 @@ fn classify(exit_code: Option<i32>, stderr: &[u8]) -> CliError {
             || (message.starts_with("Error loading SSO Token: Token for ")
                 && (message.ends_with(" does not exist") || message.ends_with(" is invalid")))
             // `aws login` 세션: 캐시 없음, 갱신 토큰 만료, 암호 변경.
-            || message.starts_with("Error loading login session token: Unable to load a existing login session for session ")
+            // 캐시 없음·필드 누락·키 손상 모두 `aws login`으로만 복구된다.
+            || message.starts_with("Error loading login session token: ")
             || message == "Your session has expired. Please reauthenticate using 'aws login'."
             || message
                 == "Unable to refresh login credentials because of a change in your password. Please reauthenticate with your new password using 'aws login'." =>

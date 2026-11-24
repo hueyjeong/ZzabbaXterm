@@ -16,6 +16,8 @@ pub(crate) struct DirectSsoConfig {
     pub(crate) region: String,
     pub(crate) start_url: String,
     pub(crate) session: Option<String>,
+    /// sso-session의 `sso_registration_scopes`. 재로그인 스냅샷에 빠지면 갱신 토큰 없이 등록된다.
+    pub(crate) scopes: Option<String>,
 }
 
 impl DirectSsoConfig {
@@ -24,10 +26,13 @@ impl DirectSsoConfig {
     }
 
     pub(super) fn cli_ini_for(&self, profile: &str) -> String {
-        let Self { account, role, region, start_url, session } = self;
+        let Self { account, role, region, start_url, session, scopes } = self;
         let mut config = format!("[{}]\nsso_account_id = {account}\nsso_role_name = {role}\n", section(profile));
         if let Some(name) = session {
             config.push_str(&format!("sso_session = {name}\n[sso-session \"{name}\"]\n"));
+            if let Some(scopes) = scopes {
+                config.push_str(&format!("sso_registration_scopes = {scopes}\n"));
+            }
         }
         config.push_str(&format!("sso_region = {region}\nsso_start_url = {start_url}\n"));
         config
@@ -65,14 +70,6 @@ impl ProfileAuth {
                 "[{}]\nlogin_session = {}\nregion = {}\n",
                 section(profile), config.session, config.login_region(fallback_region),
             ),
-        }
-    }
-
-    /// 같은 로그인 창을 공유하는 요청을 묶는 키.
-    pub(crate) fn lock_key(&self) -> &str {
-        match self {
-            Self::Sso(config) => config.cache_key(),
-            Self::Login(config) => &config.session,
         }
     }
 }
@@ -164,7 +161,8 @@ impl Profiles {
         let mut login = HashMap::new();
         for (name, mut profile) in profiles {
             if let Some(shared) = credentials.get(name.as_str()) {
-                profile.unsupported |= shared.unsupported;
+                // CLI는 login_session을 설정 파일에서만 읽는다.
+                profile.unsupported |= shared.unsupported || shared.options.contains_key("login_session");
                 profile.options.extend(
                     shared
                         .options
@@ -236,6 +234,13 @@ fn direct_config(
     };
     let region = settings.get("sso_region")?;
     let url = settings.get("sso_start_url")?;
+    let scopes = match name.and_then(|_| settings.get("sso_registration_scopes")) {
+        Some(scopes) if !scopes.is_empty() && scopes.bytes().all(|b| b.is_ascii_alphanumeric() || b":,._- ".contains(&b)) => {
+            Some((*scopes).to_owned())
+        }
+        Some(_) => return None,
+        None => None,
+    };
     if !valid_region(region)
         || !url
             .strip_prefix("https://")
@@ -250,6 +255,7 @@ fn direct_config(
         region: (*region).to_owned(),
         start_url: (*url).to_owned(),
         session: name.map(str::to_owned),
+        scopes,
     })
 }
 

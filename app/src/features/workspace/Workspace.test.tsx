@@ -1342,7 +1342,7 @@ describe("C02 SSM 연결", () => {
     expect(find<HTMLInputElement>("dialog input").value).toBe(node.region);
     await press("다음");
     expect([...find('[aria-label="SSM 연결 대상"]').querySelectorAll("dt, dd")].map((part) => part.textContent)).toEqual([
-      "SSO 프로필", node.profile, "리전", node.region, "인스턴스 ID", node.instanceId,
+      "AWS 프로필", node.profile, "리전", node.region, "인스턴스 ID", node.instanceId,
     ]);
     await press("취소");
     expect(host.querySelector("dialog")).toBeNull();

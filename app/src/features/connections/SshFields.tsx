@@ -58,7 +58,7 @@ export function SshReview({ ssh }: Readonly<{ ssh: SshInput }>) {
     <div><dt>호스트 키 SHA256 지문</dt><dd>{ssh.hostKeyFingerprint}</dd></div>
     <div><dt>전송 방식</dt><dd>{transport.kind === "direct" ? "직접 SSH" : "SSH-over-SSM"}</dd></div>
     {transport.kind === "ssm" && "profile" in transport && <>
-      <div><dt>SSO 프로필</dt><dd>{transport.profile}</dd></div>
+      <div><dt>AWS 프로필</dt><dd>{transport.profile}</dd></div>
       <div><dt>리전</dt><dd>{transport.region}</dd></div>
       <div><dt>인스턴스 ID</dt><dd>{transport.instanceId}</dd></div>
     </>}

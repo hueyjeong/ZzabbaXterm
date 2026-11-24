@@ -521,7 +521,7 @@ async fn s01_캐시_부재와_만료만_같은_프로필의_재로그인으로_�
         if let Some(contents) = contents { std::fs::write(&file, contents).unwrap(); }
         let config = crate::ssm::DirectSsoConfig {
             account: "012345678901".into(), role: "ReadOnly".into(), region: "eu-west-1".into(),
-            start_url: "https://s01.invalid/start".into(), session: Some("s01-test-session".into()),
+            start_url: "https://s01.invalid/start".into(), session: Some("s01-test-session".into()), scopes: None,
         };
         let result = AwsS3::verified("eu-west-1", config, home.path().to_owned(),
             SharedHttpClient::new(transport.clone()), SharedTimeSource::default()).await;
@@ -550,6 +550,7 @@ async fn live_s3_object_edit_round_trip() {
         region: "ap-northeast-1".into(),
         start_url,
         session: std::env::var("ZZABBA_LIVE_PROFILE_SESSION").ok(),
+        scopes: None,
     };
     let client = AwsS3::for_sso_profile("ap-northeast-1", config).await.expect("SSO 프로필");
     let opened = client.read_object_for_edit(&bucket, &key).await.expect("GetObject 검증");

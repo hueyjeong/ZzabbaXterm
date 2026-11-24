@@ -62,16 +62,17 @@ SSM 셸, SSH-over-SSM, SSM 경로의 RDP·VNC, SSM 포트 전달을 열다가 `S
 
 ### `aws login` 프로필
 
-AWS CLI 2.32 이상의 `aws login`이 만든 프로필(`login_session`과 선택적 `region`만 있는 프로필)을 SSM 셸, SSH-over-SSM, SSM 경로의 RDP·VNC, SSM 포트 전달에서 쓴다. `login_session`이 `arn:`으로 시작하지 않거나, `aws_*`·`sso_*`·`credential_process`·`credential_source`·`source_profile`·`role_arn`·`web_identity_token_file` 키가 함께 있으면 지원하지 않는 프로필로 거부한다. S3 저장소는 SSO 토큰을 직접 쓰므로 SSO 프로필만 받는다.
+AWS CLI 2.32 이상의 `aws login`이 만든 프로필(`login_session`과 선택적 `region`만 있는 프로필)을 SSM 셸, SSH-over-SSM, SSM 경로의 RDP·VNC, SSM 포트 전달에서 쓴다. `login_session`이 `arn:`으로 시작하지 않거나, `aws_*`·`sso_*`·`credential_process`·`credential_source`·`source_profile`·`role_arn`·`web_identity_token_file` 키가 함께 있으면 지원하지 않는 프로필로 거부한다. S3 저장소는 SSO 토큰을 직접 쓰므로 SSO 프로필만 받고, `aws login` 프로필 대상에는 `S3는 SSO 프로필만 지원`을 표시한다. AWS CLI가 2.32.0보다 낮으면 `aws login` 프로필의 내보내기와 로그인을 `SSM: AWS CLI 업그레이드 필요 (2.32.0 이상)`으로 거부한다.
 
-- **자격 내보내기.** 임시 홈의 스냅샷은 `login_session`과 `region`만 담는다. 프로필에 리전이 없으면 대상 리전을 넣는다. CLI는 자격을 갱신할 때 새 갱신 토큰을 캐시에 다시 쓰므로, 캐시를 복사하지 않고 `AWS_LOGIN_CACHE_DIRECTORY`로 사용자 로그인 캐시(`AWS_LOGIN_CACHE_DIRECTORY` 설정값, 없으면 `~/.aws/login/cache`)를 가리킨다. 앱 안의 `aws login` 프로필 내보내기는 한 번에 하나씩 실행해 같은 갱신 토큰으로 동시에 갱신하지 않는다.
-- **만료 판정.** `Error loading login session token: Unable to load a existing login session ...`, `Your session has expired. Please reauthenticate using 'aws login'.`, 암호 변경 오류를 `SsoLoginRequired`로 분류한다.
+- **자격 내보내기.** 임시 홈의 스냅샷은 `login_session`과 `region`만 담는다. 프로필에 리전이 없으면 대상 리전을 넣는다. CLI는 자격을 갱신할 때 새 갱신 토큰을 캐시에 다시 쓰므로, 캐시를 복사하지 않고 `AWS_LOGIN_CACHE_DIRECTORY`로 사용자 로그인 캐시(`AWS_LOGIN_CACHE_DIRECTORY` 설정값, 없으면 `~/.aws/login/cache`)를 가리킨다. 앱 안의 내보내기는 같은 `login_session`끼리 한 번에 하나씩 실행해 같은 갱신 토큰으로 동시에 갱신하지 않는다. 잠금은 `export-credentials` 동안만 잡고, 기다리는 중에도 취소된다.
+- **만료 판정.** `Error loading login session token: `으로 시작하는 오류(캐시 없음·필드 누락·키 손상), `Your session has expired. Please reauthenticate using 'aws login'.`, 암호 변경 오류를 `SsoLoginRequired`로 분류한다.
+- **장시간 세션.** 내보낸 자격은 `aws login` 15분, SSO 역할은 역할 세션 시간 동안만 유효하다. 탭이나 포트 전달을 닫을 때와 종료를 다시 확인할 때 남은 수명이 2분보다 짧으면 같은 프로필로 다시 내보내고, 호출자 ARN이 시작 때와 같을 때만 새 자격으로 종료를 확인한다.
 - **재로그인.** 같은 스냅샷과 사용자 로그인 캐시로 `aws login --profile <profile> --region <region>`을 실행한다. 리전을 넘겨 CLI의 대화형 리전 질문을 막는다. 다른 계정으로 로그인하면 CLI가 프로필 덮어쓰기를 묻고, 입력이 닫혀 있으므로 저장 없이 실패한다.
 - **실기 확인(2026-11-24).** 루트 `aws login` 프로필이 만료된 상태에서 앱 경로가 `LoggedIn`과 이어지는 `Valid`를 반환했다. 같은 프로필로 `tunnels::ssm::tests::live`의 두 시험이 앱 내보내기 경로로 통과했다.
 
 ### 연결 프로필과 시험 자격
 
-마법사의 `AWS Systems Manager` 방식은 SSO 프로필, 리전, 온라인 노드를 선택한다. 리전을 수정한 뒤에는 `리전 적용`을 눌러 새 범위에서 노드를 다시 선택해야 시험 단계로 넘어갈 수 있다. 프로필·리전·노드를 바꾸면 이전 시험과 저장 자격이 취소된다. 시험 실패 후에도 선택한 값은 남으며, 시험·저장 화면에는 표시명과 별도로 SSO 프로필, 리전, 인스턴스 ID가 표시된다.
+마법사의 `AWS Systems Manager` 방식은 AWS 프로필(SSO 또는 `aws login`), 리전, 온라인 노드를 선택한다. 리전을 수정한 뒤에는 `리전 적용`을 눌러 새 범위에서 노드를 다시 선택해야 시험 단계로 넘어갈 수 있다. 프로필·리전·노드를 바꾸면 이전 시험과 저장 자격이 취소된다. 시험 실패 후에도 선택한 값은 남으며, 시험·저장 화면에는 표시명과 별도로 AWS 프로필, 리전, 인스턴스 ID가 표시된다.
 
 저장 스키마는 버전 1을 유지한다. 대상은 기존 `id`, `groupId`, `displayName`과 다음 두 방식 중 하나로 구성한다.
 
@@ -80,7 +81,7 @@ AWS CLI 2.32 이상의 `aws login`이 만든 프로필(`login_session`과 선택
 
 Rust는 두 방식이 섞인 레코드와 비밀·실행 파일·임의 인자 등 정의되지 않은 필드를 거부한다. 마법사는 [C01 시험·저장 IPC](01-profiles.md#로컬-마법사-ipc)를 그대로 사용한다. 현재 초안의 실제 연결 시험이 성공한 경우에만 저장할 수 있다. 저장된 SSM 행을 열 때 `terminal_open`의 연결 인자는 `targetId`뿐이며, Rust가 파일에서 대상의 방식을 다시 읽는다.
 
-선택한 직접 SSO 프로필에서 허용된 설정만 담은 임시 스냅샷을 만든다. 스냅샷에 자격 증명이나 토큰을 담지 않는다. CLI가 내보낸 동일한 임시 자격을 신원·노드 조회, PTY의 CLI와 그 플러그인, 소유 세션 종료 확인에 사용한다. 자격은 자식 환경으로만 전달한다.
+선택한 직접 SSO 프로필에서 허용된 설정만 담은 임시 스냅샷을 만든다. sso-session의 `sso_registration_scopes`도 스냅샷에 넣어, 재로그인이 갱신 토큰을 받는 등록을 유지한다. 스냅샷에 자격 증명이나 토큰을 담지 않는다. CLI가 내보낸 동일한 임시 자격을 신원·노드 조회, PTY의 CLI와 그 플러그인, 소유 세션 종료 확인에 사용한다. 자격은 자식 환경으로만 전달한다.
 
 ### 연결 준비와 종료 확인 IPC
 

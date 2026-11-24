@@ -207,8 +207,8 @@ impl Remote {
         (if confirmed { RemoteClose::Confirmed } else { RemoteClose::Unconfirmed }, Some(self.request.target().into()))
     }
 
-    pub(super) fn recheck_closed(&self) -> bool {
-        tauri::async_runtime::block_on(self.cli.recheck_closed(&self.request, &self.scope)).is_ok()
+    pub(super) fn recheck_closed(&mut self) -> bool {
+        tauri::async_runtime::block_on(self.cli.recheck_closed(&mut self.request, &self.scope)).is_ok()
     }
 }
 
@@ -405,6 +405,9 @@ pub(crate) fn start_error(error: CliError) -> String {
         CliError::PluginMissing => "Session Manager 플러그인 없음",
         CliError::PluginUpgradeRequired { minimum } => {
             return format!("SSM: Session Manager 플러그인 업그레이드 필요 ({minimum} 이상)");
+        }
+        CliError::AwsCliUpgradeRequired { minimum } => {
+            return format!("SSM: AWS CLI 업그레이드 필요 ({minimum} 이상)");
         }
         CliError::TargetNotConnected => "노드 연결 불가",
         CliError::InvalidSessionDocument => "세션 문서 사용 불가",
