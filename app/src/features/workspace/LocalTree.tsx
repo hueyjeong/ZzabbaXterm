@@ -10,9 +10,10 @@ type MenuTarget = {
   openRemoteEditor?: () => void; elevate?: () => void; openStorage?: () => void;
 };
 
-export function LocalTree({ profiles, openCounts, onOpen, onElevate, onLocalElevate, onRegisterSshHost, onRetestS3, onOpenTunnel, onOpenStorage }: {
+export function LocalTree({ profiles, openCounts, onOpen, onElevate, onLocalElevate, onRegisterSshHost, onTrustSshHost, onRetestS3, onOpenTunnel, onOpenStorage }: {
   profiles?: SavedConnections; openCounts?: ReadonlyMap<string, number>; onOpen: OpenTarget; onElevate?: ElevateTarget; onLocalElevate?: () => void;
   onRegisterSshHost: (targetId: string) => void;
+  onTrustSshHost?: (targetId: string) => void;
   onRetestS3?: (targetId: string) => void;
   onOpenTunnel: (targetId: string, name: string, method: "ssh" | "ssm") => void;
   onOpenStorage?: (targetId: string, name: string) => void;
@@ -89,6 +90,7 @@ export function LocalTree({ profiles, openCounts, onOpen, onElevate, onLocalElev
     const sshTargetId = target.sshTargetId;
     const s3TargetId = target.s3TargetId;
     if (sshTargetId !== undefined || s3TargetId !== undefined) items.push({ kind: "separator" });
+    add("호스트 키 확인…", KeyRound, sshTargetId !== undefined && onTrustSshHost ? () => onTrustSshHost(sshTargetId) : undefined);
     add("호스트 키 등록", KeyRound, sshTargetId !== undefined ? () => onRegisterSshHost(sshTargetId) : undefined);
     add("연결 재시험", RefreshCcw, s3TargetId !== undefined ? () => onRetestS3?.(s3TargetId) : undefined);
     return items;

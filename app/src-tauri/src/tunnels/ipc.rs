@@ -526,8 +526,6 @@ impl TunnelTabs {
             SshServerPolicy::DestinationRestrictedSocks => "\n승인 전 서버 설정 확인: PermitOpen으로 SOCKS 목적지 제한",
         };
         let service = match protocol { Some(Protocol::Rdp) => "\n서비스: RDP", Some(Protocol::Vnc) => "\n서비스: VNC", None => "" };
-        let fingerprint = crate::ssh::host_trust::trusted(directory, ssh, crate::ssh::host_trust::Via::Direct,
-            &crate::ssh::host_trust::keyscan, trust)?;
         {
             let mut doc = self.writable_document(epoch)?;
             if !doc.tunnels.is_open(&owner) { return Err(STALE.into()); }
@@ -535,6 +533,15 @@ impl TunnelTabs {
             if doc.entries.len() >= LIMIT { return Err("열 수 있는 터널 수를 초과했습니다".into()); }
             doc.approving = true;
         }
+        // 첫 연결 확인 창은 터널 수와 문서 확인을 통과한 뒤, 승인 대기 상태에서 띄운다.
+        let fingerprint = match crate::ssh::host_trust::trusted(directory, ssh, crate::ssh::host_trust::Via::Direct,
+            &crate::ssh::host_trust::keyscan, trust, &tokio_util::sync::CancellationToken::new()) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                self.0.lock().unwrap().approving = false;
+                return Err(error);
+            }
+        };
         let accepted = confirm(format!("{endpoint}\n{fingerprint}\n{}{policy_label}{service}", route_label(&route)));
         let mut doc = self.0.lock().unwrap();
         doc.approving = false;

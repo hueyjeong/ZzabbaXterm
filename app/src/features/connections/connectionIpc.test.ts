@@ -32,3 +32,10 @@ it("편집 명령의 구조화된 오류를 그대로 거부한다", async () =>
   vi.mocked(invoke).mockRejectedValue(referenced);
   await expect(createLocalConnectionIpc().deleteTarget("ssh", 1)).rejects.toBe(referenced);
 });
+
+it("호스트 키 확인 명령에 세션 ID만 넘기고 결과를 그대로 돌려준다", async () => {
+  const reply = { fingerprint: "SHA256:UCUiLr7Pjs9wFFJMDByLgc3NrtdU344OgUM45wZPcIQ", status: "replaced" } as const;
+  vi.mocked(invoke).mockResolvedValue(reply);
+  await expect(createLocalConnectionIpc().trustSavedSshHost("server")).resolves.toEqual(reply);
+  expect(vi.mocked(invoke).mock.calls).toEqual([["trust_saved_ssh_host", { targetId: "server" }]]);
+});

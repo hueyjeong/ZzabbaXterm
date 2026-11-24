@@ -16,7 +16,7 @@ const SHA: &str = "SHA256:UCUiLr7Pjs9wFFJMDByLgc3NrtdU344OgUM45wZPcIQ";
 
 /// 핀이 이미 있는 경로의 확인 창이다. 띄우면 시험이 실패한다.
 pub(crate) fn no_trust() -> Confirm {
-    std::sync::Arc::new(|_| panic!("등록된 핀이 있는데 서버 키 확인 창을 열었습니다"))
+    std::sync::Arc::new(|_, _: &CancellationToken| panic!("등록된 핀이 있는데 서버 키 확인 창을 열었습니다"))
 }
 
 #[test]

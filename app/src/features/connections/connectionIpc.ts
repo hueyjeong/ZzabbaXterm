@@ -3,6 +3,9 @@ import type { ConnectionProfileDraft, ConnectionRequest, ConnectionTestDraft, Co
 
 type SavedEntry<T> = Readonly<{ revision: number; profile: T }>;
 // parentId가 없으면 최상위 그룹, groupId가 없으면 그룹 없는 최상위 세션이다.
+/** 서버 키를 다시 받은 결과다. 핀이 없어 등록했으면 registered, 같으면 unchanged, 교체했으면 replaced다. */
+export type SshHostTrust = Readonly<{ fingerprint: string; status: "registered" | "unchanged" | "replaced" }>;
+
 export type SavedGroup = ConnectionProfileDraft["group"] & Readonly<{ parentId?: string }>;
 type WithoutGroup<T> = T extends unknown ? Omit<T, "groupId"> & Readonly<{ groupId?: string }> : never;
 export type SavedTarget = WithoutGroup<ConnectionProfileDraft["target"]>;
@@ -32,6 +35,7 @@ type Execution = {
 export function createLocalConnectionIpc(): Omit<LocalConnectionActions, "onClose"> & {
   load(): Promise<SavedConnections>;
   registerSavedSshHost(targetId: string): Promise<null>;
+  trustSavedSshHost(targetId: string): Promise<SshHostTrust>;
   capabilities(): Promise<{ storedAuth: boolean }>;
   saveGroup(draft: GroupDraft): Promise<{ revision: number }>;
   deleteGroup(id: string, revision: number, expected: readonly ExpectedEntry[]): Promise<null>;
@@ -44,6 +48,7 @@ export function createLocalConnectionIpc(): Omit<LocalConnectionActions, "onClos
   return {
     load: () => invoke<SavedConnections>("connections_load", {}),
     registerSavedSshHost: (targetId) => invoke<null>("register_saved_ssh_host", { targetId }),
+    trustSavedSshHost: (targetId) => invoke<SshHostTrust>("trust_saved_ssh_host", { targetId }),
     capabilities: () => invoke<{ storedAuth: boolean }>("connection_capabilities", {}),
     // 아래 편집 명령은 실패하면 ConnectionEditError로 거부한다.
     saveGroup: (draft) => invoke<{ revision: number }>("connection_group_save", { draft }),

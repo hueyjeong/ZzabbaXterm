@@ -379,7 +379,7 @@ fn prepare_stored_bounded(
     // 직접 전송은 첫 연결 확인 뒤 저장 암호 승인 창을 띄운다.
     // SSM 경유는 승인 창이 전달 전에 지문을 보여 줘야 하므로 PIN이 먼저 있어야 한다.
     let fingerprint = match ssh.transport {
-        SshTransport::Direct {} => host_trust::trusted(config, ssh, Via::Direct, &host_trust::keyscan, Some(trust))?,
+        SshTransport::Direct {} => host_trust::trusted(config, ssh, Via::Direct, &host_trust::keyscan, Some(trust), &CancellationToken::new())?,
         SshTransport::Ssm(_) => host_trust::required(config, ssh)?,
     };
     let approved = ApprovedHost::confirm(endpoint, endpoint, &fingerprint).map_err(pin_error)?;
@@ -533,11 +533,15 @@ pub(crate) fn prepare_remote_editor(config: &Path, id: &str, revision: std::num:
         return Err("nano 연동에는 SSH Agent 또는 키 파일이 필요합니다".into());
     }
     let endpoint = super::Endpoint::new(&ssh.host, ssh.port).map_err(pin_error)?;
+    // 승인 창이 지문을 보여 줘야 하므로 SSM 경유 nano는 PIN이 먼저 있어야 한다.
+    if matches!(ssh.transport, SshTransport::Ssm(_)) {
+        host_trust::required(config, ssh)?;
+    }
     let launch = match ForwardLaunch::saved(config, ssh, Some(trust))? {
         Some(forward) => SavedLaunch::Forward(forward),
         None => SavedLaunch::Ready(prepare_saved(config, ssh, &endpoint, &CancellationToken::new(), Some(trust))?),
     };
-    // 직접 전송은 이미 첫 연결 확인을 마쳤으므로 핀 지문이 표시된다.
+    // 직접 전송은 이미 첫 연결 확인을 마쳤고 SSM 경유는 PIN을 요구했으므로 핀 지문이 표시된다.
     let message = format!(
         "프로필: {id}\n리비전: {revision}\n서버: {}\n포트: {}\n계정: {}\n호스트 키 지문: {}\n{}\n관리자가 SSH 셸과 SFTP에서 같은 경로가 같은 파일을 가리킨다고 확인했습니까?",
         endpoint.host, endpoint.port, ssh.account, host_trust::shown(config, ssh), transport_line(ssh),
@@ -552,7 +556,7 @@ fn prepare_saved(config: &Path, ssh: &Ssh, endpoint: &super::Endpoint, cancel: &
 }
 
 /// 서버 키 받기. 시험은 가짜 출력을 넣는다.
-pub(crate) type ScanFn = fn(&str, u16) -> Result<String, String>;
+pub(crate) type ScanFn = fn(&Path, &str, u16, &CancellationToken) -> Result<String, String>;
 /// SSM 포트 전달 열기. 시험은 가짜 전달을 넣는다.
 pub(crate) type OpenForward<F> = fn(&crate::connections::profile::Ssm, u16, &CancellationToken) -> Result<(u16, F), String>;
 
@@ -573,7 +577,7 @@ pub(crate) fn prepare_saved_with<F: crate::tunnels::Transport + Send + 'static>(
         SshAuth::StoredPassword { .. } => return Err("저장된 SSH 암호를 사용할 수 없습니다".into()),
     };
     let (fingerprint, transport) = match &ssh.transport {
-        SshTransport::Direct {} => (host_trust::trusted(config, ssh, Via::Direct, &scan, trust)?, Transport::Direct),
+        SshTransport::Direct {} => (host_trust::trusted(config, ssh, Via::Direct, &scan, trust, cancel)?, Transport::Direct),
         SshTransport::Ssm(target) => {
             // 핀이 있으면 AWS 호출 전에 확인하고, 없으면 전달을 연 뒤 그 포트로 서버 키를 받는다.
             let pinned = host_trust::pinned(config, ssh)?;
@@ -581,10 +585,13 @@ pub(crate) fn prepare_saved_with<F: crate::tunnels::Transport + Send + 'static>(
                 return Err(pin_error(Error::UnregisteredHost));
             }
             let (port, forward) = open(target, ssh.port, cancel)?;
-            let forward: super::Forward = Box::new(forward);
+            let mut forward: super::Forward = Box::new(forward);
             let fingerprint = match pinned {
                 Some(fingerprint) => fingerprint,
-                None => host_trust::trusted(config, ssh, Via::Forward(port), &scan, trust)?,
+                // 신뢰를 거절하거나 실패하면 연 전달을 바로 닫는다.
+                None => host_trust::trusted(config, ssh, Via::Forward(port), &scan, trust, cancel).inspect_err(|_| {
+                    let _ = forward.close();
+                })?,
             };
             (fingerprint, Transport::Ssm { port, forward })
         }

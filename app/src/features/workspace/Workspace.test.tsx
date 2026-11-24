@@ -159,7 +159,7 @@ beforeEach(async () => {
     if (command === "connections_load") return loadProfiles();
     if (command === "ai_models") return ["local:latest"];
     if (command === "ai_targets" || command === "ai_decisions") return [];
-    if (command.startsWith("connection_") || ["verify_ssh_host", "commit_ssh_host", "cancel_ssh_host", "register_saved_ssh_host"].includes(command)) return runConnectionCommand(command, args);
+    if (command.startsWith("connection_") || ["verify_ssh_host", "commit_ssh_host", "cancel_ssh_host", "register_saved_ssh_host", "trust_saved_ssh_host"].includes(command)) return runConnectionCommand(command, args);
     if (command === "ssm_discovery") return runDiscovery(args);
     if (command.startsWith("storage_")) return runStorage(command, args);
     if (command.startsWith("editor_sftp_")) return runSftp(command, args);
@@ -1878,7 +1878,7 @@ describe("F01 직접 SSH", () => {
 
     await key(target, "ContextMenu");
     expect([...find('[role="menu"]').querySelectorAll('[role="menuitem"]')].map(item => item.textContent))
-      .toEqual(["SSH", "터널 열기", "호스트 키 등록"]);
+      .toEqual(["SSH", "터널 열기", "호스트 키 확인…", "호스트 키 등록"]);
     await press("호스트 키 등록");
     expect(host.querySelector('[role="menu"]')).toBeNull();
     expect(find('footer [role="alert"]').textContent).toContain("SSH 호스트 키 등록이 취소되었습니다");
@@ -1894,6 +1894,38 @@ describe("F01 직접 SSH", () => {
     expect(calls("open").filter(args => args.targetId)).toEqual([]);
     await act(async () => { target.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); });
     expect(calls("open").slice(-1)[0]).toMatchObject({ targetId: "server" });
+  });
+
+  it("SSH 행의 호스트 키 확인 결과를 상태 줄에 표시한다", async () => {
+    const replies: (() => Promise<unknown>)[] = [
+      async () => ({ fingerprint, status: "registered" }),
+      async () => ({ fingerprint, status: "unchanged" }),
+      async () => ({ fingerprint, status: "replaced" }),
+      async () => { throw "SSH 서버 키 교체가 취소되었습니다"; },
+    ];
+    runConnectionCommand = vi.fn(() => replies.shift()!());
+    loadProfiles = async () => ({
+      version: 2,
+      groups: [{ revision: 1, profile: { id: "work", displayName: "작업" } }],
+      targets: [{
+        revision: 1, profile: {
+          id: "server", groupId: "work", displayName: "개발 서버", defaultMethod: "ssh",
+          ssh: { host: "dev.example.invalid", port: 2222, account: "deploy", transport: { kind: "direct" }, auth: { kind: "manualPassword" } },
+        }
+      }],
+    });
+    await press("연결 새로고침");
+    const target = [...tree().querySelectorAll<HTMLElement>('[role="treeitem"]')].find(item => item.textContent === "개발 서버")!;
+    for (const expected of ["호스트 키 등록", "호스트 키 변경 없음", "호스트 키 교체"]) {
+      await key(target, "ContextMenu");
+      await press("호스트 키 확인…");
+      expect(status()).toContain(expected);
+    }
+    await key(target, "ContextMenu");
+    await press("호스트 키 확인…");
+    expect(find('footer [role="alert"]').textContent).toBe("호스트 키 확인 실패: SSH 서버 키 교체가 취소되었습니다");
+    expect(connectionCalls("trust_saved_ssh_host")).toEqual(Array(4).fill(["trust_saved_ssh_host", { targetId: "server" }]));
+    expect(calls("open").filter(args => args.targetId)).toEqual([]);
   });
 
   it("SSH 종료가 미확인이면 탭을 남기고 같은 PTY ID로만 다시 확인한다", async () => {

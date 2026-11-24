@@ -5,15 +5,20 @@
 use std::{collections::HashMap, path::Path, sync::{Arc, Mutex, OnceLock}};
 
 use ssh_key::{Algorithm, EcdsaCurve, HashAlg, PublicKey};
+use tokio_util::sync::CancellationToken;
 
 use crate::connections::profile::{Ssh, SshTransport};
 use super::{ApprovedHost, Endpoint, Error, TRUST_DIRECTORY, TrustStore, terminal::{pin_error, trust_store}, trust::plain_public_key};
 
 /// OS 확인 창을 띄우고 사용자의 선택을 돌려준다. WebView 밖의 네이티브 창만 넣는다.
-pub(crate) type Confirm = Arc<dyn Fn(String) -> Result<bool, String> + Send + Sync>;
+/// 토큰이 취소되면 창을 닫고 거절로 본다.
+pub(crate) type Confirm = Arc<dyn Fn(String, &CancellationToken) -> Result<bool, String> + Send + Sync>;
 
-/// 서버 키 목록(`ssh-keyscan` 출력)을 받는다. 시험은 가짜 출력을 넣는다.
-pub(crate) type Scan<'a> = &'a dyn Fn(&str, u16) -> Result<String, String>;
+/// 확인 창 하나다. `check`는 문서 확인을 덧붙인 창을 받는다.
+pub(crate) type Prompt<'a> = &'a dyn Fn(String, &CancellationToken) -> Result<bool, String>;
+
+/// 서버 키 목록(`known_hosts` 형식)을 받는다. 첫 인자는 임시 파일을 둘 신뢰 저장소 디렉터리다. 시험은 가짜 출력을 넣는다.
+pub(crate) type Scan<'a> = &'a dyn Fn(&Path, &str, u16, &CancellationToken) -> Result<String, String>;
 
 /// 키를 받을 주소다. SSM 경유면 앱이 연 전달의 루프백 포트다.
 #[derive(Clone, Copy)]
@@ -63,7 +68,9 @@ fn pinned_in(store: &TrustStore, endpoint: &Endpoint, ssh: &Ssh) -> Result<Optio
 
 /// 핀이 있으면 그 지문을 쓴다. 없으면 서버 키를 받아 확인 창을 거친 뒤 고정한다.
 /// `confirm`이 없으면 등록된 핀만 받는다.
-pub(crate) fn trusted(config: &Path, ssh: &Ssh, via: Via, scan: Scan<'_>, confirm: Option<&Confirm>) -> Result<String, String> {
+pub(crate) fn trusted(config: &Path, ssh: &Ssh, via: Via, scan: Scan<'_>, confirm: Option<&Confirm>, cancel: &CancellationToken)
+    -> Result<String, String>
+{
     if let Some(fingerprint) = pinned(config, ssh)? {
         return Ok(fingerprint);
     }
@@ -76,8 +83,8 @@ pub(crate) fn trusted(config: &Path, ssh: &Ssh, via: Via, scan: Scan<'_>, confir
     if let Some(fingerprint) = pinned_in(&store, &endpoint, ssh)? {
         return Ok(fingerprint);
     }
-    let (key, fingerprint) = scanned(&endpoint, ssh, via, scan)?;
-    if !confirm(prompt(&endpoint, ssh, &key, &fingerprint))? {
+    let (key, fingerprint) = scanned(&store, &endpoint, ssh, via, scan, cancel)?;
+    if !confirm(prompt(&endpoint, ssh, &key, &fingerprint), cancel)? {
         return Err(DECLINED.into());
     }
     let approved = ApprovedHost::confirm(&endpoint, &endpoint, &fingerprint).map_err(pin_error)?;
@@ -94,17 +101,17 @@ pub(crate) enum Checked {
 }
 
 /// 서버 키를 다시 받아 핀과 비교한다. 핀이 없으면 등록 확인 창을, 다르면 이전·새 지문을 보여 주는 교체 확인 창을 띄운다.
-pub(crate) fn check(config: &Path, ssh: &Ssh, via: Via, scan: Scan<'_>, confirm: &Confirm, replace: &Confirm)
-    -> Result<(String, Checked), String>
+pub(crate) fn check(config: &Path, ssh: &Ssh, via: Via, scan: Scan<'_>, confirm: Prompt<'_>, replace: Prompt<'_>,
+    cancel: &CancellationToken) -> Result<(String, Checked), String>
 {
     let endpoint = Endpoint::new(&ssh.host, ssh.port).map_err(pin_error)?;
     let store = trust_store(config)?;
     let lock = alias_lock(&endpoint.alias());
     let _guard = lock.lock().map_err(|_| pin_error(Error::TrustRootChanged))?;
-    let (key, fingerprint) = scanned(&endpoint, ssh, via, scan)?;
+    let (key, fingerprint) = scanned(&store, &endpoint, ssh, via, scan, cancel)?;
     let approved = ApprovedHost::confirm(&endpoint, &endpoint, &fingerprint).map_err(pin_error)?;
     let Some(previous) = store.pinned(&endpoint).map_err(pin_error)? else {
-        if !confirm(prompt(&endpoint, ssh, &key, &fingerprint))? {
+        if !confirm(prompt(&endpoint, ssh, &key, &fingerprint), cancel)? {
             return Err(DECLINED.into());
         }
         store.register(&approved, &openssh(&key)?).map_err(trust_error)?;
@@ -118,19 +125,21 @@ pub(crate) fn check(config: &Path, ssh: &Ssh, via: Via, scan: Scan<'_>, confirm:
         "서버: {}\n포트: {}\n{}키 종류: {}\n이전 SHA256 지문: {old}\n새 SHA256 지문: {fingerprint}",
         endpoint.host, endpoint.port, route_line(ssh), key.algorithm().as_str(),
     );
-    if !replace(message)? {
+    if !replace(message, cancel)? {
         return Err("SSH 서버 키 교체가 취소되었습니다".into());
     }
     store.replace(&approved, &previous, &openssh(&key)?).map_err(trust_error)?;
     Ok((fingerprint, Checked::Replaced))
 }
 
-fn scanned(endpoint: &Endpoint, ssh: &Ssh, via: Via, scan: Scan<'_>) -> Result<(PublicKey, String), String> {
+fn scanned(store: &TrustStore, endpoint: &Endpoint, ssh: &Ssh, via: Via, scan: Scan<'_>, cancel: &CancellationToken)
+    -> Result<(PublicKey, String), String>
+{
     let (host, port) = match via {
         Via::Direct => (endpoint.host.as_str(), endpoint.port),
         Via::Forward(port) => ("127.0.0.1", port),
     };
-    let key = choose(&scan(host, port)?).ok_or(NO_KEY)?;
+    let key = choose(&scan(&store.root, host, port, cancel)?).ok_or(NO_KEY)?;
     let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
     // 입력한 지문이 있으면 확인 창 없이 먼저 대조한다.
     if ssh.host_key_fingerprint.as_ref().is_some_and(|expected| *expected != fingerprint) {
@@ -190,47 +199,43 @@ pub(super) fn choose(output: &str) -> Option<PublicKey> {
         .map(|(_, key)| key)
 }
 
-/// OpenSSH `ssh`로 키 교환만 해서 서버 키를 받는다. 셸 없이 인자 배열로 실행하고 호스트는 `--` 뒤에 둔다.
+/// OpenSSH `ssh`로 키 교환만 해서 서버 키를 받는다. 셸 없이 인자 배열로 실행한다.
 /// Windows OpenSSH 9.5의 `ssh-keyscan`은 sntrup761 키 교환을 처리하지 못해 최신 서버에서 키를 받지 못하므로 쓰지 않는다.
-/// 빈 임시 `known_hosts`에 `accept-new`로 키 한 줄만 기록하게 하고, 모든 인증 방식을 꺼 키 교환 직후 끊는다.
-pub(crate) fn keyscan(host: &str, port: u16) -> Result<String, String> {
+/// 신뢰 저장소 아래 세션 디렉터리의 빈 `known_hosts`에 `accept-new`로 키 한 줄만 기록하게 하고, 인증 방식을 모두 꺼 키 교환 직후 끊는다.
+pub(crate) fn keyscan(root: &Path, host: &str, port: u16, cancel: &CancellationToken) -> Result<String, String> {
     use std::{io::Read, process::{Command, Stdio}, time::{Duration, Instant}};
     const LIMIT: u64 = 16 * 1024;
     const DEADLINE: Duration = Duration::from_secs(20);
     let failed = |error: std::io::Error| format!("SSH 서버 키 받기: {error}");
-    let directory = tempfile::tempdir().map_err(failed)?;
-    let known_hosts = directory.path().join("known_hosts");
+    let files = super::session_files(root).map_err(failed)?;
+    let known_hosts = files.path().join("known_hosts");
     let known_hosts_value = super::config_path(&known_hosts).map_err(pin_error)?;
     let program = super::openssh_directory().map_err(failed)?.join(if cfg!(windows) { "ssh.exe" } else { "ssh" });
     let mut command = Command::new(program);
-    command.args(["-F", "none", "-T", "-p", &port.to_string(), "-l", "zzabba-host-key"])
-        .args([
-            "BatchMode=yes", "StrictHostKeyChecking=accept-new", &format!("UserKnownHostsFile={known_hosts_value}"),
-            "GlobalKnownHostsFile=none", "HashKnownHosts=no", "CheckHostIP=no", "UpdateHostKeys=no",
-            "ProxyCommand=none", "ProxyJump=none", "ConnectTimeout=10", "ControlMaster=no", "ControlPath=none",
-            "PubkeyAuthentication=no", "PasswordAuthentication=no", "KbdInteractiveAuthentication=no",
-            "HostbasedAuthentication=no", "IdentityAgent=none", "ForwardAgent=no", "ClearAllForwardings=yes",
-            "SessionType=none", "LogLevel=ERROR",
-            "HostKeyAlgorithms=ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,rsa-sha2-512,rsa-sha2-256",
-        ].into_iter().flat_map(|option| ["-o".to_owned(), option.to_owned()]))
-        .args(["--", host])
-        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+    command.args(keyscan_args(host, port, &known_hosts_value))
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped())
         .env_remove("SSH_AUTH_SOCK").env_remove("SSH_ASKPASS").env("SSH_ASKPASS_REQUIRE", "never");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     }
-    let mut child = command.spawn().map_err(failed)?;
+    let mut child = Reaped(command.spawn().map_err(failed)?);
     let started = Instant::now();
-    // 인증이 모두 꺼져 있어 보통 키 교환 직후 끝난다. 기한을 넘기면 끊는다.
-    while child.try_wait().map_err(failed)?.is_none() {
+    // 인증이 모두 꺼져 있어 보통 키 교환 직후 끝난다. 취소되거나 기한을 넘기면 끊는다.
+    while child.0.try_wait().map_err(failed)?.is_none() {
+        if cancel.is_cancelled() {
+            return Err("SSH 서버 키 받기가 취소되었습니다".into());
+        }
         if started.elapsed() > DEADLINE {
-            let _ = child.kill();
-            let _ = child.wait();
+            child.stop();
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut stderr = Vec::new();
+    if let Some(pipe) = child.0.stderr.take() {
+        let _ = pipe.take(2 * 1024).read_to_end(&mut stderr);
     }
     let mut text = String::new();
     match std::fs::File::open(&known_hosts) {
@@ -238,7 +243,58 @@ pub(crate) fn keyscan(host: &str, port: u16) -> Result<String, String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(failed(error)),
     }
+    if text.trim().is_empty() {
+        let stderr = String::from_utf8_lossy(&stderr);
+        return Err(match stderr.lines().map(str::trim).rfind(|line| !line.is_empty()) {
+            Some(line) => format!("{NO_KEY}: {line}"),
+            None => NO_KEY.into(),
+        });
+    }
     Ok(text)
+}
+
+/// 서버 키 받기의 `ssh` 인자다. 사용자 설정과 프록시를 쓰지 않고, 인증을 모두 끄고, 호스트는 `--` 뒤에만 둔다.
+fn keyscan_args(host: &str, port: u16, known_hosts_value: &str) -> Vec<String> {
+    let options = [
+        "BatchMode=yes".to_owned(), "StrictHostKeyChecking=accept-new".to_owned(),
+        format!("UserKnownHostsFile={known_hosts_value}"), "GlobalKnownHostsFile=none".to_owned(),
+        "KnownHostsCommand=none".to_owned(), "HashKnownHosts=no".to_owned(), "CheckHostIP=no".to_owned(),
+        "UpdateHostKeys=no".to_owned(), "VerifyHostKeyDNS=no".to_owned(), "CanonicalizeHostname=no".to_owned(),
+        "ProxyCommand=none".to_owned(), "ProxyJump=none".to_owned(), "ConnectTimeout=10".to_owned(),
+        "ControlMaster=no".to_owned(), "ControlPath=none".to_owned(),
+        "PubkeyAuthentication=no".to_owned(), "PasswordAuthentication=no".to_owned(),
+        "KbdInteractiveAuthentication=no".to_owned(), "HostbasedAuthentication=no".to_owned(),
+        "GSSAPIAuthentication=no".to_owned(), "IdentityAgent=none".to_owned(), "ForwardAgent=no".to_owned(),
+        "ClearAllForwardings=yes".to_owned(), "LogLevel=ERROR".to_owned(),
+        "HostKeyAlgorithms=ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,rsa-sha2-512,rsa-sha2-256".to_owned(),
+    ];
+    let mut args: Vec<String> = ["-F", "none", "-T", "-N", "-p", &port.to_string(), "-l", "zzabba-host-key"]
+        .into_iter().map(str::to_owned).collect();
+    for option in options {
+        args.push("-o".into());
+        args.push(option);
+    }
+    args.push("--".into());
+    args.push(host.into());
+    args
+}
+
+/// 어느 경로로 빠져나가도 자식을 끝내고 회수한다.
+struct Reaped(std::process::Child);
+
+impl Reaped {
+    fn stop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None) | Err(_)) {
+            let _ = self.0.kill();
+        }
+        let _ = self.0.wait();
+    }
+}
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 #[cfg(test)]

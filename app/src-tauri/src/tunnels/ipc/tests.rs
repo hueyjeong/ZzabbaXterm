@@ -583,7 +583,7 @@ fn isolated_openssh_desktop_lease_outlives_source_tab() {
     }, |description| {
         let ssh = &fixture.ssh.1;
         assert_eq!(description, format!("{}@{}:{}\n{}\n-L {listen} → {}:{}\n서비스: RDP",
-            ssh.account, ssh.host, ssh.port, ssh.host_key_fingerprint, destination.host, destination.port));
+            ssh.account, ssh.host, ssh.port, crate::ssh::host_trust::shown(directory, ssh), destination.host, destination.port));
         Ok(true)
     }).unwrap().unwrap();
     let deadline = Instant::now() + timeout;

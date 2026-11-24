@@ -440,6 +440,17 @@ export function Workspace() {
     setLoadVersion((version) => version + 1);
   }
 
+  async function trustSavedSshHost(targetId: string) {
+    const labels = { registered: "호스트 키 등록", unchanged: "호스트 키 변경 없음", replaced: "호스트 키 교체" } as const;
+    setHostRegistration({ kind: "status", message: "호스트 키 확인 중" });
+    try {
+      const { status } = await connections.trustSavedSshHost(targetId);
+      setHostRegistration({ kind: "status", message: labels[status] });
+    } catch (error) {
+      setHostRegistration({ kind: "alert", message: `호스트 키 확인 실패: ${error instanceof Error ? error.message : String(error)}` });
+    }
+  }
+
   async function registerSavedSshHost(targetId: string) {
     setHostRegistration({ kind: "status", message: "SSH 호스트 키 등록 중" });
     try {
@@ -926,6 +937,7 @@ export function Workspace() {
                 });
               } : undefined}
               onRegisterSshHost={(targetId) => void registerSavedSshHost(targetId)}
+              onTrustSshHost={(targetId) => void trustSavedSshHost(targetId)}
               onRetestS3={retestStorageTarget} onOpenTunnel={(targetId, name, method) => {
                 setWindowError("");
                 void openTunnel(targetId, name, method).catch(error => setWindowError(String(error)));

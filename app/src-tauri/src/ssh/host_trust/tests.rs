@@ -56,18 +56,18 @@ fn pinned_key(directory: &tempfile::TempDir) -> Option<String> {
 fn answering(answer: bool) -> (Confirm, Arc<Mutex<Vec<String>>>) {
     let shown = Arc::new(Mutex::new(Vec::new()));
     let record = Arc::clone(&shown);
-    (Arc::new(move |message| { record.lock().unwrap().push(message); Ok(answer) }), shown)
+    (Arc::new(move |message, _: &CancellationToken| { record.lock().unwrap().push(message); Ok(answer) }), shown)
 }
 
 fn refuse_prompt() -> Confirm {
-    Arc::new(|message| panic!("확인 창을 열었습니다: {message}"))
+    Arc::new(|message, _: &CancellationToken| panic!("확인 창을 열었습니다: {message}"))
 }
 
-fn serve(key: &'static str) -> impl Fn(&str, u16) -> Result<String, String> {
-    move |host, port| Ok(format!("# {host}:{port} SSH-2.0-OpenSSH_9.6\n[{host}]:{port} {key}\n"))
+fn serve(key: &'static str) -> impl Fn(&Path, &str, u16, &CancellationToken) -> Result<String, String> {
+    move |_, host, port, _| Ok(format!("# {host}:{port} SSH-2.0-OpenSSH_9.6\n[{host}]:{port} {key}\n"))
 }
 
-fn no_scan(_: &str, _: u16) -> Result<String, String> {
+fn no_scan(_: &Path, _: &str, _: u16, _: &CancellationToken) -> Result<String, String> {
     panic!("등록된 핀이 있는데 서버 키를 받았습니다")
 }
 
@@ -95,7 +95,7 @@ fn existing_pin_skips_scan_and_prompt() {
     let (directory, ssh) = target(None);
     pin(&directory, ED25519);
     let refuse = refuse_prompt();
-    assert_eq!(trusted(directory.path(), &ssh, Via::Direct, &no_scan, Some(&refuse)), Ok(sha(ED25519)));
+    assert_eq!(trusted(directory.path(), &ssh, Via::Direct, &no_scan, Some(&refuse), &CancellationToken::new()), Ok(sha(ED25519)));
     assert_eq!(required(directory.path(), &ssh), Ok(sha(ED25519)));
 }
 
@@ -103,20 +103,20 @@ fn existing_pin_skips_scan_and_prompt() {
 fn missing_pin_prompts_with_host_port_type_and_sha256_then_registers() {
     let (directory, ssh) = target(None);
     let (confirm, shown) = answering(true);
-    assert_eq!(trusted(directory.path(), &ssh, Via::Direct, &serve(ED25519), Some(&confirm)), Ok(sha(ED25519)));
+    assert_eq!(trusted(directory.path(), &ssh, Via::Direct, &serve(ED25519), Some(&confirm), &CancellationToken::new()), Ok(sha(ED25519)));
     let shown = shown.lock().unwrap().clone();
     assert_eq!(shown, [format!("서버: dev.example.invalid\n포트: 2222\n키 종류: ssh-ed25519\nSHA256 지문: {}", sha(ED25519))]);
     assert_eq!(pinned_key(&directory), Some(sha(ED25519)));
     // 다시 연결할 때는 창을 띄우지 않고 서버 키도 다시 받지 않는다.
     let refuse = refuse_prompt();
-    assert_eq!(trusted(directory.path(), &ssh, Via::Direct, &no_scan, Some(&refuse)), Ok(sha(ED25519)));
+    assert_eq!(trusted(directory.path(), &ssh, Via::Direct, &no_scan, Some(&refuse), &CancellationToken::new()), Ok(sha(ED25519)));
 }
 
 #[test]
 fn declined_prompt_writes_no_pin() {
     let (directory, ssh) = target(None);
     let (confirm, shown) = answering(false);
-    assert_eq!(trusted(directory.path(), &ssh, Via::Direct, &serve(ED25519), Some(&confirm)), Err(DECLINED.into()));
+    assert_eq!(trusted(directory.path(), &ssh, Via::Direct, &serve(ED25519), Some(&confirm), &CancellationToken::new()), Err(DECLINED.into()));
     assert_eq!(shown.lock().unwrap().len(), 1);
     assert_eq!(pinned_key(&directory), None);
 }
@@ -126,7 +126,7 @@ fn expected_fingerprint_mismatch_stops_without_prompt() {
     let fingerprint = sha(OTHER);
     let (directory, ssh) = target(Some(&fingerprint));
     let refuse = refuse_prompt();
-    assert_eq!(trusted(directory.path(), &ssh, Via::Direct, &serve(ED25519), Some(&refuse)), Err(INPUT_MISMATCH.into()));
+    assert_eq!(trusted(directory.path(), &ssh, Via::Direct, &serve(ED25519), Some(&refuse), &CancellationToken::new()), Err(INPUT_MISMATCH.into()));
     assert_eq!(pinned_key(&directory), None);
 }
 
@@ -136,7 +136,7 @@ fn matching_expected_fingerprint_still_prompts() {
     let fingerprint = sha(ED25519);
     let (directory, ssh) = target(Some(&fingerprint));
     let (confirm, shown) = answering(false);
-    assert_eq!(trusted(directory.path(), &ssh, Via::Direct, &serve(ED25519), Some(&confirm)), Err(DECLINED.into()));
+    assert_eq!(trusted(directory.path(), &ssh, Via::Direct, &serve(ED25519), Some(&confirm), &CancellationToken::new()), Err(DECLINED.into()));
     assert!(shown.lock().unwrap()[0].ends_with("\n입력한 지문과 일치"));
     assert_eq!(pinned_key(&directory), None);
 }
@@ -148,7 +148,7 @@ fn expected_fingerprint_differs_from_existing_pin_stops() {
     pin(&directory, ED25519);
     let refuse = refuse_prompt();
     let error = "등록된 SSH 호스트 키의 지문이 다릅니다".to_owned();
-    assert_eq!(trusted(directory.path(), &ssh, Via::Direct, &no_scan, Some(&refuse)), Err(error.clone()));
+    assert_eq!(trusted(directory.path(), &ssh, Via::Direct, &no_scan, Some(&refuse), &CancellationToken::new()), Err(error.clone()));
     assert_eq!(required(directory.path(), &ssh), Err(error));
 }
 
@@ -156,12 +156,12 @@ fn expected_fingerprint_differs_from_existing_pin_stops() {
 fn trusted_pin_blocks_a_changed_server_key() {
     let (directory, ssh) = target(None);
     let (confirm, _) = answering(true);
-    trusted(directory.path(), &ssh, Via::Direct, &serve(ED25519), Some(&confirm)).unwrap();
+    trusted(directory.path(), &ssh, Via::Direct, &serve(ED25519), Some(&confirm), &CancellationToken::new()).unwrap();
     // 서버 키가 바뀌어도 접속 경로는 창을 띄우거나 핀을 바꾸지 않는다. 접속 계획에는 이전 키만 들어간다.
     let refuse = refuse_prompt();
     let endpoint = endpoint();
     let launch = prepare_saved_with(directory.path(), &ssh, &endpoint, &CancellationToken::new(), Some(&refuse),
-        |_, _| Ok(format!("[dev.example.invalid]:2222 {OTHER}")), crate::tunnels::ssm::open_ssh_forward).unwrap();
+        |_, _, _, _| Ok(format!("[dev.example.invalid]:2222 {OTHER}")), crate::tunnels::ssm::open_ssh_forward).unwrap();
     let (_, plan) = launch.into_parts();
     let known_hosts = std::fs::read_to_string(plan.config.with_file_name("known_hosts")).unwrap();
     assert!(known_hosts.contains(ED25519) && !known_hosts.contains(OTHER), "{known_hosts}");
@@ -173,13 +173,15 @@ fn concurrent_first_connects_show_one_prompt() {
     let (directory, ssh) = target(None);
     let prompts = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&prompts);
-    let confirm: Confirm = Arc::new(move |_| {
+    let confirm: Confirm = Arc::new(move |_, _: &CancellationToken| {
         counted.fetch_add(1, Ordering::SeqCst);
         std::thread::sleep(std::time::Duration::from_millis(100));
         Ok(true)
     });
+    // 두 탭이 함께 출발하게 맞춘다.
+    let barrier = std::sync::Barrier::new(2);
     let results = std::thread::scope(|scope| {
-        let tabs: Vec<_> = (0..2).map(|_| scope.spawn(|| trusted(directory.path(), &ssh, Via::Direct, &serve(ED25519), Some(&confirm))))
+        let tabs: Vec<_> = (0..2).map(|_| scope.spawn(|| { barrier.wait(); trusted(directory.path(), &ssh, Via::Direct, &serve(ED25519), Some(&confirm), &CancellationToken::new()) }))
             .collect();
         tabs.into_iter().map(|tab| tab.join().unwrap()).collect::<Vec<_>>()
     });
@@ -190,7 +192,7 @@ fn concurrent_first_connects_show_one_prompt() {
 #[test]
 fn missing_pin_without_confirm_reports_unregistered_host() {
     let (directory, ssh) = target(None);
-    assert_eq!(trusted(directory.path(), &ssh, Via::Direct, &no_scan, None), Err("호스트 키 확인 필요".into()));
+    assert_eq!(trusted(directory.path(), &ssh, Via::Direct, &no_scan, None, &CancellationToken::new()), Err("호스트 키 확인 필요".into()));
     assert_eq!(required(directory.path(), &ssh), Err("호스트 키 확인 필요".into()));
     // 승격과 원격 화면 SSH 경로가 쓰는 확인 창 없는 접속 준비다.
     assert_eq!(crate::ssh::terminal::saved(directory.path(), &ssh, &CancellationToken::new()).err(), Some("호스트 키 확인 필요".into()));
@@ -203,15 +205,15 @@ fn replace_requires_the_previous_record_and_shows_both_fingerprints() {
     pin(&directory, ED25519);
     let refuse = refuse_prompt();
     // 같은 키면 창 없이 변경 없음이다.
-    assert_eq!(check(directory.path(), &ssh, Via::Direct, &serve(ED25519), &refuse, &refuse), Ok((sha(ED25519), Checked::Unchanged)));
+    assert_eq!(check(directory.path(), &ssh, Via::Direct, &serve(ED25519), &*refuse, &*refuse, &CancellationToken::new()), Ok((sha(ED25519), Checked::Unchanged)));
 
     let (declined, _) = answering(false);
-    assert_eq!(check(directory.path(), &ssh, Via::Direct, &serve(OTHER), &refuse, &declined),
+    assert_eq!(check(directory.path(), &ssh, Via::Direct, &serve(OTHER), &*refuse, &*declined, &CancellationToken::new()),
         Err("SSH 서버 키 교체가 취소되었습니다".into()));
     assert_eq!(pinned_key(&directory), Some(sha(ED25519)));
 
     let (replace, shown) = answering(true);
-    assert_eq!(check(directory.path(), &ssh, Via::Direct, &serve(OTHER), &refuse, &replace), Ok((sha(OTHER), Checked::Replaced)));
+    assert_eq!(check(directory.path(), &ssh, Via::Direct, &serve(OTHER), &*refuse, &*replace, &CancellationToken::new()), Ok((sha(OTHER), Checked::Replaced)));
     assert_eq!(shown.lock().unwrap().clone(), [format!(
         "서버: dev.example.invalid\n포트: 2222\n키 종류: ssh-ed25519\n이전 SHA256 지문: {}\n새 SHA256 지문: {}", sha(ED25519), sha(OTHER),
     )]);
@@ -231,7 +233,7 @@ fn check_without_pin_registers_after_trust() {
     let (directory, ssh) = target(None);
     let (confirm, shown) = answering(true);
     let refuse = refuse_prompt();
-    assert_eq!(check(directory.path(), &ssh, Via::Direct, &serve(ECDSA), &confirm, &refuse), Ok((sha(ECDSA), Checked::Registered)));
+    assert_eq!(check(directory.path(), &ssh, Via::Direct, &serve(ECDSA), &*confirm, &*refuse, &CancellationToken::new()), Ok((sha(ECDSA), Checked::Registered)));
     assert!(shown.lock().unwrap()[0].contains("키 종류: ecdsa-sha2-nistp256\n"));
     assert_eq!(pinned_key(&directory), Some(sha(ECDSA)));
 }
@@ -242,7 +244,7 @@ fn direct_connection_without_pin_trusts_then_prepares_the_plan() {
     let (confirm, shown) = answering(true);
     let endpoint = endpoint();
     let launch = prepare_saved_with(directory.path(), &ssh, &endpoint, &CancellationToken::new(), Some(&confirm),
-        |host, port| {
+        |_, host, port, _| {
             assert_eq!((host, port), ("dev.example.invalid", 2222));
             Ok(format!("[{host}]:{port} {ED25519}"))
         }, crate::tunnels::ssm::open_ssh_forward).unwrap();
@@ -258,7 +260,7 @@ fn cancelled_direct_connection_prepares_nothing() {
     let (confirm, _) = answering(false);
     let endpoint = endpoint();
     let launch = prepare_saved_with(directory.path(), &ssh, &endpoint, &CancellationToken::new(), Some(&confirm),
-        |host, port| Ok(format!("[{host}]:{port} {ED25519}")), crate::tunnels::ssm::open_ssh_forward);
+        |_, host, port, _| Ok(format!("[{host}]:{port} {ED25519}")), crate::tunnels::ssm::open_ssh_forward);
     assert_eq!(launch.err(), Some(DECLINED.into()));
     assert_eq!(pinned_key(&directory), None);
 }
@@ -267,12 +269,16 @@ struct FakeForward;
 
 impl crate::tunnels::Transport for FakeForward {
     fn observe(&mut self) -> crate::tunnels::Observation { crate::tunnels::Observation::Listening }
-    fn close(&mut self) -> std::io::Result<()> { Ok(()) }
+    fn close(&mut self) -> std::io::Result<()> {
+        CLOSED.set(CLOSED.get() + 1);
+        Ok(())
+    }
 }
 
 thread_local! {
     static OPENED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SCANNED_PORT: std::cell::Cell<u16> = const { std::cell::Cell::new(0) };
+    static CLOSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn fake_open(_: &crate::connections::profile::Ssm, port: u16, _: &CancellationToken) -> Result<(u16, FakeForward), String> {
@@ -281,7 +287,7 @@ fn fake_open(_: &crate::connections::profile::Ssm, port: u16, _: &CancellationTo
     Ok((40022, FakeForward))
 }
 
-fn forwarded_scan(host: &str, port: u16) -> Result<String, String> {
+fn forwarded_scan(_: &Path, host: &str, port: u16, _: &CancellationToken) -> Result<String, String> {
     assert_eq!(host, "127.0.0.1");
     SCANNED_PORT.set(port);
     Ok(format!("[{host}]:{port} {ED25519}"))
@@ -318,6 +324,38 @@ fn ssm_with_pin_is_checked_before_any_aws_call() {
     let (directory, mut ssh) = target(None);
     over_ssm(&mut ssh);
     assert_eq!(ForwardLaunch::saved_with(directory.path(), &ssh, None, no_scan, fake_open).err(), Some("호스트 키 확인 필요".into()));
+}
+
+#[test]
+fn ssm_declined_trust_closes_the_forward() {
+    let (directory, mut ssh) = target(None);
+    over_ssm(&mut ssh);
+    let (declined, _) = answering(false);
+    let forward = ForwardLaunch::saved_with(directory.path(), &ssh, Some(&declined), forwarded_scan, fake_open).unwrap().unwrap();
+    let closed = CLOSED.get();
+    assert_eq!(forward.prepare(&CancellationToken::new()).err(), Some(DECLINED.into()));
+    assert!(CLOSED.get() > closed);
+    assert_eq!(pinned_key(&directory), None);
+}
+
+#[test]
+fn keyscan_args_ignore_user_config_disable_auth_and_end_with_the_host() {
+    let args = keyscan_args("-oProxyCommand=evil", 2222, "\"C:/trust/ssh plan 1/known_hosts\"");
+    let (host, options) = args.split_last().unwrap();
+    assert_eq!(host, "-oProxyCommand=evil");
+    // 호스트는 `--` 바로 뒤 한 곳에만 있다.
+    assert_eq!(options.last().map(String::as_str), Some("--"));
+    assert!(!options.contains(host));
+    assert_eq!(&args[..8], ["-F", "none", "-T", "-N", "-p", "2222", "-l", "zzabba-host-key"]);
+    let options: Vec<_> = options.chunks(2).skip(4).filter(|pair| pair[0] == "-o").map(|pair| pair[1].as_str()).collect();
+    for expected in ["BatchMode=yes", "StrictHostKeyChecking=accept-new", "UserKnownHostsFile=\"C:/trust/ssh plan 1/known_hosts\"",
+        "GlobalKnownHostsFile=none", "KnownHostsCommand=none", "ProxyCommand=none", "ProxyJump=none", "VerifyHostKeyDNS=no",
+        "CanonicalizeHostname=no", "PubkeyAuthentication=no", "PasswordAuthentication=no", "KbdInteractiveAuthentication=no",
+        "HostbasedAuthentication=no", "GSSAPIAuthentication=no", "IdentityAgent=none", "UpdateHostKeys=no"] {
+        assert!(options.contains(&expected), "{expected}: {options:?}");
+    }
+    // OpenSSH 8.5~8.6이 모르는 옵션은 넣지 않는다.
+    assert!(!options.iter().any(|option| option.starts_with("SessionType")));
 }
 
 /// 실제 sshd로 첫 연결 확인, 접속, 키 변경 차단, 교체를 확인한다.
@@ -370,7 +408,7 @@ fn live_first_connect_trusts_then_blocks_a_changed_key() {
             eprintln!("{error}");
             assert!(error.contains("REMOTE HOST IDENTIFICATION HAS CHANGED") || error.contains("Host key verification failed"), "{error}");
             let (replace, shown) = answering(true);
-            let (fingerprint, checked) = check(&directory, &ssh, Via::Direct, &keyscan, &refuse, &replace).unwrap();
+            let (fingerprint, checked) = check(&directory, &ssh, Via::Direct, &keyscan, &*refuse, &*replace, &CancellationToken::new()).unwrap();
             assert_eq!(checked, Checked::Replaced);
             let shown = shown.lock().unwrap().clone();
             eprintln!("{}", shown[0]);

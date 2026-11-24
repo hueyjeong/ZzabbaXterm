@@ -188,21 +188,43 @@ impl Registration {
     }
 
     /// 메뉴 "호스트 키 확인…"이다. 열려 있는 확인 창이 있으면 새 창을 띄우지 않는다.
-    fn trust_saved(
+    /// 확인 창을 승인한 직후 문서를 다시 확인해, 그사이 페이지가 바뀌었으면 핀을 쓰지 않는다.
+    #[allow(clippy::too_many_arguments)]
+    fn trust_saved<F: crate::tunnels::Transport + Send + 'static>(
         &self,
         directory: &Path,
         target_id: &str,
         sessions: &Sessions,
         document: u64,
-        check: impl FnOnce(&crate::connections::profile::Ssh) -> Result<(String, Checked), String>,
+        (trust, replace): (&Confirm, &Confirm),
+        scan: host_trust::Scan<'_>,
+        open: crate::ssh::terminal::OpenForward<F>,
     ) -> Result<Trusted, String> {
+        use crate::connections::profile::SshTransport;
         let ticket = self.begin(document, None).map_err(|error| error.saved_message())?;
         let _reservation = Pending { state: self, ticket: &ticket };
-        sessions.with_probes("main", document, |_| Ok(())).map_err(|_| Rejection::StaleDocument.saved_message())?;
+        let current = || sessions.with_probes("main", document, |_| Ok(())).map_err(|_| Rejection::StaleDocument.saved_message().to_owned());
+        current()?;
         let (_, ssh) = crate::connections::with_saved_ssh(directory, target_id, |saved| saved)
             .map_err(|_| Rejection::StoreUnavailable.saved_message())?
             .ok_or(Rejection::InvalidTarget.saved_message())?;
-        let (fingerprint, checked) = check(&ssh)?;
+        let approved = |prompt: &Confirm, message: String, cancel: &tokio_util::sync::CancellationToken| -> Result<bool, String> {
+            let accepted = prompt(message, cancel)?;
+            if accepted { current()?; }
+            Ok(accepted)
+        };
+        let trust = |message, cancel: &_| approved(trust, message, cancel);
+        let replace = |message, cancel: &_| approved(replace, message, cancel);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (fingerprint, checked) = match &ssh.transport {
+            SshTransport::Direct {} => host_trust::check(directory, &ssh, Via::Direct, scan, &trust, &replace, &cancel)?,
+            SshTransport::Ssm(target) => {
+                let (port, mut forward) = open(target, ssh.port, &cancel)?;
+                let result = host_trust::check(directory, &ssh, Via::Forward(port), scan, &trust, &replace, &cancel);
+                let _ = forward.close();
+                result?
+            }
+        };
         let status = match checked {
             Checked::Registered => "registered",
             Checked::Unchanged => "unchanged",
@@ -219,35 +241,26 @@ pub(crate) struct Trusted {
     status: &'static str,
 }
 
-/// 첫 연결 확인 창이다. 단추는 신뢰와 취소이고 기본 단추는 취소다.
+/// 첫 연결 확인 창이다. 단추는 신뢰와 취소이고 기본 단추는 취소다. 토큰이 취소되거나 5분이 지나면 닫힌다.
 pub(crate) fn host_key_trust(window: tauri::WebviewWindow) -> Confirm {
-    Arc::new(move |description| dialogs::decide(&window, host_trust::TRUST_TITLE, description, "신뢰", false)
+    Arc::new(move |description, cancel| dialogs::decide(&window, dialogs::Decision::Trust, description, cancel)
         .map_err(|_| "SSH 서버 키 확인 창을 열 수 없습니다".into()))
 }
 
 fn host_key_replace(window: tauri::WebviewWindow) -> Confirm {
-    Arc::new(move |description| dialogs::decide(&window, host_trust::REPLACE_TITLE, description, "교체", true)
+    Arc::new(move |description, cancel| dialogs::decide(&window, dialogs::Decision::Replace, description, cancel)
         .map_err(|_| "SSH 서버 키 변경 창을 열 수 없습니다".into()))
 }
 
 /// 저장된 SSH 세션의 서버 키를 다시 받아 등록하거나, 이전·새 지문을 보여 준 뒤 교체한다.
 /// SSM 경유면 앱이 연 포트 전달로 키를 받고 바로 닫는다.
 pub(crate) fn trust_saved(caller: &Webview, document: u64, target_id: String) -> Result<Trusted, String> {
-    use crate::{connections::profile::SshTransport, tunnels::Transport};
     let config = caller.path().app_config_dir().map_err(|error| format!("앱 설정 디렉터리: {error}"))?;
     let state = caller.try_state::<Registration>().ok_or(Rejection::StoreUnavailable.saved_message())?;
     let window = caller.app_handle().get_webview_window(caller.label()).ok_or(Rejection::StoreUnavailable.saved_message())?;
     let (trust, replace) = (host_key_trust(window.clone()), host_key_replace(window));
-    state.trust_saved(&config, &target_id, &caller.state::<Sessions>(), document, |ssh| match &ssh.transport {
-        SshTransport::Direct {} => host_trust::check(&config, ssh, Via::Direct, &host_trust::keyscan, &trust, &replace),
-        SshTransport::Ssm(target) => {
-            let cancel = tokio_util::sync::CancellationToken::new();
-            let (port, mut forward) = crate::tunnels::ssm::open_ssh_forward(target, ssh.port, &cancel)?;
-            let result = host_trust::check(&config, ssh, Via::Forward(port), &host_trust::keyscan, &trust, &replace);
-            let _ = forward.close();
-            result
-        }
-    })
+    state.trust_saved(&config, &target_id, &caller.state::<Sessions>(), document, (&trust, &replace),
+        &host_trust::keyscan, crate::tunnels::ssm::open_ssh_forward)
 }
 
 pub(crate) fn register_saved(caller: &Webview, document: u64, target_id: String) -> Result<(), String> {
