@@ -1,5 +1,6 @@
 mod clipboard;
 mod connect;
+mod display;
 mod frame;
 pub(crate) mod ipc;
 mod native;
@@ -8,10 +9,7 @@ mod trust;
 
 use std::{
     collections::VecDeque,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -21,7 +19,6 @@ use ironrdp::{
         DesktopSize,
         connection_activation::{ConnectionActivationFactory, ConnectionActivationState},
     },
-    displaycontrol::client::DisplayControlClient,
     dvc::DrdynvcClient,
     graphics::image_processing::PixelFormat,
     pdu::input::{
@@ -32,6 +29,7 @@ use ironrdp::{
         ActiveStage, ActiveStageBuilder, ActiveStageOutput, fast_path::ProcessorBuilder,
         image::DecodedImage,
     },
+    pdu::geometry::InclusiveRectangle,
 };
 use ironrdp_tokio::FramedWrite as _;
 use tokio::{
@@ -58,6 +56,8 @@ struct Target {
     endpoint: route::Endpoint,
     server_name: String,
     size: DesktopSize,
+    /// 데스크톱 배율(%)이다. 100~500만 서버에 알리고 0은 알리지 않는다.
+    scale: u32,
     /// 사용자가 승인한 경우에만 NLA 없는 서버에 TLS 전용으로 한 번 재연결한다.
     tls_only: bool,
 }
@@ -73,6 +73,8 @@ struct Account {
 pub enum Error {
     Bounds,
     Busy,
+    /// 요청한 크기가 서버가 Display Control 능력으로 알린 최대 면적을 넘는다.
+    DisplayLimit,
     /// 앞선 복사 응답을 기다리는 중이다. 다시 보내도 풀리지 않으므로 busy와 나눠 알린다.
     CopyPending,
     ChannelUnavailable,
@@ -127,6 +129,8 @@ pub enum Input {
     Resize {
         width: u16,
         height: u16,
+        /// 데스크톱 배율(%)이다. 100~500 밖이면 보내지 않는다.
+        scale: u32,
     },
 }
 
@@ -202,15 +206,7 @@ impl Session {
         A: FnOnce(trust::Request) -> AFut,
         AFut: Future<Output = Result<bool, Error>>,
     {
-        let area = Arc::new(AtomicU64::new(0));
-        let display = DisplayControlClient::new({
-            let area = Arc::clone(&area);
-            move |caps| {
-                area.store(caps.max_monitor_area(), Ordering::Relaxed);
-                Ok(Vec::new())
-            }
-        });
-        let (result, mut transport) = connect::connect(target, name, tls, trust, resolve, display, auth).await?;
+        let (result, mut transport) = connect::connect(target, name, tls, trust, resolve, auth).await?;
         let id = SessionId(
             NEXT_ID
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
@@ -242,38 +238,81 @@ impl Session {
             let _permit = permit;
             timeout(MAX_LIFETIME, async {
                 let mut channels = Channels::default();
+                // 화면 외 이벤트만 쌓는다. 화면은 바뀐 영역을 합쳐 두었다가 이벤트를 보낼 수 있을 때 한 번에 만든다.
                 let mut pending = VecDeque::new();
+                let mut dirty: Option<InclusiveRectangle> = None;
                 let mut display_generation = 1_u64;
                 let mut normalizer = frame::Normalizer::default();
+                // 서버 연결이 끊겨도 이미 받은 화면을 탭에 넘긴 뒤 끝낸다.
+                let mut ended = None;
+                // 해상도 변경을 보낸 뒤 IO_TIMEOUT 동안이다. xrdp는 Deactivate All 전에 새 크기 좌표의 화면 갱신을 보낸다.
+                let mut resizing: Option<tokio::time::Instant> = None;
                 loop {
+                    if let Some(error) = ended.filter(|_| pending.is_empty() && dirty.is_none()) {
+                        return Err(error);
+                    }
                     let clipboard_deadline = clipboard::deadline(&mut active);
-                    tokio::select! {
-                        permit = event_tx.reserve(), if !pending.is_empty() => {
-                            let event = pending.pop_front().expect("pending event");
-                            if matches!(event, Event::Frame(_)) { graphics.ready = true; }
-                            permit.map_err(|_| Error::Closed)?.send((display_generation, event));
+                    // 탭이 이벤트를 받을 수 있으면 먼저 보낸다. 탭이 앞 화면을 처리하는 동안에는 서버를 계속 읽어 바뀐 영역을 합친다.
+                    tokio::select! { biased;
+                        permit = event_tx.reserve(), if !pending.is_empty() || dirty.is_some() => {
+                            let permit = permit.map_err(|_| Error::Closed)?;
+                            let event = match pending.pop_front() {
+                                Some(event) => event,
+                                None => {
+                                    // 탭이 앞 화면을 받는 동안 도착한 갱신은 모두 이 한 프레임에 들어간다.
+                                    let Some(frame) = graphics.update(id, &dirty.take().expect("dirty rect"))? else { continue };
+                                    graphics.ready = true;
+                                    Event::Frame(frame)
+                                }
+                            };
+                            permit.send((display_generation, event));
+                        }
+                        command = rx.recv() => {
+                            let Some((generation, command, ack)) = command else { return Ok(()) };
+                            if ack.is_closed() { continue; }
+                            if generation.is_some_and(|generation| generation != display_generation) {
+                                let _ = ack.send(Err(Error::StaleDisplay));
+                                continue;
+                            }
+                            // 탭에 보낼 채널·클립보드 이벤트가 밀린 상태는 복사 진행 중이 아니다. busy로 답하고 탭은 알림만 띄운다.
+                            if matches!(command, Input::ReadClipboardText) && !pending.is_empty() {
+                                let _ = ack.send(Err(Error::Busy));
+                                continue;
+                            }
+                            let resize = matches!(command, Input::Resize { .. });
+                            let data = encode(&mut active, &graphics, channels, command);
+                            let outcome = match data {
+                                Ok(data) => write(&mut transport, &data).await,
+                                Err(error) => Err(error),
+                            };
+                            if resize && outcome.is_ok() { resizing = Some(tokio::time::Instant::now() + IO_TIMEOUT); }
+                            let _ = ack.send(outcome);
+                            if matches!(outcome, Err(Error::Transport | Error::Timeout)) { outcome?; }
                         }
                         () = wait_deadline(clipboard_deadline) => {
                             if let Some(event) = clipboard::expire(&mut active) { pending.push_back(event); }
                         }
-                        next = connect::read_bounded(&mut transport, &ironrdp::pdu::RDP_HINT, Error::Transport, None), if pending.is_empty() => {
-                            let pdu = next?;
+                        next = connect::read_bounded(&mut transport, &ironrdp::pdu::RDP_HINT, Error::Transport, None), if pending.is_empty() && ended.is_none() => {
+                            let pdu = match next {
+                                Ok(pdu) => pdu,
+                                Err(error) => { ended = Some(error); continue; }
+                            };
                             let action = ironrdp::pdu::find_size(&pdu).map_err(|_| Error::Protocol)?.ok_or(Error::Protocol)?.action;
-                            let pdus = match normalizer.normalize(action, &pdu, &graphics.image)? {
-                                frame::Normalized::Pass => vec![(action, pdu)],
-                                frame::Normalized::Drop => Vec::new(),
-                                frame::Normalized::Replace(pdus) => pdus,
+                            let resizing_now = resizing.is_some_and(|until| tokio::time::Instant::now() < until);
+                            let pdus = match display::skip_while_resizing(normalizer.normalize(action, &pdu, &graphics.image), resizing_now)? {
+                                Some(frame::Normalized::Pass) => vec![(action, pdu)],
+                                Some(frame::Normalized::Drop) | None => Vec::new(),
+                                Some(frame::Normalized::Replace(pdus)) => pdus,
                             };
                             for (action, pdu) in pdus {
-                                let pixels = inbound.check(action, &pdu, &graphics.image)?;
+                                let Some(pixels) = display::skip_while_resizing(inbound.check(action, &pdu, &graphics.image), resizing_now)? else { continue };
                                 let outputs = active.process(&mut graphics.image, action, &pdu).map_err(|_| Error::Protocol)?;
-                                let mut dirty = None;
                                 for output in outputs {
                                     match output {
                                         ActiveStageOutput::ResponseFrame(data) => write(&mut transport, &data).await?,
                                         ActiveStageOutput::GraphicsUpdate(rect) if pixels => {
-                                            use ironrdp::pdu::geometry::{InclusiveRectangle, Rectangle as _};
-                                            dirty = Some(dirty.map_or_else(|| rect.clone(), |previous: InclusiveRectangle| previous.union(&rect)));
+                                            use ironrdp::pdu::geometry::Rectangle as _;
+                                            dirty = Some(dirty.take().map_or_else(|| rect.clone(), |previous| previous.union(&rect)));
                                         }
                                         ActiveStageOutput::DeactivateAll => {
                                             graphics = timeout(IO_TIMEOUT, reactivate(&mut transport, &mut active, &result.activation_factory))
@@ -287,15 +326,8 @@ impl Session {
                                         _ => {}
                                     }
                                 }
-                                if let Some(dirty) = dirty {
-                                    if let Some(frame) = graphics.update(id, &dirty)? {
-                                        pending.push_back(Event::Frame(frame));
-                                        // 같은 PDU에서 나뉜 나머지 밴드는 전체 프레임이 아니라 패치로 보낸다.
-                                        graphics.ready = true;
-                                    }
-                                }
                             }
-                            let next_channels = channel_state(&mut active, inbound.clipboard_id, &area);
+                            let next_channels = channel_state(&mut active, inbound.clipboard_id);
                             if next_channels != channels {
                                 channels = next_channels;
                                 pending.push_back(Event::Channels(channels));
@@ -303,26 +335,6 @@ impl Session {
                             let (reply, event) = clipboard::received(&mut active)?;
                             write(&mut transport, &reply).await?;
                             if let Some(event) = event { pending.push_back(event); }
-                        }
-                        command = rx.recv() => {
-                            let Some((generation, command, ack)) = command else { return Ok(()) };
-                            if ack.is_closed() { continue; }
-                            if generation.is_some_and(|generation| generation != display_generation) {
-                                let _ = ack.send(Err(Error::StaleDisplay));
-                                continue;
-                            }
-                            // 화면 이벤트가 밀린 상태는 복사 진행 중이 아니다. busy로 답하고 탭은 알림만 띄운다.
-                            if matches!(command, Input::ReadClipboardText) && !pending.is_empty() {
-                                let _ = ack.send(Err(Error::Busy));
-                                continue;
-                            }
-                            let data = encode(&mut active, &graphics, channels, command);
-                            let outcome = match data {
-                                Ok(data) => write(&mut transport, &data).await,
-                                Err(error) => Err(error),
-                            };
-                            let _ = ack.send(outcome);
-                            if matches!(outcome, Err(Error::Transport | Error::Timeout)) { outcome?; }
                         }
                     }
                 }
@@ -459,7 +471,7 @@ async fn reactivate(
 ) -> Result<Graphics, Error> {
     let mut sequence = factory.create();
     loop {
-        connect::step(transport, &mut sequence, Error::Activation).await?;
+        connect::reactivation_step(transport, &mut sequence).await?;
         if let ConnectionActivationState::Finalized {
             desktop_size,
             share_id,
@@ -486,11 +498,7 @@ async fn reactivate(
     }
 }
 
-fn channel_state(
-    stage: &mut ActiveStage,
-    cliprdr_mcs_id: Option<u16>,
-    area: &AtomicU64,
-) -> Channels {
+fn channel_state(stage: &mut ActiveStage, cliprdr_mcs_id: Option<u16>) -> Channels {
     let mut state = Channels {
         cliprdr_mcs_id,
         ..Default::default()
@@ -500,14 +508,12 @@ fn channel_state(
         state.cliprdr_ready = clip.ready;
         state.remote_clipboard_text = clip.remote_text;
     }
-    if let Some(channel) = stage.get_dvc::<DisplayControlClient>() {
+    if let Some(channel) = stage.get_dvc::<display::DisplayControl>() {
         state.display_dvc_id = channel.channel_id();
-        if state.display_dvc_id.is_some()
-            && channel
-                .channel_processor_downcast_ref::<DisplayControlClient>()
-                .is_some_and(DisplayControlClient::ready)
-        {
-            state.display_max_area = Some(area.load(Ordering::Relaxed));
+        if state.display_dvc_id.is_some() {
+            state.display_max_area = channel
+                .channel_processor_downcast_ref::<display::DisplayControl>()
+                .and_then(display::DisplayControl::max_area);
         }
     }
     state
@@ -573,20 +579,10 @@ fn encode(
                 y_position: y,
             })
         }
-        Input::Resize { width, height } => {
-            frame::frame_len(width, height)?;
+        Input::Resize { width, height, scale } => {
             let area = channels.display_max_area.ok_or(Error::ChannelUnavailable)?;
-            if width < 200
-                || height < 200
-                || width % 2 != 0
-                || u64::from(width) * u64::from(height) > area
-            {
-                return Err(Error::Bounds);
-            }
-            return active
-                .encode_resize(width.into(), height.into(), None, None)
-                .ok_or(Error::ChannelUnavailable)?
-                .map_err(|_| Error::Protocol);
+            display::check(width, height, area)?;
+            return display::encode_resize(active, width, height, scale);
         }
         command @ (Input::OfferClipboardText(_) | Input::ReadClipboardText) => {
             return clipboard::command(active, command);

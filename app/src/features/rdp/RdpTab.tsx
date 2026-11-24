@@ -2,11 +2,21 @@ import { RotateCcw } from "lucide-react";
 import { useEffect, useImperativeHandle, useLayoutEffect, useRef, useState, type Ref, type SubmitEvent } from "react";
 import { RemoteDesktopView } from "../remoteDesktop/RemoteDesktopView";
 import type { DesktopPreset } from "../remoteDesktop/desktopProfile";
+import { createFitScheduler, fitSize, type DesktopFit } from "../remoteDesktop/fit";
+import type { RemoteDesktopSize } from "../remoteDesktop/session";
 import type { DesktopTunnelSource } from "../tunnels/tunnelIpc";
 import { IconButton } from "../ui/controls";
 import { connect, type Capabilities, type Connection } from "./session";
 
 const noChannels: Capabilities = { copy: false, paste: false, resize: false };
+/** 창 크기 변경이 이 시간 동안 멈추면 원격 해상도를 맞춘다. */
+export const FIT_DELAY_MS = 400;
+/** 첫 화면 영역 크기를 이 시간 안에 받지 못하면 기본 크기로 연결한다. */
+const VIEWPORT_WAIT_MS = 1000;
+/** 직접 요청한 해상도가 이 시간 뒤에도 그대로면 알린다. */
+export const APPLY_WAIT_MS = 5000;
+export const NOT_APPLIED_NOTICE = "서버가 해상도를 바꾸지 않았습니다";
+const scaleOf = () => Math.round((window.devicePixelRatio || 1) * 100);
 
 type Draft = { host: string; port: number; tlsOnly: boolean; source?: DesktopTunnelSource };
 
@@ -42,13 +52,65 @@ export function RdpTab({ active, label, source, preset, autoStart, onSecurityMod
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [closeStatus, setCloseStatus] = useState<"closing" | "unconfirmed">();
+  const [fit, setFit] = useState(true);
+  const [remoteSize, setRemoteSize] = useState<RemoteDesktopSize>();
+  /** 크기 변경 콜백과 타이머가 읽는 최신 값이다. */
+  const latest = useRef({ connection, ready, resize: channels.resize, fit, active });
+  const display = useRef<{ view?: RemoteDesktopSize; remote?: RemoteDesktopSize; requested?: string; initial?: (size: DesktopFit | undefined) => void }>({});
+  const fitter = useRef<ReturnType<typeof createFitScheduler>>(undefined);
+  fitter.current ??= createFitScheduler(FIT_DELAY_MS, () => requestFit());
+  const applyCheck = useRef<ReturnType<typeof setTimeout>>(undefined);
   const forwardedAddress = forwarded(source);
   const loginMode = opening?.tlsOnly ? "NLA, 미지원 시 TLS 전용(표준 RDP 보안 없음)" : "NLA";
 
-  useLayoutEffect(() => () => { void cancel.current?.().catch(() => { }); }, []);
+  useLayoutEffect(() => () => {
+    fitter.current?.cancel();
+    clearTimeout(applyCheck.current);
+    void cancel.current?.().catch(() => { });
+  }, []);
+  useLayoutEffect(() => { latest.current = { connection, ready, resize: channels.resize, fit, active }; });
+  useEffect(() => { if (fit && ready) requestFit(); }, [fit, ready, remoteSize, channels.resize, active]);
   useImperativeHandle(ref, () => ({ requestClose }));
 
+  /** 창에 맞춤에서 화면 영역의 장치 픽셀 크기를 서버에 요청한다. 서버가 다른 크기를 적용해도 같은 요청을 되풀이하지 않는다. */
+  function requestFit() {
+    const { connection, ready, resize, fit, active } = latest.current;
+    const { view, remote, requested } = display.current;
+    const target = view && fitSize(view, window.devicePixelRatio);
+    if (!fit || !target || !connection || !ready || !resize || !active) return;
+    const key = `${target.width}x${target.height}`;
+    if ((remote?.width === target.width && remote.height === target.height) || requested === key) return;
+    display.current.requested = key;
+    connection.resize(target);
+  }
+
+  /** 첫 측정은 연결 크기로 쓴다. 영역이 0이면 기본 크기로 연결하고, 숨겨진 동안의 0은 무시한다. */
+  function viewport(size: RemoteDesktopSize) {
+    const initial = display.current.initial;
+    display.current.initial = undefined;
+    if (size.width > 0 && size.height > 0) display.current.view = size;
+    if (initial) initial(fitSize(size, window.devicePixelRatio));
+    else if (latest.current.fit && display.current.view === size) fitter.current?.schedule();
+  }
+
+  function applyFixed(width: number, height: number) {
+    const connection = latest.current.connection;
+    if (!connection) return;
+    const before = display.current.remote;
+    setNotice("");
+    connection.resize({ width, height, scale: scaleOf() });
+    clearTimeout(applyCheck.current);
+    applyCheck.current = setTimeout(() => {
+      const now = display.current.remote;
+      if (now && before && now.width === before.width && now.height === before.height && (now.width !== width || now.height !== height)) {
+        setNotice((current) => current || NOT_APPLIED_NOTICE);
+      }
+    }, APPLY_WAIT_MS);
+  }
+
   function reset() {
+    fitter.current?.cancel();
+    clearTimeout(applyCheck.current);
     setOpening(undefined);
     setConnection(undefined);
     setChannels(noChannels);
@@ -88,14 +150,32 @@ export function RdpTab({ active, label, source, preset, autoStart, onSecurityMod
     setError("");
     setOpening({ host: draft.source ? draft.host.toLowerCase() : draft.host, port: draft.port, forwardedAddress: forwarded(draft.source), tlsOnly: draft.tlsOnly });
     onSecurityMode?.(draft.tlsOnly);
+    // 창에 맞춤이면 화면 영역을 잰 크기로, 고정이면 직전 원격 크기로 연결한다.
+    const initial = Promise.withResolvers<DesktopFit | undefined>();
+    const fixed = display.current.remote;
+    display.current.requested = undefined;
+    if (!fit && fixed) initial.resolve({ ...fixed, scale: scaleOf() });
+    else {
+      display.current.initial = initial.resolve;
+      setTimeout(() => {
+        if (display.current.initial !== initial.resolve) return;
+        display.current.initial = undefined;
+        initial.resolve(undefined);
+      }, VIEWPORT_WAIT_MS);
+    }
     cancel.current = connect(draft, setConnection,
-      setChannels, setReady, setNotice, (message, closed, kind) => {
+      setChannels, (value, size) => {
+        setReady(value);
+        if (!size) return;
+        display.current.remote = size;
+        setRemoteSize(size);
+      }, setNotice, (message, closed, kind) => {
         reset();
         if (closed) cancel.current = undefined;
         setCloseStatus(closed ? undefined : "unconfirmed");
         setError(message);
         setRouteLost(!!draft.source && kind === "transport");
-      });
+      }, undefined, initial.promise);
   }
 
   useEffect(() => {
@@ -136,7 +216,7 @@ export function RdpTab({ active, label, source, preset, autoStart, onSecurityMod
   }
 
   const idle = !(opening || connection || closeStatus);
-  return <section aria-label={label}>
+  return <section className="remote-desktop-tab" aria-label={label}>
     {idle && !editing && last.current && <div className="remote-desktop-toolbar">
       <IconButton icon={RotateCcw} label="다시 연결" small disabled={!active} onClick={reconnect} />
       <button type="button" onClick={() => { awaitingRoute.current = false; setEditing(true); }}>연결 설정 편집</button>
@@ -159,16 +239,19 @@ export function RdpTab({ active, label, source, preset, autoStart, onSecurityMod
         <button type="button" disabled={!active || !ready || !channels.paste} onClick={(event) => {
           if (event.nativeEvent.isTrusted) { setNotice(""); connection.clipboard("paste"); }
         }}>붙여넣기</button>
-        <form className="remote-desktop-toolbar" onSubmit={(event) => {
+        <form key={remoteSize ? `${remoteSize.width}x${remoteSize.height}` : ""} className="remote-desktop-toolbar" onSubmit={(event) => {
           event.preventDefault();
-          if (!event.nativeEvent.isTrusted || !active || !ready || !channels.resize) return;
+          if (!event.nativeEvent.isTrusted || fit || !active || !ready || !channels.resize) return;
           const size = new FormData(event.currentTarget);
-          setNotice("");
-          connection.resize(Number(size.get("width")), Number(size.get("height")));
+          applyFixed(Number(size.get("width")), Number(size.get("height")));
         }}>
-          <label>너비 <input name="width" type="number" defaultValue={1024} min={200} max={4096} step={2} required /></label>
-          <label>높이 <input name="height" type="number" defaultValue={768} min={200} max={4096} required /></label>
-          <button type="submit" disabled={!active || !ready || !channels.resize}>해상도 변경</button>
+          <label><input type="checkbox" checked={fit} onChange={(event) => {
+            display.current.requested = undefined;
+            setFit(event.target.checked);
+          }} /> 창에 맞춤</label>
+          <label>너비 <input name="width" type="number" defaultValue={remoteSize?.width ?? 1024} min={200} max={4096} step={2} required disabled={fit} /></label>
+          <label>높이 <input name="height" type="number" defaultValue={remoteSize?.height ?? 768} min={200} max={4096} required disabled={fit} /></label>
+          <button type="submit" disabled={fit || !active || !ready || !channels.resize}>해상도 변경</button>
         </form>
       </>}
     </div>}
@@ -176,6 +259,6 @@ export function RdpTab({ active, label, source, preset, autoStart, onSecurityMod
     {closeStatus === "unconfirmed" && <button type="button" onClick={() => { void requestClose(); }}>종료 다시 확인</button>}
     {notice && <div role="status">{notice}</div>}
     {error && <div role="alert">{error}</div>}
-    {connection && <RemoteDesktopView key={connection.sessionId} session={connection} active={active} label={`${label} 화면`} />}
+    {connection && <RemoteDesktopView key={connection.sessionId} session={connection} active={active} label={`${label} 화면`} onViewport={viewport} />}
   </section>;
 }

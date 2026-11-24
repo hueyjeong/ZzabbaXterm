@@ -15,8 +15,28 @@
 .remote-desktop-view canvas {
   display: block;
   max-width: 100%;
-  height: auto;
+  max-height: 100%;
   touch-action: none;
+}
+
+/* RDP 탭은 남은 높이를 모두 화면 영역에 준다. 그 영역 크기가 창에 맞춤 해상도의 기준이다. */
+.remote-desktop-tab:not([hidden]) {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.remote-desktop-tab > .remote-desktop-view:not([hidden]) {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.remote-desktop-tab .remote-desktop-screen {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .remote-desktop-view canvas:focus-visible {

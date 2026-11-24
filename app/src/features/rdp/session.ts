@@ -1,13 +1,14 @@
 import { Channel, convertFileSrc, invoke, type InvokeArgs } from "@tauri-apps/api/core";
-import { approvalSignal, type RemoteDesktopEvent, type RemoteDesktopIdentity, type RemoteDesktopSession } from "../remoteDesktop/session";
+import type { DesktopFit } from "../remoteDesktop/fit";
+import { approvalSignal, type RemoteDesktopEvent, type RemoteDesktopIdentity, type RemoteDesktopSession, type RemoteDesktopSize } from "../remoteDesktop/session";
 import type { DesktopTunnelSource } from "../tunnels/tunnelIpc";
 import { scanCode } from "./keys";
 
-interface Draft { readonly host: string; readonly port: number; readonly tlsOnly?: boolean; readonly source?: DesktopTunnelSource }
+interface Draft { readonly host: string; readonly port: number; readonly tlsOnly?: boolean; readonly source?: DesktopTunnelSource; readonly size?: DesktopFit }
 export interface Capabilities { readonly copy: boolean; readonly paste: boolean; readonly resize: boolean }
 export interface Connection extends RemoteDesktopSession {
   clipboard(action: "copy" | "paste"): void;
-  resize(width: number, height: number): void;
+  resize(size: DesktopFit): void;
 }
 
 const CHUNK = 256 * 1024;
@@ -36,7 +37,7 @@ const record = (value: unknown): value is Record<string, unknown> => typeof valu
 type Action = { kind: "active"; active: boolean } | { kind: "release" } | { kind: "copy" } |
 { kind: "key"; code: number; extended: boolean; down: boolean } |
 { kind: "pointer"; x: number; y: number; buttons: number } |
-{ kind: "paste"; text: string } | { kind: "resize"; width: number; height: number };
+{ kind: "paste"; text: string } | { kind: "resize"; width: number; height: number; scale: number };
 type Frame = Extract<RemoteDesktopEvent, { kind: "full" | "patch" }>;
 type Queued = { action: Action; epoch: number; displayGeneration: number };
 /** 입력 한 건의 결과다. busy는 Rust가 순번을 쓰지 않았으므로 같은 순번으로 다시 보낸다. */
@@ -50,9 +51,11 @@ function failure(error: unknown): { message: string; kind?: EndKind } {
   return { message: String(error) };
 }
 
+/** `ready`는 새 화면을 적용한 뒤 서버가 정한 크기와 함께 불린다. `initialSize`가 있으면 그 크기를 받은 뒤 연결을 시작한다. */
 export function connect(draft: Draft, opened: (connection: Connection) => void,
-  caps: (value: Capabilities) => void, ready: (value: boolean) => void, showNotice: (message: string) => void,
-  ended: (message: string, closed: boolean, kind?: EndKind) => void, clipboard: Pick<Clipboard, "readText" | "writeText"> = navigator.clipboard): () => Promise<void> {
+  caps: (value: Capabilities) => void, ready: (value: boolean, size?: RemoteDesktopSize) => void, showNotice: (message: string) => void,
+  ended: (message: string, closed: boolean, kind?: EndKind) => void, clipboard: Pick<Clipboard, "readText" | "writeText"> = navigator.clipboard,
+  initialSize?: Promise<DesktopFit | undefined>): () => Promise<void> {
   const document = proof();
   const life = new AbortController();
   let shown = "";
@@ -78,6 +81,7 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
   let serial = 0;
   let lastPacket = 0;
   let lastFrame = 0;
+  let lastSize: RemoteDesktopSize | undefined;
   const queue: Queued[] = [];
   let sending = false;
   let dropped = false;
@@ -277,6 +281,7 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
           if (done || proof() !== document) return;
           if (!receive?.(pending.frame)) throw new Error();
           lastFrame = pending.frame.sequence;
+          lastSize = pending.frame.size;
           pending = undefined;
         }
       } else if (type === "application/json") {
@@ -309,7 +314,7 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
             if (!lastFrame || value.displayGeneration !== frameGeneration || displayGeneration) throw new Error();
             displayGeneration = frameGeneration;
             send({ kind: "active", active });
-            ready(true);
+            ready(true, lastSize);
             break;
           case "channels":
             if (typeof value.copy !== "boolean" || typeof value.paste !== "boolean" || typeof value.resize !== "boolean") throw new Error();
@@ -344,7 +349,6 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
       output = new Channel<string>((ticket: unknown) => {
         if (!approvalSignal(ticket, notice, () => shown)) void packet(ticket);
       });
-      const completion = run("rdp_connect", { id, draft, output });
       opened({
         ...assigned,
         subscribe(listener) {
@@ -367,9 +371,12 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
           }
         },
         clipboard: clipboardAction,
-        resize(width, height) { send({ kind: "resize", width, height }); },
+        resize({ width, height, scale }) { send({ kind: "resize", width, height, scale }); },
       });
-      await completion;
+      // 탭 화면 영역을 잰 뒤 그 크기로 연결한다.
+      const size = initialSize && await initialSize;
+      if (done) return;
+      await run("rdp_connect", { id, draft: size ? { ...draft, size } : draft, output });
       end("RDP 연결이 종료되었습니다");
     } catch (error) {
       const { message, kind } = failure(error);

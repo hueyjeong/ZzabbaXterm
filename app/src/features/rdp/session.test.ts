@@ -170,18 +170,20 @@ it("Canvas 적용 ACK 뒤에만 키를 전달하고 서버가 보낸 크기와 �
   expect(f.draw.mock.invocationCallOrder[0]).toBeLessThan(Math.max(...invoke.mock.invocationCallOrder));
   expect(f.ready).not.toHaveBeenCalled();
   f.display(2);
-  await vi.waitFor(() => expect(f.ready).toHaveBeenCalledWith(true));
+  await vi.waitFor(() => expect(f.ready).toHaveBeenCalledWith(true, { width: 1, height: 1 }));
   view.send(input);
   await vi.waitFor(() => expect(f.calls("rdp_input")[1]).toMatchObject({ id, input: { sequence: 2, action: { kind: "key", code: 0x1e, down: true } } }));
   f.packet({ kind: "channels", sequence: 3, copy: true, paste: true, resize: true });
   await vi.waitFor(() => expect(f.caps).toHaveBeenCalledWith({ copy: true, paste: true, resize: true }));
-  f.connection.resize(800, 600);
+  f.connection.resize({ width: 800, height: 600, scale: 125 });
+  await vi.waitFor(() => expect(f.calls("rdp_input")[2]).toMatchObject({ input: { action: { kind: "resize", width: 800, height: 600, scale: 125 } } }));
   expect(f.canvas.width).toBe(1);
   f.header(4, 2, 2, 2);
   await vi.waitFor(() => expect(f.calls("rdp_ack")).toContainEqual({ id, sequence: 4, offset: 0 }));
   f.pixels(4, 2);
   await vi.waitFor(() => expect(f.canvas.width).toBe(2));
   f.display(5, 2);
+  await vi.waitFor(() => expect(f.ready).toHaveBeenLastCalledWith(true, { width: 2, height: 1 }));
   await vi.waitFor(() => expect(f.calls("rdp_input")[3]).toMatchObject({ input: { displayGeneration: 2, action: { kind: "active" } } }));
   f.connection.clipboard("paste");
   f.connection.clipboard("copy");
@@ -319,6 +321,24 @@ it("TLS 전용 opt-in을 연결 초안에 전달한다", async () => {
   await vi.waitFor(() => expect(invoke.mock.calls.map(([name]) => name)).toContain("rdp_connect"));
   const draft = invoke.mock.calls.find(([name]) => name === "rdp_connect")?.[1]?.draft;
   expect(draft).toEqual({ host: "rdp.example.invalid", port: 3389, tlsOnly: true });
+});
+
+it("화면 영역 크기를 받은 뒤 그 크기로 연결을 시작한다", async () => {
+  vi.stubGlobal("__ZZABBA_RDP_DOCUMENT__", { proof });
+  invoke.mockImplementation((name) => {
+    if (name === "rdp_prepare") return Promise.resolve(id);
+    if (name === "rdp_connect") return Promise.withResolvers<void>().promise;
+    return Promise.resolve();
+  });
+  const size = Promise.withResolvers<{ width: number; height: number; scale: number } | undefined>();
+  const opened = vi.fn();
+  connect({ host: "rdp.example.invalid", port: 3389 }, opened, vi.fn(), vi.fn(), vi.fn(), vi.fn(), undefined, size.promise);
+  await vi.waitFor(() => expect(opened).toHaveBeenCalledOnce());
+  expect(invoke.mock.calls.map(([name]) => name)).not.toContain("rdp_connect");
+  size.resolve({ width: 1474, height: 812, scale: 125 });
+  await vi.waitFor(() => expect(invoke.mock.calls.map(([name]) => name)).toContain("rdp_connect"));
+  expect(invoke.mock.calls.find(([name]) => name === "rdp_connect")?.[1]?.draft)
+    .toEqual({ host: "rdp.example.invalid", port: 3389, size: { width: 1474, height: 812, scale: 125 } });
 });
 
 it("복사가 busy이거나 진행 중이어도 다시 보내지 않고 뒤 키 입력을 계속 보낸다", async () => {

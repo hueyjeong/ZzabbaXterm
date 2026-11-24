@@ -31,17 +31,17 @@ pub(super) enum Endpoint {
     Forwarded { stream: Option<TcpStream>, listen: std::net::SocketAddr },
 }
 
-pub(super) fn direct(dns: String, port: u16, size: DesktopSize, tls_only: bool) -> Target {
-    Target { endpoint: Endpoint::Direct(port), server_name: dns, size, tls_only }
+pub(super) fn direct(dns: String, port: u16, size: DesktopSize, scale: u32, tls_only: bool) -> Target {
+    Target { endpoint: Endpoint::Direct(port), server_name: dns, size, scale, tls_only }
 }
 
-pub(super) fn forwarded(dns: String, destination: &Destination, size: DesktopSize, lease: &mut DesktopLease, tls_only: bool) -> Result<Target, Error> {
+pub(super) fn forwarded(dns: String, destination: &Destination, size: DesktopSize, scale: u32, lease: &mut DesktopLease, tls_only: bool) -> Result<Target, Error> {
     if lease.protocol() != Protocol::Rdp || lease.destination() != destination { return Err(Error::Tcp); }
     let stream = lease.take_stream().map_err(|_| Error::Transport)?;
     stream.set_nonblocking(true).map_err(|_| Error::Tcp)?;
     let stream = TcpStream::from_std(stream).map_err(|_| Error::Tcp)?;
     let listen = stream.peer_addr().map_err(|_| Error::Tcp)?;
-    Ok(Target { endpoint: Endpoint::Forwarded { stream: Some(stream), listen }, server_name: dns, size, tls_only })
+    Ok(Target { endpoint: Endpoint::Forwarded { stream: Some(stream), listen }, server_name: dns, size, scale, tls_only })
 }
 
 #[cfg(test)]

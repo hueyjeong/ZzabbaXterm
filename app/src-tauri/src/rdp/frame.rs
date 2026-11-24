@@ -6,13 +6,14 @@ use ironrdp::{
         bitmap::{BitmapData, BitmapUpdateData, Compression},
         fast_path::{EncryptionFlags, FastPathHeader, FastPathUpdatePdu, Fragmentation, UpdateCode},
         geometry::InclusiveRectangle,
-        mcs::decode_send_data_indication,
+        mcs::{SendDataIndication, SendDataIndicationCtx, decode_send_data_indication},
         rdp::{
             headers::{IoChannelPdu, ShareDataPdu, decode_io_channel},
             vc::{ChannelControlFlags as Flags, ChannelPduHeader},
         },
         slow_path::{self, GraphicsUpdateType},
         surface_commands::SurfaceCommand,
+        x224::X224,
     },
     session::image::DecodedImage,
 };
@@ -574,6 +575,9 @@ impl Normalizer {
 
     fn slowpath(&mut self, pdu: &[u8], image: &DecodedImage) -> Result<Normalized, Error> {
         let Ok(data) = decode_send_data_indication(pdu) else { return Ok(Normalized::Pass) };
+        if let Some(pdu) = full_deactivate(&data)? {
+            return Ok(Normalized::Replace(vec![(Action::X224, pdu)]));
+        }
         let Ok(IoChannelPdu::Data(ctx)) = decode_io_channel(data).map_err(|_| Error::Protocol) else { return Ok(Normalized::Pass) };
         let ShareDataPdu::Update(bytes) = ctx.pdu else { return Ok(Normalized::Pass) };
         let mut input = ReadCursor::new(&bytes);
@@ -593,6 +597,29 @@ impl Normalizer {
             Ok(Normalized::Replace(pdus.into_iter().map(|pdu| (Action::FastPath, pdu)).collect()))
         }
     }
+}
+
+/// xrdp 0.9.24는 해상도를 바꿀 때 Deactivate All을 ShareControlHeader 6바이트만으로 보낸다.
+/// IronRDP는 shareId까지 읽어야 하므로 shareId 0과 1바이트 sourceDescriptor를 붙인 정상 PDU로 바꿔 재활성화가 이어지게 한다.
+fn full_deactivate(data: &SendDataIndicationCtx<'_>) -> Result<Option<Bytes>, Error> {
+    const DEACTIVATE_ALL: u16 = 0x16;
+    let user = data.user_data;
+    if user.len() != 6 || user[..2] != [6, 0] || u16::from_le_bytes([user[2], user[3]]) != DEACTIVATE_ALL {
+        return Ok(None);
+    }
+    let mut fixed = Vec::with_capacity(13);
+    fixed.extend_from_slice(&13_u16.to_le_bytes());
+    fixed.extend_from_slice(&user[2..6]);
+    fixed.extend_from_slice(&0_u32.to_le_bytes());
+    fixed.extend_from_slice(&1_u16.to_le_bytes());
+    fixed.push(0);
+    let pdu = encode_vec(&X224(SendDataIndication {
+        initiator_id: data.initiator_id,
+        channel_id: data.channel_id,
+        user_data: std::borrow::Cow::Owned(fixed),
+    }))
+    .map_err(|_| Error::Protocol)?;
+    Ok(Some(Bytes::from(pdu)))
 }
 
 #[derive(Default)]

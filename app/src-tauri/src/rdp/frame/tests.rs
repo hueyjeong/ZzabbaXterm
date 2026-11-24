@@ -445,3 +445,28 @@ fn a_pointer_next_to_a_bitmap_fragment_is_not_dropped() {
     let update: FastPathUpdatePdu<'_> = decode_cursor(&mut input).unwrap();
     assert_eq!((update.update_code, update.data), (UpdateCode::PositionPointer, &[1u8, 0, 2, 0][..]));
 }
+
+#[test]
+fn xrdp_short_deactivate_all_is_completed_before_ironrdp_reads_it() {
+    use ironrdp::pdu::{mcs::SendDataIndication, rdp::headers::IoChannelPdu, x224::X224};
+
+    // R6b 재현: xrdp 0.9.24는 해상도 변경 때 shareId 없이 ShareControlHeader(길이 6, 종류 0x16)만 보낸다.
+    let short = encode_vec(&X224(SendDataIndication {
+        initiator_id: 1002,
+        channel_id: 1003,
+        user_data: std::borrow::Cow::Owned(vec![6, 0, 0x16, 0, 0xea, 0x03]),
+    }))
+    .unwrap();
+    let data = decode_send_data_indication(&short).unwrap();
+    assert!(decode_io_channel(data).is_err());
+
+    let image = DecodedImage::new(PixelFormat::RgbA32, 644, 633);
+    let Normalized::Replace(pdus) = Normalizer::default().normalize(Action::X224, &short, &image).unwrap() else {
+        panic!("short Deactivate All must be completed")
+    };
+    assert_eq!(pdus.len(), 1);
+    let data = decode_send_data_indication(&pdus[0].1).unwrap();
+    assert_eq!((data.initiator_id, data.channel_id), (1002, 1003));
+    assert!(matches!(decode_io_channel(data).unwrap(), IoChannelPdu::DeactivateAll(_)));
+    assert!(Inbound { io_id: 1003, ..Default::default() }.check(Action::X224, &pdus[0].1, &image).is_ok());
+}
