@@ -358,6 +358,7 @@ fn command(shell: Shell, directory: &std::path::Path) -> Result<CommandBuilder, 
         #[allow(unreachable_patterns)]
         _ => return Err("지원하지 않는 셸입니다".into()),
     };
+    super::strip_inherited_agent_env(&mut command);
     command.cwd(directory);
     command.env("ZZABBA_C01_CWD", directory);
     Ok(command)

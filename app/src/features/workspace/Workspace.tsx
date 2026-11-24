@@ -168,6 +168,8 @@ export function Workspace() {
   const [filePickerBusy, setFilePickerBusy] = useState(false);
   const [fileError, setFileError] = useState("");
   const [focusTab, setFocusTab] = useState<number | null>(1);
+  // 포커스가 문서 밖으로 빠져도 focusTab은 그대로라 같은 값 설정은 렌더를 만들지 않는다. 요청마다 올린다.
+  const [focusSeq, setFocusSeq] = useState(0);
   const liveTabs = useRef(tabs);
   const closingTabs = useRef(new Set<number>());
   const sessionClosers = useRef(new Map<number, { confirmClose(): Promise<void> }>());
@@ -661,6 +663,7 @@ export function Workspace() {
   function selectTab(id: number, requestFocus = true) {
     updateLayout(current => L.selectTab(current, id));
     setFocusTab(requestFocus ? id : null);
+    if (requestFocus) setFocusSeq(seq => seq + 1);
   }
 
   async function closeTab(id: number) {
@@ -996,7 +999,8 @@ export function Workspace() {
               onMouseDownCapture: (event: MouseEvent<HTMLDivElement>) => {
                 if (terminalHasFocus(event.currentTarget)) return;
                 blockTerminalInput(event);
-                if (visible && event.button === 0) selectTab(id);
+                // 우클릭도 탭을 고르고 포커스를 옮긴다. contextmenu는 그 뒤에 와서 복사·붙여넣기를 한다.
+                if (visible && (event.button === 0 || event.button === 2)) selectTab(id);
               },
               onMouseUpCapture: blockTerminalInput, onMouseMoveCapture: blockTerminalInput,
               // 휠 리스너는 passive라 기본 동작을 막을 수 없다. 전파만 막는다.
@@ -1012,7 +1016,7 @@ export function Workspace() {
                 if (visible && id !== activeId.current && (tab.kind !== "terminal" || event.target.closest(".terminal-screen"))) selectTab(id, false);
               }}>
               {tab.kind === "terminal" ? (
-                <TerminalView active={visible} focusRequested={id === focusTab} label={label} targetId={tab.targetId}
+                <TerminalView active={visible} focusRequested={id === focusTab} focusSeq={id === focusTab ? focusSeq : 0} label={label} targetId={tab.targetId}
                   elevation={tab.elevation} reconnect={!tab.elevation}
                   remote={!!tab.ssm} ssh={!!tab.ssh} remoteEditor={tab.remoteEditor} closing={!!tab.closeStatus} closeRef={tab.ssm || tab.ssh ? bindClose : undefined}
                   onStatus={(status, sessionId) => updateStatus(id, status, sessionId)} />
@@ -1040,7 +1044,7 @@ export function Workspace() {
               ) : (
                 <EditorTab file={tab.file} active={visible && !tab.attaching} transport={tab.transport} readOnly={tab.readOnly}
                   confirmDiscard={(request) => confirmEditorDiscard(tab.source, request)}
-                  focusRequested={id === focusTab}
+                  focusRequested={id === focusTab} focusSeq={id === focusTab ? focusSeq : 0}
                   ref={(actions) => {
                     if (actions) editorActions.current.set(id, actions);
                     else editorActions.current.delete(id);

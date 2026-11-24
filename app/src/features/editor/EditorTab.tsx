@@ -18,6 +18,8 @@ export interface EditorTabProps {
   readonly active: boolean;
   readonly readOnly?: boolean;
   readonly focusRequested?: boolean;
+  /** 같은 탭의 포커스를 다시 요청할 때마다 바뀐다. */
+  readonly focusSeq?: number;
   readonly transport: EditorTransport;
   readonly confirmDiscard: ConfirmEditorDiscard;
   /** 호출자가 해당 탭을 실제로 제거한다. 비활성 탭도 마운트 상태를 유지한다. */
@@ -55,7 +57,7 @@ export function EditorTab(props: EditorTabProps) {
   return <EditorTabContent key={props.file.handle} {...props} />;
 }
 
-function EditorTabContent({ ref, file, active, readOnly = false, focusRequested, transport, confirmDiscard, onClose }: EditorTabProps) {
+function EditorTabContent({ ref, file, active, readOnly = false, focusRequested, focusSeq, transport, confirmDiscard, onClose }: EditorTabProps) {
   const host = useRef<HTMLDivElement>(null);
   const diffHost = useRef<HTMLDivElement>(null);
   const mono = useRef<editor.IStandaloneCodeEditor | null>(null);
@@ -123,7 +125,7 @@ function EditorTabContent({ ref, file, active, readOnly = false, focusRequested,
     if (!active || !focusRequested) return;
     if (showingDiff) diff.current?.getModifiedEditor().focus();
     else mono.current?.focus();
-  }, [active, focusRequested, showingDiff]);
+  }, [active, focusRequested, focusSeq, showingDiff]);
 
   return (
     <section className="editor-tab" aria-label={file.label} hidden={!active} onKeyDownCapture={(event) => {

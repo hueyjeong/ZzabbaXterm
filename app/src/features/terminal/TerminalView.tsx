@@ -2,6 +2,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { RotateCcw } from "lucide-react";
+import { rightClick, type TerminalClipboard } from "./rightClick";
 import { useImperativeHandle, useLayoutEffect, useRef, useState, type Ref } from "react";
 import type { ElevationRequest } from "../elevation/elevation";
 import { SsoLoginAction, ssoExpired, useSsoLogin, type SsoLoginIpc } from "../ssm/ssoLogin";
@@ -12,6 +13,9 @@ import "./terminal.css";
 export interface TerminalViewProps {
   readonly active: boolean;
   readonly focusRequested: boolean;
+  /** 같은 탭의 포커스를 다시 요청할 때마다 바뀐다. */
+  readonly focusSeq?: number;
+  readonly clipboard?: TerminalClipboard;
   readonly label: string;
   readonly targetId?: string;
   readonly ipc?: LocalTerminalIpc;
@@ -38,9 +42,11 @@ function text(status: TerminalStatus) {
   }
 }
 
-export function TerminalView({ active, focusRequested, label, targetId, ipc, remote, ssh, remoteEditor, elevation, closing, closeRef, onStatus, reconnect, ssoIpc }: TerminalViewProps) {
+export function TerminalView({ active, focusRequested, focusSeq, clipboard, label, targetId, ipc, remote, ssh, remoteEditor, elevation, closing, closeRef, onStatus, reconnect, ssoIpc }: TerminalViewProps) {
   const host = useRef<HTMLDivElement>(null);
   const session = useRef<LocalTerminal | undefined>(undefined);
+  const clipboardRef = useRef(clipboard);
+  clipboardRef.current = clipboard;
   const stopRequested = useRef(false);
   useImperativeHandle(closeRef, () => ({
     async confirmClose() {
@@ -106,6 +112,27 @@ export function TerminalView({ active, focusRequested, label, targetId, ipc, rem
     }
     // xterm의 onData에는 입력 출처가 없다. 준비 전 DOM 입력만 차단하고 파서 응답은 전달한다.
     if (remote) for (const type of inputEvents) element.addEventListener(type, blockUserInput, { capture: true, passive: false });
+    let disposed = false;
+    // 포커스가 없던 창을 고르려는 우클릭은 붙여넣지 않는다. 작업 공간이 mousedown에서 포커스를 옮기므로
+    // 그보다 먼저 실행되는 window 캡처에서 누르기 전 상태를 기록한다.
+    let focusedBeforePress = false;
+    const hasFocus = () => element.contains(element.ownerDocument.activeElement);
+    const onPress = (event: MouseEvent) => {
+      if (event.button === 2 && event.target instanceof Node && element.contains(event.target)) focusedBeforePress = hasFocus();
+    };
+    window.addEventListener("mousedown", onPress, { capture: true });
+    // 웹뷰 기본 메뉴 대신 복사·붙여넣기를 한다. 캡처 단계에서 멈춰 xterm의 우클릭 선택 처리도 막는다.
+    // Shift 우클릭은 앱 전역처럼 기본 메뉴를 남긴다.
+    const onContextMenu = (event: MouseEvent) => {
+      const allowPaste = focusedBeforePress;
+      focusedBeforePress = false;
+      if (event.shiftKey) return;
+      event.preventDefault();
+      event.stopPropagation();
+      rightClick(term, clipboardRef.current ?? navigator.clipboard,
+        () => allowPaste && !disposed && acceptsUserInput && !stopRequested.current && hasFocus());
+    };
+    element.addEventListener("contextmenu", onContextMenu, { capture: true });
     const subscription = term.onData((data) => session.current?.input(data, "terminal"));
     const layout = () => {
       if (!element.clientWidth || !element.clientHeight) return;
@@ -134,6 +161,9 @@ export function TerminalView({ active, focusRequested, label, targetId, ipc, rem
       observer.disconnect();
       subscription.dispose();
       if (remote) for (const type of inputEvents) element.removeEventListener(type, blockUserInput, true);
+      disposed = true;
+      window.removeEventListener("mousedown", onPress, true);
+      element.removeEventListener("contextmenu", onContextMenu, true);
       session.current?.close();
       session.current = undefined;
       term.dispose();
@@ -142,7 +172,7 @@ export function TerminalView({ active, focusRequested, label, targetId, ipc, rem
 
   useLayoutEffect(() => {
     refresh.current?.(active, !closing && status.kind === "running", focusRequested);
-  }, [active, closing, status.kind, focusRequested]);
+  }, [active, closing, status.kind, focusRequested, focusSeq]);
 
   const message = text(status);
   const failed = status.kind === "failed" && !closing;
