@@ -5,6 +5,8 @@ import { ChevronsDownUp, Columns2, Database, FileText, FolderTree, Maximize2, Mo
 import { LocalAiPanel } from "../ai/LocalAiPanel";
 import { createLocalConnectionIpc, type SavedConnections } from "../connections/connectionIpc";
 import { DeleteDialog } from "../connections/DeleteDialog";
+import { GroupDialog, type GroupRequest } from "../connections/GroupDialog";
+import { groupContents } from "../connections/groupTree";
 import type { ConnectionClose, SshTransport } from "../connections/profiles";
 import { SessionEditor } from "../connections/SessionEditor";
 import type { EditorRequest } from "../connections/sessionEditorState";
@@ -59,8 +61,11 @@ async function confirmEditorDiscard(source: EditorSource, { label, reason }: Par
     ? `${label}: ${source === "sftp" ? "서버" : source === "s3" ? "S3" : "디스크"}에서 다시 읽을까요? 현재 편집 내용은 사라집니다.`
     : `${label}: 미저장 편집 내용을 버리고 닫을까요?`);
 }
-type SessionEditorState = { key: string; request: EditorRequest };
+// fromTree면 닫을 때 연결 트리로 포커스를 돌린다.
+type SessionEditorState = { key: string; request: EditorRequest; fromTree?: boolean };
 type SavedEntry = SavedConnections["targets"][number];
+type Deleting = { kind: "target"; entry: SavedEntry }
+  | { kind: "group"; entry: SavedConnections["groups"][number]; contents: ReturnType<typeof groupContents> };
 
 function terminalStatus(status: TerminalStatus) {
   switch (status.kind) {
@@ -232,7 +237,11 @@ export function Workspace() {
   const [profileLoad, setProfileLoad] = useState<ProfileLoad>({ kind: "loading" });
   const [hostRegistration, setHostRegistration] = useState<{ kind: "status" | "alert"; message: string }>();
   const [sessionEditor, setSessionEditor] = useState<SessionEditorState>();
-  const [deleting, setDeleting] = useState<SavedEntry>();
+  const [groupDialog, setGroupDialog] = useState<{ key: string; request: GroupRequest }>();
+  const [deleting, setDeleting] = useState<Deleting>();
+  // 트리에서 연 대화상자를 닫으면 값을 올려 트리로 포커스를 돌린다. 저장 뒤에는 다시 읽은 목록에서 한 번 더 돌린다.
+  const [treeFocus, setTreeFocus] = useState(0);
+  const refocusAfterLoad = useRef(false);
   const [elevationContext, setElevationContext] = useState<Readonly<{ targetId?: string; target?: string; account?: string }>>();
   const [storedAuth, setStoredAuth] = useState(false);
   const elevation = elevationActions(storedAuth, navigator.userAgent);
@@ -432,7 +441,12 @@ export function Workspace() {
   useEffect(() => {
     let active = true;
     void connections.load().then((profiles) => {
-      if (active) setProfileLoad({ kind: "ready", profiles });
+      if (!active) return;
+      setProfileLoad({ kind: "ready", profiles });
+      if (refocusAfterLoad.current) {
+        refocusAfterLoad.current = false;
+        setTreeFocus(value => value + 1);
+      }
     }, (error: unknown) => {
       if (active) setProfileLoad(({ profiles }) => ({ kind: "error", profiles, error: String(error) }));
     });
@@ -470,25 +484,82 @@ export function Workspace() {
     return () => window.removeEventListener("focus", reloadProfiles);
   }, []);
 
-  /** 세션 편집 창을 연다. 그룹만 주면 새 세션, 저장된 세션을 주면 그 개정으로 편집한다. */
-  function openSessionEditor(request: EditorRequest = {}) {
+  /** 세션 편집 창을 연다. 그룹만 주면 새 세션, 저장된 세션을 주면 그 개정으로 편집, copy를 주면 복제한다. */
+  function openSessionEditor(request: EditorRequest = {}, fromTree?: boolean) {
     if (sessionEditor) return;
-    setSessionEditor({ key: crypto.randomUUID(), request });
+    setSessionEditor({ key: crypto.randomUUID(), request, fromTree });
   }
 
+  /** 트리에서 연 대화상자를 닫았다. 저장했으면 목록을 다시 읽는다. */
+  function returnToTree(saved: boolean) {
+    if (saved) {
+      refocusAfterLoad.current = true;
+      reloadProfiles();
+    }
+    setTreeFocus(value => value + 1);
+  }
+
+  /** 저장 충돌 뒤 목록을 바로 다시 읽어 화면에 반영하고 돌려준다. */
+  async function refreshProfiles() {
+    const profiles = await connections.load();
+    setProfileLoad({ kind: "ready", profiles });
+    return profiles;
+  }
+
+  /** 삭제 충돌이면 목록을 다시 읽어 개정과 하위 항목을 새로 계산한다. 다음 삭제는 새 값으로 나간다. */
+  async function refreshDeleting(failure: unknown): Promise<never> {
+    if ((failure as { kind?: string } | null)?.kind !== "conflict" || !deleting) throw failure;
+    const profiles = await refreshProfiles();
+    const id = deleting.entry.profile.id;
+    if (deleting.kind === "group") {
+      const entry = profiles.groups.find(({ profile }) => profile.id === id);
+      if (!entry) throw { kind: "failed", message: "이미 삭제되었습니다" };
+      setDeleting({ kind: "group", entry, contents: groupContents(profiles, id) });
+    } else {
+      const entry = profiles.targets.find(({ profile }) => profile.id === id);
+      if (!entry) throw { kind: "failed", message: "이미 삭제되었습니다" };
+      setDeleting({ kind: "target", entry });
+    }
+    throw failure;
+  }
+
+  const savedTarget = (id: string) => profileLoad.profiles?.targets.find(({ profile }) => profile.id === id);
+  const savedGroup = (id: string) => profileLoad.profiles?.groups.find(({ profile }) => profile.id === id);
+
   function editSavedTarget(id: string) {
-    const saved = profileLoad.profiles?.targets.find(({ profile }) => profile.id === id);
-    if (saved) openSessionEditor({ target: saved.profile, revision: saved.revision });
+    const saved = savedTarget(id);
+    if (saved) openSessionEditor({ target: saved.profile, revision: saved.revision }, true);
+  }
+
+  function duplicateSavedTarget(id: string) {
+    const saved = savedTarget(id);
+    if (saved) openSessionEditor({ copy: saved.profile }, true);
   }
 
   function closeSessionEditor(result: ConnectionClose) {
+    const fromTree = sessionEditor?.fromTree;
     setSessionEditor(undefined);
-    if (result.kind === "saved") reloadProfiles();
+    if (fromTree) returnToTree(result.kind === "saved");
+    else if (result.kind === "saved") reloadProfiles();
   }
 
   function deleteSavedTarget(id: string) {
-    if (deleting) return;
-    setDeleting(profileLoad.profiles?.targets.find(({ profile }) => profile.id === id));
+    const entry = savedTarget(id);
+    if (!deleting && entry) setDeleting({ kind: "target", entry });
+  }
+
+  function openGroupDialog(request: GroupRequest) {
+    if (!groupDialog) setGroupDialog({ key: crypto.randomUUID(), request });
+  }
+
+  function editSavedGroup(id: string) {
+    const group = savedGroup(id);
+    if (group) openGroupDialog({ group });
+  }
+
+  function deleteSavedGroup(id: string) {
+    const entry = savedGroup(id);
+    if (!deleting && entry && profileLoad.profiles) setDeleting({ kind: "group", entry, contents: groupContents(profileLoad.profiles, id) });
   }
 
   useLayoutEffect(() => {
@@ -925,7 +996,10 @@ export function Workspace() {
               } : undefined}
               onRegisterSshHost={(targetId) => void registerSavedSshHost(targetId)}
               onTrustSshHost={(targetId) => void trustSavedSshHost(targetId)}
-              onEdit={editSavedTarget} onDelete={deleteSavedTarget} onOpenTunnel={(targetId, name, method) => {
+              onEdit={editSavedTarget} onDelete={deleteSavedTarget} onDuplicate={duplicateSavedTarget}
+              onAddSession={(groupId) => openSessionEditor(groupId ? { groupId } : {}, true)}
+              onAddGroup={(parentId) => openGroupDialog(parentId ? { parentId } : {})}
+              onEditGroup={editSavedGroup} onDeleteGroup={deleteSavedGroup} focusRequest={treeFocus} onOpenTunnel={(targetId, name, method) => {
                 setWindowError("");
                 void openTunnel(targetId, name, method).catch(error => setWindowError(String(error)));
               }}
@@ -1138,14 +1212,34 @@ export function Workspace() {
       {sessionEditor && <SessionEditor key={sessionEditor.key} request={sessionEditor.request}
         groups={profileLoad.profiles?.groups ?? []} targets={profileLoad.profiles?.targets} capabilities={connections.capabilities}
         test={connections.test} cancelTest={connections.cancelTest} save={connections.save} saveTarget={connections.saveTarget}
+        latestRevision={async (id) => (await refreshProfiles()).targets.find(({ profile }) => profile.id === id)?.revision}
         onClose={closeSessionEditor} />}
-      {deleting && <DeleteDialog name={deleting.profile.displayName}
-        nameOf={id => profileLoad.profiles?.targets.find(({ profile }) => profile.id === id)?.profile.displayName ?? id}
+      {groupDialog && <GroupDialog key={groupDialog.key} request={groupDialog.request} groups={profileLoad.profiles?.groups ?? []}
+        save={connections.saveGroup}
+        latestRevision={async (id) => (await refreshProfiles()).groups.find(({ profile }) => profile.id === id)?.revision}
+        onClose={(saved) => {
+          setGroupDialog(undefined);
+          returnToTree(saved);
+        }} />}
+      {deleting && <DeleteDialog name={deleting.entry.profile.displayName}
+        contents={deleting.kind === "group" ? deleting.contents : undefined}
+        conflictText={deleting.kind === "group" ? "다른 작업이 그룹을 변경했습니다" : undefined}
+        nameOf={id => savedTarget(id)?.profile.displayName ?? id}
         onDelete={async () => {
-          await connections.deleteTarget(deleting.profile.id, deleting.revision);
+          const { profile, revision } = deleting.entry;
+          try {
+            if (deleting.kind === "group") await connections.deleteGroup(profile.id, revision, deleting.contents.expected);
+            else await connections.deleteTarget(profile.id, revision);
+          } catch (failure) {
+            await refreshDeleting(failure);
+          }
+          refocusAfterLoad.current = true;
           reloadProfiles();
         }}
-        onClose={() => setDeleting(undefined)} />}
+        onClose={() => {
+          setDeleting(undefined);
+          returnToTree(false);
+        }} />}
     </main>
   );
 }

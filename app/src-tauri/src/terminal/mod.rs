@@ -801,6 +801,17 @@ pub(crate) enum Event {
     Notice(String),
 }
 
+/// 저장된 로컬 세션의 시작 디렉터리다. 비어 있으면 사용자 홈 디렉터리에서 시작한다.
+fn start_directory(directory: &std::path::Path) -> Result<std::borrow::Cow<'_, std::path::Path>, String> {
+    let directory = if directory.as_os_str().is_empty() {
+        std::borrow::Cow::Owned(dirs::home_dir().ok_or("작업 디렉터리: 홈 디렉터리를 찾을 수 없습니다")?)
+    } else {
+        std::borrow::Cow::Borrowed(directory)
+    };
+    validate_working_directory(&directory)?;
+    Ok(directory)
+}
+
 fn validate_working_directory(directory: &std::path::Path) -> Result<(), String> {
     #[cfg(windows)]
     {

@@ -125,6 +125,18 @@ fn c02_rejects_mixed_methods_forbidden_fields_and_invalid_references() {
     }
 }
 
+#[test]
+fn local_start_directory_may_be_empty_but_not_relative() {
+    let dir = TestDir::new();
+    let checked = |path: &str| {
+        let mut input = draft(dir.path(), "work", "local-shell");
+        input["target"]["local"]["startDirectory"] = json!(path);
+        serde_json::from_value::<Draft>(input).unwrap().validate().err()
+    };
+    assert_eq!(checked(""), None);
+    assert_eq!(checked("relative"), Some(super::profile::ValidationError::StartDirectory));
+}
+
 pub(crate) fn ssh_draft(dir: &Path) -> Value {
     let mut value = draft(dir, "work", "ssh-server");
     value["target"] = json!({

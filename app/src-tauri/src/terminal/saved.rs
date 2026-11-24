@@ -177,7 +177,8 @@ pub(super) fn command(config: &Path, id: &str) -> Result<CommandBuilder, String>
 }
 
 fn local(shell: Shell, directory: &Path) -> Result<CommandBuilder, String> {
-    super::validate_working_directory(directory)?;
+    let directory = super::start_directory(directory)?;
+    let directory = &*directory;
 
     // portable-pty는 시작 직전에 경로가 사라지면 홈을 선택할 수 있다. 프롬프트 전에 실제 위치를 확인한다.
     let mut command = match shell {

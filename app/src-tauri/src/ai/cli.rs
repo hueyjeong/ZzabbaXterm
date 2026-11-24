@@ -343,7 +343,9 @@ fn parse(command: &str, input: impl Read) -> Result<Command> {
             #[cfg(windows)]
             MethodRef::Local { start_directory, .. } => {
                 use std::path::{Component, Prefix};
-                if !matches!(start_directory.components().next(), Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_))) {
+                // 빈 경로는 홈 디렉터리에서 시작하므로 드라이브 경로 검사를 건너뛴다.
+                if !start_directory.as_os_str().is_empty()
+                    && !matches!(start_directory.components().next(), Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_))) {
                     return Err(Error::UnsupportedWindowsStartDirectory);
                 }
             }

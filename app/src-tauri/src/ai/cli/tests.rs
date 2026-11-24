@@ -153,6 +153,12 @@ fn register_rejects_unsupported_ssh_settings_before_save() {
     }
 }
 
+#[test]
+fn register_accepts_an_empty_start_directory_for_the_home_directory() {
+    let input = connections::tests::draft(Path::new(""), "work", "dev-a");
+    assert!(matches!(parse("register", input.to_string().as_bytes()), Ok(Command::Register(_))));
+}
+
 #[cfg(windows)]
 #[test]
 fn register_rejects_nonstandard_windows_start_directories() {

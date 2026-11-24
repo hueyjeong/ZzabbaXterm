@@ -1153,7 +1153,7 @@ describe("C01 저장된 로컬 연결", () => {
     await act(async () => { alpha.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); });
     expect(calls("open").slice(-1)[0]).toMatchObject({ targetId: "work-alpha" });
     await key(alpha, "ContextMenu");
-    expect([...find('[role="menu"]').querySelectorAll('[role="menuitem"]')].map((item) => item.textContent)).toEqual(["로컬", "편집…", "삭제"]);
+    expect([...find('[role="menu"]').querySelectorAll('[role="menuitem"]')].map((item) => item.textContent)).toEqual(["로컬", "편집…", "복제", "삭제"]);
     await press("로컬");
     expect(calls("open").filter((args) => args.targetId).map((args) => args.targetId))
       .toEqual(["work-beta", "work-alpha", "work-alpha"]);
@@ -1582,7 +1582,7 @@ describe("C02 SSM 연결", () => {
     expect(row).toBeDefined();
     await key(row!, "ContextMenu");
     expect([...find('[role="menu"]').querySelectorAll('[role="menuitem"]')].map(item => item.textContent))
-      .toEqual(["AWS Systems Manager", "S3 버킷 열기", "터널 열기", "편집…", "삭제"]);
+      .toEqual(["AWS Systems Manager", "S3 버킷 열기", "터널 열기", "편집…", "복제", "삭제"]);
     // 메뉴 항목은 동작 뒤 포커스를 트리 행으로 돌려보내므로, 준비 후 터미널 포커스는 더블클릭 열기에서 확인한다.
     await key(find('[role="menu"]'), "Escape");
     expect(host.querySelector('[role="menu"]')).toBeNull();
@@ -1833,7 +1833,7 @@ describe("F01 직접 SSH", () => {
 
     await key(target, "ContextMenu");
     expect([...find('[role="menu"]').querySelectorAll('[role="menuitem"]')].map(item => item.textContent))
-      .toEqual(["SSH", "터널 열기", "호스트 키 확인…", "호스트 키 파일로 등록…", "편집…", "삭제"]);
+      .toEqual(["SSH", "터널 열기", "호스트 키 확인…", "호스트 키 파일로 등록…", "편집…", "복제", "삭제"]);
     await press("호스트 키 파일로 등록…");
     expect(host.querySelector('[role="menu"]')).toBeNull();
     expect(find('footer [role="alert"]').textContent).toContain("SSH 호스트 키 등록이 취소되었습니다");
@@ -2693,6 +2693,27 @@ describe("세션 편집 창", () => {
     expect(tree().textContent).toContain("새 셸");
   });
 
+  it("세션 편집 창의 저장 충돌 뒤에는 목록을 다시 읽어 새 개정으로 저장한다", async () => {
+    let revision = 5;
+    loadProfiles = async () => ({ version: 2, groups: [], targets: [shell(revision)] });
+    runConnectionCommand = async (command) => {
+      if (command !== "connection_target_save") throw command;
+      if (revision === 5) {
+        revision = 9;
+        throw { kind: "conflict" };
+      }
+      return { revision: 10 };
+    };
+    await restartWorkspace();
+    await treeMenuAction("작업 셸", "편집…");
+    await changeInput("이름", "바꾼 셸");
+    await press("저장");
+    expect(find("dialog[open] [role=alert]").textContent).toBe("다른 작업이 세션을 변경했습니다");
+    await press("저장");
+    expect(connectionCalls("connection_target_save").map(([, args]) => (args as { draft: { targetRevision: number } }).draft.targetRevision)).toEqual([5, 9]);
+    expect(host.querySelector("dialog")).toBeNull();
+  });
+
   it("세션 행의 편집…은 저장본과 개정으로 편집 창을 연다", async () => {
     loadProfiles = async () => ({ version: 2, groups: [], targets: [shell(5)] });
     runConnectionCommand = async (command) => {
@@ -2709,12 +2730,15 @@ describe("세션 편집 창", () => {
     } }]]);
   });
 
-  it("세션 행의 삭제는 확인 뒤 개정과 함께 지우고 참조 오류와 충돌을 표시한다", async () => {
-    loadProfiles = async () => ({ version: 2, groups: [], targets: [shell(2)] });
+  it("세션 행의 삭제는 확인 뒤 개정과 함께 지우고 참조 오류와 충돌을 표시하며 충돌 뒤에는 새 개정으로 지운다", async () => {
+    let revision = 2;
+    loadProfiles = async () => ({ version: 2, groups: [], targets: [shell(revision)] });
     const replies: unknown[] = [{ kind: "referenced", targets: ["shell"] }, { kind: "conflict" }];
     runConnectionCommand = async (command) => {
       if (command !== "connection_target_delete") throw command;
       const reply = replies.shift();
+      // 충돌은 다른 작업이 세션을 먼저 저장해 개정이 3이 된 경우다.
+      if ((reply as { kind?: string } | undefined)?.kind === "conflict") revision = 3;
       if (reply) throw reply;
       return null;
     };
@@ -2730,8 +2754,208 @@ describe("세션 편집 창", () => {
     expect(dialog.querySelector("[role=alert]")?.textContent).toBe("다른 작업이 세션을 변경했습니다");
     const loads = connectionCalls("connections_load").length;
     await act(async () => { dialog.querySelector("button")!.click(); });
-    expect(connectionCalls("connection_target_delete")).toEqual(Array(3).fill(["connection_target_delete", { id: "shell", revision: 2 }]));
+    expect(connectionCalls("connection_target_delete").map(([, args]) => args)).toEqual([2, 2, 3].map(revision => ({ id: "shell", revision })));
     expect(host.querySelector('dialog[aria-label="삭제"]')).toBeNull();
     expect(connectionCalls("connections_load")).toHaveLength(loads + 1);
+  });
+});
+
+describe("연결 트리 메뉴", () => {
+  const shell = (id: string, revision: number, groupId?: string) => ({
+    revision, profile: { id, displayName: `${id} 셸`, ...(groupId ? { groupId } : {}), defaultMethod: "local" as const, local: { shell: "powerShell" as const, startDirectory: "" } },
+  });
+  type Draft<T> = { draft: T };
+
+  /** 연결 트리에서 이름이 같은 그룹 행을 찾는다. */
+  function treeGroup(label: string) {
+    const row = [...tree().querySelectorAll<HTMLElement>('[role="treeitem"][aria-expanded]')]
+      .find(item => item.querySelector(":scope > .tree-row > span")?.textContent === label);
+    expect(row, label).toBeDefined();
+    return row!;
+  }
+
+  async function groupMenuAction(label: string, action: string) {
+    await contextMenu(treeGroup(label));
+    await chooseMenuItem(action);
+  }
+
+  async function chooseSelect(label: string, value: string) {
+    const field = [...host.querySelectorAll("dialog[open] label")].find(item => item.firstChild?.textContent?.trim() === label)?.querySelector("select");
+    expect(field, label).toBeDefined();
+    await act(async () => {
+      field!.value = value;
+      field!.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+  }
+
+  const selected = (label: string) => [...host.querySelectorAll("dialog[open] label")]
+    .find(item => item.firstChild?.textContent?.trim() === label)?.querySelector("select")?.value;
+  const inTree = () => !!document.activeElement && tree().contains(document.activeElement);
+
+  it("빈 곳 우클릭은 최상위 세션·그룹 추가만 띄우고 그룹 추가는 최상위 그룹을 저장한 뒤 트리로 포커스를 돌린다", async () => {
+    let store: SavedConnections = emptyStore;
+    loadProfiles = async () => store;
+    runConnectionCommand = async (command, args) => {
+      if (command !== "connection_group_save") throw command;
+      const { draft } = args as Draft<{ group: SavedConnections["groups"][number]["profile"] }>;
+      store = { ...store, groups: [{ revision: 1, profile: draft.group }] };
+      return { revision: 1 };
+    };
+    await restartWorkspace();
+    await contextMenu(tree());
+    expect(openMenu().getAttribute("aria-label")).toBe("연결 메뉴");
+    expect(menuItemNames()).toEqual(["세션 추가…", "그룹 추가…"]);
+    await chooseMenuItem("세션 추가…");
+    expect(find("dialog[open] h2").textContent).toBe("세션 추가");
+    expect(selected("그룹")).toBe("");
+    await press("취소");
+    expect(host.querySelector("dialog[open]")).toBeNull();
+    expect(inTree()).toBe(true);
+
+    await contextMenu(tree());
+    await chooseMenuItem("그룹 추가…");
+    expect(find("dialog[open]").getAttribute("aria-label")).toBe("그룹 추가");
+    expect(selected("상위 그룹")).toBe("");
+    const loads = connectionCalls("connections_load").length;
+    await changeInput("이름", "운영");
+    await press("저장");
+    expect(connectionCalls("connection_group_save")).toEqual([["connection_group_save", {
+      draft: { version: 2, revision: null, group: { id: expect.any(String), displayName: "운영" } },
+    }]]);
+    expect(host.querySelector("dialog")).toBeNull();
+    expect(connectionCalls("connections_load")).toHaveLength(loads + 1);
+    expect(treeGroup("운영").getAttribute("aria-level")).toBe("1");
+    expect(inTree()).toBe(true);
+  });
+
+  it("그룹 메뉴의 세션 추가는 그 그룹을 기본값으로 편집 창을 열고 그룹 추가는 하위 그룹으로 저장한다", async () => {
+    loadProfiles = async () => ({ version: 2, groups: [{ revision: 1, profile: { id: "work", displayName: "작업" } }], targets: [] });
+    runConnectionCommand = async (command) => {
+      if (command === "connection_target_save" || command === "connection_group_save") return { revision: 1 };
+      throw command;
+    };
+    await restartWorkspace();
+    await contextMenu(treeGroup("작업"));
+    expect(openMenu().getAttribute("aria-label")).toBe("작업 그룹 메뉴");
+    expect(menuItemNames()).toEqual(["세션 추가…", "그룹 추가…", "편집…", "삭제"]);
+    await chooseMenuItem("세션 추가…");
+    expect(find("dialog[open] h2").textContent).toBe("세션 추가");
+    expect(selected("그룹")).toBe("work");
+    await changeInput("이름", "그룹 안 셸");
+    await press("저장");
+    expect(connectionCalls("connection_target_save")).toEqual([["connection_target_save", { draft: {
+      version: 2, targetRevision: null, target: expect.objectContaining({ groupId: "work", displayName: "그룹 안 셸" }),
+    } }]]);
+
+    await groupMenuAction("작업", "그룹 추가…");
+    expect(selected("상위 그룹")).toBe("work");
+    await changeInput("이름", "하위");
+    await press("저장");
+    expect(connectionCalls("connection_group_save")).toEqual([["connection_group_save", {
+      draft: { version: 2, revision: null, group: { id: expect.any(String), displayName: "하위", parentId: "work" } },
+    }]]);
+  });
+
+  it("그룹 편집에서 이름과 상위 그룹을 바꾸면 개정과 함께 이동하고 충돌 뒤에는 새 개정으로 다시 보낸다", async () => {
+    let groupA = { revision: 4, profile: { id: "a", displayName: "가" } };
+    loadProfiles = async () => ({
+      version: 2, targets: [],
+      groups: [
+        groupA,
+        { revision: 2, profile: { id: "b", displayName: "나", parentId: "a" } },
+        { revision: 1, profile: { id: "c", displayName: "다" } },
+      ],
+    });
+    let conflict = true;
+    runConnectionCommand = async (command) => {
+      if (command !== "connection_group_save") throw command;
+      if (conflict) {
+        // 다른 작업이 먼저 이름을 바꿔 저장본의 개정이 6이 됐다.
+        conflict = false;
+        groupA = { revision: 6, profile: { id: "a", displayName: "다른 이름" } };
+        throw { kind: "conflict" };
+      }
+      return { revision: 7 };
+    };
+    await restartWorkspace();
+    expect(treeGroup("나").getAttribute("aria-level")).toBe("2");
+    await groupMenuAction("가", "편집…");
+    const dialog = find<HTMLDialogElement>('dialog[aria-label="그룹 편집"]');
+    expect([...dialog.querySelectorAll("option")].map(item => item.value)).toEqual(["", "c"]);
+    await changeInput("이름", "가가");
+    await chooseSelect("상위 그룹", "c");
+    await press("저장");
+    expect(dialog.querySelector("[role=alert]")?.textContent).toBe("다른 작업이 그룹을 변경했습니다");
+    // 입력은 그대로 두고 다음 저장만 새 개정으로 보낸다.
+    expect(dialog.querySelector("input")?.value).toBe("가가");
+    await press("저장");
+    expect(connectionCalls("connection_group_save").map(([, args]) => args)).toEqual([4, 6].map(revision => ({
+      draft: { version: 2, revision, group: { id: "a", displayName: "가가", parentId: "c" } },
+    })));
+    expect(host.querySelector("dialog")).toBeNull();
+  });
+
+  it("그룹 삭제는 하위 그룹·세션 수를 보이고 본 하위 집합을 expected로 보내며 충돌 뒤에는 다시 계산한다", async () => {
+    let store: SavedConnections = {
+      version: 2,
+      groups: [
+        { revision: 4, profile: { id: "a", displayName: "가" } },
+        { revision: 2, profile: { id: "b", displayName: "나", parentId: "a" } },
+        { revision: 1, profile: { id: "c", displayName: "다" } },
+      ],
+      targets: [shell("s1", 1, "a"), shell("s2", 3, "b"), shell("s3", 1, "c"), shell("top", 1)],
+    };
+    loadProfiles = async () => store;
+    const replies: unknown[] = [{ kind: "referenced", targets: ["s2"] }, { kind: "conflict" }];
+    runConnectionCommand = async (command) => {
+      if (command !== "connection_group_delete") throw command;
+      const reply = replies.shift();
+      if (reply && (reply as { kind: string }).kind === "conflict") {
+        // 다른 작업이 그룹 이름을 바꾸고 하위 그룹에 세션을 하나 더 넣었다.
+        store = { ...store, groups: [{ revision: 5, profile: { id: "a", displayName: "가" } }, ...store.groups.slice(1)],
+          targets: [...store.targets, shell("s4", 1, "b")] };
+      }
+      if (reply) throw reply;
+      store = { ...store, groups: store.groups.slice(2), targets: store.targets.filter(({ profile }) => profile.id === "s3" || profile.id === "top") };
+      return null;
+    };
+    await restartWorkspace();
+    await key(treeGroup("가"), "ContextMenu");
+    await chooseMenuItem("삭제");
+    const dialog = find<HTMLDialogElement>('dialog[aria-label="삭제"]');
+    expect([...dialog.querySelectorAll("h2, p")].map(item => item.textContent)).toEqual(["가", "하위 그룹 1개, 세션 2개"]);
+    await act(async () => { dialog.querySelector("button")!.click(); });
+    expect(dialog.querySelector("[role=alert]")?.textContent).toBe("참조 중인 세션: s2 셸");
+    await act(async () => { dialog.querySelector("button")!.click(); });
+    expect(dialog.querySelector("[role=alert]")?.textContent).toBe("다른 작업이 그룹을 변경했습니다");
+    expect(dialog.querySelector("p")?.textContent).toBe("하위 그룹 1개, 세션 3개");
+    await act(async () => { dialog.querySelector("button")!.click(); });
+    const seen = [{ kind: "group", id: "b", revision: 2 }, { kind: "target", id: "s1", revision: 1 }, { kind: "target", id: "s2", revision: 3 }];
+    expect(connectionCalls("connection_group_delete").map(([, args]) => args)).toEqual([
+      { id: "a", revision: 4, expected: seen },
+      { id: "a", revision: 4, expected: seen },
+      { id: "a", revision: 5, expected: [...seen, { kind: "target", id: "s4", revision: 1 }] },
+    ]);
+    expect(host.querySelector('dialog[aria-label="삭제"]')).toBeNull();
+    expect(tree().textContent).not.toContain("s1 셸");
+    // 지운 행 대신 트리의 현재 행으로 포커스를 돌린다.
+    expect(inTree()).toBe(true);
+  });
+
+  it("세션 메뉴의 복제는 같은 설정과 \"이름 (복사본)\"으로 새 세션 편집 창을 연다", async () => {
+    const source = shell("shell", 7, "work");
+    loadProfiles = async () => ({ version: 2, groups: [{ revision: 1, profile: { id: "work", displayName: "작업" } }], targets: [source] });
+    runConnectionCommand = async (command) => {
+      if (command === "connection_target_save") return { revision: 1 };
+      throw command;
+    };
+    await restartWorkspace();
+    await treeMenuAction("shell 셸", "복제");
+    expect(find("dialog[open] h2").textContent).toBe("세션 추가");
+    expect(selected("그룹")).toBe("work");
+    await press("저장");
+    const [[, args]] = connectionCalls("connection_target_save") as [string, Draft<{ targetRevision: null; target: { id: string } }>][];
+    expect(args.draft).toEqual({ version: 2, targetRevision: null, target: { ...source.profile, id: expect.any(String), displayName: "shell 셸 (복사본)" } });
+    expect(args.draft.target.id).not.toBe("shell");
   });
 });

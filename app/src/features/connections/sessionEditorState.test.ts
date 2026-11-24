@@ -58,6 +58,23 @@ describe("세션 편집 창 상태", () => {
     expect(actions.onClose).toHaveBeenCalledExactlyOnceWith({ kind: "saved", draftId: "draft", targetId: editor.getSnapshot().draft.id });
   });
 
+  it("복제는 같은 설정과 새 ID, \"이름 (복사본)\"으로 새 세션을 저장한다", async () => {
+    const ssh: SavedTarget = {
+      id: "dev", groupId: "work", displayName: "개발 서버", defaultMethod: "ssh",
+      ssh: { host: "ssh.actual.test", port: 2222, account: "deploy", hostKeyFingerprint: fingerprint, transport: { kind: "direct" },
+        auth: { kind: "keyFile", privateKeyPath: "C:\\keys\\id" } },
+    };
+    const { editor, actions } = open({ copy: ssh });
+    expect(editor.targetRevision).toBeNull();
+    expect(editor.getSnapshot().draft).toMatchObject({ groupId: "work", displayName: "개발 서버 (복사본)", ssh: { port: "2222" } });
+    expect(editor.getSnapshot().draft.id).not.toBe("dev");
+    expect(editor.canSave()).toBe(true);
+    await editor.save();
+    expect(actions.saveTarget).toHaveBeenCalledExactlyOnceWith({
+      version: 2, targetRevision: null, target: { ...ssh, id: editor.getSnapshot().draft.id, displayName: "개발 서버 (복사본)" },
+    });
+  });
+
   it("시험에 성공한 뒤 저장하면 티켓 저장을 호출한다", async () => {
     const { editor, actions } = open({ target: local, revision: 3 });
     await editor.test();
@@ -327,13 +344,57 @@ describe("편집 창 시험과 오류 표시", () => {
     const { editor } = open({ target: local, revision: 3 }, actions);
     await editor.test();
     await editor.save();
-    expect(editor.getSnapshot().status).toMatchObject({ kind: "saveFailed", error: "입력 오류", field: "local.startDirectory" });
+    expect(editor.getSnapshot().status).toMatchObject({ kind: "saveFailed", error: "경로 형식 오류", field: "local.startDirectory" });
     await editor.save();
     expect(editor.getSnapshot().status).toMatchObject({ kind: "saveFailed", error: "다른 작업이 세션을 변경했습니다" });
     await editor.save();
     expect(editor.getSnapshot().status).toMatchObject({ kind: "saveFailed", error: "설정 파일 교체 실패" });
     expect(actions.save).toHaveBeenCalledTimes(3);
     expect(actions.saveTarget).not.toHaveBeenCalled();
+  });
+
+  it("저장 충돌 뒤에는 저장본의 새 개정으로 다시 저장하고 입력을 유지한다", async () => {
+    const actions = { ...fakeActions(), latestRevision: vi.fn(async (_id: string): Promise<number | undefined> => 8) };
+    actions.saveTarget.mockRejectedValueOnce({ kind: "conflict" });
+    const { editor } = open({ target: local, revision: 3 }, actions);
+    editor.setName("바꾼 셸");
+    await editor.save();
+    expect(editor.getSnapshot().status).toMatchObject({ kind: "saveFailed", error: "다른 작업이 세션을 변경했습니다" });
+    expect(actions.latestRevision).toHaveBeenCalledExactlyOnceWith("work-shell");
+    expect(editor.getSnapshot().draft.displayName).toBe("바꾼 셸");
+    expect(editor.targetRevision).toBe(8);
+    await editor.save();
+    expect(actions.saveTarget.mock.calls.map(([draft]) => draft.targetRevision)).toEqual([3, 8]);
+    expect(actions.onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("티켓 저장이 충돌하면 이전 개정에 묶인 티켓을 버리고 실행을 회수한 뒤 새 개정으로 저장한다", async () => {
+    const actions = { ...fakeActions(), latestRevision: vi.fn(async (_id: string): Promise<number | undefined> => 5) };
+    actions.save.mockRejectedValueOnce({ kind: "conflict" });
+    const { editor } = open({ target: local, revision: 3 }, actions);
+    await editor.test();
+    await editor.save();
+    expect(editor.getSnapshot().status).toEqual({ kind: "saveFailed", error: "다른 작업이 세션을 변경했습니다" });
+    expect(actions.cancelTest).toHaveBeenCalledTimes(1);
+    await editor.save();
+    expect(actions.save).toHaveBeenCalledTimes(1);
+    expect(actions.saveTarget).toHaveBeenCalledExactlyOnceWith({ version: 2, targetRevision: 5, target: local });
+  });
+
+  it("로컬 시작 디렉터리는 비우면 통과하고 입력하면 절대 경로여야 한다", () => {
+    const { editor } = open({});
+    editor.setName("셸");
+    expect(validate(editor.getSnapshot().draft, false)).toEqual({});
+    expect(editor.canSave()).toBe(true);
+    for (const path of ["C:\\work", "c:/work", "/home/dev"]) {
+      editor.editLocal(path);
+      expect(validate(editor.getSnapshot().draft, false), path).toEqual({});
+    }
+    for (const path of ["work", ".\\work", "C:work"]) {
+      editor.editLocal(path);
+      expect(validate(editor.getSnapshot().draft, false)["local.startDirectory"], path).toEqual({ text: "절대 경로 필요" });
+      expect(editor.canSave()).toBe(false);
+    }
   });
 
   it("화면에 표시하는 필드는 방식, 경로, 인증에 따른다", () => {

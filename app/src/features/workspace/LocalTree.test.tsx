@@ -108,41 +108,244 @@ it("승격 메뉴는 저장 인증 기반 명령이 준비된 경우에만 표�
   }
 });
 
-it("그룹 없는 세션은 그룹 뒤 최상위에, 상위 그룹이 있는 그룹은 아직 최상위에 표시한다", () => {
-  const local = (id: string, displayName: string, groupId?: string) => ({
-    revision: 1,
-    profile: { id, displayName, ...(groupId ? { groupId } : {}), defaultMethod: "local" as const, local: { shell: "powerShell" as const, startDirectory: "C:\\work" } },
-  });
-  const top = local("top", "최상위 셸");
-  const profiles: SavedConnections = {
-    version: 2,
-    groups: [{ revision: 1, profile: { id: "work", displayName: "작업" } }, { revision: 1, profile: { id: "child", displayName: "하위", parentId: "work" } }],
-    targets: [top, local("nested", "하위 셸", "child")],
-  };
+const local = (id: string, displayName: string, groupId?: string) => ({
+  revision: 1,
+  profile: { id, displayName, ...(groupId ? { groupId } : {}), defaultMethod: "local" as const, local: { shell: "powerShell" as const, startDirectory: "C:\\work" } },
+});
+const nested: SavedConnections = {
+  version: 2,
+  groups: [
+    { revision: 1, profile: { id: "work", displayName: "작업" } },
+    { revision: 1, profile: { id: "child", displayName: "하위", parentId: "work" } },
+    { revision: 1, profile: { id: "grand", displayName: "손자", parentId: "child" } },
+    { revision: 1, profile: { id: "other", displayName: "기타" } },
+  ],
+  targets: [local("top", "최상위 셸"), local("deep", "깊은 셸", "grand"), local("shell", "작업 셸", "work")],
+};
+
+/** 중첩 트리를 그린다. 시험이 끝나면 unmount를 호출한다. */
+function renderTree(props: Partial<Parameters<typeof LocalTree>[0]> = {}) {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   const host = document.body.appendChild(document.createElement("div"));
   const root = createRoot(host);
-  const onOpen = vi.fn();
-  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
-  try {
-    act(() => root.render(<LocalTree profiles={profiles} onOpen={onOpen} onRegisterSshHost={vi.fn()} onOpenTunnel={vi.fn()} />));
-    const tree = host.querySelector("ul[role=tree]")!;
-    const rows = [...tree.children].map((item) => item.querySelector(".tree-row")?.textContent);
-    expect(rows).toEqual(["로컬", "작업", "하위", "최상위 셸"]);
-    const row = [...tree.children].find((item) => item.textContent === "최상위 셸")!;
-    act(() => { row.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); });
-    expect(onOpen).toHaveBeenCalledWith(top.profile);
-
-    const search = host.querySelector<HTMLInputElement>("input[type=search]")!;
-    act(() => {
-      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(search, "최상위");
-      search.dispatchEvent(new Event("input", { bubbles: true }));
-    });
-    expect([...tree.children].map((item) => item.querySelector(".tree-row")?.textContent)).toEqual(["최상위 셸"]);
-    expect(host.querySelector("[role=status]")).toBeNull();
-  } finally {
+  const handlers = {
+    onOpen: vi.fn(), onRegisterSshHost: vi.fn(), onOpenTunnel: vi.fn(), onEdit: vi.fn(), onDelete: vi.fn(), onDuplicate: vi.fn(),
+    onAddSession: vi.fn(), onAddGroup: vi.fn(), onEditGroup: vi.fn(), onDeleteGroup: vi.fn(),
+  };
+  const render = (extra: Partial<Parameters<typeof LocalTree>[0]> = {}) =>
+    act(() => root.render(<LocalTree profiles={nested} {...handlers} {...props} {...extra} />));
+  render();
+  const tree = host.querySelector<HTMLUListElement>("ul[role=tree]")!;
+  const name = (item: Element) => item.querySelector(":scope > .tree-row > span")?.textContent;
+  const row = (label: string) => {
+    const match = [...host.querySelectorAll<HTMLLIElement>("li[role=treeitem]")].find(item => name(item) === label);
+    if (!match) throw new Error(`행 없음: ${label}`);
+    return match;
+  };
+  const shown = () => [...tree.querySelectorAll("li[role=treeitem]")].filter(item => !item.closest("[hidden]")).map(name);
+  const levels = () => Object.fromEntries([...tree.querySelectorAll("li[role=treeitem]")].map(item => [name(item), item.getAttribute("aria-level")]));
+  const search = (value: string) => act(() => {
+    const input = host.querySelector<HTMLInputElement>("input[type=search]")!;
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, value);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  const press = (element: Element, key: string, shiftKey = false) =>
+    act(() => { element.dispatchEvent(new KeyboardEvent("keydown", { key, shiftKey, bubbles: true })); });
+  const contextMenu = (element: Element) =>
+    act(() => { element.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true })); });
+  const menu = () => host.querySelector<HTMLElement>("[role=menu]");
+  const menuItems = () => [...host.querySelectorAll<HTMLButtonElement>("button[role=menuitem]")].map(item => item.textContent);
+  const choose = (label: string) => act(() => {
+    const item = [...host.querySelectorAll<HTMLButtonElement>("button[role=menuitem]")].find(entry => entry.textContent === label);
+    if (!item) throw new Error(`메뉴 항목 없음: ${label}`);
+    item.click();
+  });
+  const unmount = () => {
     act(() => root.unmount());
     host.remove();
     vi.unstubAllGlobals();
+  };
+  return { host, tree, handlers, render, row, shown, levels, search, press, contextMenu, menu, menuItems, choose, unmount };
+}
+
+it("그룹을 parentId로 중첩해 aria-level과 함께 그리고 그룹 없는 세션은 최상위 그룹 뒤에 둔다", () => {
+  const view = renderTree();
+  try {
+    expect(view.shown()).toEqual(["로컬", "내 PC", "작업", "하위", "손자", "깊은 셸", "작업 셸", "기타", "최상위 셸"]);
+    expect(view.levels()).toEqual({
+      "로컬": "1", "내 PC": "2", "작업": "1", "하위": "2", "손자": "3", "깊은 셸": "4", "작업 셸": "2", "기타": "1", "최상위 셸": "1",
+    });
+    expect(view.row("손자").parentElement?.closest("li")).toBe(view.row("하위"));
+    expect(view.row("손자").style.getPropertyValue("--tree-level")).toBe("3");
+    act(() => { view.row("최상위 셸").dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); });
+    expect(view.handlers.onOpen).toHaveBeenCalledWith(nested.targets[0].profile);
+
+    // 그룹 머리를 누르면 접고, 다시 누르면 펼친다. 접힌 하위는 숨긴다.
+    act(() => view.row("하위").querySelector<HTMLElement>(".tree-row")!.click());
+    expect(view.row("하위").getAttribute("aria-expanded")).toBe("false");
+    expect(view.shown()).toEqual(["로컬", "내 PC", "작업", "하위", "작업 셸", "기타", "최상위 셸"]);
+    act(() => view.row("하위").querySelector<HTMLElement>(".tree-row")!.click());
+    expect(view.shown()).toContain("깊은 셸");
+  } finally {
+    view.unmount();
+  }
+});
+
+it("검색하면 일치하는 항목과 조상 그룹만 남기고 이름이 일치한 그룹은 내용을 모두 보인다", () => {
+  const view = renderTree();
+  try {
+    act(() => view.row("하위").querySelector<HTMLElement>(".tree-row")!.click());
+    view.search("깊은");
+    expect(view.shown()).toEqual(["작업", "하위", "손자", "깊은 셸"]);
+    view.search("하위");
+    expect(view.shown()).toEqual(["작업", "하위", "손자", "깊은 셸"]);
+    view.search("최상위");
+    expect(view.shown()).toEqual(["최상위 셸"]);
+    expect(view.host.querySelector("[role=status]")).toBeNull();
+    view.search("없는 이름");
+    expect(view.shown()).toEqual([]);
+    expect(view.host.querySelector("[role=status]")?.textContent).toBe("검색 결과 없음");
+    // 검색을 지우면 접어 둔 상태가 돌아온다.
+    view.search("");
+    expect(view.row("하위").getAttribute("aria-expanded")).toBe("false");
+  } finally {
+    view.unmount();
+  }
+});
+
+it("중첩 트리에서 화살표·Home·End·Enter·Space·F2·Delete로 이동하고 동작한다", () => {
+  const view = renderTree();
+  try {
+    const focused = () => document.activeElement?.querySelector(":scope > .tree-row > span")?.textContent;
+    act(() => view.row("작업").focus());
+    view.press(view.row("작업"), "ArrowDown");
+    expect(focused()).toBe("하위");
+    view.press(view.row("하위"), "ArrowRight");
+    expect(focused()).toBe("손자");
+    view.press(view.row("손자"), "ArrowLeft");
+    expect(view.row("손자").getAttribute("aria-expanded")).toBe("false");
+    view.press(view.row("손자"), "ArrowRight");
+    expect(view.row("손자").getAttribute("aria-expanded")).toBe("true");
+    view.press(view.row("손자"), "ArrowRight");
+    expect(focused()).toBe("깊은 셸");
+    view.press(view.row("깊은 셸"), "ArrowLeft");
+    expect(focused()).toBe("손자");
+    view.press(view.row("손자"), " ");
+    expect(view.row("손자").getAttribute("aria-expanded")).toBe("false");
+    view.press(view.row("손자"), "ArrowLeft");
+    expect(focused()).toBe("하위");
+    view.press(view.row("하위"), "End");
+    expect(focused()).toBe("최상위 셸");
+    expect(view.row("최상위 셸").tabIndex).toBe(0);
+    view.press(view.row("최상위 셸"), "ArrowUp");
+    expect(focused()).toBe("기타");
+    view.press(view.row("기타"), "Home");
+    expect(focused()).toBe("로컬");
+    view.press(view.row("최상위 셸"), "Enter");
+    expect(view.handlers.onOpen).toHaveBeenCalledWith(nested.targets[0].profile);
+
+    view.press(view.row("하위"), "F2");
+    expect(view.handlers.onEditGroup).toHaveBeenCalledExactlyOnceWith("child");
+    view.press(view.row("작업 셸"), "F2");
+    expect(view.handlers.onEdit).toHaveBeenCalledExactlyOnceWith("shell");
+    view.press(view.row("기타"), "Delete");
+    expect(view.handlers.onDeleteGroup).toHaveBeenCalledExactlyOnceWith("other");
+    view.press(view.row("작업 셸"), "Delete");
+    expect(view.handlers.onDelete).toHaveBeenCalledExactlyOnceWith("shell");
+    // 합성 "로컬" 그룹은 이름 바꾸기와 삭제 대상이 아니다.
+    view.press(view.row("로컬"), "F2");
+    view.press(view.row("로컬"), "Delete");
+    expect(view.handlers.onEditGroup).toHaveBeenCalledTimes(1);
+    expect(view.handlers.onDeleteGroup).toHaveBeenCalledTimes(1);
+  } finally {
+    view.unmount();
+  }
+});
+
+it("빈 곳은 최상위 추가, 그룹은 그 안의 추가·편집·삭제, 세션은 편집·복제·삭제 메뉴를 띄운다", () => {
+  const view = renderTree();
+  try {
+    view.contextMenu(view.tree);
+    expect(view.menu()?.getAttribute("aria-label")).toBe("연결 메뉴");
+    expect(view.menuItems()).toEqual(["세션 추가…", "그룹 추가…"]);
+    view.choose("세션 추가…");
+    expect(view.handlers.onAddSession).toHaveBeenCalledExactlyOnceWith();
+    view.contextMenu(view.tree);
+    view.choose("그룹 추가…");
+    expect(view.handlers.onAddGroup).toHaveBeenCalledExactlyOnceWith();
+
+    // 합성 "로컬" 그룹은 빈 곳과 같은 최상위 메뉴다.
+    view.contextMenu(view.row("로컬"));
+    expect(view.menuItems()).toEqual(["세션 추가…", "그룹 추가…"]);
+    view.press(view.menu()!, "Escape");
+
+    view.contextMenu(view.row("하위").querySelector(".tree-row")!);
+    expect(view.menu()?.getAttribute("aria-label")).toBe("하위 그룹 메뉴");
+    expect(view.menuItems()).toEqual(["세션 추가…", "그룹 추가…", "편집…", "삭제"]);
+    expect(view.menu()!.querySelectorAll("[role=separator]")).toHaveLength(2);
+    for (const label of ["세션 추가…", "그룹 추가…", "편집…", "삭제"]) {
+      view.contextMenu(view.row("하위"));
+      view.choose(label);
+    }
+    expect(view.handlers.onAddSession).toHaveBeenLastCalledWith("child");
+    expect(view.handlers.onAddGroup).toHaveBeenLastCalledWith("child");
+    expect(view.handlers.onEditGroup).toHaveBeenCalledExactlyOnceWith("child");
+    expect(view.handlers.onDeleteGroup).toHaveBeenCalledExactlyOnceWith("child");
+
+    // 하위 세션의 우클릭은 상위 그룹 메뉴로 번지지 않는다.
+    view.contextMenu(view.row("깊은 셸"));
+    expect(view.menu()?.getAttribute("aria-label")).toBe("로컬 메뉴");
+    expect(view.menuItems()).toEqual(["로컬", "편집…", "복제", "삭제"]);
+    view.choose("복제");
+    expect(view.handlers.onDuplicate).toHaveBeenCalledExactlyOnceWith("deep");
+  } finally {
+    view.unmount();
+  }
+});
+
+it("메뉴 키와 Shift+F10으로 그룹·로컬 메뉴를 열고 닫으면 원래 행으로 포커스를 돌린다", () => {
+  const view = renderTree();
+  try {
+    act(() => view.row("작업").focus());
+    view.press(view.row("작업"), "F10");
+    expect(view.menu()).toBeNull();
+    view.press(view.row("작업"), "F10", true);
+    expect(view.menu()?.getAttribute("aria-label")).toBe("작업 그룹 메뉴");
+    expect(document.activeElement?.textContent).toBe("세션 추가…");
+    view.press(document.activeElement!, "Escape");
+    expect(view.menu()).toBeNull();
+    expect(document.activeElement).toBe(view.row("작업"));
+
+    view.press(view.row("로컬"), "ContextMenu");
+    expect(view.menu()?.getAttribute("aria-label")).toBe("연결 메뉴");
+    view.press(document.activeElement!, "Escape");
+    expect(document.activeElement).toBe(view.row("로컬"));
+
+    // 메뉴 항목을 고르면 동작 전에 행으로 포커스를 돌린다.
+    view.contextMenu(view.row("기타"));
+    view.choose("편집…");
+    expect(document.activeElement).toBe(view.row("기타"));
+  } finally {
+    view.unmount();
+  }
+});
+
+it("focusRequest가 바뀌면 트리의 현재 행으로 포커스를 돌린다", () => {
+  const view = renderTree();
+  try {
+    act(() => view.row("기타").focus());
+    act(() => (document.activeElement as HTMLElement).blur());
+    expect(document.activeElement).toBe(document.body);
+    view.render({ focusRequest: 1 });
+    expect(document.activeElement).toBe(view.row("기타"));
+    // 다른 곳에 있는 포커스는 가져오지 않는다.
+    const outside = document.body.appendChild(document.createElement("button"));
+    act(() => outside.focus());
+    view.render({ focusRequest: 2 });
+    expect(document.activeElement).toBe(outside);
+    outside.remove();
+  } finally {
+    view.unmount();
   }
 });
 
@@ -178,5 +381,35 @@ it("세션 행 메뉴의 편집…과 삭제는 세션 ID를 넘기고 내 PC에
     act(() => root.unmount());
     host.remove();
     vi.unstubAllGlobals();
+  }
+});
+
+it("이미 8단계인 그룹의 그룹 추가는 비활성이고 빈 곳 메뉴를 Escape로 닫으면 트리의 현재 행으로 포커스를 돌린다", () => {
+  const deep: SavedConnections = {
+    version: 2, targets: [],
+    groups: Array.from({ length: 8 }, (_, index) => ({
+      revision: 1, profile: { id: `l${index + 1}`, displayName: `단계 ${index + 1}`, ...(index ? { parentId: `l${index}` } : {}) },
+    })),
+  };
+  const view = renderTree({ profiles: deep });
+  try {
+    const addGroup = () => [...view.host.querySelectorAll<HTMLButtonElement>("button[role=menuitem]")].find(item => item.textContent === "그룹 추가…")!;
+    view.contextMenu(view.row("단계 7"));
+    expect(addGroup().disabled).toBe(false);
+    view.press(view.menu()!, "Escape");
+    view.contextMenu(view.row("단계 8"));
+    expect(view.row("단계 8").getAttribute("aria-level")).toBe("8");
+    expect(addGroup().disabled).toBe(true);
+    expect(view.menuItems()).toEqual(["세션 추가…", "그룹 추가…", "편집…", "삭제"]);
+    view.press(view.menu()!, "Escape");
+
+    act(() => (document.activeElement as HTMLElement).blur());
+    expect(document.activeElement).toBe(document.body);
+    view.contextMenu(view.tree);
+    view.press(view.menu()!, "Escape");
+    expect(view.menu()).toBeNull();
+    expect(document.activeElement).toBe(view.row("단계 8"));
+  } finally {
+    view.unmount();
   }
 });
