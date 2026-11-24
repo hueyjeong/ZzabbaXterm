@@ -834,5 +834,38 @@ fn shell() -> CommandBuilder {
     #[cfg(unix)]
     cmd.args(["--noprofile", "--norc", "-i"]);
     cmd.env("TERM", "xterm-256color");
+    strip_inherited_agent_env(&mut cmd);
     cmd
+}
+
+/// 앱을 띄운 에이전트 세션(Claude Code, Orca)의 표식과 토큰은 새 셸로 넘기지 않는다.
+/// 넘기면 셸에서 실행한 `claude`가 하위 세션으로 동작하고 부모의 설정 디렉터리·훅 토큰을 쓴다.
+/// API 키나 `CLAUDE_CODE_USE_*` 같은 사용자 설정은 그대로 둔다.
+pub(crate) fn strip_inherited_agent_env(cmd: &mut CommandBuilder) {
+    for key in inherited_agent_env(std::env::vars_os()) {
+        cmd.env_remove(key);
+    }
+}
+
+fn inherited_agent_env(vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>) -> Vec<std::ffi::OsString> {
+    let vars: Vec<_> = vars.into_iter().collect();
+    // Windows 환경 변수 이름은 대소문자를 가리지 않는다.
+    let name = |key: &std::ffi::OsString| key.to_string_lossy().to_ascii_uppercase();
+    let injected = vars.iter().find(|(key, _)| name(key) == "ORCA_CLAUDE_INJECTED_CONFIG_DIR").map(|(_, value)| value.clone());
+    vars.into_iter()
+        .filter(|(key, value)| {
+            let name = name(key);
+            name.starts_with("ORCA_")
+                || name.starts_with("CLAUDE_CODE_SESSION_")
+                || name.starts_with("CLAUDE_CODE_MESSAGING_")
+                || matches!(
+                    name.as_str(),
+                    "CLAUDECODE" | "CLAUDE_PID" | "CLAUDE_EFFORT" | "CLAUDE_CODE_CHILD_SESSION" | "CLAUDE_CODE_CHILD_NOTES_DIR"
+                        | "CLAUDE_CODE_ENTRYPOINT" | "CLAUDE_CODE_EXECPATH" | "CLAUDE_CODE_SSE_PORT"
+                )
+                // 사용자가 직접 정한 설정 디렉터리는 남기고, Orca가 주입한 값일 때만 뺀다.
+                || (name == "CLAUDE_CONFIG_DIR" && injected.as_ref() == Some(value))
+        })
+        .map(|(key, _)| key)
+        .collect()
 }

@@ -214,6 +214,7 @@ fn local(shell: Shell, directory: &Path) -> Result<CommandBuilder, String> {
         }
         _ => return Err("지원하지 않는 셸입니다".into()),
     };
+    super::strip_inherited_agent_env(&mut command);
     command.cwd(directory);
     command.env("ZZABBA_C01_CWD", directory);
     command.env("TERM", "xterm-256color");

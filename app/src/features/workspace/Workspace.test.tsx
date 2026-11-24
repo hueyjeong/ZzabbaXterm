@@ -855,6 +855,20 @@ describe("L02", () => {
       expect(document.activeElement).toBe(find('section[aria-label="로컬 2"] textarea'));
     });
 
+  it.each([0, 2])("포커스가 문서 밖으로 빠진 터미널은 %i번 단추로 누르면 다시 입력을 받는다", async (button) => {
+    await openSecond();
+    const input = find<HTMLTextAreaElement>('section[aria-label="로컬 2"] textarea');
+    expect(document.activeElement).toBe(input);
+    // 포커스를 받지 않는 영역을 누른 것처럼 포커스만 body로 뺀다. 선택 탭 상태는 그대로다.
+    await act(async () => { input.blur(); });
+    expect(document.activeElement).toBe(document.body);
+    const screen = find('section[aria-label="로컬 2"] .terminal-screen');
+    await act(async () => { screen.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, button })); });
+    expect(document.activeElement).toBe(input);
+    await type(input, "OK");
+    expect(calls("input").slice(-1)[0]).toEqual({ id: "pty-11", bytes: Array.from(new TextEncoder().encode("OK")) });
+  });
+
   it("창 축소와 집중 보기 복귀에서 선택 탭을 노출한다", async () => {
     await openSecond();
     const list = find(".workspace-tabs");

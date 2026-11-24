@@ -243,3 +243,33 @@ fn l01_terminal_exit_259_is_not_a_running_process() {
         }
     }
 }
+
+#[test]
+fn inherited_agent_session_markers_are_removed_but_user_settings_stay() {
+    use std::ffi::OsString;
+    let os = |value: &str| OsString::from(value);
+    let injected = r"C:\Users\fixture\orca\claude-profiles\x\home";
+    let vars = [
+        ("Claude_Code_Child_Session", "1"),
+        ("CLAUDE_CODE_SESSION_ID", "s"),
+        ("CLAUDE_CODE_MESSAGING_SOCKET", "pipe"),
+        ("CLAUDECODE", "1"),
+        ("ORCA_AGENT_HOOK_TOKEN", "t"),
+        ("ORCA_CLAUDE_INJECTED_CONFIG_DIR", injected),
+        ("CLAUDE_CONFIG_DIR", injected),
+        ("PATH", r"C:\Windows"),
+        ("TERM", "xterm-256color"),
+        ("ANTHROPIC_API_KEY", "k"),
+        ("CLAUDE_CODE_USE_POWERSHELL_TOOL", "1"),
+    ]
+    .map(|(key, value)| (os(key), os(value)));
+    let mut removed: Vec<_> = super::inherited_agent_env(vars.clone()).into_iter().map(|key| key.into_string().unwrap()).collect();
+    removed.sort();
+    assert_eq!(removed, [
+        "CLAUDECODE", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CONFIG_DIR",
+        "Claude_Code_Child_Session", "ORCA_AGENT_HOOK_TOKEN", "ORCA_CLAUDE_INJECTED_CONFIG_DIR",
+    ]);
+    // 사용자가 직접 정한 설정 디렉터리는 남긴다.
+    let own = [(os("CLAUDE_CONFIG_DIR"), os(r"D:\claude"))];
+    assert!(super::inherited_agent_env(own).is_empty());
+}
