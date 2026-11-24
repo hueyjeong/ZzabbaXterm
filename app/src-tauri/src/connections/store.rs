@@ -146,6 +146,12 @@ impl Store {
             other => return Err(StoreError::Version(other)),
         };
         let mut file: ProfileFile = serde_json::from_slice(&contents).map_err(StoreError::Format)?;
+        if from_v1 && (file.groups.iter().any(|entry| entry.profile.parent_id.is_some())
+            || file.targets.iter().any(|entry| entry.profile.group_id.is_none()))
+        {
+            use serde::de::Error;
+            return Err(StoreError::Format(serde_json::Error::custom("v1 파일에는 parentId가 없고 모든 대상에 groupId가 있습니다")));
+        }
         file.version = VERSION;
         file.from_v1 = from_v1;
         file.validate()?;
@@ -264,7 +270,10 @@ impl Store {
             }
             let account = match (&old, account_scope(&target)) {
                 (_, None) => None,
-                (Some(entry), scope) if account_scope(&entry.profile) == scope => entry.tested_account_id.clone(),
+                // 저장된 계정이 없으면 같은 범위라도 로컬 SSO 설정을 다시 읽는다.
+                (Some(entry), scope) if account_scope(&entry.profile) == scope && entry.tested_account_id.is_some() => {
+                    entry.tested_account_id.clone()
+                }
                 (_, Some((_, profile, region))) => configured_account(profile, region)
                     .filter(|account| validate_tested_account(Some(account), true).is_ok()),
             };
@@ -454,31 +463,48 @@ impl Store {
 }
 
 impl Store {
-    /// v1 원본을 `connections.v1.json`으로 한 번만 복사한다. 이미 있으면 덮어쓰지 않는다.
+    /// v1 원본을 `connections.v1.json`으로 한 번만 복사한다. v1으로 읽히는 백업이 이미 있으면 덮어쓰지 않는다.
+    /// 임시 파일을 끝까지 쓴 뒤 덮어쓰지 않는 하드 링크로 확정하므로, 중간에 끝나도 불완전한 백업이 남지 않는다.
     fn backup_v1(&self, source: &Path) -> Result<(), StoreError> {
         let backup = self.directory.join("connections.v1.json");
+        let temporary = self.directory.join("connections.v1.json.tmp");
+        match fs::symlink_metadata(&backup) {
+            Ok(metadata) if is_link(&metadata) || !metadata.is_file() => return Err(unsafe_path().into()),
+            Ok(_) => {
+                let mut contents = Vec::new();
+                open_regular(&backup, OpenOptions::new().read(true))?.read_to_end(&mut contents)?;
+                if serde_json::from_slice::<FileVersion>(&contents).is_ok_and(|header| header.version == 1) {
+                    return Ok(());
+                }
+                // 비었거나 v1이 아닌 백업은 다시 만든다.
+                fs::remove_file(&backup)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        match fs::symlink_metadata(&temporary) {
+            Ok(metadata) if is_link(&metadata) || !metadata.is_file() => return Err(unsafe_path().into()),
+            Ok(_) => fs::remove_file(&temporary)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(windows)]
         options.access_mode(windows_sys::Win32::Foundation::GENERIC_WRITE | windows_sys::Win32::Storage::FileSystem::WRITE_DAC);
-        let mut output = match open_regular(&backup, &mut options) {
-            Ok(output) => output,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(()),
-            Err(error) => return Err(error.into()),
-        };
+        let mut output = open_regular(&temporary, &mut options)?;
         let result = (|| {
-            // 원본의 권한을 적용할 때까지 백업 파일은 비워 둔다.
+            // 원본의 권한을 적용할 때까지 임시 파일은 비워 둔다.
             #[cfg(windows)]
             preserve_dacl(source, &output)?;
             let mut contents = Vec::new();
             open_regular(source, OpenOptions::new().read(true))?.read_to_end(&mut contents)?;
             output.write_all(&contents)?;
-            output.sync_all()
-        })();
-        if result.is_err() {
+            output.sync_all()?;
             drop(output);
-            let _ = fs::remove_file(&backup);
-        }
+            fs::hard_link(&temporary, &backup)
+        })();
+        let _ = fs::remove_file(&temporary);
         result.map_err(StoreError::Io)
     }
 }
@@ -575,10 +601,10 @@ impl ProfileFile {
                 if !seen.insert(id) {
                     return Err(StoreError::GroupCycle);
                 }
+                if seen.len() > MAX_GROUP_DEPTH {
+                    return Err(StoreError::GroupDepth);
+                }
                 current = *parents.get(id).ok_or(StoreError::MissingGroup)?;
-            }
-            if seen.len() > MAX_GROUP_DEPTH {
-                return Err(StoreError::GroupDepth);
             }
         }
         let mut targets = HashSet::with_capacity(self.targets.len());

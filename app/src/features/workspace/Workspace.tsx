@@ -473,7 +473,11 @@ export function Workspace() {
     const profiles = profileLoad.profiles;
     const target = profiles?.targets.find(({ profile }) => profile.id === id);
     const group = profiles?.groups.find(({ profile }) => profile.id === target?.profile.groupId);
-    if (!target || !group || (target.profile.defaultMethod !== "ssm" && target.profile.defaultMethod !== "s3")) return;
+    if (!target || (target.profile.defaultMethod !== "ssm" && target.profile.defaultMethod !== "s3")) return;
+    if (!group) {
+      setWindowError("그룹 없는 세션은 연결 재시험을 할 수 없습니다");
+      return;
+    }
     setWizard({
       draftId: crypto.randomUUID(), initialDraft: {
         version: 1, groupRevision: group.revision, targetRevision: target.revision,

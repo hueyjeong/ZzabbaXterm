@@ -60,7 +60,7 @@ export function LocalTree({ profiles, openCounts, onOpen, onElevate, onLocalElev
     .filter((target) => matches(target.name));
   const expanded = (key: string) => Boolean(term) || !collapsed.has(key);
   const tabStop = topLevel.some((target) => target.key === selected) || groups.some((group) => group.key === selected ||
-    (expanded(group.key) && group.targets.some((target) => target.key === selected))) ? selected : groups[0]?.key;
+    (expanded(group.key) && group.targets.some((target) => target.key === selected))) ? selected : groups[0]?.key ?? topLevel[0]?.key;
 
   function toggle(key: string) {
     if (term) return;

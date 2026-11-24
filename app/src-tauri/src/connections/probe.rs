@@ -216,11 +216,11 @@ pub(super) fn save_confirmed(sessions: &Sessions, owner: &str, document: u64, re
     if cfg!(all(feature = "stored-auth", any(windows, target_os = "linux")))
         && matches!(draft.method(), MethodRef::Ssh { ssh } if matches!(ssh.auth, SshAuth::StoredPassword { .. }))
     {
-        return saved(store.save_authorized(draft, None, || Ok(()), || {}));
+        return saved(store.save_authorized(draft, None, || sessions.with_probes(owner, document, |_| Ok(())), || {}));
     }
     // 원격 화면 프로필은 비밀 없이 경로만 저장한다. SSH 경로는 저장소가 확인하고, 서버 신원과 터널은 열 때 다시 확인한다.
     if matches!(draft.method(), MethodRef::Desktop { .. }) {
-        return saved(store.save_authorized(draft, None, || Ok(()), || {}));
+        return saved(store.save_authorized(draft, None, || sessions.with_probes(owner, document, |_| Ok(())), || {}));
     }
     let expected = sessions.with_probes(owner, document, |runs| {
         let run = runs.get(owner, &key)?;
