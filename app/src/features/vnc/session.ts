@@ -14,6 +14,8 @@ type Frame = Extract<RemoteDesktopEvent, { kind: "full" | "patch" }>;
 const HEADER = 33;
 const CHUNK = 256 * 1024;
 const MAX_PIXELS = 8_294_400;
+const MAX_QUEUE = 32;
+export const DROPPED_NOTICE = "VNC 입력 일부를 버렸습니다";
 
 type Action = { kind: "release" } | { kind: "key"; keysym: number; down: boolean } |
 { kind: "pointer"; x: number; y: number; buttons: number } |
@@ -114,7 +116,7 @@ export function connect(
     const previous = queued[queued.length - 1];
     if (action.kind === "pointer" && previous?.action.kind === "pointer" && previous.action.buttons === action.buttons) {
       previous.action = action;
-    } else if (queued.length < 32) {
+    } else if (queued.length < MAX_QUEUE) {
       queued.push({ action, epoch });
     } else {
       terminate("VNC 입력 큐가 가득 찼습니다", true);
@@ -166,6 +168,15 @@ export function connect(
           case "key": {
             const symbol = keysym(input.key, input.location, input.code);
             if (symbol !== undefined) send({ kind: "key", keysym: symbol, down: input.down });
+            break;
+          }
+          case "text": {
+            // VNC에는 유니코드 이벤트가 없어 유니코드 keysym(0x01000000 + 코드 포인트)을 누르고 뗀다.
+            const symbol = keysym(input.text, 0, "");
+            if (symbol === undefined) break;
+            // 긴 확정 문자열이 큐를 넘기면 연결을 끊지 않고 남은 글자를 버린다.
+            if (queued.length + 2 > MAX_QUEUE) { if (shown !== DROPPED_NOTICE) notice(DROPPED_NOTICE); break; }
+            for (const down of [true, false]) send({ kind: "key", keysym: symbol, down });
             break;
           }
           case "pointer": send({ kind: "pointer", x: input.x, y: input.y, buttons: (input.buttons & 1) | ((input.buttons & 2) << 1) | ((input.buttons & 4) >> 1) }); break;

@@ -37,7 +37,7 @@ const nonnegative = (value: unknown): value is number => value === 0 || positive
 const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null;
 
 type Action = { kind: "active"; active: boolean } | { kind: "release" } | { kind: "copy" } |
-{ kind: "key"; code: number; extended: boolean; down: boolean } |
+{ kind: "key"; code: number; extended: boolean; down: boolean } | { kind: "unicode"; text: string } |
 { kind: "pointer"; x: number; y: number; buttons: number } |
 { kind: "paste"; text: string } | { kind: "resize"; width: number; height: number; scale: number };
 type Frame = Extract<RemoteDesktopEvent, { kind: "full" | "patch" }>;
@@ -392,6 +392,8 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
               if (scan) send({ kind: "key", ...scan, down: input.down });
               break;
             }
+            // 글자 하나를 Rust가 TS_UNICODE_KEYBOARD_EVENT 누름·뗌으로 보낸다. 눌린 상태가 남지 않아 해제할 것이 없다.
+            case "text": send({ kind: "unicode", text: input.text }); break;
           }
         },
         clipboard: clipboardAction,

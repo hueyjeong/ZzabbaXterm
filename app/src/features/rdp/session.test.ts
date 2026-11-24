@@ -486,3 +486,21 @@ it("승인 대기 끝은 승인 대기 알림만 지운다", () => {
   expect(notice).toHaveBeenCalledExactlyOnceWith("");
   expect(approvalSignal("c".repeat(32), notice, () => "")).toBe(false);
 });
+
+it("확정된 글자는 스캔코드 대신 유니코드 입력으로 묶어 보낸다", async () => {
+  const f = await fixture();
+  const view = await f.live();
+  const held = Promise.withResolvers<string>();
+  f.sendInput.mockReturnValueOnce(held.promise);
+  view.send(input);
+  for (const text of ["한", "😀"]) view.send({ kind: "text", text });
+  held.resolve("ok");
+  await vi.waitFor(() => expect(f.inputs()).toHaveLength(4));
+  expect(f.inputs().slice(1).map((item) => [item.sequence, item.action])).toEqual([
+    [2, { kind: "key", ...scanCode("KeyA"), down: true }],
+    [3, { kind: "unicode", text: "한" }],
+    [4, { kind: "unicode", text: "😀" }],
+  ]);
+  expect(f.calls("rdp_input_batch")).toHaveLength(1);
+  view.dispose();
+});

@@ -32,8 +32,9 @@ fn confirm_change_native(window: &WebviewWindow, description: &str) -> bool {
     confirm_native(window, description)
 }
 
-pub(super) async fn account(window: WebviewWindow, target: String, live: CancellationToken, approval: Arc<()>, notify: Notify) -> Result<Account, Error> {
-    dialog(window, live, approval, notify, move |window| account_native(&window, &target)).await?.ok_or(Error::Credentials)
+/// `remembered`는 이 대상에서 마지막으로 로그인한 계정 이름이다. 계정 칸에만 미리 채운다.
+pub(super) async fn account(window: WebviewWindow, target: String, remembered: Option<String>, live: CancellationToken, approval: Arc<()>, notify: Notify) -> Result<Account, Error> {
+    dialog(window, live, approval, notify, move |window| account_native(&window, &target, remembered.as_deref())).await?.ok_or(Error::Credentials)
 }
 
 async fn dialog<T: Send + 'static>(window: WebviewWindow, live: CancellationToken, approval: Arc<()>, notify: Notify,
@@ -59,18 +60,20 @@ async fn dialog<T: Send + 'static>(window: WebviewWindow, live: CancellationToke
     }
 }
 
+/// 계정 칸 값이 `계정` 또는 `도메인\계정` 형식인지 본다.
+#[cfg(any(windows, target_os = "linux"))]
+fn valid_login(login: &str) -> bool {
+    login.trim() == login && !login.is_empty() && match login.split_once('\\') {
+        Some((domain, user)) => !domain.is_empty() && !user.is_empty() && !user.contains('\\'),
+        None => true,
+    }
+}
+
 #[cfg(any(windows, target_os = "linux"))]
 fn account_from_login(mut login: String, password: zeroize::Zeroizing<String>) -> Option<Account> {
-    if login.trim() != login || login.is_empty() || password.is_empty() { return None; }
-    let domain = match login.split_once('\\') {
-        Some((domain, user)) if !domain.is_empty() && !user.is_empty() && !user.contains('\\') => {
-            let domain = domain.to_owned();
-            login.drain(..=domain.len());
-            Some(domain)
-        }
-        Some(_) => return None,
-        None => None,
-    };
+    if !valid_login(&login) || password.is_empty() { return None; }
+    let domain = login.split_once('\\').map(|(domain, _)| domain.to_owned());
+    if let Some(domain) = &domain { login.drain(..=domain.len()); }
     Some(Account { username: login, domain, password })
 }
 
@@ -90,7 +93,7 @@ fn confirm_native(window: &WebviewWindow, description: &str) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn account_native(window: &WebviewWindow, target: &str) -> Option<Account> {
+fn account_native(window: &WebviewWindow, target: &str, remembered: Option<&str>) -> Option<Account> {
     let parent = window.gtk_window().ok()?;
     let dialog = gtk::Dialog::with_buttons(Some("RDP 계정 인증"), Some(&parent),
         gtk::DialogFlags::MODAL | gtk::DialogFlags::DESTROY_WITH_PARENT,
@@ -103,15 +106,41 @@ fn account_native(window: &WebviewWindow, target: &str) -> Option<Account> {
     password.set_visibility(false);
     password.set_input_purpose(gtk::InputPurpose::Password);
     let label = gtk::Label::new(Some(&format!("검증된 서버: {target}")));
+    // 긴 대상 이름은 끝을 줄임표로 표시한다.
+    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    let error = gtk::Label::new(None);
     let area = dialog.content_area();
     area.add(&label);
     area.add(&gtk::Label::new(Some("계정 (또는 도메인\\계정)")));
     area.add(&login);
     area.add(&gtk::Label::new(Some("비밀번호")));
     area.add(&password);
+    area.add(&error);
+    // 두 칸이 모두 차야 로그인 단추를 켠다.
+    let update = {
+        let (dialog, login, password, error) = (dialog.clone(), login.clone(), password.clone(), error.clone());
+        move || {
+            dialog.set_response_sensitive(gtk::ResponseType::Ok, !login.text().is_empty() && !password.text().is_empty());
+            error.set_text("");
+        }
+    };
+    login.connect_changed({ let update = update.clone(); move |_| update() });
+    password.connect_changed({ let update = update.clone(); move |_| update() });
     dialog.show_all();
-    let account = (dialog.run() == gtk::ResponseType::Ok)
-        .then(|| account_from_login(login.text().to_string(), zeroize::Zeroizing::new(password.text().to_string()))).flatten();
+    if let Some(remembered) = remembered {
+        login.set_text(remembered);
+        password.grab_focus();
+    }
+    update();
+    // 계정 형식이 틀리면 창을 닫지 않고 오류를 표시한다.
+    let account = loop {
+        if dialog.run() != gtk::ResponseType::Ok { break None; }
+        if valid_login(login.text().as_str()) {
+            break account_from_login(login.text().to_string(), zeroize::Zeroizing::new(password.text().to_string()));
+        }
+        error.set_text("계정 형식이 올바르지 않습니다");
+        login.grab_focus();
+    };
     password.set_text("");
     dialog.close();
     account
@@ -128,34 +157,12 @@ fn confirm_native(window: &WebviewWindow, description: &str) -> bool {
         .set_buttons(rfd::MessageButtons::OkCancel).show() == rfd::MessageDialogResult::Ok
 }
 
+/// 앱이 직접 만든 계정 창이다. 자격 증명 관리자의 다른 항목을 목록으로 보이지 않고 비밀번호를 저장하지 않는다.
 #[cfg(windows)]
-fn account_native(window: &WebviewWindow, target: &str) -> Option<Account> {
-    use std::ptr::{null, null_mut};
-    use windows_sys::Win32::Security::Credentials::{CREDUI_FLAGS_ALWAYS_SHOW_UI, CREDUI_FLAGS_DO_NOT_PERSIST,
-        CREDUI_FLAGS_GENERIC_CREDENTIALS, CREDUI_FLAGS_EXCLUDE_CERTIFICATES,
-        CREDUI_INFOW, CredUIPromptForCredentialsW};
-    use zeroize::Zeroizing;
-    let wide = |text: &str| text.encode_utf16().chain([0]).collect::<Vec<_>>();
-    let title = wide("RDP 계정 인증");
-    let message = wide(&format!("검증된 서버: {target}\n계정 또는 도메인\\계정"));
-    let target = wide(&super::ipc::opaque()?);
-    let info = CREDUI_INFOW {
-        cbSize: std::mem::size_of::<CREDUI_INFOW>() as u32,
-        hwndParent: window.hwnd().ok()?.0 as _, pszMessageText: message.as_ptr(),
-        pszCaptionText: title.as_ptr(), hbmBanner: null_mut(),
-    };
-    let mut login = [0_u16; 514];
-    let mut secret = Zeroizing::new([0_u16; 257]);
-    let mut save = 0;
-    // Generic + always show + do not persist prevents reuse and storage of the entered password.
-    let result = unsafe { CredUIPromptForCredentialsW(&info, target.as_ptr(), null(), 0,
-        login.as_mut_ptr(), login.len() as u32, secret.as_mut_ptr(), secret.len() as u32, &mut save,
-        CREDUI_FLAGS_GENERIC_CREDENTIALS | CREDUI_FLAGS_ALWAYS_SHOW_UI | CREDUI_FLAGS_DO_NOT_PERSIST
-            | CREDUI_FLAGS_EXCLUDE_CERTIFICATES) };
-    if result != 0 { return None; }
-    let decode = |s: &[u16]| String::from_utf16(&s[..s.iter().position(|unit| *unit == 0)?]).ok();
-    account_from_login(decode(&login)?, Zeroizing::new(decode(secret.as_ref())?))
+fn account_native(window: &WebviewWindow, target: &str, remembered: Option<&str>) -> Option<Account> {
+    let (login, password) = super::account_dialog::prompt(window.hwnd().ok()?.0 as _, target, remembered, valid_login)?;
+    account_from_login(login, password)
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
-fn account_native(_: &WebviewWindow, _: &str) -> Option<Account> { None }
+fn account_native(_: &WebviewWindow, _: &str, _: Option<&str>) -> Option<Account> { None }

@@ -48,6 +48,20 @@ export function modifierEvents(state: ModifierState, input: ModifierInput): { st
   return { state: next, events };
 }
 
+/// IME 조합이나 insertText로 확정된 문자열을 원격에 보낼 글자(코드 포인트) 단위로 나눈다.
+/// BMP 밖 글자는 서러게이트 쌍째로 한 글자다. 제어 문자와 짝 없는 서러게이트는 버린다.
+export function textCharacters(text: string): string[] {
+  return Array.from(text).filter((character) => {
+    const point = character.codePointAt(0)!;
+    return !(point < 0x20 || (point >= 0x7f && point < 0xa0) || (point >= 0xd800 && point <= 0xdfff));
+  });
+}
+
+/// IME가 처리하는 keydown이다. 이 키를 스캔코드로도 보내면 조합 결과와 함께 두 번 입력된다.
+export function imeKeyDown(event: { readonly isComposing: boolean; readonly key: string; readonly keyCode: number }): boolean {
+  return event.isComposing || event.key === "Process" || event.keyCode === 229;
+}
+
 export function releasedModifiers(state: ModifierState): { state: ModifierState; events: ModifierEvent[] } {
   const events = (Object.keys(MODIFIER_KEYS) as Modifier[])
     .filter((name) => state[name])

@@ -4,7 +4,7 @@ import { act, createElement, createRef } from "react";
 import { createRoot } from "react-dom/client";
 import { expect, it, vi } from "vitest";
 import { createRemoteDesktopViewSession, type RemoteDesktopViewSession } from "../remoteDesktop/session";
-import { connect, type Connection } from "./session";
+import { connect, DROPPED_NOTICE, type Connection } from "./session";
 import { VncView, type VncTabActions } from "./VncView";
 
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn<(name: string, args: Record<string, unknown>) => Promise<unknown>>() }));
@@ -211,4 +211,41 @@ it("연결 준비 중 발견한 정리 미확인을 연결 오류와 함께 전�
   expect(failed).toHaveBeenCalledWith("종료 확인 불가");
   expect(unconfirmed).toHaveBeenCalledOnce();
   expect(invoke.mock.calls.map(([name]) => name)).toEqual(["vnc_connect"]);
+});
+
+it("확정된 글자는 유니코드 keysym을 누르고 떼며 큐를 넘기면 끊지 않고 버린다", async () => {
+  invoke.mockClear();
+  const delivery = Promise.withResolvers<void>();
+  invoke.mockImplementation((name) => name === "vnc_input" ? delivery.promise : Promise.resolve());
+  const identity = { sessionId: "3", generation: 1 };
+  const notice = vi.fn();
+  const failed = vi.fn();
+  let session!: Connection;
+  connect({ tab: "tab", document: 1 }, { host: "localhost", port: 5900, password: false },
+    (value) => { session = value; }, notice, failed, { readText: vi.fn(), writeText: vi.fn() });
+  const { output } = invoke.mock.calls[0][1] as { output: { onmessage(message: unknown): void } };
+  output.onmessage({ identity, kind: "started", serial: 0 });
+  await Promise.resolve();
+  session.subscribe(() => true);
+  session.setActive(true);
+  output.onmessage({ identity, kind: "waiting", value: 1, serial: 1 });
+  output.onmessage(full(1, 1));
+  await Promise.resolve();
+  const text = (value: string, sequence: number) => session.send({ ...identity, kind: "text", text: value, sequence });
+  text("한", 1);
+  text("😀", 2);
+  text("é", 3);
+  for (let sequence = 4; sequence < 40; sequence++) text("a", sequence);
+  expect(failed).not.toHaveBeenCalled();
+  expect(notice.mock.calls).toEqual([[DROPPED_NOTICE]]);
+  const actions = () => invoke.mock.calls.filter(([name]) => name === "vnc_input")
+    .map(([, args]) => (args.input as { action: unknown }).action);
+  expect(actions()).toEqual([{ kind: "key", keysym: 0x0100d55c, down: true }]);
+  delivery.resolve();
+  await vi.waitFor(() => expect(actions()).toHaveLength(32));
+  expect(actions().slice(0, 6)).toEqual([
+    { kind: "key", keysym: 0x0100d55c, down: true }, { kind: "key", keysym: 0x0100d55c, down: false },
+    { kind: "key", keysym: 0x0101f600, down: true }, { kind: "key", keysym: 0x0101f600, down: false },
+    { kind: "key", keysym: 0xe9, down: true }, { kind: "key", keysym: 0xe9, down: false },
+  ]);
 });
