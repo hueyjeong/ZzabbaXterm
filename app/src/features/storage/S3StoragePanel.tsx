@@ -8,6 +8,7 @@ import {
 import {
   FileBrowser, VersionedFiles, exactBytes, formatBytes, sameEntry, type EntryRef, type FileEntry, type FileView, type VersionedFilesStatus,
 } from "../files/FileBrowser";
+import { copyText } from "../ui/clipboard";
 import { IconButton, type MenuItem } from "../ui/controls";
 import type { BucketRow, LocalFileActions, ObjectRow, S3Actions, S3FileSelection, S3Location, S3Session, StorageEditorOpen } from "./s3";
 import {
@@ -414,7 +415,7 @@ export function S3StoragePanel({
   }
 
   function menuItems(entry: FileEntry): MenuItem[] {
-    const copy: MenuItem = { label: "전체 키 복사", icon: Copy, onSelect: () => { void navigator.clipboard?.writeText(entry.key).catch(() => undefined); } };
+    const copy: MenuItem = { label: "전체 키 복사", icon: Copy, onSelect: () => copyText(entry.key) };
     if (entry.kind === "folder") return [{ label: "열기", icon: FolderOpen, disabled: !navigable, onSelect: () => openEntry(entry) }, { kind: "separator" }, copy];
     return [
       ...(canEdit && approvedRowId(entry.key) ? [{ label: "편집", icon: FilePen, onSelect: () => void edit(entry.key) }] : []),

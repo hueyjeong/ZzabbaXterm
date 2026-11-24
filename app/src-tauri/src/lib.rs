@@ -65,6 +65,7 @@ pub fn run() {
         .register_asynchronous_uri_scheme_protocol("vnc-packet", vnc::output::protocol)
         .plugin(ssm::ipc::lifecycle())
         .plugin(navigation::guard())
+        .plugin(navigation::clipboard_read())
         .setup(|app| {
             if let Ok(registration) = connections::ipc::initialize_ssh_registration(app) {
                 app.manage(registration);

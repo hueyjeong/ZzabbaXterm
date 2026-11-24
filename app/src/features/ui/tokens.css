@@ -121,6 +121,7 @@ select.ui-field { padding-inline-end: 4px; }
   background: var(--bg-elevated);
   box-shadow: var(--shadow-popover);
 }
+.ui-menu:focus { outline: none; }
 .ui-menu [role="menuitem"] {
   display: flex;
   align-items: center;
