@@ -43,8 +43,8 @@ type Tab = { id: number; label: string } & (
   | { kind: "terminal"; targetId?: string; remoteEditor?: true; elevation?: ElevationRequest; ssm?: SsmTarget; ssh?: SshTransport["kind"]; status: TerminalStatus; sessionId?: string; sftpSessionId?: string; closeStatus?: CloseStatus }
   | { kind: "editor"; file: ApprovedEditorFile; transport: EditorTransport; close: () => Promise<void>; source: EditorSource; attaching?: true; readOnly?: true; nano?: Pick<RemoteNanoFile, "sessionId" | "disconnect"> }
   | { kind: "tunnel"; handle: string; targetId: string; name: string; method: "ssh" | "ssm"; closeStatus?: CloseStatus; closeError?: string }
-  | { kind: "rdp"; source?: DesktopTunnelSource; tlsOnly?: boolean; closeStatus?: CloseStatus; targetId?: string; preset?: DesktopPreset; release?: () => Promise<void> }
-  | { kind: "vnc"; source?: DesktopTunnelSource; closeStatus?: CloseStatus; targetId?: string; preset?: DesktopPreset; release?: () => Promise<void> }
+  | { kind: "rdp"; source?: DesktopTunnelSource; tlsOnly?: boolean; closeStatus?: CloseStatus; targetId?: string; preset?: DesktopPreset; autoStart?: true; release?: () => Promise<void> }
+  | { kind: "vnc"; source?: DesktopTunnelSource; closeStatus?: CloseStatus; targetId?: string; preset?: DesktopPreset; autoStart?: true; release?: () => Promise<void> }
   | { kind: "storage"; storage: StorageTarget; closeStatus?: CloseStatus }
 );
 type ProfileLoad = { kind: "loading" | "ready"; profiles?: SavedConnections }
@@ -161,6 +161,8 @@ export function Workspace() {
   const sftpPanels = useRef(new Map<string, SftpPanelActions>());
   const editorActions = useRef(new Map<number, EditorTabActions>());
   const desktopActions = useRef(new Map<number, RdpTabActions | VncTabActions>());
+  /** 경로를 다시 여는 중인 화면 탭이다. 같은 탭의 두 번째 요청은 받지 않는다. */
+  const reopeningRoutes = useRef(new Set<number>());
   const cliMounts = useRef(new Map<number, (mounted: boolean) => void>());
   const pendingEditorMounts = useRef(new Set<number>());
   const closingWindow = useRef(false);
@@ -540,7 +542,7 @@ export function Workspace() {
     if (target) openTab(target, tab.remoteEditor ? { remoteEditor: true } : undefined, placement);
   }
 
-  /** 저장된 RDP·VNC 프로필의 경로를 연 뒤 입력칸을 채운 화면 탭을 만든다. 서비스 연결은 탭에서 사용자가 시작한다. */
+  /** 저장된 RDP·VNC 프로필의 경로를 연 뒤 화면 탭을 만든다. 탭은 준비된 경로로 바로 연결을 시작한다. */
   async function openDesktopTarget(target: DesktopProfile, split?: Placement) {
     if (desktopOpening?.id === target.id) return;
     setWindowError("");
@@ -556,7 +558,7 @@ export function Workspace() {
       }
       const id = nextTab.current++;
       setTabs(current => [...current, {
-        id, label: opened.label, kind: opened.kind, source: opened.source, targetId: target.id, preset: opened.preset, release: opened.close,
+        id, label: opened.label, kind: opened.kind, source: opened.source, targetId: target.id, preset: opened.preset, autoStart: true, release: opened.close,
       }]);
       placeTab(id, split);
     } catch (error) {
@@ -568,6 +570,46 @@ export function Workspace() {
         if (ssoExpired(message)) setDesktopRetry({ target, split, error: failure });
       }
     } finally {
+      setDesktopOpening(current => current === pending ? undefined : current);
+    }
+  }
+
+  /** 끊긴 프로필 경로를 닫고 같은 프로필로 다시 열어 화면 탭의 source만 바꾼다. 연결은 탭이 새 source로 시작한다. */
+  async function reopenDesktopRoute(id: number): Promise<boolean> {
+    const tab = liveTabs.current.find(item => item.id === id);
+    if ((tab?.kind !== "rdp" && tab?.kind !== "vnc") || !tab.targetId || closingTabs.current.has(id)) return false;
+    const target = profileLoad.profiles?.targets.find(({ profile }) => profile.id === tab.targetId)?.profile;
+    if (target?.defaultMethod !== "rdp" && target?.defaultMethod !== "vnc") return false;
+    if (desktopOpening?.id === target.id || reopeningRoutes.current.has(id)) return false;
+    reopeningRoutes.current.add(id);
+    setWindowError("");
+    const pending = { id: target.id, label: target.displayName, controller: new AbortController() };
+    desktopOpening?.controller.abort();
+    setDesktopOpening(pending);
+    const previous = tab.source;
+    const release = tab.release;
+    setTabs(current => current.map(item => item.id === id && item.kind === tab.kind ? { ...item, release: undefined } : item));
+    try {
+      await release?.().catch(error => {
+        setWindowError(`${tab.label} 경로 종료 실패: ${String(error)}`);
+        if (previous) keepUnclosedRoute(previous.tabHandle, previous.targetId, tab.label, String(error), previous.targetId === tab.targetId ? "ssm" : "ssh");
+      });
+      const opened = await openDesktopProfile(target, { signal: pending.controller.signal });
+      if (closingWindow.current || pending.controller.signal.aborted || !liveTabs.current.some(item => item.id === id) || closingTabs.current.has(id)) {
+        await opened.close();
+        return false;
+      }
+      setTabs(current => current.map(item => item.id === id && item.kind === tab.kind
+        ? { ...item, source: opened.source, release: opened.close } : item));
+      return true;
+    } catch (error) {
+      if (error instanceof DesktopRouteError) keepUnclosedRoute(error.handle, error.targetId, target.displayName, error.message, error.method);
+      if (!pending.controller.signal.aborted || error instanceof DesktopRouteError) {
+        setWindowError(`${target.displayName} 경로 다시 열기 실패: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      return false;
+    } finally {
+      reopeningRoutes.current.delete(id);
       setDesktopOpening(current => current === pending ? undefined : current);
     }
   }
@@ -1031,11 +1073,12 @@ export function Workspace() {
                   onShare={(targetId, tabHandle, tunnelId) => openTunnel(targetId, tab.name, tab.method, { tab: tabHandle, id: tunnelId })}
                   onOpenDesktop={openDesktop} />
               ) : tab.kind === "rdp" ? (
-                <RdpTab ref={bindDesktopClose} active={visible} label={label} source={tab.source} preset={tab.preset}
+                <RdpTab ref={bindDesktopClose} active={visible} label={label} source={tab.source} preset={tab.preset} autoStart={tab.autoStart}
+                  onReopenRoute={tab.targetId && tab.source ? () => reopenDesktopRoute(id) : undefined}
                   onSecurityMode={(tlsOnly) => setTabs(current => current.map(item => item.id === id && item.kind === "rdp"
                     ? { ...item, tlsOnly } : item))} />
               ) : tab.kind === "vnc" ? (
-                <VncView ref={bindDesktopClose} active={visible} source={tab.source} preset={tab.preset} />
+                <VncView ref={bindDesktopClose} active={visible} source={tab.source} preset={tab.preset} autoStart={tab.autoStart} />
               ) : tab.kind === "storage" ? (
                 <div className="workspace-storage">
                   <div inert={!!tab.closeStatus}>

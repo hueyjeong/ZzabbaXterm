@@ -331,7 +331,7 @@ async fn connect(window: &WebviewWindow, owner: Owner, draft: Draft, notify: Cha
         Err(error) => Err(error.into()),
         Ok(false) => Err(CLEANUP_UNCONFIRMED.into()),
         Ok(true) if life.revoked() => Err(CLOSED.into()),
-        Ok(true) => match draft.approve(window, life.clone(), tunnel_epoch, &mut lease).await {
+        Ok(true) => match draft.approve(window, life.clone(), tunnel_epoch, &mut lease, &output.notify).await {
             Err(error) => Err(error),
             Ok(mut approved) => {
                 let loss = approved.loss();

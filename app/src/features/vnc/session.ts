@@ -1,7 +1,7 @@
 import type { DesktopTunnelSource } from "../tunnels/tunnelIpc";
 import { Channel } from "@tauri-apps/api/core";
 import { documentProof, invokeVnc, readPacket } from "./document";
-import type { RemoteDesktopEvent, RemoteDesktopIdentity, RemoteDesktopSession } from "../remoteDesktop/session";
+import { approvalSignal, type RemoteDesktopEvent, type RemoteDesktopIdentity, type RemoteDesktopSession } from "../remoteDesktop/session";
 import { keysym } from "./keys";
 
 export interface Owner { readonly tab: string; readonly document: number }
@@ -40,11 +40,16 @@ export interface Connection extends RemoteDesktopSession {
 
 export function connect(
   owner: Owner, draft: Draft, started: (session: Connection) => void,
-  notice: (message: string) => void, failed: (message: string) => void,
+  showNotice: (message: string) => void, failed: (message: string) => void,
   clipboard: Pick<Clipboard, "readText" | "writeText"> = navigator.clipboard,
   cleanup?: { readonly closeOpening: () => void; readonly unconfirmed: () => void },
 ): () => void {
   const proof = documentProof();
+  let shown = "";
+  const notice = (message: string) => {
+    shown = message;
+    showNotice(message);
+  };
   function onCloseResult(confirmed: boolean) {
     if (confirmed) return;
     if (cleanup) cleanup.unconfirmed();
@@ -233,7 +238,7 @@ export function connect(
     queued.length = 0;
   }
 
-  const output = new Channel<unknown>((ticket) => { void handle(ticket); });
+  const output = new Channel<unknown>((ticket) => { if (!approvalSignal(ticket, notice, () => shown)) void handle(ticket); });
   async function handle(ticket: unknown) {
     if (done) return;
     try {

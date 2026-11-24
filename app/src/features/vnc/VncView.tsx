@@ -1,4 +1,4 @@
-import { useImperativeHandle, useLayoutEffect, useRef, useState, type Ref, type SubmitEvent } from "react";
+import { useEffect, useImperativeHandle, useLayoutEffect, useRef, useState, type Ref, type SubmitEvent } from "react";
 import { RemoteDesktopView } from "../remoteDesktop/RemoteDesktopView";
 import type { DesktopPreset } from "../remoteDesktop/desktopProfile";
 import type { DesktopTunnelSource } from "../tunnels/tunnelIpc";
@@ -6,12 +6,17 @@ import { CLOSE_UNCONFIRMED, closeOwner, connect, createOwner, type Connection, t
 
 export interface VncTabActions { requestClose(): Promise<boolean> }
 
-export function VncView({ active, source, preset, ref }: {
+type Draft = Parameters<typeof connect>[1];
+
+export function VncView({ active, source, preset, autoStart, ref }: {
   readonly active: boolean;
   readonly source?: DesktopTunnelSource;
   readonly preset?: DesktopPreset;
+  /** 저장 프로필로 연 탭은 기본 인증(VNC 비밀번호)으로 한 번 바로 연결한다. */
+  readonly autoStart?: boolean;
   readonly ref?: Ref<VncTabActions>;
 }) {
+  const autoStarted = useRef(false);
   const owner = useRef<Promise<Owner> | null>(null);
   const cancel = useRef<(() => void) | null>(null);
   const busy = useRef(false);
@@ -79,14 +84,31 @@ export function VncView({ active, source, preset, ref }: {
     };
   }, []);
 
-  async function open(event: SubmitEvent<HTMLFormElement>) {
+  function open(event: SubmitEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!active || !event.nativeEvent.isTrusted || busy.current || closing.current || unconfirmed.current || sealed.current) return;
+    if (!event.nativeEvent.isTrusted) return;
     const fields = new FormData(event.currentTarget);
     const password = fields.get("auth") === "password";
-    const draft = source ? { source, password } : {
+    void start(source ? { source, password } : {
       host: String(fields.get("host") ?? "").trim(), port: Number(fields.get("port")), password,
-    };
+    });
+  }
+
+  useEffect(() => {
+    if (!autoStart || !active || autoStarted.current || !(source || preset)) return;
+    let stopped = false;
+    // StrictMode에서 즉시 해제된 첫 마운트는 연결을 시작하지 않는다.
+    void Promise.resolve().then(() => {
+      if (stopped || autoStarted.current) return;
+      autoStarted.current = true;
+      void start(source ? { source, password: true } : { host: preset!.host, port: preset!.port, password: true });
+    });
+    return () => { stopped = true; };
+  }, [autoStart, active, source, preset]);
+
+  /** 승인·자격 증명 확인은 Rust 네이티브 창이 맡는다. 여기서는 중복·종료 중 연결만 막는다. */
+  async function start(draft: Draft) {
+    if (!active || busy.current || closing.current || unconfirmed.current || sealed.current) return;
     busy.current = true;
     cancel.current?.();
     cancel.current = null;
@@ -125,7 +147,7 @@ export function VncView({ active, source, preset, ref }: {
   }
 
   return <section className="remote-desktop-view" aria-label="VNC" hidden={!active} inert={!active}>
-    <form className="remote-desktop-toolbar" onSubmit={(event) => void open(event)}>
+    <form className="remote-desktop-toolbar" onSubmit={open}>
       {source ? <span>SSH 터널 · [{source.destination.host}]:{source.destination.port}</span> : <>
         <label>TLS 호스트 <input name="host" maxLength={253} required autoComplete="off" defaultValue={preset?.host} disabled={connecting || cleanupBlocked} /></label>
         <label>TLS 포트 <input name="port" type="number" min={1} max={65535} defaultValue={preset?.port ?? 5900} required disabled={connecting || cleanupBlocked} /></label>

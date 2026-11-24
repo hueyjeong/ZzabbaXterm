@@ -13,11 +13,14 @@ use crate::{connections::{SavedRoute, profile::valid_id}, tunnels::{Destination,
 use super::{Error, Event, Session, native, route};
 use input::{Command, Controls};
 
-const COMMANDS: [&str; 5] = ["rdp_prepare", "rdp_connect", "rdp_input", "rdp_ack", "rdp_close"];
+const COMMANDS: [&str; 6] = ["rdp_prepare", "rdp_connect", "rdp_input", "rdp_input_batch", "rdp_ack", "rdp_close"];
 const CLOSED: &str = "RDP 세션이 닫혔습니다";
 const MAX_SAFE: u64 = (1 << 53) - 1;
 const CHUNK: usize = 256 * 1024;
 const MAX_JSON: usize = 6 * super::clipboard::MAX_TEXT + 4096;
+const MAX_BATCH: usize = 64;
+/// 묶음 처리 중 이 개수마다 controls 잠금을 놓아 화면 이벤트 처리가 오래 기다리지 않게 한다.
+const LOCK_SPAN: usize = 16;
 
 pub(crate) fn handles(command: &str) -> bool { COMMANDS.contains(&command) }
 
@@ -335,13 +338,17 @@ pub(crate) fn dispatch(invoke: Invoke) {
             let command = read!(Command, "input");
             drop(state);
             invoke.resolver.respond_async(async move {
-                match slot.controls.try_lock().map_err(|_| InvokeError::from(message(Error::Busy)))?
-                    .send(&slot.life, command).await {
-                    Ok(()) => Ok(true),
-                    Err(Error::StaleDisplay) => Ok(false),
-                    Err(error) => Err(InvokeError::from(message(error))),
+                match input_batch(&slot, vec![command]).await.map_err(|error| InvokeError::from(Failure::from(error)))?.pop() {
+                    Some(Reply::Failed(error)) => Err(InvokeError::from(Failure::from(error))),
+                    Some(reply) => Ok(reply),
+                    None => Err(InvokeError::from(CLOSED)),
                 }
             });
+        }
+        "rdp_input_batch" => {
+            let commands = read!(Vec<Command>, "inputs");
+            drop(state);
+            invoke.resolver.respond_async(async move { input_batch(&slot, commands).await.map_err(|error| InvokeError::from(Failure::from(error))) });
         }
         "rdp_connect" => {
             if !cfg!(any(windows, target_os = "linux")) {
@@ -385,7 +392,7 @@ pub(crate) fn dispatch(invoke: Invoke) {
     }
 }
 
-async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draft: Draft, tunnel_epoch: u64, approval: Arc<()>, lease: &mut Option<DesktopLease>) -> Result<(), String> {
+async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draft: Draft, tunnel_epoch: u64, approval: Arc<()>, lease: &mut Option<DesktopLease>) -> Result<(), Failure> {
     let life = &slot.life;
     let prompt = life.child_token();
     let _prompt_lifetime = prompt.clone().drop_guard();
@@ -408,7 +415,7 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
         window.state::<TunnelTabs>().preflight_desktop(tunnel_epoch, (&source.tab_handle, &source.tunnel_id),
             &source.target_id, &destination, Protocol::Rdp)?;
         let description = format!("{description}\n{}", describe_route(&saved));
-        native::confirm(window.clone(), description, prompt.clone(), approval.clone()).await.map_err(message)?;
+        native::confirm(window.clone(), description, prompt.clone(), approval.clone(), notify.clone()).await.map_err(message)?;
         let target_name = format!("{dns} (TLS DNS)");
         let caller = window.clone();
         let live = prompt.clone();
@@ -426,7 +433,7 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
         let endpoint = format!("{}:{}", approved_destination.host, approved_destination.port);
         (target, Some(loss), target_name, endpoint)
     } else {
-        native::confirm(window.clone(), description, prompt.clone(), approval.clone()).await.map_err(message)?;
+        native::confirm(window.clone(), description, prompt.clone(), approval.clone(), notify.clone()).await.map_err(message)?;
         let target_name = format!("{dns}:{}", draft.port);
         let endpoint = target_name.clone();
         (route::direct(dns.clone(), draft.port, size, draft.tls_only), None, target_name, endpoint)
@@ -446,21 +453,23 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
             let window = window.clone();
             let live = prompt.clone();
             let approval = approval.clone();
+            let notify = notify.clone();
             move |request| {
                 let window = window.clone();
                 let live = live.clone();
                 let approval = approval.clone();
-                async move { native::trust(window, request, live, approval).await }
+                let notify = notify.clone();
+                async move { native::trust(window, request, live, approval, notify).await }
             }
         },
     };
     let mut session = tokio::select! { biased;
         error = &mut stopped => {
             prompt.cancel();
-            return Err(message(error).into());
+            return Err(error.into());
         },
         session = Session::open(target, tokio_rustls::rustls::RootCertStore::empty(), trust,
-            || native::account(window.clone(), target_name, prompt.clone(), approval.clone()), AuthIo::new(slot, lease.as_ref())) => session.map_err(message)?,
+            || native::account(window.clone(), target_name, prompt.clone(), approval.clone(), notify.clone()), AuthIo::new(slot, lease.as_ref())) => session.map_err(message)?,
     };
     drop(approval);
     let operation = async {
@@ -535,17 +544,98 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
     };
     prompt.cancel();
     if result.is_ok() {
-        session.finish().await.map_err(|error| message(error).into())
+        session.finish().await.map_err(Failure::from)
     } else {
         session.close().await;
-        result.map_err(|error| message(error).into())
+        result.map_err(Failure::from)
     }
+}
+
+/// 연결·입력 실패를 탭에 알리는 값이다. `kind: "transport"`는 전송 연결이 끊긴 경우로, 터널 경로는 다시 열어야 한다.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct Failure { kind: Option<&'static str>, message: String }
+
+impl Serialize for Failure {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(kind) = self.kind { map.serialize_entry("kind", kind)?; }
+        map.serialize_entry("message", &self.message)?;
+        map.end()
+    }
+}
+
+impl From<Error> for Failure {
+    fn from(error: Error) -> Self {
+        Self { kind: (error == Error::Transport).then_some("transport"), message: message(error).into() }
+    }
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Self { Self { kind: None, message } }
+}
+
+impl From<&'static str> for Failure {
+    fn from(message: &'static str) -> Self { message.to_owned().into() }
+}
+
+/// 입력 한 건의 결과다. `busy`는 순번을 쓰지 않았으므로 같은 순번으로 다시 보낸다.
+#[derive(Debug, PartialEq, Eq)]
+enum Reply { Ok, Stale, Busy, Failed(Error) }
+
+impl Serialize for Reply {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        match self {
+            Self::Ok => serializer.serialize_str("ok"),
+            Self::Stale => serializer.serialize_str("stale"),
+            Self::Busy => serializer.serialize_str("busy"),
+            Self::Failed(error) => {
+                let mut map = serializer.serialize_map(None)?;
+                map.serialize_entry("error", message(*error))?;
+                if *error == Error::Transport { map.serialize_entry("kind", "transport")?; }
+                map.end()
+            }
+        }
+    }
+}
+
+impl From<Result<(), Error>> for Reply {
+    fn from(result: Result<(), Error>) -> Self {
+        match result {
+            Ok(()) => Self::Ok,
+            Err(Error::StaleDisplay) => Self::Stale,
+            Err(Error::Busy) => Self::Busy,
+            Err(error) => Self::Failed(error),
+        }
+    }
+}
+
+/// 입력을 순서대로 처리하고 `busy`에서 멈춘다. 남은 항목은 같은 순번으로 다시 보내야 한다.
+async fn input_batch(slot: &Slot, commands: Vec<Command>) -> Result<Vec<Reply>, Error> {
+    if commands.is_empty() || commands.len() > MAX_BATCH { return Err(Error::Bounds); }
+    let mut replies = Vec::with_capacity(commands.len());
+    let mut commands = commands.into_iter().peekable();
+    while commands.peek().is_some() {
+        let mut controls = tokio::select! { biased;
+            () = slot.life.cancelled() => return Err(Error::Closed),
+            controls = slot.controls.lock() => controls,
+        };
+        for command in commands.by_ref().take(LOCK_SPAN) {
+            let reply = Reply::from(controls.send(&slot.life, command).await);
+            let busy = reply == Reply::Busy;
+            replies.push(reply);
+            if busy { return Ok(replies); }
+        }
+    }
+    Ok(replies)
 }
 
 pub(super) fn message(error: Error) -> &'static str {
     match error {
         Error::Bounds => "RDP 화면 또는 입력 범위가 올바르지 않습니다",
         Error::Busy => "RDP 세션이 작업 중입니다",
+        Error::CopyPending => "RDP 복사가 진행 중입니다",
         Error::ChannelUnavailable => "서버가 이 RDP 채널을 열지 않았습니다",
         Error::Clipboard => "RDP 클립보드 교환 실패",
         Error::Closed => CLOSED,
@@ -584,6 +674,56 @@ mod tests {
         assert!(close.as_mut().poll(&mut cx).is_pending());
         assert!(closed.send(Ok(())).is_ok());
         assert!(matches!(close.as_mut().poll(&mut cx), std::task::Poll::Ready(Ok(()))));
+    }
+
+    fn input(sequence: u64, action: serde_json::Value) -> Command {
+        serde_json::from_value(serde_json::json!({ "sequence": sequence, "epoch": 1, "displayGeneration": 1, "action": action })).unwrap()
+    }
+
+    #[test]
+    fn rdp_input_replies_map_busy_and_stale_without_failing() {
+        assert_eq!(Reply::from(Err(Error::Busy)), Reply::Busy);
+        assert_eq!(Reply::from(Err(Error::StaleDisplay)), Reply::Stale);
+        assert_eq!(Reply::from(Err(Error::CopyPending)), Reply::Failed(Error::CopyPending));
+        assert_eq!(serde_json::to_value([Reply::Ok, Reply::Stale, Reply::Busy, Reply::Failed(Error::CopyPending), Reply::Failed(Error::Transport)]).unwrap(),
+            serde_json::json!(["ok", "stale", "busy", { "error": message(Error::CopyPending) },
+                { "error": message(Error::Transport), "kind": "transport" }]));
+        assert_eq!(serde_json::to_value(Failure::from(Error::Transport)).unwrap(),
+            serde_json::json!({ "kind": "transport", "message": message(Error::Transport) }));
+        assert_eq!(serde_json::to_value(Failure::from(CLOSED)).unwrap(), serde_json::json!({ "message": CLOSED }));
+    }
+
+    #[tokio::test]
+    async fn rdp_input_batch_stops_at_busy_and_accepts_the_same_sequence_again() {
+        use super::super::{Input, InputHandle, SessionId};
+
+        let slot = Slot::new(1);
+        let id = SessionId(1);
+        let (sender, mut commands) = tokio::sync::mpsc::channel(1);
+        slot.controls.lock().await.display(id, InputHandle { id, input: sender.clone() }, (640, 480), 1);
+        let key = |sequence, down| input(sequence, serde_json::json!({ "kind": "key", "code": 0x1e, "extended": false, "down": down }));
+        assert_eq!(input_batch(&slot, Vec::new()).await, Err(Error::Bounds));
+        assert_eq!(input_batch(&slot, (1..=65).map(|n| key(n, true)).collect()).await, Err(Error::Bounds));
+
+        // 세션 작업이 명령을 꺼내지 않아 큐가 찬 상태다. 두 번째 항목은 busy이고 세 번째는 처리하지 않는다.
+        let (filler, _) = oneshot::channel();
+        sender.try_send((None, Input::ReadClipboardText, filler)).unwrap();
+        let replies = input_batch(&slot, vec![input(1, serde_json::json!({ "kind": "active", "active": true })), key(2, true), key(3, false)]).await;
+        assert_eq!(replies, Ok(vec![Reply::Ok, Reply::Busy]));
+
+        let written = tokio::spawn(async move {
+            let mut keys = Vec::new();
+            while let Some((_, input, ack)) = commands.recv().await {
+                if let Input::ScanCode { code, released, .. } = input { keys.push((code, released)); }
+                let _ = ack.send(Ok(()));
+            }
+            keys
+        });
+        assert_eq!(input_batch(&slot, vec![key(2, true), key(3, false)]).await, Ok(vec![Reply::Ok, Reply::Ok]));
+        assert_eq!(input_batch(&slot, vec![key(3, true)]).await, Ok(vec![Reply::Failed(Error::Closed)]));
+        drop(slot);
+        drop(sender);
+        assert_eq!(written.await.unwrap(), vec![(0x1e, false), (0x1e, true)]);
     }
 
     #[test]

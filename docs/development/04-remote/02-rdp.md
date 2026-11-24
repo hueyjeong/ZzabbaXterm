@@ -40,6 +40,13 @@
 - **체인 실패 후의 범위**: 체인 검증이 실패해 1회 승인한 뒤에는 그 지문만 검증한다. 이름 불일치·만료·알 수 없는 CA 같은 체인/이름/유효기간 문제는 승인 카드의 `사유` 항목으로 표시하며, 승인 후에는 지문 일치가 연결 조건이다.
 - **범위**: TLS 전용(opt-in)과 NLA 경로 모두 같은 규칙을 쓴다. 인증서 검증을 끄는 옵션은 없다. 2026-11-23 실측 시점에 이 Windows 사용자 신뢰 저장소에는 시험 CA가 남아 있지 않다(`certutil -user -store Root`에서 0건).
 
+## 입력 전달과 승인 창
+
+- **입력 큐**: 탭은 입력을 최대 512개까지 쌓고 키·포인터·활성·해제를 `rdp_input_batch`로 64개씩 묶어 보낸다. 복사·붙여넣기·해상도 변경은 묶지 않고 `rdp_input`으로 하나씩 보낸다. 큐가 넘치면 버튼 상태가 같은 오래된 포인터 이동부터 버리되 큐의 마지막 포인터는 남기고, 연결은 끊지 않는다. 키 입력까지 버리면 `RDP 입력 일부를 버렸습니다`를 표시하고 큐가 빈 뒤 `release`를 한 번 보내 눌린 키를 해제한다.
+- **결과와 순번**: `rdp_input`·`rdp_input_batch`의 항목 결과는 `ok`·`stale`·`busy`(묶음에서는 오류 `{ error, kind? }`도 포함)다. Rust는 세션 작업 큐에 최대 500ms 기다려 넣고, 그래도 차 있으면 `busy`로 답하며 그 순번을 쓰지 않는다. 묶음은 16개마다 입력 잠금을 놓는다. 탭은 순번을 `busy`가 아닌 결과에서만 올리고, `busy` 항목은 15ms 뒤 같은 순번으로 다시 보낸다. 같은 키·포인터 항목이 3초 넘게 `busy`면 그 항목과 같은 epoch의 남은 입력을 모두 버리고 바로 다음 순번으로 `release`를 보낸다(수정키 keyup만 빠져 뒤 키가 단축키로 적용되는 것을 막는다). 활성 전환이 3초 넘게 `busy`면 `RDP 세션이 입력 활성화를 받지 않아 연결을 닫았습니다`로 끝내고, `release`는 상한 없이 다시 보낸다. 복사·붙여넣기·해상도 변경은 `busy`여도 다시 보내지 않고 `RDP 세션이 작업 중입니다`를 표시한다. 앞선 복사 응답을 기다리는 중의 복사는 `busy`가 아닌 `RDP 복사가 진행 중입니다` 오류로 답해 뒤 입력을 막지 않는다. 화면 이벤트가 밀려 복사를 시작할 수 없을 때는 `busy`다.
+- **종료 종류**: `rdp_connect`와 입력 실패는 `{ kind?, message }`로 답한다. `kind: "transport"`는 전송 연결이 끊긴 종료이며, 터널 경로 탭은 이 값으로 경로를 다시 열지 정한다.
+- **승인 창**: 연결 승인·계정·인증서 창을 띄우기 직전에 주 창의 최소화를 푼다. 앱이 이미 전경일 때만 포커스를 옮기고(Windows는 `SetForegroundWindow`를 직접 부르고 실패는 무시한다. tao `set_focus`는 실패 시 Alt 입력을 우회해 넣는다), 백그라운드면 포커스를 받을 때까지 작업 표시줄을 깜빡인다(`UserAttentionType::Critical`). Windows 연결 승인은 `MessageBoxW`(`MB_OKCANCEL | MB_ICONQUESTION | MB_SETFOREGROUND | MB_DEFBUTTON2`)를 쓴다. 창이 열려 있는 동안 출력 채널로 `approval`을, 닫히면 `approval-done`을 보내 탭에 `승인 창 확인 필요`를 표시한다. 창을 띄우지 못해도 `approval-done`은 가며, 이 신호는 승인 대기 알림만 지운다. 이 처리는 `app/src-tauri/src/desktop_dialog.rs`에서 VNC와 함께 쓴다.
+
 ## 실측 기록
 
 - xrdp 0.9.24(Ubuntu 24.04 패키지, `security_layer=negotiate`)는 `HYBRID|HYBRID_EX`만 요청하면 `RDP_NEG_RSP selectedProtocol = 0x0`(RDP 표준 보안)을 돌려주고, `SSL`을 요청하면 `0x1`(TLS 전용)을 돌려준다. 즉 NLA를 모르는 서버는 SSL로 다운그레이드하지 않고 RDP 표준 보안을 고른다. 앱은 NLA가 아닌 선택을 모두 NLA 미지원으로 보고 opt-in이 켜진 경우에만 `SSL` 요청으로 한 번 재협상한다.
@@ -54,4 +61,4 @@
 
 ## 저장 프로필로 열기
 
-연결 트리의 RDP 프로필은 `app/src/features/remoteDesktop/desktopProfile.ts`의 `openDesktopProfile`로 연다. 직접 경로는 입력칸만 미리 채운다. SSH 경로는 저장된 직접 SSH 대상으로 서버 루프백 `-L` 전달을 승인받아 열고, Rust가 준비 완료로 확인한 전달을 탭의 터널 출처로 넘긴다. TLS 인증 DNS와 TLS 전용 허용 값은 프로필에서 채운다. 연결은 사용자가 **직접 연결** 또는 **터널 연결**을 눌러 시작한다. SSM 경로는 프로필 자신을 경로 대상으로 공식 SSM 포트 전달(`AWS-StartPortForwardingSessionToRemoteHost`, 원격 호스트는 프로필의 TLS 인증 DNS 이름)을 승인받아 열고, Rust가 세션 소유권까지 확인한 전달을 같은 방식으로 넘긴다. 승인 창에는 SSM 프로필·리전·관리 노드를 표시한다. 실제 AWS 경로는 미실행이다([R01 SSM 포트 전달](01-tunnels.md#ssm-포트-전달)).
+연결 트리의 RDP 프로필은 `app/src/features/remoteDesktop/desktopProfile.ts`의 `openDesktopProfile`로 연다. 직접 경로는 프로필의 주소로 바로 연결한다. SSH 경로는 저장된 직접 SSH 대상으로 서버 루프백 `-L` 전달을 승인받아 열고, Rust가 준비 완료로 확인한 전달을 탭의 터널 출처로 넘긴다. TLS 인증 DNS와 TLS 전용 허용 값은 프로필에서 채운다. 프로필로 연 탭은 경로가 준비된 뒤 입력칸 없이 한 번 바로 연결을 시작한다. 신뢰 경계는 Rust의 네이티브 연결 승인·계정·인증서 창이며, 빈 **RDP 연결** 메뉴로 연 탭만 입력칸을 보이고 사용자가 **직접 연결** 또는 **터널 연결**을 눌러 시작한다. 연결이 끊기면 오류와 **다시 연결**을 보이고, 입력칸은 **연결 설정 편집**을 눌렀을 때만 보인다. 터널 경로가 `kind: "transport"`로 끊기면 **다시 연결**이 같은 프로필의 경로를 다시 열고 새 경로로 연결한다. SSM 경로는 프로필 자신을 경로 대상으로 공식 SSM 포트 전달(`AWS-StartPortForwardingSessionToRemoteHost`, 원격 호스트는 프로필의 TLS 인증 DNS 이름)을 승인받아 열고, Rust가 세션 소유권까지 확인한 전달을 같은 방식으로 넘긴다. 승인 창에는 SSM 프로필·리전·관리 노드를 표시한다. 실제 AWS 경로는 미실행이다([R01 SSM 포트 전달](01-tunnels.md#ssm-포트-전달)).

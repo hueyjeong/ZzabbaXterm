@@ -3,5 +3,5 @@
   "identifier": "local-rdp",
   "local": true,
   "webviews": ["main"],
-  "permissions": ["allow-rdp-prepare", "allow-rdp-connect", "allow-rdp-input", "allow-rdp-ack", "allow-rdp-close"]
+  "permissions": ["allow-rdp-prepare", "allow-rdp-connect", "allow-rdp-input", "allow-rdp-input-batch", "allow-rdp-ack", "allow-rdp-close"]
 }
