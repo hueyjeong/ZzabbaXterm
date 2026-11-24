@@ -23,23 +23,25 @@ pub(super) fn launch_interactive(
     id: &str,
     owner: &str,
     document: u64,
+    trust: &crate::ssh::host_trust::Confirm,
     confirm: impl FnOnce(String) -> Result<bool, String>,
 ) -> Result<Launch, String> {
     with_saved_method(config, id, |method, _| match method {
         MethodRef::Local { shell, start_directory } => local(shell, start_directory).map(Launch::Local),
         MethodRef::Ssm { profile, region, instance_id } => remote::Target::new(profile, region, instance_id).map(Launch::Ssm),
-        MethodRef::Ssh { ssh } => crate::ssh::terminal::saved_interactive(config, ssh, owner, document, confirm).map(Launch::from),
+        MethodRef::Ssh { ssh } => crate::ssh::terminal::saved_interactive(config, ssh, owner, document, trust, confirm).map(Launch::from),
         MethodRef::S3 { .. } => Err("S3 연결은 스토리지 탭에서 열 수 있습니다".into()),
         MethodRef::Desktop { .. } => Err("원격 화면 연결은 RDP·VNC 탭에서 열 수 있습니다".into()),
     })
 }
 
 pub(super) fn approve_remote_editor<T>(config: &Path, id: &str,
+    trust: &crate::ssh::host_trust::Confirm,
     confirm: impl FnOnce(String) -> Result<bool, String>,
     register: impl FnOnce(SavedLaunch) -> Result<T, String>,
 ) -> Result<T, String> {
     let saved = with_saved_ssh(config, id, |saved| saved)?.ok_or("저장된 SSH 연결을 찾을 수 없습니다")?;
-    let (launch, message) = prepare_remote_editor(config, id, saved.0, &saved.1)?;
+    let (launch, message) = prepare_remote_editor(config, id, saved.0, &saved.1, trust)?;
     if !confirm(message)? {
         return Err("SSH nano 연동 승인이 취소되었습니다".into());
     }
@@ -82,7 +84,7 @@ fn nano_approval_admits_only_the_confirmed_saved_ssh_and_document() {
     wrong_pin["targets"][0]["profile"]["ssh"]["hostKeyFingerprint"] =
         json!("SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
     fs::write(&file, serde_json::to_vec(&wrong_pin).unwrap()).unwrap();
-    assert_eq!(approve_remote_editor(directory, ID, |_| panic!("PIN 불일치 상태에서 승인 창을 열었습니다"),
+    assert_eq!(approve_remote_editor(directory, ID, &crate::ssh::terminal::tests::no_trust(), |_| panic!("PIN 불일치 상태에서 승인 창을 열었습니다"),
         |_| -> Result<(), String> { panic!("PIN 불일치 상태에서 세션을 등록했습니다") },
     ).unwrap_err(), "등록된 SSH 호스트 키의 지문이 다릅니다");
 
@@ -103,7 +105,7 @@ fn nano_approval_admits_only_the_confirmed_saved_ssh_and_document() {
         let document = sessions.document("main");
         let confirmations = Cell::new(0);
         let launch_admissions = Cell::new(0);
-        let result = approve_remote_editor(directory, ID, |message| {
+        let result = approve_remote_editor(directory, ID, &crate::ssh::terminal::tests::no_trust(), |message| {
             confirmations.set(confirmations.get() + 1);
             for field in ["프로필: ssh-server", "리비전: 1", "서버: dev.example.test", "포트: 2222", "계정: deploy", SHA,
                 "관리자가 SSH 셸과 SFTP에서 같은 경로가 같은 파일을 가리킨다고 확인했습니까?"] {

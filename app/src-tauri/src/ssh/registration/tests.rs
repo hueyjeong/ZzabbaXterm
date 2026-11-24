@@ -25,7 +25,7 @@ fn target(id: &str) -> Option<Endpoint> {
 fn request() -> Request {
     Request {
         target_id: "dev".into(), host: "DEV.example.invalid".into(), port: 2222,
-        expected_fingerprint: SHA.into(),
+        expected_fingerprint: Some(SHA.into()),
     }
 }
 
@@ -62,7 +62,7 @@ fn checks_current_target_and_fingerprint_before_opening_the_picker() {
         (Request { port: 22, ..request() }, Rejection::EndpointMismatch),
         (Request { port: 0, ..request() }, Rejection::InvalidEndpoint),
         (Request { host: "host\nInjectedOption".into(), ..request() }, Rejection::InvalidEndpoint),
-        (Request { expected_fingerprint: "SHA256:invalid".into(), ..request() }, Rejection::InvalidFingerprint),
+        (Request { expected_fingerprint: Some("SHA256:invalid".into()), ..request() }, Rejection::InvalidFingerprint),
     ] {
         assert_eq!(verify(&state, request, target, || panic!("picker"), |_, _| panic!("confirm")), Err(error));
     }
@@ -152,7 +152,7 @@ fn commits_exactly_the_confirmed_key_without_automatic_replacement() {
     let sessions = Sessions::default();
     assert_eq!(state.commit(0, &attempt(0), &ticket, &sessions), Ok(expected));
     assert_eq!(state.commit(0, &attempt(0), &ticket, &sessions), Err(Rejection::Cancelled));
-    let replacement = Request { expected_fingerprint: OTHER_SHA.into(), ..request() };
+    let replacement = Request { expected_fingerprint: Some(OTHER_SHA.into()), ..request() };
     let replacement = verify(&state, replacement, target, || Some(path), |_, _| true).unwrap();
     assert_eq!(state.commit(0, &attempt(0), &replacement, &sessions), Err(Rejection::ExistingPinConflict));
     let endpoint = endpoint();
@@ -233,4 +233,48 @@ fn saved_registration_acl_allows_only_the_local_main_webview() {
     assert!(acl.resolve_access(command, "main", "secondary", &Origin::Local).is_none());
     let remote = Origin::Remote { url: "https://remote.example.invalid".parse().unwrap() };
     assert!(acl.resolve_access(command, "main", "main", &remote).is_none());
+}
+
+#[test]
+fn trust_saved_rejects_busy_unknown_targets_and_a_document_changed_during_confirmation() {
+    use crate::{connections::{self, profile::Draft, tests::ssh_draft}, ssh::{TRUST_DIRECTORY, host_trust::Confirm}};
+    use serde_json::json;
+    use tokio_util::sync::CancellationToken;
+
+    let (root, state) = setup();
+    let config = root.path().join("config");
+    let mut input = ssh_draft(&config);
+    input["target"]["ssh"]["host"] = json!("dev.example.invalid");
+    input["target"]["ssh"].as_object_mut().unwrap().remove("hostKeyFingerprint");
+    connections::register(&config, serde_json::from_value::<Draft>(input).unwrap().validate().unwrap()).unwrap();
+    let pins = TrustStore::create(&config.join(TRUST_DIRECTORY)).unwrap();
+    let sessions = Arc::new(Sessions::default());
+    let scan = |_: &Path, host: &str, port: u16, _: &CancellationToken| Ok(format!("[{host}]:{port} {KEY}"));
+    let refuse: Confirm = Arc::new(|_, _| panic!("확인 창을 열었습니다"));
+    let trust_saved = |id: &str, document: u64, trust: &Confirm| {
+        state.trust_saved(&config, id, &sessions, document, (trust, &refuse), &scan, crate::tunnels::ssm::open_ssh_forward)
+    };
+
+    assert_eq!(trust_saved("other", 0, &refuse), Err(Rejection::InvalidTarget.saved_message().into()));
+    // 열려 있는 확인 창이 있으면 새 창을 띄우지 않는다.
+    state.begin(0, None).unwrap();
+    assert_eq!(trust_saved("ssh-server", 0, &refuse), Err(Rejection::Busy.saved_message().into()));
+    state.pending.lock().unwrap().take();
+    assert_eq!(trust_saved("ssh-server", 1, &refuse), Err(Rejection::StaleDocument.saved_message().into()));
+
+    // 확인 창을 띄운 사이 페이지가 바뀌면 승인해도 핀을 쓰지 않는다.
+    let navigated = Arc::clone(&sessions);
+    let navigate: Confirm = Arc::new(move |_, _| { navigated.navigate(OWNER); Ok(true) });
+    assert_eq!(trust_saved("ssh-server", 0, &navigate), Err(Rejection::StaleDocument.saved_message().into()));
+    assert!(pins.pinned(&endpoint()).unwrap().is_none());
+    assert!(state.pending.lock().unwrap().is_none());
+
+    let document = sessions.document(OWNER);
+    let accept: Confirm = Arc::new(|message, _| {
+        assert!(message.contains("SHA256 지문: SHA256:UCUiLr7Pjs9wFFJMDByLgc3NrtdU344OgUM45wZPcIQ"), "{message}");
+        Ok(true)
+    });
+    assert_eq!(trust_saved("ssh-server", document, &accept), Ok(Trusted { fingerprint: SHA.into(), status: "registered" }));
+    assert_eq!(trust_saved("ssh-server", document, &refuse), Ok(Trusted { fingerprint: SHA.into(), status: "unchanged" }));
+    assert!(pins.pinned(&endpoint()).unwrap().is_some());
 }

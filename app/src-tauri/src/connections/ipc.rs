@@ -105,7 +105,8 @@ pub(crate) fn handle(invoke: Invoke, other: fn(Invoke) -> bool) -> bool {
             let draft = args.get("draft")?;
             Ok(move |caller: Webview, document| {
                 let config = caller.path().app_config_dir().map_err(|error| format!("앱 설정 디렉터리: {error}"))?;
-                probe::start(&caller.state::<Sessions>(), caller.label(), document, draft_id, draft_version, draft, config)
+                let trust = caller.app_handle().get_webview_window(caller.label()).map(crate::ssh::registration::host_key_trust);
+                probe::start_trusting(&caller.state::<Sessions>(), caller.label(), document, draft_id, draft_version, draft, config, trust)
             })
         }),
         crate::ssh::registration::COMMAND | crate::ssh::registration::COMMIT | crate::ssh::registration::CANCEL => {
@@ -114,6 +115,10 @@ pub(crate) fn handle(invoke: Invoke, other: fn(Invoke) -> bool) -> bool {
         "register_saved_ssh_host" => dispatch(invoke, "register_saved_ssh_host", |args| {
             let target_id: String = args.get("targetId")?;
             Ok(move |caller: Webview, document| crate::ssh::registration::register_saved(&caller, document, target_id))
+        }),
+        "trust_saved_ssh_host" => dispatch(invoke, "trust_saved_ssh_host", |args| {
+            let target_id: String = args.get("targetId")?;
+            Ok(move |caller: Webview, document| crate::ssh::registration::trust_saved(&caller, document, target_id))
         }),
         "connection_ssh_test_attach" => dispatch(invoke, "connection_ssh_test_attach", |args| {
             let run = args.get("run")?;

@@ -213,54 +213,40 @@ describe("F01 SSH 마법사", () => {
     expect(ipc).toHaveBeenLastCalledWith("cancel_ssh_host", { attempt });
   });
 
-  it("이전 호스트 키 확인과 늦은 SSM 선택으로 직접 SSH 시험을 승인할 수 없다", async () => {
+  it("지문 없이 SSH 초안을 완성하고 호스트 키 확인 없이 시험하며 이전 확인은 새 초안에 적용하지 않는다", async () => {
     const first = Promise.withResolvers<void>();
-    const verifySshHost = vi.fn().mockReturnValueOnce(first.promise).mockResolvedValueOnce(undefined);
+    const verifySshHost = vi.fn().mockReturnValueOnce(first.promise);
     const peer = { ...nativePeer(), verifySshHost };
     const wizard = createLocalConnectionWizard("work-draft", draft);
-    const ssm = { profile: "company", region: "ap-northeast-2", instanceId: "i-0123456789abcdef0" };
-    const host = {
-      host: "ssh.actual.test", port: "2222", account: "deploy",
-      hostKeyFingerprint: `SHA256:${"A".repeat(43)}`,
-    };
+    const host = { host: "ssh.actual.test", port: "2222", account: "deploy", hostKeyFingerprint: "" };
     wizard.go(1);
     wizard.selectMethod("ssh");
-    wizard.editSsh({ ...host, transport: { kind: "ssm" } });
+    wizard.editSsh({ ...host, transport: { kind: "direct" } });
     wizard.go(1);
-    wizard.editSsh({ auth: { kind: "storedPassword", itemId: "vault-item" } });
+    wizard.editSsh({ auth: { kind: "manualPassword" } });
     wizard.go(1, null);
-    expect(wizard.getSnapshot().step).toBe("auth");
-    wizard.go(1, ssm);
-    await wizard.test(peer);
-    expect(ipc).not.toHaveBeenCalled();
+    expect(wizard.getSnapshot().step).toBe("verify");
     const oldApproval = wizard.verifySshHost(peer);
     wizard.go(-1);
     wizard.go(-1);
-    wizard.editSsh({ host: "second.actual.test", transport: { kind: "direct" } });
+    wizard.editSsh({ host: "second.actual.test" });
     wizard.go(1);
-    wizard.editSsh({ auth: { kind: "manualPassword" } });
-    wizard.go(1, ssm);
+    wizard.go(1, null);
     first.resolve();
     await oldApproval;
-    await wizard.test(peer);
-    await wizard.save(peer);
-    expect(ipc).not.toHaveBeenCalled();
-    await wizard.verifySshHost(peer);
+    expect(wizard.getSnapshot().sshPin).toEqual({ kind: "idle" });
     expect(verifySshHost.mock.calls).toEqual([
-      [{ targetId: draft.target.id, host: host.host, port: 2222, hostKeyFingerprint: host.hostKeyFingerprint }, expect.any(Object),
-      { draftId: "work-draft", draftVersion: expect.any(Number), attemptId: "1" }, expect.objectContaining({ aborted: true })],
-      [{ targetId: draft.target.id, host: "second.actual.test", port: 2222, hostKeyFingerprint: host.hostKeyFingerprint }, expect.any(Object),
-      { draftId: "work-draft", draftVersion: expect.any(Number), attemptId: "2" }, expect.objectContaining({ aborted: false })],
+      [{ targetId: draft.target.id, host: host.host, port: 2222 }, expect.any(Object),
+        { draftId: "work-draft", draftVersion: expect.any(Number), attemptId: "1" }, expect.objectContaining({ aborted: true })],
     ]);
     ipc.mockRejectedValueOnce("SSH 연결 시험을 실행할 수 없습니다");
     await wizard.test(peer);
-    await wizard.save(peer);
     expect(ipc.mock.calls).toEqual([["connection_test_start", {
       draftId: "work-draft", draftVersion: expect.any(Number), draft: {
         ...draft, target: {
           id: draft.target.id, groupId: draft.target.groupId, displayName: draft.target.displayName,
           defaultMethod: "ssh", ssh: {
-            host: "second.actual.test", port: 2222, account: "deploy", hostKeyFingerprint: host.hostKeyFingerprint,
+            host: "second.actual.test", port: 2222, account: "deploy",
             transport: { kind: "direct" }, auth: { kind: "manualPassword" },
           },
         },
@@ -269,7 +255,18 @@ describe("F01 SSH 마법사", () => {
     expect(wizard.getSnapshot().status).toEqual({ kind: "testFailed", error: "SSH 연결 시험을 실행할 수 없습니다" });
   });
 
-  it("확인한 저장 암호 대상은 연결 시험 없이 참조만 저장한다", async () => {
+  it("입력한 지문의 형식이 틀리면 SSH 초안을 완성하지 않는다", async () => {
+    const wizard = createLocalConnectionWizard("work-draft", draft);
+    wizard.go(1);
+    wizard.selectMethod("ssh");
+    wizard.editSsh({ host: "ssh.actual.test", port: "2222", account: "deploy", hostKeyFingerprint: "SHA256:short", transport: { kind: "direct" } });
+    wizard.go(1);
+    wizard.editSsh({ auth: { kind: "manualPassword" } });
+    wizard.go(1, null);
+    expect(wizard.getSnapshot().step).toBe("auth");
+  });
+
+  it("저장 암호 대상은 호스트 키 등록과 연결 시험 없이 참조만 저장한다", async () => {
     setStoredAuthAvailable(true);
     const verifySshHost = vi.fn().mockResolvedValue(undefined);
     const peer = { ...nativePeer(), verifySshHost };
@@ -286,11 +283,9 @@ describe("F01 SSH 마법사", () => {
     wizard.editSsh({ auth: { kind: "storedPassword", itemId } });
     wizard.go(1, null);
     expect(wizard.getSnapshot().step).toBe("verify");
+    // 호스트 키는 첫 연결에서 확인하므로 등록 없이 저장한다.
     await wizard.save(peer);
-    expect(ipc).not.toHaveBeenCalled();
-    await wizard.verifySshHost(peer);
-    expect(wizard.getSnapshot().sshPin).toEqual({ kind: "verified" });
-    await wizard.save(peer);
+    expect(verifySshHost).not.toHaveBeenCalled();
     expect(ipc).toHaveBeenCalledTimes(1);
     expect(ipc).toHaveBeenCalledWith("connection_save", { request: {
       run: { draftId: "stored-draft", draftVersion: expect.any(Number), runId: "stored-draft" },

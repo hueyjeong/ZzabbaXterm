@@ -14,6 +14,11 @@ use crate::ssh::{Endpoint, session_files};
 const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti";
 const SHA: &str = "SHA256:UCUiLr7Pjs9wFFJMDByLgc3NrtdU344OgUM45wZPcIQ";
 
+/// 핀이 이미 있는 경로의 확인 창이다. 띄우면 시험이 실패한다.
+pub(crate) fn no_trust() -> Confirm {
+    std::sync::Arc::new(|_, _: &CancellationToken| panic!("등록된 핀이 있는데 서버 키 확인 창을 열었습니다"))
+}
+
 #[test]
 fn invalid_confirmation_creates_no_launch_files() {
     let root = session_files(&std::env::temp_dir()).unwrap();
@@ -132,7 +137,7 @@ fn remote_editor_approval_shows_the_ssm_transport() {
         "auth": {"kind": "agent", "publicKeyPath": directory.path().join("agent.pub")},
     })).unwrap();
     // SSM 대상은 승인 창을 띄우기 전에 전달을 열지 않는다.
-    let (launch, message) = prepare_remote_editor(directory.path(), "profile-1", std::num::NonZeroU64::MIN, &ssh).unwrap();
+    let (launch, message) = prepare_remote_editor(directory.path(), "profile-1", std::num::NonZeroU64::MIN, &ssh, &no_trust()).unwrap();
     assert!(matches!(launch, SavedLaunch::Forward(_)));
     assert!(message.contains("\n전송: SSM · dev-sso · ap-northeast-2 · i-0123456789abcdef0\n"), "{message}");
 }
@@ -154,6 +159,7 @@ mod stored {
     };
 
     use super::super::{APPROVAL_TTL, DirectLaunch, SavedLaunch, prepare_stored_bounded, prepare_stored_with, saved, transport};
+    use super::no_trust;
     use tokio_util::sync::CancellationToken;
 
     const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti";
@@ -204,7 +210,7 @@ mod stored {
         let (directory, ssh, endpoint) = target();
         let vault = vault(directory.path());
         let mut shown = String::new();
-        let result = prepare_stored_with(directory.path(), &ssh, &endpoint, ITEM, "main", 1, Ok(vault), |message| {
+        let result = prepare_stored_with(directory.path(), &ssh, &endpoint, ITEM, "main", 1, Ok(vault), &no_trust(), |message| {
             shown = message;
             Ok(false)
         });
@@ -225,7 +231,7 @@ mod stored {
         for approve in [false, true] {
             let vault = vault(directory.path());
             let mut shown = String::new();
-            let result = prepare_stored_with(directory.path(), &ssh, &endpoint, ITEM, "main", 1, Ok(vault), |message| {
+            let result = prepare_stored_with(directory.path(), &ssh, &endpoint, ITEM, "main", 1, Ok(vault), &no_trust(), |message| {
                 shown = message;
                 Ok(approve)
             });
@@ -246,7 +252,7 @@ mod stored {
             "kind": "ssm", "profile": "dev-sso", "region": "ap-northeast-2", "instanceId": "i-0123456789abcdef0",
         })).unwrap();
         let vault = vault(directory.path());
-        let launch = prepare_stored_bounded(directory.path(), &ssh, &endpoint, ITEM, "main", 1, budget, open, Ok(vault), |_| Ok(true));
+        let launch = prepare_stored_bounded(directory.path(), &ssh, &endpoint, ITEM, "main", 1, budget, open, Ok(vault), &no_trust(), |_| Ok(true));
         let Ok(SavedLaunch::Forward(forward)) = launch else { panic!("SSM 저장 암호는 탭에서 전달을 준비합니다") };
         let launch = forward.prepare(&CancellationToken::new());
         (directory, launch)
@@ -277,7 +283,7 @@ mod stored {
         ssh.transport = serde_json::from_value(json!({
             "kind": "ssm", "profile": "dev-sso", "region": "ap-northeast-2", "instanceId": "i-0123456789abcdef0",
         })).unwrap();
-        let launch = prepare_stored_with(directory.path(), &ssh, &endpoint, ITEM, "main", 1, Err(Error::VaultUnavailable), |_| {
+        let launch = prepare_stored_with(directory.path(), &ssh, &endpoint, ITEM, "main", 1, Err(Error::VaultUnavailable), &no_trust(), |_| {
             panic!("금고 없이 승인 창을 열었습니다")
         });
         assert!(matches!(launch, Ok(SavedLaunch::Forward(_))));
@@ -288,7 +294,7 @@ mod stored {
         let (directory, ssh, endpoint) = target();
         let vault = vault(directory.path());
         std::fs::write(directory.path().join("mode"), "locked").unwrap();
-        let launch = ready(prepare_stored_with(directory.path(), &ssh, &endpoint, ITEM, "main", 1, Ok(vault), |_| {
+        let launch = ready(prepare_stored_with(directory.path(), &ssh, &endpoint, ITEM, "main", 1, Ok(vault), &no_trust(), |_| {
             panic!("잠긴 금고에서 승인 창을 열었습니다")
         })
         .ok()
@@ -301,7 +307,7 @@ mod stored {
     #[test]
     fn missing_vault_falls_back_with_reason() {
         let (directory, ssh, endpoint) = target();
-        let launch = ready(prepare_stored_with(directory.path(), &ssh, &endpoint, ITEM, "main", 1, Err(Error::VaultUnavailable), |_| {
+        let launch = ready(prepare_stored_with(directory.path(), &ssh, &endpoint, ITEM, "main", 1, Err(Error::VaultUnavailable), &no_trust(), |_| {
             panic!("금고 없이 승인 창을 열었습니다")
         })
         .ok()
@@ -313,7 +319,7 @@ mod stored {
     fn stored_approval_is_consumed_once() {
         let (directory, ssh, endpoint) = target();
         let vault = vault(directory.path());
-        let mut launch = ready(prepare_stored_with(directory.path(), &ssh, &endpoint, ITEM, "main", 1, Ok(vault), |_| Ok(true))
+        let mut launch = ready(prepare_stored_with(directory.path(), &ssh, &endpoint, ITEM, "main", 1, Ok(vault), &no_trust(), |_| Ok(true))
             .ok()
             .unwrap());
         assert!(launch.stored.take().is_some());
@@ -333,7 +339,7 @@ mod stored {
         let vault = vault(directory.path());
         // 창을 읽는 시간은 승인 기한에서 따로 재고, 승인 뒤 교환 예산은 spawn에서 새로 잰다.
         let launch = prepare_stored_bounded(
-            directory.path(), &ssh, &endpoint, ITEM, "main", 1, Duration::from_secs(5), transport, Ok(vault),
+            directory.path(), &ssh, &endpoint, ITEM, "main", 1, Duration::from_secs(5), transport, Ok(vault), &no_trust(),
             |_| {
                 std::thread::sleep(Duration::from_millis(60));
                 Ok(true)
@@ -348,7 +354,7 @@ mod stored {
         let (directory, ssh, endpoint) = target();
         let vault = vault(directory.path());
         let result = prepare_stored_bounded(
-            directory.path(), &ssh, &endpoint, ITEM, "main", 1, Duration::from_millis(10), transport, Ok(vault),
+            directory.path(), &ssh, &endpoint, ITEM, "main", 1, Duration::from_millis(10), transport, Ok(vault), &no_trust(),
             |_| {
                 std::thread::sleep(Duration::from_millis(30));
                 Ok(true)

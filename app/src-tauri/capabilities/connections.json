@@ -12,6 +12,7 @@
     "allow-commit-ssh-host",
     "allow-cancel-ssh-host",
     "allow-register-saved-ssh-host",
+    "allow-trust-saved-ssh-host",
     "allow-connection-test-cancel",
     "allow-connection-save",
     "allow-connection-group-save",

@@ -3,6 +3,9 @@ import type { ConnectionProfileDraft, ConnectionRequest, ConnectionTestDraft, Co
 
 type SavedEntry<T> = Readonly<{ revision: number; profile: T }>;
 // parentId가 없으면 최상위 그룹, groupId가 없으면 그룹 없는 최상위 세션이다.
+/** 서버 키를 다시 받은 결과다. 핀이 없어 등록했으면 registered, 같으면 unchanged, 교체했으면 replaced다. */
+export type SshHostTrust = Readonly<{ fingerprint: string; status: "registered" | "unchanged" | "replaced" }>;
+
 export type SavedGroup = ConnectionProfileDraft["group"] & Readonly<{ parentId?: string }>;
 type WithoutGroup<T> = T extends unknown ? Omit<T, "groupId"> & Readonly<{ groupId?: string }> : never;
 export type SavedTarget = WithoutGroup<ConnectionProfileDraft["target"]>;
@@ -32,6 +35,7 @@ type Execution = {
 export function createLocalConnectionIpc(): Omit<LocalConnectionActions, "onClose"> & {
   load(): Promise<SavedConnections>;
   registerSavedSshHost(targetId: string): Promise<null>;
+  trustSavedSshHost(targetId: string): Promise<SshHostTrust>;
   capabilities(): Promise<{ storedAuth: boolean }>;
   saveGroup(draft: GroupDraft): Promise<{ revision: number }>;
   deleteGroup(id: string, revision: number, expected: readonly ExpectedEntry[]): Promise<null>;
@@ -44,6 +48,7 @@ export function createLocalConnectionIpc(): Omit<LocalConnectionActions, "onClos
   return {
     load: () => invoke<SavedConnections>("connections_load", {}),
     registerSavedSshHost: (targetId) => invoke<null>("register_saved_ssh_host", { targetId }),
+    trustSavedSshHost: (targetId) => invoke<SshHostTrust>("trust_saved_ssh_host", { targetId }),
     capabilities: () => invoke<{ storedAuth: boolean }>("connection_capabilities", {}),
     // 아래 편집 명령은 실패하면 ConnectionEditError로 거부한다.
     saveGroup: (draft) => invoke<{ revision: number }>("connection_group_save", { draft }),
@@ -55,7 +60,9 @@ export function createLocalConnectionIpc(): Omit<LocalConnectionActions, "onClos
       const request = { targetId, host, port, expectedFingerprint: hostKeyFingerprint };
       const cancel = () => { void invoke("cancel_ssh_host", { attempt }).catch(() => { }); };
       const check = (result: Reply) => {
-        if (result?.targetId !== targetId || result.port !== port || result.fingerprint !== hostKeyFingerprint || result.host !== host) {
+        // 입력한 지문이 없으면 선택한 공개 키 파일의 지문이 그대로 돌아온다.
+        if (result?.targetId !== targetId || result.port !== port || result.host !== host
+          || (hostKeyFingerprint !== undefined && result.fingerprint !== hostKeyFingerprint)) {
           throw new Error("SSH 호스트 키 확인 응답이 현재 초안과 일치하지 않습니다");
         }
       };

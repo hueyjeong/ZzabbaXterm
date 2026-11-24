@@ -1,4 +1,4 @@
-import type { LocalConnectionWizardState, SshAuth, SshInput } from "./profiles";
+import { fingerprintValid, type LocalConnectionWizardState, type SshAuth, type SshInput } from "./profiles";
 
 type Edit = LocalConnectionWizardState["editSsh"];
 type Props = Readonly<{ ssh: SshInput; edit: Edit }>;
@@ -22,7 +22,8 @@ export function SshMethodFields({ ssh, edit }: Props) {
       <option value="direct">직접 SSH</option>
       <option value="ssm">SSH-over-SSM</option>
     </select></label></div>
-    <div><label>호스트 키 SHA256 지문 <input value={ssh.hostKeyFingerprint} onChange={event => edit({ hostKeyFingerprint: event.target.value })} /></label></div>
+    <div><label>호스트 키 SHA256 지문 (선택) <input value={ssh.hostKeyFingerprint} onChange={event => edit({ hostKeyFingerprint: event.target.value })} /></label></div>
+    {!fingerprintValid(ssh.hostKeyFingerprint) && <div role="alert">지문 형식 오류</div>}
   </>;
 }
 
@@ -55,7 +56,7 @@ export function SshReview({ ssh }: Readonly<{ ssh: SshInput }>) {
     <div><dt>서버 호스트</dt><dd>{ssh.host}</dd></div>
     <div><dt>SSH 포트</dt><dd>{ssh.port}</dd></div>
     <div><dt>SSH 계정</dt><dd>{ssh.account}</dd></div>
-    <div><dt>호스트 키 SHA256 지문</dt><dd>{ssh.hostKeyFingerprint}</dd></div>
+    {ssh.hostKeyFingerprint && <div><dt>호스트 키 SHA256 지문</dt><dd>{ssh.hostKeyFingerprint}</dd></div>}
     <div><dt>전송 방식</dt><dd>{transport.kind === "direct" ? "직접 SSH" : "SSH-over-SSM"}</dd></div>
     {transport.kind === "ssm" && "profile" in transport && <>
       <div><dt>AWS 프로필</dt><dd>{transport.profile}</dd></div>

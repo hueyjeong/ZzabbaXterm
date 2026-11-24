@@ -54,9 +54,22 @@ fn cancelled_or_stale_native_approval_does_not_start_a_tunnel() {
     let target = "ssh-server";
     let mut profile = crate::connections::tests::ssh_draft(dir.path());
     profile["target"]["ssh"]["auth"] = json!({"kind":"keyFile", "privateKeyPath": dir.path().join("client")});
+    // 지문을 입력하지 않은 세션은 승인 창에 등록된 핀의 지문을 보여 준다.
+    profile["target"]["ssh"].as_object_mut().unwrap().remove("hostKeyFingerprint");
     let draft = serde_json::from_value::<crate::connections::profile::Draft>(profile).unwrap().validate().unwrap();
     crate::connections::save_test_profile(dir.path(), draft);
     let handle = tabs.open(0, dir.path(), target.into(), "시험 터널".into()).unwrap();
+    // 확인 창이 없는 터널 시작은 핀이 없으면 승인 창 전에 중단한다.
+    assert_eq!(tabs.start(0, dir.path(), &handle, PortRequest::Dynamic { listen: 1080 }, |_| panic!("핀 없이 승인 창을 열었습니다")),
+        Err("호스트 키 확인 필요".into()));
+    {
+        use crate::ssh::{ApprovedHost, Endpoint, TRUST_DIRECTORY, TrustStore};
+        const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti";
+        const SHA: &str = "SHA256:UCUiLr7Pjs9wFFJMDByLgc3NrtdU344OgUM45wZPcIQ";
+        let endpoint = Endpoint::new("dev.example.test", 2222).unwrap();
+        TrustStore::create(&dir.path().join(TRUST_DIRECTORY)).unwrap()
+            .register(&ApprovedHost::confirm(&endpoint, &endpoint, SHA).unwrap(), KEY).unwrap();
+    }
     #[cfg(windows)]
     {
         let remote = tabs.start(0, dir.path(), &handle, PortRequest::Remote {
@@ -72,7 +85,7 @@ fn cancelled_or_stale_native_approval_does_not_start_a_tunnel() {
 
     let cancelled = tabs.start(0, dir.path(), &handle, request(), |description| {
         assert!(description.contains("deploy@dev.example.test:2222"));
-        assert!(description.contains("SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
+        assert!(description.contains("SHA256:UCUiLr7Pjs9wFFJMDByLgc3NrtdU344OgUM45wZPcIQ"));
         assert!(description.contains("-D 127.0.0.1:1080 → SOCKS"));
         assert!(description.contains("PermitOpen"));
         assert_eq!(tabs.confirm_desktop_cleanup(0, "close", &CancellationToken::new()).unwrap_err(), APPROVAL_PENDING);
@@ -570,7 +583,7 @@ fn isolated_openssh_desktop_lease_outlives_source_tab() {
     }, |description| {
         let ssh = &fixture.ssh.1;
         assert_eq!(description, format!("{}@{}:{}\n{}\n-L {listen} → {}:{}\n서비스: RDP",
-            ssh.account, ssh.host, ssh.port, ssh.host_key_fingerprint, destination.host, destination.port));
+            ssh.account, ssh.host, ssh.port, crate::ssh::host_trust::shown(directory, ssh), destination.host, destination.port));
         Ok(true)
     }).unwrap().unwrap();
     let deadline = Instant::now() + timeout;

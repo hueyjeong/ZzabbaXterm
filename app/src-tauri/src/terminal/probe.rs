@@ -104,13 +104,13 @@ impl Probe {
     }
 
 
-    pub(crate) fn run(&self, draft: &ValidatedDraft, config: &std::path::Path) {
+    pub(crate) fn run(&self, draft: &ValidatedDraft, config: &std::path::Path, trust: Option<&crate::ssh::host_trust::Confirm>) {
         let launch = match draft.method() {
             MethodRef::Local { shell, start_directory } => command(shell, start_directory).map(Launch::Local),
             MethodRef::Ssm { profile, region, instance_id } => remote::Target::new(profile, region, instance_id).map(Launch::Ssm),
             MethodRef::Desktop { .. } => Err(DESKTOP_UNTESTED.into()),
             MethodRef::Ssh { ssh } => {
-                self.finish(self.run_ssh(config, ssh).map(|()| None));
+                self.finish(self.run_ssh(config, ssh, trust).map(|()| None));
                 return;
             }
             MethodRef::S3 { s3 } => {
@@ -132,7 +132,7 @@ impl Probe {
         self.finish(launch.and_then(|launch| self.measure(launch)));
     }
 
-    fn run_ssh(&self, config: &std::path::Path, ssh: &crate::connections::profile::Ssh) -> Result<(), String> {
+    fn run_ssh(&self, config: &std::path::Path, ssh: &crate::connections::profile::Ssh, trust: Option<&crate::ssh::host_trust::Confirm>) -> Result<(), String> {
         let (size, output) = {
             let (mut state, _) = self.ready.wait_timeout_while(self.state.lock().unwrap(), self.remaining(), |state| {
                 !state.stopped && state.attachment.is_none()
@@ -140,7 +140,12 @@ impl Probe {
             if state.stopped { return Err(super::CLOSED.into()); }
             state.attachment.take().ok_or(TIMED_OUT)?
         };
-        let launch = crate::ssh::terminal::saved(config, ssh, self.cancel.as_ref().unwrap())?;
+        let cancel = self.cancel.as_ref().unwrap();
+        // 핀이 없으면 첫 연결 확인 창을 거친다.
+        let launch = match trust {
+            Some(trust) => crate::ssh::terminal::saved_trusting(config, ssh, cancel, trust)?,
+            None => crate::ssh::terminal::saved(config, ssh, cancel)?,
+        };
         let mut nonce = [0; 16];
         getrandom::fill(&mut nonce).map_err(|_| "SSH 시험 난수를 생성할 수 없습니다")?;
         let nonce = u128::from_ne_bytes(nonce);
