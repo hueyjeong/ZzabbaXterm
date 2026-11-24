@@ -9,6 +9,8 @@ use std::{
 use super::*;
 use crate::connections::{SavedSsm, profile::Ssm};
 
+mod live;
+
 pub(super) const SESSION: &str = "fixture-0123456789abcdef0";
 const NODE: &str = "i-0123456789abcdef0";
 
