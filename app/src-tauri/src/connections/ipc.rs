@@ -185,10 +185,7 @@ pub(crate) fn handle(invoke: Invoke, other: fn(Invoke) -> bool) -> bool {
             Ok(move |caller: Webview, document| -> Result<(), EditError> {
                 let sessions = caller.state::<Sessions>();
                 let authorize = || sessions.with_probes(caller.label(), document, |_| Ok(()));
-                let removed: Vec<String> = expected.iter().filter_map(|entry| entry.target_id().map(str::to_owned)).collect();
-                edited(store(&caller)?.delete_group(&id, revision, expected, authorize), "parentId")?;
-                forget_rdp_accounts(&caller, &removed);
-                Ok(())
+                delete_group(&config_dir(&caller)?, &id, revision, expected, authorize)
             })
         }),
         "connection_target_delete" => dispatch(invoke, "connection_target_delete", |args| {
@@ -197,9 +194,7 @@ pub(crate) fn handle(invoke: Invoke, other: fn(Invoke) -> bool) -> bool {
             Ok(move |caller: Webview, document| -> Result<(), EditError> {
                 let sessions = caller.state::<Sessions>();
                 let authorize = || sessions.with_probes(caller.label(), document, |_| Ok(()));
-                edited(store(&caller)?.delete_target(&id, revision, authorize), "groupId")?;
-                forget_rdp_accounts(&caller, std::slice::from_ref(&id));
-                Ok(())
+                delete_target(&config_dir(&caller)?, &id, revision, authorize)
             })
         }),
         "connection_target_save" => dispatch(invoke, "connection_target_save", |args| {
@@ -268,16 +263,32 @@ where
     });
 }
 
+/// 연결 대상을 지우고 그 대상을 전달 경로로 쓰던 RDP 계정 이름도 지운다.
+pub(super) fn delete_target(directory: &Path, id: &str, revision: Revision, authorize: impl FnMut() -> Result<(), String>) -> Result<(), EditError> {
+    edited(store_at(directory)?.delete_target(id, revision, authorize), "groupId")?;
+    forget_rdp_accounts(directory, &[id]);
+    Ok(())
+}
+
+/// 그룹과 하위 항목을 지우고 함께 지워진 연결 대상을 전달 경로로 쓰던 RDP 계정 이름도 지운다.
+pub(super) fn delete_group(directory: &Path, id: &str, revision: Revision, expected: Vec<Expected>, authorize: impl FnMut() -> Result<(), String>) -> Result<(), EditError> {
+    let removed: Vec<String> = expected.iter().filter_map(|entry| entry.target_id().map(str::to_owned)).collect();
+    edited(store_at(directory)?.delete_group(id, revision, expected, authorize), "parentId")?;
+    forget_rdp_accounts(directory, &removed.iter().map(String::as_str).collect::<Vec<_>>());
+    Ok(())
+}
+
 /// 지운 연결 대상을 전달 경로로 쓰던 RDP 계정 이름을 지운다. 실패해도 삭제 결과는 바꾸지 않는다.
-fn forget_rdp_accounts(caller: &Webview, removed: &[String]) {
-    let Ok(directory) = caller.path().app_config_dir() else { return; };
-    let routes: Vec<&str> = removed.iter().map(String::as_str).collect();
-    let _ = crate::rdp::accounts::forget(&directory.join(crate::rdp::accounts::FILE), &routes);
+fn forget_rdp_accounts(directory: &Path, routes: &[&str]) {
+    let _ = crate::rdp::accounts::forget(&directory.join(crate::rdp::accounts::FILE), routes);
+}
+
+fn config_dir(caller: &Webview) -> Result<std::path::PathBuf, String> {
+    caller.path().app_config_dir().map_err(|error| format!("앱 설정 디렉터리: {error}"))
 }
 
 fn store(caller: &Webview) -> Result<Store, String> {
-    let directory = caller.path().app_config_dir().map_err(|error| format!("앱 설정 디렉터리: {error}"))?;
-    store_at(&directory)
+    store_at(&config_dir(caller)?)
 }
 
 pub(crate) fn initialize_ssh_registration(app: &tauri::App) -> Result<crate::ssh::registration::Registration, String> {

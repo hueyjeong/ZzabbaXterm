@@ -45,6 +45,11 @@ export type MenuItem =
   | { kind: "separator" }
   | { kind: "label"; label: string };
 
+/** 첫 켜진 항목에 포커스를 둔다. 켜진 항목이 없으면 메뉴 자체에 두어 Escape로 닫을 수 있게 한다. */
+function focusFirst(menu: HTMLElement) {
+  (menu.querySelector<HTMLButtonElement>('[role="menuitem"]:not(:disabled)') ?? menu).focus();
+}
+
 /** 화면 좌표에 여는 메뉴다. 바깥 클릭·Escape·포커스 이탈로 닫고 화살표로 항목을 이동한다. */
 export function Menu({ x, y, items, label, onClose, restoreFocus }: {
   x: number;
@@ -63,8 +68,7 @@ export function Menu({ x, y, items, label, onClose, restoreFocus }: {
     const { width, height } = menu.getBoundingClientRect();
     menu.style.left = `${Math.max(4, Math.min(x, window.innerWidth - width - 4))}px`;
     menu.style.top = `${Math.max(4, Math.min(y, window.innerHeight - height - 4))}px`;
-    // 켜진 항목이 없으면 메뉴 자체에 포커스를 두어 Escape로 닫을 수 있게 한다.
-    (menu.querySelector<HTMLButtonElement>('[role="menuitem"]:not(:disabled)') ?? menu).focus();
+    focusFirst(menu);
     const outside = (event: PointerEvent) => {
       if (!menu.contains(event.target as Node)) onClose();
     };
@@ -75,6 +79,13 @@ export function Menu({ x, y, items, label, onClose, restoreFocus }: {
       window.removeEventListener("blur", onClose);
     };
   }, [x, y]);
+
+  // 포커스가 있던 항목이 상태 변화로 사라지거나 꺼지면 body로 가 Escape가 먹지 않는다. 남은 켜진 항목이나 메뉴로 옮긴다.
+  useLayoutEffect(() => {
+    const menu = element.current!;
+    const active = document.activeElement;
+    if (!active || active === document.body || (menu.contains(active) && active.matches(":disabled"))) focusFirst(menu);
+  });
 
   function close() {
     onClose();

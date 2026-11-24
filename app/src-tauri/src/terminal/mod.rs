@@ -804,7 +804,7 @@ pub(crate) enum Event {
 /// 저장된 로컬 세션의 시작 디렉터리다. 비어 있으면 사용자 홈 디렉터리에서 시작한다.
 fn start_directory(directory: &std::path::Path) -> Result<std::borrow::Cow<'_, std::path::Path>, String> {
     let directory = if directory.as_os_str().is_empty() {
-        std::borrow::Cow::Owned(dirs::home_dir().ok_or("작업 디렉터리: 홈 디렉터리를 찾을 수 없습니다")?)
+        std::borrow::Cow::Owned(home_directory(dirs::home_dir())?)
     } else {
         std::borrow::Cow::Borrowed(directory)
     };
@@ -812,7 +812,20 @@ fn start_directory(directory: &std::path::Path) -> Result<std::borrow::Cow<'_, s
     Ok(directory)
 }
 
+/// 홈 디렉터리 해석 결과다. Unix의 `HOME`이 상대 경로이면 시작 위치가 실행 위치에 따라 달라지므로 거부한다.
+fn home_directory(home: Option<std::path::PathBuf>) -> Result<std::path::PathBuf, String> {
+    let home = home.ok_or("작업 디렉터리: 홈 디렉터리를 찾을 수 없습니다")?;
+    if !home.is_absolute() {
+        return Err("작업 디렉터리: 홈 디렉터리가 절대 경로가 아닙니다".into());
+    }
+    Ok(home)
+}
+
 fn validate_working_directory(directory: &std::path::Path) -> Result<(), String> {
+    // `..`, Windows의 `C:foo`·`\foo`처럼 기준 위치에 따라 달라지는 경로는 절대 경로가 아니다.
+    if !directory.is_absolute() {
+        return Err("작업 디렉터리: 절대 경로만 지원합니다".into());
+    }
     #[cfg(windows)]
     {
         use std::path::{Component, Prefix};

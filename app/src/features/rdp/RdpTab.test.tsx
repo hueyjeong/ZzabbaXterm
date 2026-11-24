@@ -2,7 +2,7 @@
 import { act, StrictMode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, expect, it, vi } from "vitest";
-import { NOT_APPLIED_NOTICE, RdpTab } from "./RdpTab";
+import { NOT_APPLIED_NOTICE, RdpTab, RESIZE_WAIT_NOTICE, RETRY_NOTICE_AFTER } from "./RdpTab";
 
 const { connect, view } = vi.hoisted(() => ({
   connect: vi.fn(() => () => Promise.resolve()),
@@ -271,6 +271,27 @@ it("재활성화 중이라 보내지 못한 창 맞춤 요청은 잠시 뒤 같�
   // 보낸 뒤에는 같은 크기를 다시 요청하지 않는다.
   await act(async () => { vi.advanceTimersByTime(2000); });
   expect(connection.resize).toHaveBeenCalledTimes(2);
+});
+
+it("같은 크기의 창 맞춤 요청이 5번 넘게 retry로 이어지면 해상도 변경 대기를 한 번 보이고 전송되면 지운다", async () => {
+  const { host, connection, caps, ready } = await opened();
+  vi.useFakeTimers();
+  await act(async () => { view.onViewport!({ width: 800, height: 600 }); });
+  await act(async () => { caps({ copy: false, paste: false, resize: true }); ready(true, { width: 1000, height: 750 }); });
+  connection.resize.mockResolvedValue("retry");
+  const notices = () => host.querySelectorAll(".remote-desktop-notices [role=status]");
+  await act(async () => { view.onViewport!({ width: 1000, height: 640 }); vi.advanceTimersByTime(400); });
+  for (let count = 1; count < RETRY_NOTICE_AFTER; count += 1) await act(async () => { vi.advanceTimersByTime(400); });
+  expect(connection.resize).toHaveBeenCalledTimes(RETRY_NOTICE_AFTER);
+  expect(notices()).toHaveLength(0);
+  await act(async () => { vi.advanceTimersByTime(400); });
+  expect(connection.resize).toHaveBeenCalledTimes(RETRY_NOTICE_AFTER + 1);
+  expect([...notices()].map(item => item.textContent)).toEqual([RESIZE_WAIT_NOTICE]);
+  await act(async () => { vi.advanceTimersByTime(400 * 3); });
+  expect([...notices()].map(item => item.textContent)).toEqual([RESIZE_WAIT_NOTICE]);
+  connection.resize.mockResolvedValue("sent");
+  await act(async () => { vi.advanceTimersByTime(400); });
+  expect(notices()).toHaveLength(0);
 });
 
 it("고정 크기로 다시 연결하면 서버가 정한 홀수 폭을 짝수로 내린다", async () => {

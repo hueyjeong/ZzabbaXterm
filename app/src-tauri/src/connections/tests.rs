@@ -1197,3 +1197,62 @@ mod schema_v2 {
         assert_eq!(store.load().unwrap().targets[0].tested_account_id.as_deref(), Some("012345678901"));
     }
 }
+
+
+mod deleting_forgets_rdp_accounts {
+    use super::*;
+    use crate::connections::ipc::{EditError, delete_group, delete_target};
+
+    fn logins(config: &Path) -> Vec<String> {
+        let file: Value = serde_json::from_slice(&fs::read(config.join(crate::rdp::accounts::FILE)).unwrap()).unwrap();
+        let mut logins: Vec<String> = file["logins"].as_object().unwrap().values().map(|login| login.as_str().unwrap().to_owned()).collect();
+        logins.sort();
+        logins
+    }
+
+    fn key(route: Option<&str>) -> String {
+        match route {
+            Some(route) => format!("rdp.example\n127.0.0.1:3389\n{route}"),
+            None => "rdp.example\nrdp.example:3389".to_owned(),
+        }
+    }
+
+    #[test]
+    fn target_and_group_delete_forget_the_removed_routes_accounts() {
+        let config = TestDir::new();
+        let store = Store::new(config.path());
+        let mut lab = ssh_draft(config.path());
+        lab["group"]["id"] = json!("lab");
+        lab["target"]["groupId"] = json!("lab");
+        lab["target"]["id"] = json!("lab-ssh");
+        for input in [ssh_draft(config.path()), lab] {
+            assert_eq!(save(&store, input).unwrap(), SaveStatus::Saved);
+        }
+        let seeded = json!({ "version": 1, "logins": {
+            key(None): "direct", key(Some("ssh-server")): "a", key(Some("lab-ssh")): "b", key(Some("kept")): "c",
+        }});
+        fs::write(config.path().join(crate::rdp::accounts::FILE), serde_json::to_vec(&seeded).unwrap()).unwrap();
+        let loaded = store.load().unwrap();
+        let target = |id: &str| loaded.targets.iter().find(|entry| entry.profile.id.as_str() == id).unwrap().revision;
+        let group = |id: &str| loaded.groups.iter().find(|entry| entry.profile.id.as_str() == id).unwrap().revision;
+
+        delete_target(config.path(), "ssh-server", target("ssh-server"), || Ok(())).unwrap();
+        assert_eq!(logins(config.path()), ["b", "c", "direct"]);
+
+        let expected = serde_json::from_value(json!([{ "kind": "target", "id": "lab-ssh", "revision": target("lab-ssh") }])).unwrap();
+        delete_group(config.path(), "lab", group("lab"), expected, || Ok(())).unwrap();
+        assert_eq!(logins(config.path()), ["c", "direct"]);
+    }
+
+    #[test]
+    fn rejected_delete_keeps_the_accounts() {
+        let config = TestDir::new();
+        let store = Store::new(config.path());
+        assert_eq!(save(&store, ssh_draft(config.path())).unwrap(), SaveStatus::Saved);
+        let seeded = json!({ "version": 1, "logins": { key(Some("ssh-server")): "a" } });
+        fs::write(config.path().join(crate::rdp::accounts::FILE), serde_json::to_vec(&seeded).unwrap()).unwrap();
+        let stale = std::num::NonZeroU64::new(99).unwrap();
+        assert_eq!(delete_target(config.path(), "ssh-server", stale, || Ok(())), Err(EditError::Conflict));
+        assert_eq!(logins(config.path()), ["a"]);
+    }
+}

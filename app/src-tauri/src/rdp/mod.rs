@@ -286,6 +286,11 @@ impl Session {
                         command = rx.recv() => {
                             let Some((generation, command, ack)) = command else { return Ok(()) };
                             if ack.is_closed() { continue; }
+                            // 서버가 끝낸 세션에는 입력을 쓰지 않는다. 쓰기 실패가 정상 종료 결과(`Ok`)를 덮는다.
+                            if ended.is_some() {
+                                let _ = ack.send(Err(Error::Closed));
+                                continue;
+                            }
                             if generation.is_some_and(|generation| generation != display_generation) {
                                 let _ = ack.send(Err(Error::StaleDisplay));
                                 continue;

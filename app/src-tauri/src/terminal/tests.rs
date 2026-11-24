@@ -295,3 +295,36 @@ fn empty_saved_start_directory_starts_in_the_home_directory() {
     assert_eq!(start_directory(&dir).unwrap().as_ref(), dir.as_path());
     assert!(start_directory(&dir.join("zzabba-missing-start-directory")).is_err());
 }
+
+#[test]
+fn start_directory_rejects_paths_that_are_not_absolute() {
+    for path in ["..", "relative", "."] {
+        assert!(start_directory(std::path::Path::new(path)).is_err(), "{path}");
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn start_directory_rejects_windows_drive_relative_and_root_relative_paths() {
+    for path in ["C:foo", r"\foo", "/foo"] {
+        assert!(start_directory(std::path::Path::new(path)).is_err(), "{path}");
+    }
+}
+
+#[test]
+fn home_directory_must_be_absolute() {
+    let absolute = std::env::temp_dir();
+    assert_eq!(super::home_directory(Some(absolute.clone())).unwrap(), absolute);
+    assert!(super::home_directory(None).is_err());
+    for path in ["relative", "..", "."] {
+        assert!(super::home_directory(Some(path.into())).is_err(), "{path}");
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn home_directory_rejects_windows_drive_relative_and_root_relative_paths() {
+    for path in ["C:foo", r"\foo"] {
+        assert!(super::home_directory(Some(path.into())).is_err(), "{path}");
+    }
+}

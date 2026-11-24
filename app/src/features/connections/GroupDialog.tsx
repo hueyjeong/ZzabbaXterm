@@ -2,7 +2,7 @@ import { useLayoutEffect, useMemo, useRef, useState, type FormEvent } from "reac
 import type { ConnectionEditError, GroupDraft, SavedConnections } from "./connectionIpc";
 import { Field } from "./fields/Field";
 import { groupDepth, groupOptions, MAX_GROUP_DEPTH, subtreeHeight } from "./groupTree";
-import { editError } from "./sessionEditorState";
+import { DELETED_TEXT, editError } from "./sessionEditorState";
 import "./editor.css";
 
 /** parentId만 있으면 그 아래 새 그룹, group이 있으면 저장된 그룹의 이름 바꾸기와 이동이다. */
@@ -28,6 +28,7 @@ export function GroupDialog({ request, groups, save, onClose, latestRevision }: 
   const [name, setName] = useState(existing?.profile.displayName ?? "");
   const [parentId, setParentId] = useState(existing ? existing.profile.parentId : request.parentId);
   const [busy, setBusy] = useState(false);
+  const [deleted, setDeleted] = useState(false);
   const [failure, setFailure] = useState<{ field?: "displayName" | "parentId"; error: string }>();
   const options = useMemo(() => groupOptions(groups, existing ? id : undefined), [groups, existing, id]);
   const dialog = useRef<HTMLDialogElement>(null);
@@ -41,7 +42,7 @@ export function GroupDialog({ request, groups, save, onClose, latestRevision }: 
 
   const depth = (parentId ? groupDepth(groups, parentId) : 0) + (existing ? subtreeHeight(groups, id) : 1);
   const parentError = depth > MAX_GROUP_DEPTH ? DEPTH_TEXT : failure?.field === "parentId" ? failure.error : undefined;
-  const canSave = !busy && !!name.trim() && depth <= MAX_GROUP_DEPTH;
+  const canSave = !busy && !deleted && !!name.trim() && depth <= MAX_GROUP_DEPTH;
   const title = existing ? "그룹 편집" : "그룹 추가";
 
   async function submit(event: FormEvent) {
@@ -59,8 +60,16 @@ export function GroupDialog({ request, groups, save, onClose, latestRevision }: 
       const field = edit?.kind === "invalid" ? edit.field : undefined;
       // 충돌이면 다음 저장이 저장본의 새 개정으로 나가도록 다시 읽는다.
       if (edit?.kind === "conflict" && revision !== null && latestRevision) {
-        const latest = await latestRevision(id).catch(() => undefined);
+        // 다시 읽기 자체가 실패하면 충돌로 남기고, 읽었는데 없으면 이미 삭제된 그룹이다.
+        let reloaded = true;
+        const latest = await latestRevision(id).catch(() => { reloaded = false; return undefined; });
         if (latest !== undefined) setRevision(latest);
+        else if (reloaded) {
+          setDeleted(true);
+          setFailure({ error: DELETED_TEXT });
+          setBusy(false);
+          return;
+        }
       }
       setFailure(field === "displayName" ? { field, error: "이름 형식 오류" }
         : field === "parentId" ? { field, error: "상위 그룹 오류" }

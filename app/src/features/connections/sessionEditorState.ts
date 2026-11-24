@@ -21,7 +21,8 @@ export type EditorRequest = Readonly<{ groupId?: string; target?: never; copy?: 
   | Readonly<{ copy: SavedTarget; target?: never }>;
 export type FieldError = Readonly<{ text: string; required?: true }>;
 export type FieldErrors = Readonly<Record<string, FieldError>>;
-export type EditorState = TestState & Readonly<{ draft: EditorTarget; touched: ReadonlySet<string> }>;
+/** deleted는 저장하려던 세션이 다른 작업으로 이미 지워진 상태다. 저장할 수 없다. */
+export type EditorState = TestState & Readonly<{ draft: EditorTarget; touched: ReadonlySet<string>; deleted?: true }>;
 
 const ssmFields = ["ssm.profile", "ssm.region", "ssm.instanceId"];
 
@@ -59,6 +60,7 @@ export function testSupported(target: EditorTarget) {
 
 const required: FieldError = { text: "필수 입력", required: true };
 export const CONFLICT_TEXT = "다른 작업이 세션을 변경했습니다";
+export const DELETED_TEXT = "이미 삭제되었습니다";
 
 /** 클라이언트 검증이다. 빈 필수 입력은 required로 표시해 건드린 필드에서만 보인다. */
 export function validate(target: EditorTarget, storedAuth: boolean): FieldErrors {
@@ -262,7 +264,7 @@ export function createSessionEditor(request: EditorRequest, actions: EditorActio
 
   function savable() {
     const { draft, status } = state;
-    if (tester.locked() || status.kind === "testing") return false;
+    if (tester.locked() || status.kind === "testing" || state.deleted) return false;
     return !!ticket(status) || (Object.keys(validate(draft, storedAuth())).length === 0 && completeTarget(draft) !== null);
   }
 
@@ -287,11 +289,15 @@ export function createSessionEditor(request: EditorRequest, actions: EditorActio
       if (state.status !== saving) return;
       if ((error as Partial<ConnectionEditError> | null)?.kind === "conflict" && targetRevision !== null && actions.latestRevision) {
         // 다음 저장은 저장본의 새 개정으로 보낸다. 시험 티켓은 이전 개정에 묶여 있으므로 버리고 실행을 회수한다.
-        const latest = await actions.latestRevision(target.id).catch(() => undefined);
+        // 다시 읽기 자체가 실패하면 충돌로 남기고, 읽었는데 없으면 이미 삭제된 세션이다.
+        let reloaded = true;
+        const latest = await actions.latestRevision(target.id).catch(() => { reloaded = false; return undefined; });
         if (latest !== undefined) targetRevision = latest;
         if (state.status !== saving) return;
         if (passed) draftVersion += 1;
-        update({ status: { kind: "saveFailed", ...editError(error) } });
+        const deleted = reloaded && latest === undefined;
+        update(deleted ? { deleted: true, status: { kind: "saveFailed", error: DELETED_TEXT } }
+          : { status: { kind: "saveFailed", ...editError(error) } });
         if (passed) void tester.cancelPending();
         return;
       }

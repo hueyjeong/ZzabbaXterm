@@ -16,6 +16,9 @@ const VIEWPORT_WAIT_MS = 1000;
 /** 직접 요청한 해상도가 이 시간 뒤에도 그대로면 알린다. */
 export const APPLY_WAIT_MS = 5000;
 export const NOT_APPLIED_NOTICE = "서버가 해상도를 바꾸지 않았습니다";
+/** 같은 크기의 창 맞춤 요청이 이 횟수를 넘게 `retry`로 돌아오면 알린다. */
+export const RETRY_NOTICE_AFTER = 5;
+export const RESIZE_WAIT_NOTICE = "해상도 변경 대기";
 const scaleOf = () => Math.round((window.devicePixelRatio || 1) * 100);
 /** 서버가 정한 크기를 다시 연결 크기로 쓸 때 Display Control 범위(짝수 폭, 200 이상)로 맞춘다. */
 const evenSize = ({ width, height }: RemoteDesktopSize): DesktopFit =>
@@ -62,6 +65,8 @@ export function RdpTab({ active, label, source, preset, autoStart, onSecurityMod
   /** `scale`은 서버에 마지막으로 알린 배율이다. `requested`는 크기와 배율을 합친 마지막 요청이다. */
   const display = useRef<{
     view?: RemoteDesktopSize; remote?: RemoteDesktopSize; scale?: number; requested?: string;
+    /** 같은 크기 요청이 `retry`로 이어진 횟수다. 알림을 낸 뒤에는 요청 크기가 바뀔 때까지 다시 내지 않는다. */
+    retries?: { key: string; count: number };
     initial?: (size: DesktopFit | undefined) => void; wait?: ReturnType<typeof setTimeout>;
   }>({});
   const fitter = useRef<ReturnType<typeof createFitScheduler>>(undefined);
@@ -91,9 +96,16 @@ export function RdpTab({ active, label, source, preset, autoStart, onSecurityMod
     if ((remote?.width === target.width && remote.height === target.height && scale === target.scale) || requested === key) return;
     display.current.requested = key;
     void connection.resize(target).then((result) => {
-      if (result === "sent") display.current.scale = target.scale;
+      if (result === "sent") {
+        display.current.scale = target.scale;
+        display.current.retries = undefined;
+        setNotice((current) => current === RESIZE_WAIT_NOTICE ? "" : current);
+      }
       if (result !== "retry" || display.current.requested !== key) return;
       display.current.requested = undefined;
+      const retries = display.current.retries?.key === key ? display.current.retries : { key, count: 0 };
+      display.current.retries = { key, count: retries.count + 1 };
+      if (retries.count === RETRY_NOTICE_AFTER) setNotice((current) => current || RESIZE_WAIT_NOTICE);
       fitter.current?.schedule();
     });
   }
@@ -183,6 +195,7 @@ export function RdpTab({ active, label, source, preset, autoStart, onSecurityMod
     const initial = Promise.withResolvers<DesktopFit | undefined>();
     const fixed = display.current.remote;
     display.current.requested = undefined;
+    display.current.retries = undefined;
     void initial.promise.then((size) => { display.current.scale = size?.scale; });
     if (!fit && fixed) initial.resolve(evenSize(fixed));
     else {

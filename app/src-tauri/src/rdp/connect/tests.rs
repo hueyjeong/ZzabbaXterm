@@ -363,6 +363,7 @@ async fn tls_only_server(
     activate: bool,
     bitmaps: &[InclusiveRectangle],
     acknowledged: bool,
+    terminate: bool,
 ) -> Option<ClientInfo> {
     let (socket, _) = listener.accept().await.unwrap();
     let mut framed = TokioFramed::new(socket);
@@ -436,7 +437,42 @@ async fn tls_only_server(
         let (action, _) = framed.read_pdu().await.ok()?;
         assert_eq!(action, ironrdp::pdu::Action::X224);
     }
+    if terminate {
+        framed.write_all(&server_disconnect_frame()).await.ok()?;
+        // 클라이언트가 소켓을 닫을 때까지 연결을 유지한다.
+        while framed.read_pdu().await.is_ok() {}
+    }
     credentials
+}
+
+/// 서버가 세션을 끝내며 보내는 Set Error Info PDU다. 클라이언트에서는 `ActiveStageOutput::Terminate`가 된다.
+fn server_disconnect_frame() -> Vec<u8> {
+    use ironrdp::pdu::{
+        mcs::SendDataIndication,
+        rdp::{
+            client_info::CompressionType,
+            headers::{CompressionFlags, ShareControlHeader, ShareControlPdu, ShareDataHeader, ShareDataPdu, StreamPriority},
+            server_error_info::{ErrorInfo, ProtocolIndependentCode, ServerSetErrorInfoPdu},
+        },
+    };
+    let control = ShareControlHeader {
+        share_id: 0,
+        pdu_source: 1002,
+        share_control_pdu: ShareControlPdu::Data(ShareDataHeader {
+            share_data_pdu: ShareDataPdu::ServerSetErrorInfo(ServerSetErrorInfoPdu(ErrorInfo::ProtocolIndependentCode(
+                ProtocolIndependentCode::RpcInitiatedDisconnect,
+            ))),
+            stream_priority: StreamPriority::Undefined,
+            compression_flags: CompressionFlags::empty(),
+            compression_type: CompressionType::K8,
+        }),
+    };
+    encode_vec(&X224(SendDataIndication {
+        initiator_id: 1002,
+        channel_id: 1003,
+        user_data: std::borrow::Cow::Owned(encode_vec(&control).unwrap()),
+    }))
+    .unwrap()
 }
 
 #[tokio::test]
@@ -458,7 +494,7 @@ async fn tls_only_retries_once_and_activates_with_client_info_credentials() {
         top: 0,
         right: 1,
         bottom: 1,
-    }], false);
+    }], false, false);
     let client = async {
         let slot = Slot::new(1);
         let mut session = Session::open_with_tls(
@@ -520,7 +556,7 @@ async fn updates_received_while_the_tab_is_busy_are_merged_into_one_frame() {
     let tiles: Vec<_> = (0..32)
         .map(|index| InclusiveRectangle { left: index * 2, top: 0, right: index * 2, bottom: 1 })
         .collect();
-    let server = tls_only_server(&listener, tls_server(key, cert.der().clone()), size, true, &tiles, true);
+    let server = tls_only_server(&listener, tls_server(key, cert.der().clone()), size, true, &tiles, true, false);
     let client = async {
         let slot = Slot::new(1);
         let session = Session::open_with_tls(
@@ -564,6 +600,51 @@ async fn updates_received_while_the_tab_is_busy_are_merged_into_one_frame() {
 }
 
 #[tokio::test]
+async fn input_after_the_server_ends_the_session_is_rejected_and_the_session_ends_cleanly() {
+    use crate::rdp::{Event, Input, SLOTS, Session};
+
+    let size = DesktopSize { width: 800, height: 600 };
+    let ca = root();
+    let key = KeyPair::generate().unwrap();
+    let cert = CertificateParams::new(vec![REMOTE.to_owned()]).unwrap().signed_by(&key, &ca).unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca.der().clone()).unwrap();
+    let listener = listener();
+    let tiles: Vec<_> = (0..6).map(|index| InclusiveRectangle { left: index * 2, top: 0, right: index * 2, bottom: 1 }).collect();
+    let server = tls_only_server(&listener, tls_server(key, cert.der().clone()), size, true, &tiles, true, true);
+    let client = async {
+        let slot = Slot::new(1);
+        let mut session = Session::open_with_tls(
+            fixture_target(&listener, size, true, REMOTE).await,
+            REMOTE.try_into().unwrap(),
+            tls_config(roots),
+            no_trust(),
+            || async {
+                Ok(Account { username: "fixture".into(), domain: None, password: zeroize::Zeroizing::new("fixture-only".into()) })
+            },
+            SLOTS.try_acquire().unwrap(),
+            AuthIo::new(&slot, None),
+        )
+        .await?;
+        // 탭이 이벤트를 받지 않는 동안 세션 작업이 서버의 종료를 처리하고, 못 보낸 화면이 있어 종료 상태로 기다린다.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let input = Input::ScanCode { code: 0x1e, extended: false, released: true };
+        // 종료한 세션에 입력을 쓰면 안 된다. 쓰기 실패가 정상 종료 결과를 덮는다.
+        assert_eq!(session.input(session.id(), input).await, Err(Error::Closed));
+        let mut frames = 0;
+        while let Some(event) = timeout(Duration::from_secs(5), session.next()).await.unwrap() {
+            frames += usize::from(matches!(event, Event::Frame(_)));
+        }
+        assert!(frames > 0);
+        session.finish().await
+    };
+    let client = TEST_PEER_POLICY.scope(fixture_policy, client);
+    let (result, credentials) = timeout(Duration::from_secs(10), async { tokio::join!(client, server) }).await.unwrap();
+    assert!(credentials.is_some());
+    assert_eq!(result, Ok(()));
+}
+
+#[tokio::test]
 async fn tls_only_stops_before_credentials_when_the_certificate_name_differs() {
     let size = DesktopSize { width: 800, height: 600 };
     let ca = root();
@@ -575,7 +656,7 @@ async fn tls_only_stops_before_credentials_when_the_certificate_name_differs() {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(ca.der().clone()).unwrap();
     let listener = listener();
-    let server = tls_only_server(&listener, tls_server(key, cert.der().clone()), size, false, &[], false);
+    let server = tls_only_server(&listener, tls_server(key, cert.der().clone()), size, false, &[], false, false);
     let calls = AtomicUsize::new(0);
     let slot = Slot::new(1);
     let client = connect(
