@@ -1,4 +1,7 @@
-const EDITABLE = "input, textarea:not(.xterm-helper-textarea), [contenteditable]:not([contenteditable='false']), .monaco-editor";
+const EDITABLE = [
+  "input:not([type=checkbox], [type=radio], [type=button], [type=submit], [type=reset], [type=range], [type=color], [type=file], [type=image])",
+  "textarea:not(.xterm-helper-textarea)", "[contenteditable]:not([contenteditable='false'])", ".monaco-editor",
+].join(", ");
 
 /**
  * 웹뷰 기본 메뉴(뒤로·새로 고침·검사)는 앱 동작이 아니므로 막는다. 입력칸과 편집기는 편집 메뉴를 유지한다.

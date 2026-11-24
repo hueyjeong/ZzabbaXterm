@@ -16,6 +16,9 @@ it("앱 화면의 기본 메뉴는 막고 입력칸·편집기·Shift 우클릭�
   expect(rightClickOn(panel)).toBe(true);
   expect(rightClickOn(document.body.appendChild(document.createElement("input")))).toBe(false);
   expect(rightClickOn(document.body.appendChild(document.createElement("textarea")))).toBe(false);
+  const checkbox = document.body.appendChild(document.createElement("input"));
+  checkbox.type = "checkbox";
+  expect(rightClickOn(checkbox)).toBe(true);
   const xterm = document.body.appendChild(document.createElement("textarea"));
   xterm.className = "xterm-helper-textarea";
   expect(rightClickOn(xterm)).toBe(true);

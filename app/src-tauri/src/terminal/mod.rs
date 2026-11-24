@@ -842,30 +842,50 @@ fn shell() -> CommandBuilder {
 /// 넘기면 셸에서 실행한 `claude`가 하위 세션으로 동작하고 부모의 설정 디렉터리·훅 토큰을 쓴다.
 /// API 키나 `CLAUDE_CODE_USE_*` 같은 사용자 설정은 그대로 둔다.
 pub(crate) fn strip_inherited_agent_env(cmd: &mut CommandBuilder) {
-    for key in inherited_agent_env(std::env::vars_os()) {
+    // 값 비교는 빌더의 값으로 한다. Windows의 portable-pty는 레지스트리 사용자 환경을 프로세스 값 위에 덮는다.
+    let keys = inherited_agent_env(std::env::vars_os(), |key| cmd.get_env(key).map(std::ffi::OsStr::to_os_string));
+    for key in keys {
         cmd.env_remove(key);
     }
 }
 
-fn inherited_agent_env(vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>) -> Vec<std::ffi::OsString> {
+/// `vars`는 앱 프로세스의 환경, `current`는 셸에 넘길 빌더의 값이다.
+fn inherited_agent_env(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    current: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<std::ffi::OsString> {
     let vars: Vec<_> = vars.into_iter().collect();
     // Windows 환경 변수 이름은 대소문자를 가리지 않는다.
-    let name = |key: &std::ffi::OsString| key.to_string_lossy().to_ascii_uppercase();
-    let injected = vars.iter().find(|(key, _)| name(key) == "ORCA_CLAUDE_INJECTED_CONFIG_DIR").map(|(_, value)| value.clone());
-    vars.into_iter()
-        .filter(|(key, value)| {
+    let name = |key: &std::ffi::OsString| {
+        let name = key.to_string_lossy();
+        if cfg!(windows) { name.to_ascii_uppercase() } else { name.into_owned() }
+    };
+    let process = |wanted: &str| vars.iter().find(|(key, _)| name(key) == wanted).map(|(_, value)| value.clone());
+    let injected = process("ORCA_CLAUDE_INJECTED_CONFIG_DIR");
+    let agent = process("CLAUDECODE").is_some();
+    let mut keys: Vec<_> = vars
+        .iter()
+        .filter(|(key, _)| {
             let name = name(key);
             name.starts_with("ORCA_")
                 || name.starts_with("CLAUDE_CODE_SESSION_")
                 || name.starts_with("CLAUDE_CODE_MESSAGING_")
                 || matches!(
                     name.as_str(),
-                    "CLAUDECODE" | "CLAUDE_PID" | "CLAUDE_EFFORT" | "CLAUDE_CODE_CHILD_SESSION" | "CLAUDE_CODE_CHILD_NOTES_DIR"
-                        | "CLAUDE_CODE_ENTRYPOINT" | "CLAUDE_CODE_EXECPATH" | "CLAUDE_CODE_SSE_PORT"
+                    "CLAUDECODE" | "CLAUDE_PID" | "CLAUDE_EFFORT" | "AI_AGENT" | "CLAUDE_CODE_CHILD_SESSION"
+                        | "CLAUDE_CODE_CHILD_NOTES_DIR" | "CLAUDE_CODE_ENTRYPOINT" | "CLAUDE_CODE_EXECPATH"
+                        | "CLAUDE_CODE_SSE_PORT" | "CLAUDE_CODE_PLUGIN_DIRS" | "CLAUDE_CODE_FORCE_TERMINAL_IMAGES"
                 )
-                // 사용자가 직접 정한 설정 디렉터리는 남기고, Orca가 주입한 값일 때만 뺀다.
-                || (name == "CLAUDE_CONFIG_DIR" && injected.as_ref() == Some(value))
         })
-        .map(|(key, _)| key)
-        .collect()
+        .map(|(key, _)| key.clone())
+        .collect();
+    // 사용자가 직접 정한 설정 디렉터리는 남기고, Orca가 주입한 값일 때만 뺀다.
+    if injected.is_some() && current("CLAUDE_CONFIG_DIR") == injected {
+        keys.push("CLAUDE_CONFIG_DIR".into());
+    }
+    // Claude Code 도구 셸은 GIT_EDITOR=true를 둔다. 그대로 넘기면 커밋 메시지 편집이 건너뛰어진다.
+    if agent && current("GIT_EDITOR").is_some_and(|value| value == "true") {
+        keys.push("GIT_EDITOR".into());
+    }
+    keys
 }

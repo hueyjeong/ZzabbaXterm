@@ -246,30 +246,43 @@ fn l01_terminal_exit_259_is_not_a_running_process() {
 
 #[test]
 fn inherited_agent_session_markers_are_removed_but_user_settings_stay() {
-    use std::ffi::OsString;
-    let os = |value: &str| OsString::from(value);
+    use std::{collections::HashMap, ffi::OsString};
     let injected = r"C:\Users\fixture\orca\claude-profiles\x\home";
-    let vars = [
-        ("Claude_Code_Child_Session", "1"),
+    let process: Vec<(OsString, OsString)> = [
+        (if cfg!(windows) { "Claude_Code_Child_Session" } else { "CLAUDE_CODE_CHILD_SESSION" }, "1"),
         ("CLAUDE_CODE_SESSION_ID", "s"),
         ("CLAUDE_CODE_MESSAGING_SOCKET", "pipe"),
         ("CLAUDECODE", "1"),
+        ("AI_AGENT", "claude-code"),
+        ("CLAUDE_CODE_PLUGIN_DIRS", r"C:\orca\plugins"),
         ("ORCA_AGENT_HOOK_TOKEN", "t"),
         ("ORCA_CLAUDE_INJECTED_CONFIG_DIR", injected),
         ("CLAUDE_CONFIG_DIR", injected),
+        ("GIT_EDITOR", "true"),
         ("PATH", r"C:\Windows"),
-        ("TERM", "xterm-256color"),
         ("ANTHROPIC_API_KEY", "k"),
         ("CLAUDE_CODE_USE_POWERSHELL_TOOL", "1"),
     ]
-    .map(|(key, value)| (os(key), os(value)));
-    let mut removed: Vec<_> = super::inherited_agent_env(vars.clone()).into_iter().map(|key| key.into_string().unwrap()).collect();
-    removed.sort();
+    .map(|(key, value)| (OsString::from(key), OsString::from(value)))
+    .into();
+    let builder = |values: &[(&str, &str)]| {
+        let values: HashMap<String, OsString> = values.iter().map(|(key, value)| ((*key).to_owned(), OsString::from(value))).collect();
+        move |key: &str| values.get(key).cloned()
+    };
+    let sorted = |keys: Vec<OsString>| {
+        let mut keys: Vec<_> = keys.into_iter().map(|key| key.into_string().unwrap().to_ascii_uppercase()).collect();
+        keys.sort();
+        keys
+    };
+    let removed = sorted(super::inherited_agent_env(process.clone(), builder(&[("CLAUDE_CONFIG_DIR", injected), ("GIT_EDITOR", "true")])));
     assert_eq!(removed, [
-        "CLAUDECODE", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CONFIG_DIR",
-        "Claude_Code_Child_Session", "ORCA_AGENT_HOOK_TOKEN", "ORCA_CLAUDE_INJECTED_CONFIG_DIR",
+        "AI_AGENT", "CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_PLUGIN_DIRS",
+        "CLAUDE_CODE_SESSION_ID", "CLAUDE_CONFIG_DIR", "GIT_EDITOR", "ORCA_AGENT_HOOK_TOKEN", "ORCA_CLAUDE_INJECTED_CONFIG_DIR",
     ]);
-    // 사용자가 직접 정한 설정 디렉터리는 남긴다.
-    let own = [(os("CLAUDE_CONFIG_DIR"), os(r"D:\claude"))];
-    assert!(super::inherited_agent_env(own).is_empty());
+    // 레지스트리에서 덮인 사용자 설정 디렉터리와 사용자 GIT_EDITOR는 남긴다.
+    let kept = sorted(super::inherited_agent_env(process.clone(), builder(&[("CLAUDE_CONFIG_DIR", r"D:\claude"), ("GIT_EDITOR", "code --wait")])));
+    assert!(!kept.contains(&"CLAUDE_CONFIG_DIR".to_owned()) && !kept.contains(&"GIT_EDITOR".to_owned()));
+    // 에이전트 세션이 아니면 GIT_EDITOR=true도 사용자 설정이다.
+    let plain = [(OsString::from("GIT_EDITOR"), OsString::from("true"))];
+    assert!(super::inherited_agent_env(plain, builder(&[("GIT_EDITOR", "true")])).is_empty());
 }
