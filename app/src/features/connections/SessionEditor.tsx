@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type KeyboardEvent } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type FormEvent, type KeyboardEvent } from "react";
 import { X } from "lucide-react";
 import type { SavedConnections } from "./connectionIpc";
 import { SsmSelectionView } from "../ssm/SsmSelectionView";
@@ -8,7 +8,8 @@ import { TerminalView } from "../terminal/TerminalView";
 import { sshTestIpc } from "../terminal/session";
 import { IconButton, ProtocolIcon } from "../ui/controls";
 import type { ConnectionMethod } from "./profiles";
-import { createSessionEditor, editorFields, shownError, validate, type EditorActions, type EditorRequest } from "./sessionEditor";
+import { createSessionEditor, shownError, shownFields, testSupported, validate, type EditorActions, type EditorRequest } from "./sessionEditorState";
+import { Field } from "./fields/Field";
 import { DesktopFields } from "./fields/DesktopFields";
 import { LocalFields } from "./fields/LocalFields";
 import { S3Fields } from "./fields/S3Fields";
@@ -28,7 +29,8 @@ const methods: readonly (readonly [ConnectionMethod, string])[] = [
   ["local", "로컬"], ["ssh", "SSH"], ["ssm", "AWS SSM"], ["s3", "S3"], ["rdp", "RDP"], ["vnc", "VNC"],
 ];
 const discovery = createSsmDiscovery();
-const INDENT = "   ";
+// select의 option은 일반 공백을 접으므로 NBSP로 들여 쓴다.
+const INDENT = "\u00a0".repeat(3);
 
 function MethodTiles({ value, disabled, onSelect }: Readonly<{ value: ConnectionMethod; disabled: boolean; onSelect(method: ConnectionMethod): void }>) {
   const group = useRef<HTMLDivElement>(null);
@@ -52,9 +54,11 @@ function MethodTiles({ value, disabled, onSelect }: Readonly<{ value: Connection
   </div>;
 }
 
-/** 중첩 그룹을 부모 아래에 깊이만큼 들여 쓴 선택지로 펼친다. 부모가 없는 그룹은 최상위에 둔다. */
+/** 중첩 그룹을 부모 아래에 깊이만큼 들여 쓴 선택지로 펼친다. 부모가 없는 그룹은 최상위에 둔다. 이름이 겹치면 트리처럼 ID 앞 8자를 붙인다. */
 export function groupOptions(groups: SavedConnections["groups"]) {
   const known = new Set(groups.map(({ profile }) => profile.id));
+  const names = new Map<string, number>();
+  for (const { profile } of groups) names.set(profile.displayName, (names.get(profile.displayName) ?? 0) + 1);
   const children = new Map<string | undefined, SavedConnections["groups"][number]["profile"][]>();
   for (const { profile } of groups) {
     const parent = profile.parentId && known.has(profile.parentId) ? profile.parentId : undefined;
@@ -66,7 +70,8 @@ export function groupOptions(groups: SavedConnections["groups"]) {
     for (const group of children.get(parent) ?? []) {
       if (seen.has(group.id)) continue;
       seen.add(group.id);
-      options.push({ id: group.id, label: INDENT.repeat(depth) + group.displayName });
+      const suffix = (names.get(group.displayName) ?? 0) > 1 ? ` ${group.id.slice(0, 8)}` : "";
+      options.push({ id: group.id, label: INDENT.repeat(depth) + group.displayName + suffix });
       walk(group.id, depth + 1);
     }
   };
@@ -105,11 +110,19 @@ export function SessionEditor(props: SessionEditorProps) {
     || desktop?.route.kind === "ssm";
   const ssm = useSsmSelection(discovery, useSsm && !closingState, editor.invalidateSsmSelection);
   const selection = ssm.selection;
-  useEffect(() => { if (selection) editor.selectSsm(selection); }, [selection, editor]);
+  const { profile: ssmProfile, region: ssmRegion, instanceId: ssmInstance } = selection ?? {};
+  const sshTransport = draft.defaultMethod === "ssh" ? draft.ssh.transport.kind : undefined;
+  const desktopRoute = desktop?.route.kind;
+  // 선택 객체는 렌더마다 새로 만들어지므로 값으로 비교한다. 방식이나 경로를 바꾸면 화면의 선택을 새 초안에 다시 넣는다.
+  useEffect(() => {
+    if (ssmProfile && ssmRegion && ssmInstance) editor.selectSsm({ profile: ssmProfile, region: ssmRegion, instanceId: ssmInstance });
+  }, [editor, ssmProfile, ssmRegion, ssmInstance, draft.defaultMethod, sshTransport, desktopRoute]);
   const dialog = useRef<HTMLDialogElement>(null);
+  const nameInput = useRef<HTMLInputElement>(null);
   useLayoutEffect(() => {
     const modal = dialog.current;
     modal?.showModal();
+    nameInput.current?.focus();
     return () => modal?.close();
   }, []);
   useLayoutEffect(() => editor.abandon, [editor]);
@@ -134,70 +147,76 @@ export function SessionEditor(props: SessionEditorProps) {
   const ssmView = useSsm && !closingState && <>
     <SsmSelectionView state={ssm} />
     {savedSsm && !selection && <div className="editor-field"><span>현재 노드</span> <output>{savedSsm.profile} / {savedSsm.region} / {savedSsm.instanceId}</output></div>}
-    {["ssm.profile", "ssm.region", "ssm.instanceId"].map(field => error(field) && <div key={field} role="alert" className="field-error">{error(field)}</div>)}
+    {["ssm.profile", "ssm.region", "ssm.instanceId"].map(field => error(field) && <div key={field} className="field-error">{error(field)}</div>)}
   </>;
-  const saveError = status.kind === "saveFailed" && !(status.field && (editorFields as readonly string[]).includes(status.field))
-    ? status.field ? `${status.error}: ${status.field}` : status.error : undefined;
+  // 화면에 있는 필드의 오류는 필드 아래에만, 화면에 없는 경로는 상태 줄에 "입력 오류"로 표시한다.
+  const failure = status.kind === "saveFailed" || status.kind === "testFailed" ? status : undefined;
+  const failureText = failure && (!failure.field ? failure.error
+    : shownFields(draft).includes(failure.field) ? undefined : "입력 오류");
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    if (editor.canSave()) void editor.save();
+  };
 
   return (
     <dialog ref={dialog} className="connection-wizard session-editor" aria-label={title} onCancel={(event) => {
       event.preventDefault();
       close();
     }}>
-      <header className="editor-header">
-        <h2>{title}</h2>
-        <IconButton icon={X} label="닫기" small disabled={locked && status.kind !== "closeFailed"} onClick={close} />
-      </header>
-      <fieldset className="editor-body" disabled={locked}>
-        <div className="editor-field">
-          <label>이름 <input value={draft.displayName} onChange={event => editor.setName(event.target.value)} onBlur={() => touch("displayName")} /></label>
-          {error("displayName") && <div role="alert" className="field-error">{error("displayName")}</div>}
-        </div>
-        <div className="editor-field">
-          <label>그룹 <select value={draft.groupId ?? ""} onChange={event => editor.setGroup(event.currentTarget.value || undefined)}>
-            <option value="">최상위</option>
-            {groups.map(({ id, label }) => <option key={id} value={id}>{label}</option>)}
-            {draft.groupId && !groups.some(({ id }) => id === draft.groupId) && <option value={draft.groupId}>{draft.groupId}</option>}
-          </select></label>
-          {error("groupId") && <div role="alert" className="field-error">{error("groupId")}</div>}
-        </div>
-        <div className="editor-field">
-          <span>접속 방식</span>
-          <MethodTiles value={draft.defaultMethod} disabled={locked} onSelect={editor.selectMethod} />
-        </div>
-        <div className="editor-method">
-          {draft.defaultMethod === "local" && <LocalFields local={draft.local} edit={editor.editLocal} error={error} touch={touch} />}
-          {draft.defaultMethod === "ssm" && ssmView}
-          {draft.defaultMethod === "ssh" && <SshFields ssh={draft.ssh} edit={editor.editSsh} storedAuth={storedAuth} ssm={ssmView}
-            error={error} touch={touch} />}
-          {draft.defaultMethod === "s3" && <S3Fields s3={draft.s3} edit={editor.editS3} error={error} touch={touch} />}
-          {desktop && (draft.defaultMethod === "rdp" || draft.defaultMethod === "vnc") && <DesktopFields kind={draft.defaultMethod}
-            desktop={desktop} edit={editor.editDesktop} sshTargets={sshTargets} ssm={ssmView} error={error} touch={touch} />}
-        </div>
-      </fieldset>
-      {sshRun && sshAttempt && sshIpc && <div className="ssh-test-terminal">
-        <TerminalView key={sshRun.runId} active focusRequested label="SSH 시험 터미널" ipc={sshIpc} />
-        <button type="button" onClick={() => void editor.cancelSshTest(sshAttempt)}>SSH 시험 닫기</button>
-      </div>}
-      <div className="editor-status">
-        {status.kind === "testing" && <div role="status">시험 중</div>}
-        {status.kind === "passed" && <div role="status">시험 성공</div>}
-        {status.kind === "saving" && <div role="status">저장 중</div>}
-        {status.kind === "closing" && !remoteCleanup && <div role="status">취소 중</div>}
-        {remoteCleanup && <div role={remoteCleanup.kind === "cancelling" ? "status" : "alert"}>
-          {remoteCleanup.kind === "cancelling" ? "시험 취소 중" : "종료 확인 불가"}: {remoteCleanup.target.profile} / {remoteCleanup.target.region} / {remoteCleanup.target.instanceId}
-          {remoteCleanup.kind === "unconfirmed" && !locked && <button type="button" onClick={editor.retryCleanup}>종료 다시 확인</button>}
+      <form className="editor-form" onSubmit={submit}>
+        <header className="editor-header">
+          <h2>{title}</h2>
+          <IconButton icon={X} label="닫기" small disabled={locked && status.kind !== "closeFailed"} onClick={close} />
+        </header>
+        <fieldset className="editor-body" disabled={locked}>
+          <Field label="이름" error={error("displayName")}>
+            <input ref={nameInput} value={draft.displayName} onChange={event => editor.setName(event.target.value)} onBlur={() => touch("displayName")} />
+          </Field>
+          <Field label="그룹" error={error("groupId")}>
+            <select value={draft.groupId ?? ""} onChange={event => editor.setGroup(event.currentTarget.value || undefined)}>
+              <option value="">최상위</option>
+              {groups.map(({ id, label }) => <option key={id} value={id}>{label}</option>)}
+              {draft.groupId && !groups.some(({ id }) => id === draft.groupId) && <option value={draft.groupId}>{draft.groupId}</option>}
+            </select>
+          </Field>
+          <div className="editor-field">
+            <span>접속 방식</span>
+            <MethodTiles value={draft.defaultMethod} disabled={locked} onSelect={editor.selectMethod} />
+          </div>
+          <div className="editor-method">
+            {draft.defaultMethod === "local" && <LocalFields local={draft.local} edit={editor.editLocal} error={error} touch={touch} />}
+            {draft.defaultMethod === "ssm" && ssmView}
+            {draft.defaultMethod === "ssh" && <SshFields ssh={draft.ssh} edit={editor.editSsh} storedAuth={storedAuth} ssm={ssmView}
+              error={error} touch={touch} />}
+            {draft.defaultMethod === "s3" && <S3Fields s3={draft.s3} edit={editor.editS3} error={error} touch={touch} />}
+            {desktop && (draft.defaultMethod === "rdp" || draft.defaultMethod === "vnc") && <DesktopFields kind={draft.defaultMethod}
+              desktop={desktop} edit={editor.editDesktop} sshTargets={sshTargets} ssm={ssmView} error={error} touch={touch} />}
+          </div>
+        </fieldset>
+        {sshRun && sshAttempt && sshIpc && <div className="ssh-test-terminal">
+          <TerminalView key={sshRun.runId} active focusRequested label="SSH 시험 터미널" ipc={sshIpc} />
+          <button type="button" onClick={() => void editor.cancelSshTest(sshAttempt)}>SSH 시험 닫기</button>
         </div>}
-        {(status.kind === "testFailed" || (status.kind === "closeFailed" && !remoteCleanup)) && <div role="alert">{status.error}</div>}
-        {saveError && <div role="alert">{saveError}</div>}
-      </div>
-      <footer className="editor-footer">
-        {!desktop && <button type="button" disabled={!editor.canTest()} onClick={() => void editor.test()}>연결 시험</button>}
-        <button type="button" className="primary" disabled={!editor.canSave()} onClick={() => void editor.save()}>저장</button>
-        <button type="button" disabled={locked && status.kind !== "closeFailed"} onClick={close}>
-          {status.kind === "closeFailed" && remoteCleanup ? "종료 다시 확인" : "취소"}
-        </button>
-      </footer>
+        <div className="editor-status">
+          {status.kind === "testing" && <div role="status">시험 중</div>}
+          {status.kind === "passed" && <div role="status">시험 성공</div>}
+          {status.kind === "saving" && <div role="status">저장 중</div>}
+          {status.kind === "closing" && !remoteCleanup && <div role="status">취소 중</div>}
+          {remoteCleanup && <div role={remoteCleanup.kind === "cancelling" ? "status" : "alert"}>
+            {remoteCleanup.kind === "cancelling" ? "시험 취소 중" : "종료 확인 불가"}: {remoteCleanup.target.profile} / {remoteCleanup.target.region} / {remoteCleanup.target.instanceId}
+            {remoteCleanup.kind === "unconfirmed" && !locked && <button type="button" onClick={editor.retryCleanup}>종료 다시 확인</button>}
+          </div>}
+          {status.kind === "closeFailed" && !remoteCleanup && <div role="alert">{status.error}</div>}
+          {failureText && <div role="alert">{failureText}</div>}
+        </div>
+        <footer className="editor-footer">
+          {testSupported(draft) && <button type="button" disabled={!editor.canTest()} onClick={() => void editor.test()}>연결 시험</button>}
+          <button type="submit" className="primary" disabled={!editor.canSave()}>저장</button>
+          <button type="button" disabled={locked && status.kind !== "closeFailed"} onClick={close}>
+            {status.kind === "closeFailed" && remoteCleanup ? "종료 다시 확인" : "취소"}
+          </button>
+        </footer>
+      </form>
     </dialog>
   );
 }

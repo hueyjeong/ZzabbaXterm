@@ -53,6 +53,12 @@ it("연결 경로에서 AWS SSM 경유를 고르면 SSM 대상 선택을 기다�
   act(() => root.render(<SshFields ssh={{ ...ssh, transport: { kind: "ssm" } }} edit={edit} storedAuth={false}
     error={field => field === "ssh.hostKeyFingerprint" ? "지문 형식 오류" : undefined} touch={vi.fn()} ssm={<div data-testid="ssm" />} />));
   expect(host.querySelector('[data-testid="ssm"]')).not.toBeNull();
-  expect(host.querySelector('[role="alert"]')?.textContent).toBe("지문 형식 오류");
+  const fieldError = host.querySelector(".field-error");
+  expect(fieldError?.textContent).toBe("지문 형식 오류");
+  expect(host.querySelector('[role="alert"]')).toBeNull();
+  const fingerprint = fieldError!.closest(".editor-field")!.querySelector("input")!;
+  expect(fingerprint.getAttribute("aria-invalid")).toBe("true");
+  expect(fingerprint.getAttribute("aria-describedby")).toBe(fieldError!.id);
+  expect(host.querySelector('input:not([aria-invalid])[aria-describedby]')).toBeNull();
   act(() => root.unmount());
 });

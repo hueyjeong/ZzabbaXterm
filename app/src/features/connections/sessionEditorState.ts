@@ -19,12 +19,39 @@ export type FieldError = Readonly<{ text: string; required?: true }>;
 export type FieldErrors = Readonly<Record<string, FieldError>>;
 export type EditorState = TestState & Readonly<{ draft: EditorTarget; touched: ReadonlySet<string> }>;
 
-/** Rust ValidationError::field 경로 중 편집 창이 필드 아래에 표시하는 항목이다. */
-export const editorFields = [
-  "displayName", "groupId", "local.startDirectory", "ssm.profile", "ssm.region", "ssm.instanceId",
-  "ssh.host", "ssh.port", "ssh.account", "ssh.hostKeyFingerprint", "ssh.auth", "ssh.auth.keyPath", "ssh.auth.itemId",
-  "s3.profile", "s3.region", "s3.bucket", "s3.prefix", "desktop.host", "desktop.port", "desktop.route",
-] as const;
+const ssmFields = ["ssm.profile", "ssm.region", "ssm.instanceId"];
+
+/** Rust ValidationError::field 경로 중 현재 초안의 화면에서 필드 아래에 표시하는 항목이다. */
+export function shownFields(target: EditorTarget): readonly string[] {
+  const fields = ["displayName", "groupId"];
+  switch (target.defaultMethod) {
+    case "local": fields.push("local.startDirectory"); break;
+    case "ssm": fields.push(...ssmFields); break;
+    case "s3": fields.push("s3.profile", "s3.region", "s3.bucket", "s3.prefix"); break;
+    case "ssh": {
+      const { transport, auth } = target.ssh;
+      fields.push("ssh.host", "ssh.port", "ssh.account", "ssh.hostKeyFingerprint", "ssh.auth");
+      if (transport.kind === "ssm") fields.push(...ssmFields);
+      if (auth?.kind === "agent" || auth?.kind === "keyFile") fields.push("ssh.auth.keyPath");
+      if (auth?.kind === "storedPassword") fields.push("ssh.auth.itemId");
+      break;
+    }
+    case "rdp": case "vnc": {
+      const { route } = target.defaultMethod === "rdp" ? target.rdp : target.vnc;
+      fields.push("desktop.port", "desktop.route");
+      if (desktopHostUsed(target.defaultMethod, route.kind)) fields.push("desktop.host");
+      if (route.kind === "ssm") fields.push(...ssmFields);
+      break;
+    }
+  }
+  return fields;
+}
+
+/** 연결 시험을 지원하는 초안이다. RDP와 VNC, 저장 암호 SSH는 시험하지 않는다. */
+export function testSupported(target: EditorTarget) {
+  return target.defaultMethod !== "rdp" && target.defaultMethod !== "vnc"
+    && !(target.defaultMethod === "ssh" && target.ssh.auth?.kind === "storedPassword");
+}
 
 const required: FieldError = { text: "필수 입력", required: true };
 export const CONFLICT_TEXT = "다른 작업이 세션을 변경했습니다";
@@ -126,7 +153,7 @@ export function editError(error: unknown): { error: string; field?: string } {
 /** 필드 아래에 표시할 오류다. Rust 오류가 먼저이고, 빈 필수 입력은 건드린 필드에서만 보인다. */
 export function shownError(state: EditorState, errors: FieldErrors, field: string) {
   const { status, touched } = state;
-  if (status.kind === "saveFailed" && status.field === field) return status.error;
+  if ((status.kind === "saveFailed" || status.kind === "testFailed") && status.field === field) return status.error;
   const error = errors[field];
   return error && (!error.required || touched.has(field)) ? error.text : undefined;
 }
@@ -185,7 +212,7 @@ export function createSessionEditor(request: EditorRequest, actions: EditorActio
   const tester = createConnectionTest({ get: () => state, set: update }, {
     test: (...args) => actions.test(...args),
     cancelTest: attempt => actions.cancelTest(attempt),
-  });
+  }, editError);
 
   // 입력을 바꾸면 이전 시험 성공을 무효로 하고 열린 시험을 취소한다.
   function updateDraft(draft: EditorTarget, field?: string) {
@@ -210,7 +237,7 @@ export function createSessionEditor(request: EditorRequest, actions: EditorActio
 
   function testable() {
     const { draft, status, remoteCleanup } = state;
-    return draft.defaultMethod !== "rdp" && draft.defaultMethod !== "vnc" && !tester.locked()
+    return testSupported(draft) && !tester.locked()
       && status.kind !== "testing" && !remoteCleanup && Object.keys(validate(draft, storedAuth())).length === 0
       && completeTarget(draft) !== null;
   }

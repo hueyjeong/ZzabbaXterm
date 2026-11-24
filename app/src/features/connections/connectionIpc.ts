@@ -55,6 +55,7 @@ export function createLocalConnectionIpc(): LocalConnectionActions & {
     deleteTarget: (id, revision) => invoke<null>("connection_target_delete", { id, revision }),
     saveTarget: (draft) => invoke<{ revision: number }>("connection_target_save", { draft }),
     async test(attempt, interactive) {
+      // 시작은 초안 검증 실패를 ConnectionEditError의 invalid로, 그 밖의 실패를 문자열로 거부한다.
       const started = invoke<ConnectionTestRun>("connection_test_start", attempt);
       const execution: Execution = { started, cancelled: false };
       attempts.set(attempt, execution);
@@ -106,6 +107,7 @@ export function createLocalConnectionIpc(): LocalConnectionActions & {
         attempts.get(success.attempt) !== success.execution) {
         throw new Error("현재 초안의 연결 테스트 성공이 필요합니다");
       }
+      // 실패하면 ConnectionEditError로 거부한다.
       await invoke<null>("connection_save", { request });
       tested.delete(request.run);
       attempts.delete(success.attempt);

@@ -40,7 +40,7 @@ export function DesktopFields({ kind, desktop, edit, sshTargets, ssm, error, tou
       </select>
     </Field>}
     {route.kind === "ssm" && ssm}
-    {route.kind !== "ssh" && error("desktop.route") && <div role="alert" className="field-error">{error("desktop.route")}</div>}
+    {route.kind !== "ssh" && error("desktop.route") && <div className="field-error">{error("desktop.route")}</div>}
     {desktopHostUsed(kind, route.kind) && <Field label="호스트" error={error("desktop.host")}>
       <input value={desktop.host} maxLength={253} autoComplete="off" spellCheck={false} onBlur={() => touch("desktop.host")}
         onChange={event => edit({ host: event.target.value }, "desktop.host")} />

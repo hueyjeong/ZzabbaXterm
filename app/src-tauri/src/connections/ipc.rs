@@ -5,9 +5,12 @@ use tauri::{Manager, Webview, ipc::{CommandArg, CommandItem, Invoke, InvokeError
 use crate::terminal::Sessions;
 use super::{
     probe,
-    profile::{GroupDraft, Revision, TargetDraft, ValidationError},
+    profile::{GroupDraft, MethodRef, Revision, SshAuth, TargetDraft, ValidatedTarget, ValidationError},
     store::{Expected, SaveStatus, Store, StoreError},
 };
+
+/// 저장 암호를 쓸 수 있는 빌드인지다. 편집 창에 알리는 기능과 저장 검증이 같은 값을 쓴다.
+const STORED_AUTH: bool = cfg!(all(feature = "stored-auth", any(windows, target_os = "linux")));
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -20,10 +23,10 @@ struct Saved {
     revision: Revision,
 }
 
-/// 그룹과 대상 편집 명령의 오류다. 편집 창이 필드 옆이나 상태 줄에 표시한다.
+/// 그룹과 대상 편집 명령, 시험 뒤 저장(`connection_save`)의 오류다. 편집 창이 필드 옆이나 상태 줄에 표시한다.
 #[derive(Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
-enum EditError {
+pub(super) enum EditError {
     Invalid { field: &'static str },
     Conflict,
     Referenced { targets: Vec<String> },
@@ -43,7 +46,7 @@ impl From<String> for EditError {
 }
 
 /// `missing_group`은 없는 그룹을 가리킨 입력 필드다. 그룹 저장은 `parentId`, 대상 저장은 `groupId`다.
-fn edited(result: Result<SaveStatus, StoreError>, missing_group: &'static str) -> Result<(), EditError> {
+pub(super) fn edited(result: Result<SaveStatus, StoreError>, missing_group: &'static str) -> Result<(), EditError> {
     match result {
         Ok(SaveStatus::Saved) => Ok(()),
         Ok(SaveStatus::GroupConflict | SaveStatus::TargetConflict) => Err(EditError::Conflict),
@@ -59,6 +62,16 @@ fn edited(result: Result<SaveStatus, StoreError>, missing_group: &'static str) -
 
 fn next(revision: Option<Revision>) -> Result<Revision, EditError> {
     revision.ok_or_else(|| EditError::Failed { message: "프로필 저장: RevisionExhausted".into() })
+}
+
+/// 저장 암호 기능이 없는 빌드에서는 저장 암호를 참조하는 SSH 세션을 저장하지 않는다.
+fn check_stored_auth(draft: &ValidatedTarget, stored_auth: bool) -> Result<(), EditError> {
+    match draft.method() {
+        MethodRef::Ssh { ssh } if !stored_auth && matches!(ssh.auth, SshAuth::StoredPassword { .. }) => {
+            Err(ValidationError::SshItemId.into())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// SSM과 S3 세션을 시험 없이 저장할 때 기록하는 로컬 SSO 설정의 계정이다. 네트워크는 쓰지 않는다.
@@ -83,6 +96,22 @@ mod capabilities_tests {
     }
 
     #[test]
+    fn stored_password_targets_need_the_stored_auth_build() {
+        use crate::connections::tests::{TestDir, ssh_draft, target_draft};
+        use serde_json::json;
+        let dir = TestDir::new();
+        let validate = |input: &serde_json::Value| {
+            serde_json::from_value::<TargetDraft>(target_draft(input)).unwrap().validate().unwrap()
+        };
+        let manual = ssh_draft(dir.path());
+        let mut stored = manual.clone();
+        stored["target"]["ssh"]["auth"] = json!({"kind": "storedPassword", "itemId": "21eb36c3-234d-439d-9e1f-1d3cc5ba8125"});
+        assert_eq!(check_stored_auth(&validate(&stored), false), Err(EditError::Invalid { field: "ssh.auth.itemId" }));
+        assert_eq!(check_stored_auth(&validate(&stored), true), Ok(()));
+        assert_eq!(check_stored_auth(&validate(&manual), false), Ok(()));
+    }
+
+    #[test]
     fn capabilities_serialize_stored_auth_as_camel_case() {
         let value = serde_json::to_value(Capabilities { stored_auth: true }).unwrap();
         assert_eq!(value, serde_json::json!({ "storedAuth": true }));
@@ -96,7 +125,7 @@ pub(crate) fn handle(invoke: Invoke, other: fn(Invoke) -> bool) -> bool {
     match invoke.message.command() {
         "connection_capabilities" => dispatch(invoke, "connection_capabilities", |_| {
             Ok(|_, _| Ok::<_, String>(Capabilities {
-                stored_auth: cfg!(all(feature = "stored-auth", any(windows, target_os = "linux"))),
+                stored_auth: STORED_AUTH,
             }))
         }),
         "connection_test_start" => dispatch(invoke, "connection_test_start", |args| {
@@ -172,6 +201,7 @@ pub(crate) fn handle(invoke: Invoke, other: fn(Invoke) -> bool) -> bool {
             let draft: TargetDraft = args.get("draft")?;
             Ok(move |caller: Webview, document| -> Result<Saved, EditError> {
                 let draft = draft.validate()?;
+                check_stored_auth(&draft, STORED_AUTH)?;
                 let revision = next(draft.next_revision())?;
                 let sessions = caller.state::<Sessions>();
                 let authorize = || sessions.with_probes(caller.label(), document, |_| Ok(()));

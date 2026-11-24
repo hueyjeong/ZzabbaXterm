@@ -1833,13 +1833,13 @@ describe("F01 직접 SSH", () => {
 
     await key(target, "ContextMenu");
     expect([...find('[role="menu"]').querySelectorAll('[role="menuitem"]')].map(item => item.textContent))
-      .toEqual(["SSH", "터널 열기", "호스트 키 확인…", "호스트 키 등록", "편집…", "삭제"]);
-    await press("호스트 키 등록");
+      .toEqual(["SSH", "터널 열기", "호스트 키 확인…", "호스트 키 파일로 등록…", "편집…", "삭제"]);
+    await press("호스트 키 파일로 등록…");
     expect(host.querySelector('[role="menu"]')).toBeNull();
     expect(find('footer [role="alert"]').textContent).toContain("SSH 호스트 키 등록이 취소되었습니다");
 
     await key(target, "ContextMenu");
-    await press("호스트 키 등록");
+    await press("호스트 키 파일로 등록…");
     expect(connectionCalls("register_saved_ssh_host")).toEqual([
       ["register_saved_ssh_host", { targetId: "server" }],
       ["register_saved_ssh_host", { targetId: "server" }],
@@ -2092,7 +2092,7 @@ describe("현재 SSH 세션의 SFTP", () => {
       .find(item => item.querySelector(":scope > .tree-row > span")?.textContent === "서버 A");
     expect(row).toBeDefined();
     await act(async () => { row?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true })); });
-    expect(button("호스트 키 등록")).toBeDefined();
+    expect(button("호스트 키 파일로 등록…")).toBeDefined();
     const openedTerminals = calls("open").length;
     await press("터널 열기");
     const title = "서버 A · 터널 3";

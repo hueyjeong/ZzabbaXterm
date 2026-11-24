@@ -92,7 +92,7 @@ export function LocalTree({ profiles, openCounts, onOpen, onElevate, onLocalElev
     const sshTargetId = target.sshTargetId;
     if (sshTargetId !== undefined) items.push({ kind: "separator" });
     add("호스트 키 확인…", KeyRound, sshTargetId !== undefined && onTrustSshHost ? () => onTrustSshHost(sshTargetId) : undefined);
-    add("호스트 키 등록", KeyRound, sshTargetId !== undefined ? () => onRegisterSshHost(sshTargetId) : undefined);
+    add("호스트 키 파일로 등록…", KeyRound, sshTargetId !== undefined ? () => onRegisterSshHost(sshTargetId) : undefined);
     if (target.edit || target.remove) items.push({ kind: "separator" });
     add("편집…", SquarePen, target.edit);
     add("삭제", Trash2, target.remove);

@@ -1,10 +1,12 @@
 // @vitest-environment jsdom
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { invoke } from "@tauri-apps/api/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createLocalConnectionIpc } from "./connectionIpc";
 import type { SavedConnections } from "./connectionIpc";
 import type { ConnectionTestDraft, SavedTarget } from "./profiles";
-import { SessionEditor, type SessionEditorProps } from "./SessionEditor.tsx";
+import { SessionEditor, type SessionEditorProps } from "./SessionEditor";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("../terminal/TerminalView", () => ({ TerminalView: () => null }));
@@ -12,7 +14,9 @@ vi.mock("../ssm/ssmDiscovery", () => ({
   createSsmDiscovery: () => ({
     listProfiles: async () => ({ ok: true, value: ["company-sso"] }),
     configuredRegion: async () => ({ ok: true, value: "ap-northeast-2" }),
-    listOnlineNodes: async () => ({ ok: true, value: [{ instanceId: "i-0123456789abcdef0", name: "web" }] }),
+    listOnlineNodes: async () => ({ ok: true, value: [
+      { instanceId: "i-0123456789abcdef0", name: "web" }, { instanceId: "i-0fedcba9876543210", name: "api" },
+    ] }),
     relogin: async () => ({ ok: true, value: undefined }),
   }),
 }));
@@ -67,7 +71,7 @@ const labels = () => [...host.querySelectorAll(".editor-method label, .editor-me
   .map(item => (item.firstChild?.textContent || item.textContent)?.trim());
 const control = (name: string) => [...host.querySelectorAll("label")].find(item => item.firstChild?.textContent?.trim() === name)
   ?.querySelector<HTMLInputElement | HTMLSelectElement>("input, select") ?? undefined;
-const errorOf = (name: string) => control(name)?.closest(".editor-field")?.querySelector('[role="alert"]')?.textContent;
+const errorOf = (name: string) => control(name)?.closest(".editor-field")?.querySelector(".field-error")?.textContent;
 const options = (name: string) => [...(control(name) as HTMLSelectElement).options].map(option => option.textContent);
 async function type(name: string, value: string) {
   const input = control(name)!;
@@ -83,10 +87,10 @@ async function blur(name: string) {
 const method = (label: string) => act(async () => {
   [...host.querySelectorAll<HTMLButtonElement>('[role="radio"]')].find(item => item.textContent === label)!.click();
 });
-async function chooseNode() {
+async function chooseNode(instanceId = node.instanceId) {
   await type("프로필", node.profile);
   await vi.waitFor(() => expect(options("온라인 노드")).toContain(`web (${node.instanceId})`));
-  await type("온라인 노드", node.instanceId);
+  await type("온라인 노드", instanceId);
 }
 const saved = () => (actions.saveTarget.mock.calls as unknown[][])[0][0] as { targetRevision: number | null; target: SavedTarget };
 
@@ -253,5 +257,193 @@ describe("세션 편집", () => {
     expect(button("저장")!.disabled).toBe(false);
     await press("닫기");
     await vi.waitFor(() => expect(actions.onClose).toHaveBeenCalledWith({ kind: "cancelled", draftId: expect.any(String) }));
+  });
+});
+
+const secondNode = "i-0fedcba9876543210";
+const form = () => host.querySelector("form")!;
+const statusAlert = () => host.querySelector('.editor-status [role="alert"]')?.textContent;
+const s3Target = { id: "bucket", displayName: "버킷", defaultMethod: "s3",
+  s3: { profile: "company", region: "ap-northeast-2", bucket: "dev", prefix: "" } } satisfies SavedTarget;
+
+describe("편집 창 입력과 저장", () => {
+  it("열리면 이름 입력에 포커스를 두고 제출은 저장할 수 있을 때만 저장한다", async () => {
+    await render();
+    expect(document.activeElement).toBe(control("이름"));
+    expect([...form().querySelectorAll("button")].filter(item => item.type !== "button").map(item => item.textContent)).toEqual(["저장"]);
+    await act(async () => { form().requestSubmit(); });
+    expect(actions.saveTarget).not.toHaveBeenCalled();
+    await type("이름", "셸");
+    await method("SSH");
+    await method("로컬");
+    expect(actions.saveTarget).not.toHaveBeenCalled();
+    await act(async () => { form().requestSubmit(); });
+    expect(saved().target).toMatchObject({ displayName: "셸", defaultMethod: "local" });
+  });
+
+  it("필드 오류를 입력의 aria-describedby로 잇고 alert 역할을 쓰지 않는다", async () => {
+    await render();
+    await blur("이름");
+    const input = control("이름")!;
+    const fieldError = host.querySelector(".field-error")!;
+    expect(fieldError.textContent).toBe("필수 입력");
+    expect(fieldError.getAttribute("role")).toBeNull();
+    expect(input.getAttribute("aria-invalid")).toBe("true");
+    expect(input.getAttribute("aria-describedby")).toBe(fieldError.id);
+    expect(control("그룹")!.hasAttribute("aria-invalid")).toBe(false);
+  });
+
+  it("화면에 없는 Rust 검증 경로는 상태 줄에 입력 오류만 표시한다", async () => {
+    actions.saveTarget.mockRejectedValueOnce({ kind: "invalid", field: "local.shell" });
+    await render();
+    await type("이름", "셸");
+    await press("저장");
+    expect(statusAlert()).toBe("입력 오류");
+    expect(host.textContent).not.toContain("local.shell");
+  });
+
+  it("시험 시작의 invalid 오류는 필드 아래에, 문자열 오류는 상태 줄에 표시한다", async () => {
+    actions.test.mockRejectedValueOnce({ kind: "invalid", field: "s3.bucket" }).mockRejectedValueOnce("버킷 없음");
+    await render({ request: { target: s3Target, revision: 2 } });
+    await press("연결 시험");
+    expect(errorOf("버킷")).toBe("입력 오류");
+    expect(statusAlert()).toBeUndefined();
+    await press("연결 시험");
+    expect(errorOf("버킷")).toBeUndefined();
+    expect(statusAlert()).toBe("버킷 없음");
+  });
+
+  it("티켓 저장의 편집 오류를 필드 아래와 상태 줄에 표시한다", async () => {
+    actions.save.mockRejectedValueOnce({ kind: "invalid", field: "s3.region" })
+      .mockRejectedValueOnce({ kind: "conflict" }).mockRejectedValueOnce({ kind: "failed", message: "설정 파일 교체 실패" });
+    await render({ request: { target: s3Target, revision: 2 } });
+    await press("연결 시험");
+    await press("저장");
+    expect(errorOf("버킷 리전")).toBe("입력 오류");
+    expect(statusAlert()).toBeUndefined();
+    await press("저장");
+    expect(statusAlert()).toBe("다른 작업이 세션을 변경했습니다");
+    await press("저장");
+    expect(statusAlert()).toBe("설정 파일 교체 실패");
+    expect(actions.save).toHaveBeenCalledTimes(3);
+    expect(actions.onClose).not.toHaveBeenCalled();
+  });
+
+  it("저장 암호 SSH는 연결 시험을 표시하지 않는다", async () => {
+    await render({ capabilities: async () => ({ storedAuth: true }) });
+    await method("SSH");
+    expect(button("연결 시험")).toBeDefined();
+    await type("인증 방식", "storedPassword");
+    expect(button("연결 시험")).toBeUndefined();
+  });
+
+  it("그룹 선택에서 이름이 겹치는 그룹만 ID 앞 8자를 함께 표시한다", async () => {
+    await render({ groups: [
+      { revision: 1, profile: { id: "aaaaaaaa-1111", displayName: "데모" } },
+      { revision: 1, profile: { id: "bbbbbbbb-2222", displayName: "데모" } },
+      { revision: 1, profile: { id: "cccccccc-3333", displayName: "데모" } },
+      { revision: 1, profile: { id: "home", displayName: "집" } },
+    ] });
+    expect(options("그룹")).toEqual(["최상위", "데모 aaaaaaaa", "데모 bbbbbbbb", "데모 cccccccc", "집"]);
+  });
+
+  it("저장 중 Esc를 무시한다", async () => {
+    const pending = Promise.withResolvers<{ revision: number }>();
+    actions.saveTarget.mockReturnValueOnce(pending.promise);
+    await render();
+    await type("이름", "셸");
+    await press("저장");
+    const cancel = new Event("cancel", { cancelable: true });
+    await act(async () => { host.querySelector("dialog")!.dispatchEvent(cancel); });
+    expect(cancel.defaultPrevented).toBe(true);
+    expect(host.querySelector('.editor-status [role="status"]')?.textContent).toBe("저장 중");
+    expect(actions.onClose).not.toHaveBeenCalled();
+    await act(async () => pending.resolve({ revision: 1 }));
+    expect(actions.onClose).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ kind: "saved" }));
+  });
+});
+
+describe("SSM 노드 선택", () => {
+  it("방식을 오간 뒤 화면의 노드 선택과 저장 초안의 노드가 같다", async () => {
+    await render();
+    await type("이름", "윈도");
+    await method("RDP");
+    await type("호스트", "win.example.test");
+    await type("연결 경로", "ssm");
+    await chooseNode(node.instanceId);
+    await method("SSH");
+    await type("연결 경로", "ssm");
+    await chooseNode(secondNode);
+    await method("RDP");
+    expect(control("온라인 노드")!.value).toBe(secondNode);
+    await press("저장");
+    expect(saved().target).toMatchObject({ rdp: { route: { kind: "ssm", ...node, instanceId: secondNode } } });
+  });
+
+  it("RDP의 SSM 경로에서 AWS SSM 방식으로 바꾸면 현재 선택을 초안에 넣는다", async () => {
+    await render();
+    await type("이름", "노드");
+    await method("RDP");
+    await type("연결 경로", "ssm");
+    await chooseNode(secondNode);
+    await method("AWS SSM");
+    expect(control("온라인 노드")!.value).toBe(secondNode);
+    expect(host.querySelector(".field-error")).toBeNull();
+    await press("저장");
+    expect(saved().target).toMatchObject({ defaultMethod: "ssm", ssm: { ...node, instanceId: secondNode } });
+  });
+});
+
+describe("편집 창 언마운트", () => {
+  const native = () => ({ ...createLocalConnectionIpc(), onClose: vi.fn() });
+  const cancelled = () => vi.mocked(invoke).mock.calls.filter(([command]) => command === "connection_test_cancel");
+  let waitReply: PromiseWithResolvers<unknown>;
+
+  beforeEach(() => {
+    waitReply = Promise.withResolvers();
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      if (command === "connection_test_start") {
+        const { draftId, draftVersion } = args as ConnectionTestDraft;
+        return { draftId, draftVersion, runId: "rust-1" };
+      }
+      if (command === "connection_capabilities") return { storedAuth: false };
+      if (command === "connection_test_wait") return waitReply.promise;
+      // connection_save는 끝나지 않아 저장 중에 머문다.
+      if (command === "connection_save") return new Promise(() => { });
+      return null;
+    });
+  });
+  afterEach(() => { vi.mocked(invoke).mockReset(); });
+
+  async function unmount() {
+    await act(async () => root.unmount());
+    root = createRoot(host);
+  }
+
+  it("시험 중에 언마운트하면 실행을 회수한다", async () => {
+    await render({ request: { target: s3Target, revision: 2 }, ...native() });
+    await press("연결 시험");
+    expect(host.querySelector('.editor-status [role="status"]')?.textContent).toBe("시험 중");
+    await unmount();
+    await vi.waitFor(() => expect(cancelled()).toEqual([
+      ["connection_test_cancel", { run: { draftId: expect.any(String), draftVersion: 0, runId: "rust-1" } }],
+    ]));
+  });
+
+  it("티켓 저장 중에 언마운트하면 실행을 회수한다", async () => {
+    await render({ request: { target: s3Target, revision: 2 }, ...native() });
+    await press("연결 시험");
+    await act(async () => {
+      const [, args] = vi.mocked(invoke).mock.calls.find(([command]) => command === "connection_test_wait")!;
+      waitReply.resolve({ ...(args as { run: object }).run, sessionId: null });
+    });
+    expect(host.querySelector('.editor-status [role="status"]')?.textContent).toBe("시험 성공");
+    await press("저장");
+    expect(host.querySelector('.editor-status [role="status"]')?.textContent).toBe("저장 중");
+    expect(cancelled()).toEqual([]);
+    await unmount();
+    await vi.waitFor(() => expect(cancelled()).toEqual([
+      ["connection_test_cancel", { run: { draftId: expect.any(String), draftVersion: 0, runId: "rust-1" } }],
+    ]));
   });
 });

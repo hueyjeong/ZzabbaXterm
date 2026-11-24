@@ -3,9 +3,23 @@ use std::{collections::HashMap, sync::Arc, thread};
 use serde::{Deserialize, Serialize};
 
 use crate::terminal::{Sessions, probe::Probe};
-use super::{profile::{Method, MethodRef, TargetDraft, ValidatedTarget}, store::{SaveStatus, Store, StoreError}};
+use super::{ipc::{EditError, edited}, profile::{Method, MethodRef, TargetDraft, ValidatedTarget}, store::Store};
 
 const UNTESTED: &str = "이 초안의 현재 시험이 없습니다";
+
+/// 시험 시작 오류다. 초안 검증 실패는 저장과 같은 `{kind:"invalid", field}`로, 그 밖의 실패는 문자열로 보낸다.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub(super) enum StartError {
+    Invalid(EditError),
+    Failed(String),
+}
+
+impl From<String> for StartError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
 
 #[derive(Clone, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -106,19 +120,19 @@ impl Runs {
 }
 
 #[cfg(test)]
-pub(super) fn start(sessions: &Sessions, owner: &str, document: u64, draft_id: String, draft_version: u64, draft: TargetDraft, config: std::path::PathBuf) -> Result<RunKey, String> {
+pub(super) fn start(sessions: &Sessions, owner: &str, document: u64, draft_id: String, draft_version: u64, draft: TargetDraft, config: std::path::PathBuf) -> Result<RunKey, StartError> {
     start_trusting(sessions, owner, document, draft_id, draft_version, draft, config, None)
 }
 
 /// `trust`는 SSH 시험에서 핀이 없을 때 띄우는 첫 연결 확인 창이다.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn start_trusting(sessions: &Sessions, owner: &str, document: u64, draft_id: String, draft_version: u64, draft: TargetDraft,
-    config: std::path::PathBuf, trust: Option<crate::ssh::host_trust::Confirm>) -> Result<RunKey, String> {
+    config: std::path::PathBuf, trust: Option<crate::ssh::host_trust::Confirm>) -> Result<RunKey, StartError> {
     if draft_id.is_empty() || draft_version > (1 << 53) - 1 {
-        return Err("초안 ID 또는 버전이 올바르지 않습니다".into());
+        return Err(StartError::Failed("초안 ID 또는 버전이 올바르지 않습니다".into()));
     }
     if matches!(draft.target.method, Method::Rdp { .. } | Method::Vnc { .. }) {
-        return Err("원격 화면 프로필은 연결 시험 없이 저장합니다".into());
+        return Err(StartError::Failed("원격 화면 프로필은 연결 시험 없이 저장합니다".into()));
     }
     sessions.with_probe_access(owner, document, matches!(draft.target.method, Method::Ssh { .. }), |runs| {
         let active = runs.active.entry(owner.into()).or_default();
@@ -129,7 +143,10 @@ pub(super) fn start_trusting(sessions: &Sessions, owner: &str, document: u64, dr
         if let Some(previous) = active.remove(&draft_id) {
             runs.retire(owner, document, previous.key, previous.probe);
         }
-        let draft = Arc::new(draft.validate().map_err(|error| format!("초안 검증: {error:?}"))?);
+        let draft = match draft.validate() {
+            Ok(draft) => Arc::new(draft),
+            Err(error) => return Ok(Err(error)),
+        };
         let key = RunKey { draft_id, draft_version, run_id: sessions.next_id() };
         let session_id = (!matches!(draft.method(), MethodRef::S3 { .. })).then(|| sessions.next_id());
         let probe = Arc::new(Probe::for_draft(owner, &draft));
@@ -143,8 +160,8 @@ pub(super) fn start_trusting(sessions: &Sessions, owner: &str, document: u64, dr
             .map_err(|error| format!("연결 시험: {error}"))?;
         let run = Run { key: key.clone(), session_id, draft, probe, confirmed: false };
         runs.active.get_mut(owner).unwrap().insert(key.draft_id.clone(), run);
-        Ok(key)
-    })
+        Ok(Ok(key))
+    })?.map_err(|error| StartError::Invalid(error.into()))
 }
 
 pub(super) fn attach(sessions: &Sessions, owner: &str, document: u64, key: &RunKey, rows: u16, cols: u16,
@@ -217,9 +234,10 @@ fn remove_run(runs: &mut Runs, owner: &str, document: u64, key: &RunKey) -> Resu
     Ok(())
 }
 
-pub(super) fn save_confirmed(sessions: &Sessions, owner: &str, document: u64, request: SaveRequest, store: &Store) -> Result<(), String> {
+/// 오류는 `connection_target_save`와 같은 `EditError` 형식이다. 시험이 없거나 맞지 않으면 `failed`다.
+pub(super) fn save_confirmed(sessions: &Sessions, owner: &str, document: u64, request: SaveRequest, store: &Store) -> Result<(), EditError> {
     let SaveRequest { run: key, draft } = request;
-    let draft = draft.validate().map_err(|error| format!("초안 검증: {error:?}"))?;
+    let draft = draft.validate()?;
     // 시험 없이 저장하는 대상(저장 암호 SSH, 원격 화면)은 `connection_target_save`를 쓴다.
     let expected = sessions.with_probes(owner, document, |runs| {
         let run = runs.get(owner, &key)?;
@@ -230,7 +248,7 @@ pub(super) fn save_confirmed(sessions: &Sessions, owner: &str, document: u64, re
     })?;
     let tested_account_id = expected.1.wait()?;
     if draft.method().uses_tested_account() != tested_account_id.is_some() {
-        return Err(UNTESTED.into());
+        return Err(EditError::Failed { message: UNTESTED.into() });
     }
     let authorize = || sessions.with_probes(owner, document, |runs| {
         let run = runs.get(owner, &key)?;
@@ -246,20 +264,7 @@ pub(super) fn save_confirmed(sessions: &Sessions, owner: &str, document: u64, re
             Ok(())
         });
     };
-    saved(store.save_authorized(draft, tested_account_id, authorize, committed))
-}
-
-fn saved(result: Result<SaveStatus, StoreError>) -> Result<(), String> {
-    match result.map_err(|error| match error {
-        StoreError::Authorization(reason) => reason,
-        StoreError::DesktopRoute => "Agent 또는 키 파일 인증의 저장된 직접 SSH 대상이 필요합니다".into(),
-        other => format!("프로필 저장: {other:?}"),
-    })? {
-        SaveStatus::GroupConflict => Err("다른 작업이 그룹을 변경했습니다".into()),
-        SaveStatus::TargetConflict => Err("다른 작업이 대상을 변경했습니다".into()),
-        SaveStatus::Referenced(_) => Err("원격 화면 세션이 이 SSH 세션을 연결 경로로 사용합니다".into()),
-        SaveStatus::Saved => Ok(()),
-    }
+    edited(store.save_authorized(draft, tested_account_id, authorize, committed), "groupId")
 }
 
 #[cfg(test)]
@@ -524,5 +529,32 @@ mod tests {
         stored["target"]["ssh"]["auth"] = json!({"kind": "storedPassword", "itemId": "21eb36c3-234d-439d-9e1f-1d3cc5ba8125"});
         assert!(save_confirmed(&sessions, "main", 0, request(stored), &store).is_err());
         assert!(store.load().unwrap().targets.is_empty());
+    }
+
+    #[test]
+    fn start_and_save_errors_use_the_edit_error_shape() {
+        use crate::connections::tests::{desktop_draft, ssh_draft};
+        use serde_json::json;
+        let dir = TestDir::new();
+        let sessions = Sessions::default();
+        let store = Store::new(dir.path());
+        let mut invalid = ssh_draft(dir.path());
+        invalid["target"]["ssh"]["port"] = json!(0);
+        let parse = |input: &serde_json::Value| serde_json::from_value::<TargetDraft>(target_draft(input)).unwrap();
+        // 초안 검증 실패는 필드를 가리키고, 그 밖의 시작 실패는 문자열이다.
+        let error = start(&sessions, "main", 0, "draft".into(), 1, parse(&invalid), dir.path().into()).err().unwrap();
+        assert_eq!(serde_json::to_value(error).unwrap(), json!({"kind": "invalid", "field": "ssh.port"}));
+        let rdp = desktop_draft(dir.path(), "rdp", json!({
+            "host": "xrdp.example.test", "port": 3389, "tlsOnly": false, "route": {"kind": "direct"},
+        }));
+        let error = start(&sessions, "main", 0, "draft".into(), 1, parse(&rdp), dir.path().into()).err().unwrap();
+        assert_eq!(serde_json::to_value(error).unwrap(), json!("원격 화면 프로필은 연결 시험 없이 저장합니다"));
+        let run = RunKey { draft_id: "draft".into(), draft_version: 1, run_id: "unused".into() };
+        let save = |input: &serde_json::Value| {
+            let error = save_confirmed(&sessions, "main", 0, SaveRequest { run: run.clone(), draft: parse(input) }, &store).unwrap_err();
+            serde_json::to_value(error).unwrap()
+        };
+        assert_eq!(save(&invalid), json!({"kind": "invalid", "field": "ssh.port"}));
+        assert_eq!(save(&ssh_draft(dir.path())), json!({"kind": "failed", "message": UNTESTED}));
     }
 }

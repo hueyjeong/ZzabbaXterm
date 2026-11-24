@@ -66,3 +66,17 @@ it("티켓 저장은 같은 초안의 성공한 시험만 받는다", async () =
     ["connection_save", { request: { run, draft } }],
   ]);
 });
+
+it("시험 시작과 티켓 저장의 구조화된 오류를 그대로 거부한다", async () => {
+  const ipc = createLocalConnectionIpc();
+  const draft = { version: 2, targetRevision: null, target: { id: "s3", displayName: "버킷", defaultMethod: "s3",
+    s3: { profile: "company", region: "ap-northeast-2", bucket: "dev", prefix: "" } } } as const;
+  const invalid = { kind: "invalid", field: "s3.bucket" };
+  vi.mocked(invoke).mockRejectedValueOnce(invalid);
+  await expect(ipc.test({ draftId: "d", draftVersion: 0, draft })).rejects.toBe(invalid);
+  const run = { draftId: "d", draftVersion: 1, runId: "r" };
+  const conflict = { kind: "conflict" };
+  vi.mocked(invoke).mockResolvedValueOnce(run).mockResolvedValueOnce({ ...run, sessionId: null }).mockRejectedValueOnce(conflict);
+  const tested = await ipc.test({ draftId: "d", draftVersion: 1, draft });
+  await expect(ipc.save({ run: tested, draft })).rejects.toBe(conflict);
+});

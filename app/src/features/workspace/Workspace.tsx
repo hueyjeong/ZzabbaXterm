@@ -6,9 +6,8 @@ import { LocalAiPanel } from "../ai/LocalAiPanel";
 import { createLocalConnectionIpc, type SavedConnections } from "../connections/connectionIpc";
 import { DeleteDialog } from "../connections/DeleteDialog";
 import type { ConnectionClose, SshTransport } from "../connections/profiles";
-// sessionEditor.ts와 대소문자만 달라 Windows에서 확장자로 구분한다.
-import { SessionEditor } from "../connections/SessionEditor.tsx";
-import type { EditorRequest } from "../connections/sessionEditor";
+import { SessionEditor } from "../connections/SessionEditor";
+import type { EditorRequest } from "../connections/sessionEditorState";
 import { subscribeLocalCliOpen } from "../editor/cliOpen";
 import { EditorTab, type EditorTabActions } from "../editor/EditorTab";
 import { ElevationDialog } from "../elevation/ElevationDialog";

@@ -118,10 +118,11 @@ const numericTail = (host: string) => /^(\d+|0[xX][0-9A-Fa-f]*)$/.test(host.spli
 export const dnsName = (host: string) => host.length <= 253 && !ipLiteral(host) && !numericTail(host) && host.split(".").every(label => dnsLabel.test(label));
 /** IP 리터럴 또는 DNS 이름이다. */
 export const hostAddress = (host: string) => ipLiteral(host) || dnsName(host);
-// Rust가 다시 출력한 문자열과 같은 표준 표기 IP만 받는다. 대문자, 0 채움, 괄호, zone, 지정되지 않은 주소는 거부한다.
+// Rust가 다시 출력한 문자열과 같은 표준 표기 IP만 받는다. 대문자, 0 채움, 괄호, zone, 지정되지 않은 주소,
+// 0.0.0.0/8, IPv4 매핑 IPv6(::ffff:)는 거부한다.
 const canonicalIp = (host: string) => {
-  if (host === "0.0.0.0" || host === "::") return false;
-  if (ipv4(host)) return true;
+  if (host === "::" || /^::ffff:/i.test(host)) return false;
+  if (ipv4(host)) return !host.startsWith("0.");
   if (!ipv6(host)) return false;
   try { return new URL(`http://[${host}]/`).hostname === `[${host}]`; } catch { return false; }
 };

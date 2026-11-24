@@ -8,7 +8,9 @@ export type TestStatus =
   | { kind: "passed"; request: ConnectionRequest; attempt: ConnectionTestDraft }
   // 시험 티켓으로 저장할 때만 request와 attempt가 있다.
   | { kind: "saving"; request?: ConnectionRequest; attempt?: ConnectionTestDraft }
-  | { kind: "testFailed" | "closeFailed"; error: string }
+  // 시험 시작이 초안 검증으로 거부하면 testFailed에 field가 있다.
+  | { kind: "testFailed"; error: string; field?: string }
+  | { kind: "closeFailed"; error: string }
   | { kind: "saveFailed"; error: string; field?: string; request?: ConnectionRequest; attempt?: ConnectionTestDraft };
 export type RemoteCleanup = Readonly<{ kind: "cancelling" | "unconfirmed"; target: SsmTarget }>;
 export type TestState = Readonly<{ status: TestStatus; remoteCleanup?: RemoteCleanup }>;
@@ -19,9 +21,11 @@ export const errorText = (error: unknown) => error instanceof Error ? error.mess
 export const CANCEL_RESPONSE_TIMEOUT = 2_000;
 
 export type ConnectionTest = ReturnType<typeof createConnectionTest>;
+export type TestFailure = (error: unknown) => { error: string; field?: string };
 
 /** 연결 시험 실행, 취소, SSM 원격 정리, 닫기를 맡는다. 상태는 편집 창 상태 기계의 status와 remoteCleanup에 쓴다. */
-export function createConnectionTest(store: TestStore, actions: TestActions) {
+export function createConnectionTest(store: TestStore, actions: TestActions,
+  failure: TestFailure = error => ({ error: errorText(error) })) {
   const pending = new Map<ConnectionTestDraft, TestActions["cancelTest"]>();
   const remoteCancellations = new Map<ConnectionTestDraft, Promise<void>>();
   const update = store.set;
@@ -54,7 +58,7 @@ export function createConnectionTest(store: TestStore, actions: TestActions) {
       }
       update({ status: { kind: "passed", request: { run, draft: attempt.draft }, attempt } });
     } catch (error) {
-      if (isTesting(attempt)) update({ status: { kind: "testFailed", error: errorText(error) } });
+      if (isTesting(attempt)) update({ status: { kind: "testFailed", ...failure(error) } });
       else if (attempt.draft.target.defaultMethod === "ssm") return;
       void cancelPending(attempt);
     }

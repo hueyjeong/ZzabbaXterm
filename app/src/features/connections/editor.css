@@ -19,7 +19,8 @@
 .session-editor .editor-header .icon-button { min-height: 0; padding: 0; border: 0; background: transparent; }
 .session-editor .editor-header .icon-button:hover:not(:disabled) { background: var(--bg-hover); }
 
-.session-editor > fieldset.editor-body {
+.session-editor > .editor-form { display: contents; }
+.session-editor > .editor-form > fieldset.editor-body {
   flex: 1 1 auto;
   min-height: 0;
   overflow: auto;
@@ -34,7 +35,7 @@
 .session-editor .editor-field output { overflow-wrap: anywhere; }
 .session-editor .editor-method { margin-top: 4px; padding-top: 4px; border-top: 1px solid var(--border); }
 .session-editor .editor-method fieldset { margin-block: 8px; }
-.session-editor .field-error { font-size: 12px; }
+.session-editor .field-error { color: var(--danger); font-size: 12px; }
 
 .session-editor .method-tiles {
   display: grid;

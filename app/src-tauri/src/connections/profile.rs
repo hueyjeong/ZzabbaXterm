@@ -187,10 +187,13 @@ fn desktop_dns(host: &str) -> bool {
 }
 
 /// RDP TLS 인증서를 확인할 서버 이름이다. DNS 이름 또는 표준 표기의 IP 주소만 받는다.
-/// IPv4는 `10.0.1.25`, IPv6는 `2001:db8::1`처럼 표준 표기여야 하고, 지정되지 않은 주소(`0.0.0.0`, `::`)는 받지 않는다.
+/// IPv4는 `10.0.1.25`, IPv6는 `2001:db8::1`처럼 표준 표기여야 한다. 서버 신원이 될 수 없는 주소는 거부한다:
+/// `0.0.0.0/8`, `::`, 그리고 인증서 IP SAN과 표기가 갈리는 IPv4 매핑 IPv6(`::ffff:10.0.0.1`).
+/// 저장 검증과 연결 경로(`rdp::route::server_name`)가 이 함수 하나를 쓴다.
 pub(crate) fn rdp_server_name(host: &str) -> bool {
     match host.parse::<IpAddr>() {
-        Ok(ip) => ip.to_string() == host && !ip.is_unspecified(),
+        Ok(IpAddr::V4(ip)) => ip.to_string() == host && ip.octets()[0] != 0,
+        Ok(IpAddr::V6(ip)) => ip.to_string() == host && !ip.is_unspecified() && ip.to_ipv4_mapped().is_none(),
         Err(_) => desktop_dns(host),
     }
 }

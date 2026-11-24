@@ -1,5 +1,5 @@
 import { useLayoutEffect, useRef, useState } from "react";
-import { editError } from "./sessionEditor";
+import { editError } from "./sessionEditorState";
 import "./editor.css";
 
 export type DeleteDialogProps = Readonly<{
@@ -13,11 +13,14 @@ export type DeleteDialogProps = Readonly<{
 /** 삭제 확인 창이다. 대상 이름과 "삭제", "취소"만 둔다. */
 export function DeleteDialog({ name, onDelete, onClose, nameOf = id => id }: DeleteDialogProps) {
   const dialog = useRef<HTMLDialogElement>(null);
+  const cancel = useRef<HTMLButtonElement>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   useLayoutEffect(() => {
     const modal = dialog.current;
     modal?.showModal();
+    // 실수로 지우지 않게 첫 포커스를 "취소"에 둔다.
+    cancel.current?.focus();
     return () => modal?.close();
   }, []);
 
@@ -44,7 +47,7 @@ export function DeleteDialog({ name, onDelete, onClose, nameOf = id => id }: Del
     {error && <div role="alert">{error}</div>}
     <footer>
       <button type="button" className="danger" disabled={busy} onClick={() => void remove()}>삭제</button>
-      <button type="button" disabled={busy} onClick={onClose}>취소</button>
+      <button ref={cancel} type="button" disabled={busy} onClick={onClose}>취소</button>
     </footer>
   </dialog>;
 }

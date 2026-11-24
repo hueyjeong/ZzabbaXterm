@@ -405,7 +405,7 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
     let description = draft.route_approval_text(&dns, matches!(saved, Some(SavedRoute::Ssm(_)))).map_err(message)?;
     let trust_path = window.path().app_config_dir().map_err(|error| error.to_string())?.join("rdp-trust.json");
     let size = DesktopSize { width: 1024, height: 768 };
-    let (target, loss, target_name, endpoint) = if let (Some(source), Some(saved)) = (draft.source, saved) {
+    let (target, loss, target_name, endpoint, pin_route) = if let (Some(source), Some(saved)) = (draft.source, saved) {
         let directory = window.path().app_config_dir().map_err(|error| error.to_string())?;
         let destination = Destination { host: source.destination.host, port: source.destination.port };
         window.state::<TunnelTabs>().preflight_desktop(tunnel_epoch, (&source.tab_handle, &source.tunnel_id),
@@ -413,6 +413,8 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
         let description = format!("{description}\n{}", describe_route(&saved, &directory));
         native::confirm(window.clone(), description, prompt.clone(), approval.clone(), notify.clone()).await.map_err(message)?;
         let target_name = format!("{dns} (TLS 인증 이름)");
+        // 전달 경로의 endpoint는 루프백이라 경로마다 같을 수 있다. 인증서 고정은 경로 대상 ID로 구분한다.
+        let pin_route = Some(source.target_id.clone());
         let caller = window.clone();
         let live = prompt.clone();
         // 발급 중 취소되어도 작업을 기다려 인계 소켓과 임대를 이 경로에서 정리한다.
@@ -427,12 +429,12 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
         let loss = lease.loss();
         let target = route::forwarded(dns.clone(), &approved_destination, size, lease, draft.tls_only).map_err(message)?;
         let endpoint = route::host_port(&approved_destination.host, approved_destination.port);
-        (target, Some(loss), target_name, endpoint)
+        (target, Some(loss), target_name, endpoint, pin_route)
     } else {
         native::confirm(window.clone(), description, prompt.clone(), approval.clone(), notify.clone()).await.map_err(message)?;
         let target_name = route::host_port(&dns, draft.port);
         let endpoint = target_name.clone();
-        (route::direct(dns.clone(), draft.port, size, draft.tls_only), None, target_name, endpoint)
+        (route::direct(dns.clone(), draft.port, size, draft.tls_only), None, target_name, endpoint, None)
     };
     let stopped = async {
         tokio::select! { biased;
@@ -445,6 +447,7 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
         path: trust_path,
         dns: dns.clone(),
         endpoint,
+        route: pin_route,
         approve: {
             let window = window.clone();
             let live = prompt.clone();

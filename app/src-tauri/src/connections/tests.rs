@@ -273,6 +273,9 @@ other", direct.clone()),
         // IP 주소는 표준 표기만 받고, 지정되지 않은 주소는 서버 신원이 될 수 없다.
         rdp("2001:0db8::25", direct.clone()), rdp("2001:DB8::25", ssm.clone()), rdp("[2001:db8::25]", direct.clone()),
         rdp("fe80::1%eth0", direct.clone()), rdp("0.0.0.0", direct.clone()), rdp("::", ssh.clone()),
+        // 0.0.0.0/8 전체와 IPv4 매핑 IPv6도 서버 신원이 될 수 없다.
+        rdp("0.1.2.3", direct.clone()), rdp("0.255.255.255", ssm.clone()),
+        rdp("::ffff:10.0.0.1", direct.clone()), rdp("::ffff:a00:1", ssh.clone()), rdp("::ffff:0.0.0.0", direct.clone()),
     ] {
         assert!(!checked(invalid.clone()), "{invalid}");
     }
@@ -395,7 +398,7 @@ mod local_probe {
             serde_json::from_value(target_draft(&draft(dir, "work", "first"))).unwrap(), dir.to_owned()).unwrap()
     }
 
-    fn save_at(sessions: &Sessions, owner: &str, run: &RunKey, input: Value, store: &Store) -> Result<(), String> {
+    fn save_at(sessions: &Sessions, owner: &str, run: &RunKey, input: Value, store: &Store) -> Result<(), crate::connections::ipc::EditError> {
         let request: SaveRequest = serde_json::from_value(json!({"run": run, "draft": input})).unwrap();
         save_confirmed(sessions, owner, sessions.document(owner), request, store)
     }
@@ -545,7 +548,7 @@ mod local_probe {
             drop(lock);
             blocked.expect("저장 작업이 실제 설정 파일 잠금을 기다려야 합니다");
             progress.expect("설정 파일이 잠겨 있어도 PTY 입출력·취소·문서 이동이 끝나야 합니다");
-            assert_eq!(saving.join().unwrap(), Err("문서가 바뀌었습니다".into()));
+            assert_eq!(saving.join().unwrap(), Err(crate::connections::ipc::EditError::Failed { message: "문서가 바뀌었습니다".into() }));
         });
         assert!(!settings.join("connections.json").exists());
         assert!(!settings.join("connections.json.tmp").exists());

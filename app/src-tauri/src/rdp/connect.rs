@@ -422,14 +422,14 @@ where
         Err(error) => {
             let cert = tls.seen().ok_or(Error::TlsIdentity)?;
             let fingerprint = trust::fingerprint(cert.as_ref());
-            let stored = trust::load(&trust.path, &trust.dns, &trust.endpoint);
+            let stored = trust::load(&trust.path, &trust.dns, &trust.endpoint, trust.route.as_deref());
             let known = stored.as_deref() == Some(fingerprint.as_str());
             if !known {
                 let request = describe(&trust.dns, &trust.endpoint, &cert, &fingerprint, stored.as_deref(), failure_reason(&error));
                 if !(trust.approve)(request).await? {
                     return Err(Error::TlsIdentity);
                 }
-                trust::save(&trust.path, &trust.dns, &trust.endpoint, &fingerprint)?;
+                trust::save(&trust.path, &trust.dns, &trust.endpoint, trust.route.as_deref(), &fingerprint)?;
             }
             // 같은 대상에 다시 협상한 뒤 저장된 지문으로만 TLS를 완료한다.
             let (framed, next, next_selected) = tokio::time::timeout(super::CONNECT_TIMEOUT, negotiate_rdp(&mut target))

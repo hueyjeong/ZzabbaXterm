@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ConnectionRequest, ConnectionTestDraft, ConnectionTestRun, SavedTarget, TargetDraft } from "./profiles";
-import { createSessionEditor, shownError, validate, type EditorActions, type EditorRequest } from "./sessionEditor";
+import { createSessionEditor, shownError, shownFields, testSupported, validate, type EditorActions, type EditorRequest } from "./sessionEditorState";
 
 const local: SavedTarget = {
   id: "work-shell", groupId: "work", displayName: "작업 셸", defaultMethod: "local",
@@ -255,6 +255,10 @@ describe("세션 편집 창 RDP·VNC", () => {
       ["[2001:db8::25]", { kind: "direct" }, false],
       ["fe80::1%eth0", { kind: "direct" }, false],
       ["0.0.0.0", { kind: "direct" }, false],
+      ["0.1.2.3", { kind: "direct" }, false],
+      ["::ffff:10.0.0.1", { kind: "direct" }, false],
+      ["::ffff:a00:1", { kind: "ssh", targetId: "ssh-server" }, false],
+      ["::ffff:0.0.0.0", { kind: "ssm", ...node }, false],
       ["::", { kind: "ssm", ...node }, false],
       ["010.0.1.25", { kind: "direct" }, false],
       ["host,other", { kind: "ssm", ...node }, false],
@@ -287,5 +291,60 @@ describe("편집 창 실행 응답", () => {
     const { editor } = open({ target: local, revision: 3 }, actions);
     await editor.test();
     expect(editor.getSnapshot().status).toEqual({ kind: "testFailed", error: "시험 응답의 실행 ID 또는 초안 버전이 일치하지 않습니다" });
+  });
+});
+
+describe("편집 창 시험과 오류 표시", () => {
+  it("저장 암호 SSH는 시험하지 않는다", async () => {
+    const { editor, actions } = open({}, fakeActions(), true);
+    fillSsh(editor);
+    expect(editor.canTest()).toBe(true);
+    editor.editSsh({ auth: { kind: "storedPassword", itemId: "21eb36c3-234d-439d-9e1f-1d3cc5ba8125" } });
+    expect(testSupported(editor.getSnapshot().draft)).toBe(false);
+    expect(editor.canSave()).toBe(true);
+    expect(editor.canTest()).toBe(false);
+    await editor.test();
+    expect(actions.test).not.toHaveBeenCalled();
+  });
+
+  it("시험 시작의 invalid 오류를 해당 필드에 두고 문자열 오류는 그대로 둔다", async () => {
+    const actions = fakeActions();
+    actions.test.mockRejectedValueOnce({ kind: "invalid", field: "ssh.host" }).mockRejectedValueOnce("호스트에 연결할 수 없습니다");
+    const { editor } = open({}, actions);
+    fillSsh(editor);
+    await editor.test();
+    const state = editor.getSnapshot();
+    expect(state.status).toEqual({ kind: "testFailed", error: "호스트 형식 오류", field: "ssh.host" });
+    expect(shownError(state, validate(state.draft, false), "ssh.host")).toBe("호스트 형식 오류");
+    await editor.test();
+    expect(editor.getSnapshot().status).toEqual({ kind: "testFailed", error: "호스트에 연결할 수 없습니다" });
+  });
+
+  it("티켓 저장의 편집 오류를 표시하고 티켓을 유지한다", async () => {
+    const actions = fakeActions();
+    actions.save.mockRejectedValueOnce({ kind: "invalid", field: "local.startDirectory" })
+      .mockRejectedValueOnce({ kind: "conflict" }).mockRejectedValueOnce({ kind: "failed", message: "설정 파일 교체 실패" });
+    const { editor } = open({ target: local, revision: 3 }, actions);
+    await editor.test();
+    await editor.save();
+    expect(editor.getSnapshot().status).toMatchObject({ kind: "saveFailed", error: "입력 오류", field: "local.startDirectory" });
+    await editor.save();
+    expect(editor.getSnapshot().status).toMatchObject({ kind: "saveFailed", error: "다른 작업이 세션을 변경했습니다" });
+    await editor.save();
+    expect(editor.getSnapshot().status).toMatchObject({ kind: "saveFailed", error: "설정 파일 교체 실패" });
+    expect(actions.save).toHaveBeenCalledTimes(3);
+    expect(actions.saveTarget).not.toHaveBeenCalled();
+  });
+
+  it("화면에 표시하는 필드는 방식, 경로, 인증에 따른다", () => {
+    const { editor } = open({});
+    expect(shownFields(editor.getSnapshot().draft)).toEqual(["displayName", "groupId", "local.startDirectory"]);
+    editor.selectMethod("ssh");
+    editor.editSsh({ transport: { kind: "ssm" }, auth: { kind: "storedPassword", itemId: "" } });
+    expect(shownFields(editor.getSnapshot().draft)).toEqual(["displayName", "groupId", "ssh.host", "ssh.port", "ssh.account",
+      "ssh.hostKeyFingerprint", "ssh.auth", "ssm.profile", "ssm.region", "ssm.instanceId", "ssh.auth.itemId"]);
+    editor.selectMethod("vnc");
+    editor.editDesktop({ route: { kind: "ssh", targetId: "" } });
+    expect(shownFields(editor.getSnapshot().draft)).toEqual(["displayName", "groupId", "desktop.port", "desktop.route"]);
   });
 });

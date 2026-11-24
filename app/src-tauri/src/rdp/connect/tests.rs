@@ -104,6 +104,7 @@ fn no_trust() -> trust::Trust<impl FnOnce(trust::Request) -> std::future::Ready<
         path: std::path::PathBuf::new(),
         dns: "fixture".into(),
         endpoint: "fixture".into(),
+        route: None,
         approve: |_| std::future::ready(Ok(false)),
     }
 }
@@ -847,6 +848,7 @@ async fn unknown_certificate_requires_one_time_approval_and_is_pinned() {
             path: path.clone(),
             dns: REMOTE.into(),
             endpoint: "fixture".into(),
+            route: None,
             approve: move |_| {
                 approve.fetch_add(1, Ordering::Relaxed);
                 std::future::ready(Ok(true))
@@ -865,7 +867,7 @@ async fn unknown_certificate_requires_one_time_approval_and_is_pinned() {
     assert!(matches!(result, Err(Error::Authentication | Error::Transport)));
     assert_eq!(calls.load(Ordering::Relaxed), 1, "승인 뒤에만 자격 증명을 조회한다");
     assert_eq!(approvals.load(Ordering::Relaxed), 1);
-    assert_eq!(trust::load(&path, REMOTE, "fixture").as_deref(), Some(fingerprint.as_str()));
+    assert_eq!(trust::load(&path, REMOTE, "fixture", None).as_deref(), Some(fingerprint.as_str()));
     let _ = std::fs::remove_file(path);
 }
 
@@ -900,7 +902,7 @@ async fn rejecting_a_changed_fingerprint_keeps_the_old_pin_without_credentials()
     roots.add(unknown.der().clone()).unwrap();
     let path = std::env::temp_dir().join(format!("zzabba-rdp-pin-change-{}", std::process::id()));
     let _ = std::fs::remove_file(&path);
-    trust::save(&path, REMOTE, "fixture", "AA:BB").unwrap();
+    trust::save(&path, REMOTE, "fixture", None, "AA:BB").unwrap();
 
     let server = async {
         let (socket, _) = listener.accept().await.unwrap();
@@ -923,7 +925,7 @@ async fn rejecting_a_changed_fingerprint_keeps_the_old_pin_without_credentials()
         REMOTE.try_into().unwrap(),
         tls_config(roots),
         trust::Trust {
-            path: path.clone(), dns: REMOTE.into(), endpoint: "fixture".into(),
+            path: path.clone(), dns: REMOTE.into(), endpoint: "fixture".into(), route: None,
             approve: |_| std::future::ready(Ok(false)),
         },
         || async {
@@ -938,7 +940,7 @@ async fn rejecting_a_changed_fingerprint_keeps_the_old_pin_without_credentials()
     let (result, ()) = timeout(Duration::from_secs(5), async { tokio::join!(client, server) }).await.unwrap();
     assert!(matches!(result, Err(Error::TlsIdentity | Error::Transport)));
     assert_eq!(calls.load(Ordering::Relaxed), 0);
-    assert_eq!(trust::load(&path, REMOTE, "fixture").as_deref(), Some("AA:BB"));
+    assert_eq!(trust::load(&path, REMOTE, "fixture", None).as_deref(), Some("AA:BB"));
     let _ = std::fs::remove_file(path);
 }
 

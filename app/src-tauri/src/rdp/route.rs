@@ -54,7 +54,8 @@ mod tests {
         assert!(matches!(server_name("2001:db8::25"), Some(ServerName::IpAddress(_))));
         assert!(matches!(server_name("rdp.example.test"), Some(ServerName::DnsName(_))));
         for name in ["", "2852039166", "127.1", "0x7f000001", "2001:0db8::25", "2001:DB8::25", "[2001:db8::25]",
-            "fe80::1%eth0", "0.0.0.0", "::", "rdp..example.test"] {
+            "fe80::1%eth0", "0.0.0.0", "0.1.2.3", "0.255.255.255", "::", "::ffff:10.0.0.1", "::ffff:a00:1",
+            "::ffff:0.0.0.0", "rdp..example.test"] {
             assert!(server_name(name).is_none(), "{name}");
         }
         assert_eq!(host_port("2001:db8::25", 3389), "[2001:db8::25]:3389");

@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { createLocalConnectionIpc } from "./connectionIpc";
 import type { ConnectionClose, ConnectionTestRun, SavedTarget } from "./profiles";
-import { createSessionEditor } from "./sessionEditor";
+import { createSessionEditor } from "./sessionEditorState";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const ipc = vi.mocked(invoke);
