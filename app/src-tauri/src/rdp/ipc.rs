@@ -457,6 +457,10 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
         }
     };
     tokio::pin!(stopped);
+    let config = window.path().app_config_dir().map_err(|error| error.to_string())?;
+    let accounts = (config.join("rdp-accounts.json"), dns.clone(), endpoint.clone(), pin_route.clone());
+    let remembered = super::accounts::load(&accounts.0, &accounts.1, &accounts.2, accounts.3.as_deref());
+    let entered = std::sync::Mutex::new(None);
     let trust = super::trust::Trust {
         path: trust_path,
         dns: dns.clone(),
@@ -482,8 +486,16 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
             return Err(error.into());
         },
         session = Session::open(target, tokio_rustls::rustls::RootCertStore::empty(), trust,
-            || native::account(window.clone(), target_name, prompt.clone(), approval.clone(), notify.clone()), AuthIo::new(slot, lease.as_ref())) => session.map_err(message)?,
+            || async {
+                let account = native::account(window.clone(), target_name, remembered, prompt.clone(), approval.clone(), notify.clone()).await?;
+                *entered.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(account.login());
+                Ok(account)
+            }, AuthIo::new(slot, lease.as_ref())) => session.map_err(message)?,
     };
+    // 세션이 열린 뒤에만 계정 이름을 기억한다. 저장 실패는 연결을 막지 않는다.
+    if let Some(login) = entered.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner) {
+        let _ = super::accounts::save(&accounts.0, &accounts.1, &accounts.2, accounts.3.as_deref(), &login);
+    }
     drop(approval);
     let operation = async {
         let mut sequence = 0_u64;

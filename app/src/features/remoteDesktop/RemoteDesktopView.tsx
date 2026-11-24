@@ -1,6 +1,6 @@
 import { useLayoutEffect, useRef, useState, type KeyboardEvent, type PointerEvent } from "react";
 import { createRemoteDesktopViewSession, type RemoteDesktopSession, type RemoteDesktopSize, type RemoteDesktopStatus, type RemoteDesktopViewSession } from "./session";
-import { modifierEvents, releasedModifiers, type ModifierState } from "./input";
+import { imeKeyDown, modifierEvents, releasedModifiers, textCharacters, type ModifierState } from "./input";
 import "./remoteDesktop.css";
 
 interface RemoteDesktopViewProps {
@@ -22,6 +22,8 @@ function statusText(status: RemoteDesktopStatus) {
 
 export function RemoteDesktopView({ session, active, label, onViewport }: RemoteDesktopViewProps) {
   const canvas = useRef<HTMLCanvasElement>(null);
+  /** IME 조합을 받는 숨은 입력칸이다. 키보드 포커스는 canvas가 아니라 여기에 둔다. */
+  const keyboard = useRef<HTMLTextAreaElement>(null);
   const screen = useRef<HTMLDivElement>(null);
   const viewport = useRef(onViewport);
   const bound = useRef<RemoteDesktopViewSession>(null);
@@ -29,6 +31,11 @@ export function RemoteDesktopView({ session, active, label, onViewport }: Remote
   const keys = useRef(new Map<string, string>());
   const modifiers = useRef<ModifierState>({ shift: false, ctrl: false, alt: false, meta: false });
   const pointer = useRef<number | null>(null);
+  const [composing, setComposing] = useState(false);
+  /** 조합 진행 여부와, 조합을 확정하려고 입력칸을 잠깐 blur하는 중인지다. */
+  const ime = useRef({ composing: false, refocusing: false });
+  const typed = useRef<(text: string) => void>(() => { });
+  const entered = useRef<() => void>(() => { });
 
   function release() {
     const id = pointer.current;
@@ -50,17 +57,70 @@ export function RemoteDesktopView({ session, active, label, onViewport }: Remote
     const connection = createRemoteDesktopViewSession(session, element, setStatus);
     bound.current = connection;
     const window = element.ownerDocument.defaultView;
-    const blur = () => { release(); element.blur(); };
+    const blur = () => { release(); keyboard.current?.blur(); };
     window?.addEventListener("blur", blur);
     return () => {
       window?.removeEventListener("blur", blur);
       bound.current = null;
       session.setActive(false);
       release();
-      element.blur();
+      keyboard.current?.blur();
       connection.dispose();
     };
   }, [session]);
+
+  // React의 onBeforeInput은 inputType이 없는 합성 이벤트라 네이티브 이벤트를 직접 받는다.
+  useLayoutEffect(() => {
+    const element = keyboard.current;
+    if (!element) return;
+    /** 마지막 신뢰 compositionupdate의 글자다. 확정할 때도 확정 글자로 한 번 더 온다. */
+    let composed = "";
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const focused = () => element === element.ownerDocument.activeElement;
+    // 조합이 끝난 글자는 입력칸에 남는다. 다음 조합이 바로 이어지지 않으면 비운다.
+    const clear = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => { if (!ime.current.composing) element.value = ""; });
+    };
+    const start = (event: CompositionEvent) => {
+      if (!event.isTrusted) return;
+      ime.current.composing = true;
+      composed = "";
+      setComposing(true);
+    };
+    const update = (event: CompositionEvent) => {
+      if (event.isTrusted && ime.current.composing) composed = event.data;
+    };
+    const end = (event: CompositionEvent) => {
+      if (!ime.current.composing) return;
+      ime.current.composing = false;
+      setComposing(false);
+      // Chromium(WebView2)은 compositionend만 isTrusted=false로 보낸다. 그때는 직전 신뢰 compositionupdate의 글자를 쓴다.
+      const text = event.isTrusted ? event.data : composed;
+      if ((focused() || ime.current.refocusing) && text) typed.current(text);
+      clear();
+    };
+    const before = (event: InputEvent) => {
+      // 조합 중 입력은 compositionend에서 한 번에 보낸다.
+      if (ime.current.composing || event.isComposing) return;
+      // 스캔코드로 보낸 키는 keydown에서 기본 동작을 막으므로 여기에 오지 않는다. 여기 오는 입력은 IME나 자동화가 넣은 글자다.
+      event.preventDefault();
+      if (!event.isTrusted || !focused()) return;
+      if (event.inputType === "insertText" && event.data) typed.current(event.data);
+      else if (event.inputType === "insertLineBreak" || event.inputType === "insertParagraph") entered.current();
+    };
+    element.addEventListener("compositionstart", start);
+    element.addEventListener("compositionupdate", update);
+    element.addEventListener("compositionend", end);
+    element.addEventListener("beforeinput", before);
+    return () => {
+      clearTimeout(timer);
+      element.removeEventListener("compositionstart", start);
+      element.removeEventListener("compositionupdate", update);
+      element.removeEventListener("compositionend", end);
+      element.removeEventListener("beforeinput", before);
+    };
+  }, []);
 
   useLayoutEffect(() => { viewport.current = onViewport; });
   useLayoutEffect(() => {
@@ -97,14 +157,30 @@ export function RemoteDesktopView({ session, active, label, onViewport }: Remote
     session.setActive(active);
     if (!active || !connected) {
       release();
-      canvas.current?.blur();
+      keyboard.current?.blur();
     }
   }, [session, active, connected]);
 
-  function sendKey(event: KeyboardEvent<HTMLCanvasElement>, down: boolean) {
+  useLayoutEffect(() => {
+    typed.current = (text) => {
+      const connection = bound.current;
+      if (!active || !connection?.size) return;
+      for (const character of textCharacters(text)) connection.send({ kind: "text", text: character });
+    };
+    // IME가 조합을 끝내며 넘긴 Enter다. keydown은 IME 키로 걸러졌으므로 여기서 한 번만 보낸다.
+    entered.current = () => {
+      const connection = bound.current;
+      if (!active || !connection?.size) return;
+      for (const down of [true, false]) connection.send({ kind: "key", down, code: "Enter", key: "Enter", location: 0, repeat: false });
+    };
+  });
+
+  function sendKey(event: KeyboardEvent<HTMLTextAreaElement>, down: boolean) {
     const connection = bound.current;
     if (!active || !connection?.size || !event.nativeEvent.isTrusted ||
       event.currentTarget !== event.currentTarget.ownerDocument.activeElement) return;
+    // IME 키는 기본 동작을 막지 않아야 조합이 진행된다. 결과 글자는 compositionend에서 보낸다.
+    if (down && imeKeyDown({ isComposing: event.nativeEvent.isComposing, key: event.key, keyCode: event.keyCode })) return;
     const id = `${event.code || event.key}:${event.location}`;
     const pressed = keys.current.get(id);
     // Ctrl+Tab은 로컬로 보내되 앞서 전달한 Tab 누름은 해제한다.
@@ -139,11 +215,17 @@ export function RemoteDesktopView({ session, active, label, onViewport }: Remote
     const bounds = element.getBoundingClientRect();
     if (!(bounds.width > 0 && bounds.height > 0)) return;
     if (event.type === "pointerdown") {
-      element.focus({ preventScroll: true });
+      const input = keyboard.current;
+      if (input && ime.current.composing && input === input.ownerDocument.activeElement) {
+        // 조합 중 클릭은 입력칸을 잠깐 blur해 조합을 확정한다. 확정 글자가 클릭보다 먼저 원격에 간다.
+        ime.current.refocusing = true;
+        try { input.blur(); } finally { ime.current.refocusing = false; }
+      }
+      input?.focus({ preventScroll: true });
       element.setPointerCapture(event.pointerId);
       pointer.current = event.pointerId;
     }
-    if (element.ownerDocument.activeElement !== element || connection !== bound.current || !connection.size) return;
+    if (element.ownerDocument.activeElement !== keyboard.current || connection !== bound.current || !connection.size) return;
     if (pointer.current === null && (event.buttons !== 0 || event.type === "pointerup")) return;
     event.preventDefault();
     event.stopPropagation();
@@ -164,13 +246,25 @@ export function RemoteDesktopView({ session, active, label, onViewport }: Remote
         ))}
       </div>
       <div className="remote-desktop-screen" ref={screen}>
+        <textarea
+          ref={keyboard}
+          className="remote-desktop-keyboard"
+          aria-label="원격 키보드 입력"
+          data-composing={composing || undefined}
+          tabIndex={active && connected ? 0 : -1}
+          autoComplete="off"
+          autoCorrect="off"
+          autoCapitalize="off"
+          spellCheck={false}
+          onBlur={() => { if (!ime.current.refocusing) release(); }}
+          onKeyDown={(event) => sendKey(event, true)}
+          onKeyUp={(event) => sendKey(event, false)}
+        />
         <canvas
           ref={canvas}
           aria-label="원격 화면"
-          tabIndex={active && connected ? 0 : -1}
-          onBlur={release}
-          onKeyDown={(event) => sendKey(event, true)}
-          onKeyUp={(event) => sendKey(event, false)}
+          // 누를 때 포커스가 입력칸에서 canvas나 body로 옮겨 가지 않게 한다.
+          onMouseDown={(event) => event.preventDefault()}
           onPointerDown={sendPointer}
           onPointerMove={sendPointer}
           onPointerUp={sendPointer}

@@ -65,7 +65,38 @@
   overflow: hidden;
 }
 
-.remote-desktop-view canvas:focus-visible {
+.remote-desktop-screen {
+  position: relative;
+}
+
+/* IME 조합을 받는 입력칸이다. 평소에는 보이지 않고 조합 중에만 화면 왼쪽 위에 조합 글자를 띄운다. */
+.remote-desktop-keyboard {
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: 1;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  border: 0;
+  opacity: 0;
+  resize: none;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.remote-desktop-keyboard[data-composing] {
+  width: 12em;
+  height: 1.75em;
+  padding: 0.125rem 0.375rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  background: var(--bg-elevated);
+  color: var(--text);
+  opacity: 1;
+}
+
+.remote-desktop-keyboard:focus-visible + canvas {
   outline: 2px solid #9cd9bf;
   outline-offset: -2px;
 }

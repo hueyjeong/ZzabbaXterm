@@ -19,6 +19,8 @@ pub(super) struct Command {
 enum Action {
     Active { active: bool },
     Key { code: u8, extended: bool, down: bool },
+    /// IME가 확정한 글자 하나다.
+    Unicode { text: String },
     Pointer { x: u16, y: u16, buttons: u8 },
     Release,
     Copy,
@@ -77,6 +79,11 @@ impl Controls {
                     if !down && !self.keys.contains(&(code, extended)) { return Ok(()); }
                     self.write(Input::ScanCode { code, extended, released: !down }).await?;
                     if down { self.keys.insert((code, extended)); } else { self.keys.remove(&(code, extended)); }
+                }
+                Action::Unicode { text } => {
+                    let mut characters = text.chars();
+                    let (Some(character), None) = (characters.next(), characters.next()) else { return Err(Error::Bounds); };
+                    self.write(Input::Unicode(character)).await?;
                 }
                 Action::Pointer { x, y, buttons } => {
                     if x >= size.0 || y >= size.1 || buttons & !7 != 0 { return Err(Error::Bounds); }
@@ -169,6 +176,7 @@ mod tests {
             while let Some((_, input, ack)) = commands.recv().await {
                 log.push(match input {
                     Input::ScanCode { code, released, .. } => format!("key {code} {}", if released { "up" } else { "down" }),
+                    Input::Unicode(character) => format!("unicode {character}"),
                     Input::Pointer { x, y, action: Pointer::Move } => format!("move {x},{y}"),
                     Input::Pointer { action: Pointer::Button { pressed, .. }, .. } => format!("button {}", if pressed { "down" } else { "up" }),
                     _ => "other".into(),
@@ -224,5 +232,19 @@ mod tests {
         assert_eq!(controls.send(&life, command(2, 1, Action::Copy)).await, Ok(()));
         assert_eq!(controls.send(&life, command(3, 1, Action::Copy)).await, Err(Error::CopyPending));
         assert_eq!(controls.send(&life, command(4, 1, Action::Key { code: 0x1e, extended: false, down: true })).await, Ok(()));
+    }
+    #[tokio::test]
+    async fn unicode_accepts_exactly_one_character_and_keeps_no_pressed_state() {
+        let (mut controls, log) = scripted(Vec::new());
+        let life = CancellationToken::new();
+        let unicode = |text: &str| Action::Unicode { text: text.into() };
+        assert_eq!(controls.send(&life, command(1, 1, Action::Active { active: true })).await, Ok(()));
+        assert_eq!(controls.send(&life, command(2, 1, unicode("한"))).await, Ok(()));
+        assert_eq!(controls.send(&life, command(3, 1, unicode("😀"))).await, Ok(()));
+        assert_eq!(controls.send(&life, command(4, 1, unicode("ab"))).await, Err(Error::Bounds));
+        assert_eq!(controls.send(&life, command(5, 1, unicode(""))).await, Err(Error::Bounds));
+        assert!(controls.keys.is_empty());
+        drop(controls);
+        assert_eq!(log.await.unwrap(), ["unicode 한", "unicode 😀"]);
     }
 }

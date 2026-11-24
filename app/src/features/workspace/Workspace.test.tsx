@@ -630,7 +630,8 @@ describe("중앙 원격 화면", () => {
     ]]);
     if (protocol === "vnc") await deliver({ identity, kind: "started", serial: 0 });
     const canvas = find<HTMLCanvasElement>('canvas[aria-label="원격 화면"]');
-    expect(canvas.tabIndex).toBe(-1);
+    const keyboard = find<HTMLTextAreaElement>('textarea[aria-label="원격 키보드 입력"]');
+    expect(keyboard.tabIndex).toBe(-1);
     expect(pane.textContent).toContain("첫 화면 대기 중");
     expect(pane.textContent).not.toContain("연결됨");
 
@@ -658,14 +659,14 @@ describe("중앙 원격 화면", () => {
 
     const input = () => new KeyboardEvent("keydown", { code: "KeyA", key: "a", bubbles: true, cancelable: true });
     const keyCalls = () => connectionCalls(`${protocol}_input`).filter(([, args]) => args.input.action.kind === "key");
-    await act(async () => dispatchTrusted(canvas, input()));
+    await act(async () => dispatchTrusted(keyboard, input()));
     expect(keyCalls()).toHaveLength(0);
     await act(async () => {
-      canvas.focus();
-      canvas.dispatchEvent(input());
+      keyboard.focus();
+      keyboard.dispatchEvent(input());
     });
     expect(keyCalls()).toHaveLength(0);
-    await act(async () => dispatchTrusted(canvas, input()));
+    await act(async () => dispatchTrusted(keyboard, input()));
     expect(keyCalls()).toEqual([[`${protocol}_input`, expect.objectContaining({
       input: expect.objectContaining({ action: expect.objectContaining({ kind: "key", down: true }) }),
     }), expect.anything()]]);
@@ -673,7 +674,7 @@ describe("중앙 원격 화면", () => {
     await press("로컬 2");
     expect(document.activeElement).toBe(terminal);
     expect(canvas.closest("[hidden][inert]")).not.toBeNull();
-    await act(async () => dispatchTrusted(canvas, input()));
+    await act(async () => dispatchTrusted(keyboard, input()));
     expect(keyCalls()).toHaveLength(1);
     expect(menuItemNames(await showTabMenu("로컬 1"))).toEqual(["오른쪽으로 분리", "같은 연결 새 탭", "같은 연결 오른쪽에 열기", "닫기"]);
     await chooseMenuItem("오른쪽으로 분리");
@@ -691,8 +692,8 @@ describe("중앙 원격 화면", () => {
     expect(connectionCalls(`${protocol}_connect`)).toHaveLength(1);
     expect(connectionCalls(`${protocol}_close`)).toEqual([]);
     await act(async () => {
-      canvas.focus();
-      dispatchTrusted(canvas, input());
+      keyboard.focus();
+      dispatchTrusted(keyboard, input());
     });
     expect(keyCalls()).toHaveLength(2);
 

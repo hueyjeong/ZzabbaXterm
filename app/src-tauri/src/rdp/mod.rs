@@ -1,3 +1,6 @@
+#[cfg(windows)]
+mod account_dialog;
+mod accounts;
 mod clipboard;
 mod connect;
 mod display;
@@ -69,6 +72,16 @@ struct Account {
     password: zeroize::Zeroizing<String>,
 }
 
+impl Account {
+    /// 계정 창에 다시 채울 `도메인\계정` 형식이다.
+    fn login(&self) -> String {
+        match &self.domain {
+            Some(domain) => format!("{domain}\\{}", self.username),
+            None => self.username.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     Bounds,
@@ -126,6 +139,8 @@ pub enum Input {
         y: u16,
         action: Pointer,
     },
+    /// IME 조합이 끝난 글자 하나다. UTF-16 단위로 나눠 누름과 뗌을 한 PDU에 보낸다.
+    Unicode(char),
     OfferClipboardText(String),
     ReadClipboardText,
     Resize {
@@ -584,6 +599,9 @@ fn encode(
                 y_position: y,
             })
         }
+        Input::Unicode(character) => {
+            return encode_vec(&unicode_input(character)?).map_err(|_| Error::Protocol);
+        }
         Input::Resize { width, height, scale } => {
             let area = channels.display_max_area.ok_or(Error::ChannelUnavailable)?;
             display::check(width, height, area)?;
@@ -594,4 +612,35 @@ fn encode(
         }
     };
     encode_vec(&FastPathInput::single(input)).map_err(|_| Error::Protocol)
+}
+
+/// TS_UNICODE_KEYBOARD_EVENT 묶음이다. BMP 밖 글자는 상위·하위 서러게이트를 차례로 누르고 같은 순서로 뗀다.
+fn unicode_input(character: char) -> Result<ironrdp::pdu::input::fast_path::FastPathInput, Error> {
+    use ironrdp::pdu::input::fast_path::FastPathInput;
+    if character.is_control() {
+        return Err(Error::Bounds);
+    }
+    let mut buffer = [0_u16; 2];
+    let units = character.encode_utf16(&mut buffer);
+    let events = [KeyboardFlags::empty(), KeyboardFlags::RELEASE]
+        .into_iter()
+        .flat_map(|flags| units.iter().map(move |unit| FastPathInputEvent::UnicodeKeyboardEvent(flags, *unit)))
+        .collect();
+    FastPathInput::new(events).map_err(|_| Error::Protocol)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unicode_input_presses_then_releases_each_utf16_unit() {
+        let events = |character| unicode_input(character).unwrap().input_events().to_vec();
+        let press = |unit| FastPathInputEvent::UnicodeKeyboardEvent(KeyboardFlags::empty(), unit);
+        let release = |unit| FastPathInputEvent::UnicodeKeyboardEvent(KeyboardFlags::RELEASE, unit);
+        assert_eq!(events('한'), [press(0xD55C), release(0xD55C)]);
+        assert_eq!(events('😀'), [press(0xD83D), press(0xDE00), release(0xD83D), release(0xDE00)]);
+        assert_eq!(unicode_input('\n').err(), Some(Error::Bounds));
+        assert_eq!(unicode_input('\u{85}').err(), Some(Error::Bounds));
+    }
 }

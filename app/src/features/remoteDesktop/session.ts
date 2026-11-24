@@ -34,6 +34,8 @@ export type RemoteDesktopEvent = Sequenced & (
 type Input =
   | { readonly kind: "key"; readonly down: boolean; readonly code: string; readonly key: string; readonly location: number; readonly repeat: boolean }
   | { readonly kind: "pointer"; readonly x: number; readonly y: number; readonly buttons: number }
+  /** IME 조합이나 insertText로 확정된 글자 하나(코드 포인트)다. 누름과 뗌을 함께 보낸다. */
+  | { readonly kind: "text"; readonly text: string }
   | { readonly kind: "release-input" };
 
 export type RemoteDesktopInput = Sequenced & Input;
