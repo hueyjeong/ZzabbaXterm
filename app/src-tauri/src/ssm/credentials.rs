@@ -63,6 +63,15 @@ impl Credentials {
         self.expires = SystemTime::UNIX_EPOCH;
     }
 
+    pub(super) fn expires_after(&self, other: &Self) -> bool {
+        self.expires > other.expires
+    }
+
+    #[cfg(test)]
+    pub(super) fn expire_in_for_test(&mut self, after: std::time::Duration) {
+        self.expires = SystemTime::now() + after;
+    }
+
     /// 남은 수명이 `margin`보다 짧으면 참이다.
     pub(super) fn expires_within(&self, margin: std::time::Duration) -> bool {
         self.expires <= SystemTime::now() + margin

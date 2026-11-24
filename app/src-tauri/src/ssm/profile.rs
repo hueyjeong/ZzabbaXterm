@@ -109,6 +109,10 @@ impl Profiles {
         }
     }
 
+    pub(super) fn is_login(&self, name: &str) -> bool {
+        self.login.contains_key(name)
+    }
+
     pub(super) fn auth(&self, name: &str) -> Result<ProfileAuth, CliError> {
         self.require(name)?;
         Ok(match self.direct.get(name) {
@@ -235,8 +239,9 @@ fn direct_config(
     };
     let region = settings.get("sso_region")?;
     let url = settings.get("sso_start_url")?;
-    let scopes = match name.and_then(|_| settings.get("sso_registration_scopes")) {
-        Some(scopes) if !scopes.is_empty() && scopes.bytes().all(|b| b.is_ascii_alphanumeric() || b":,._- ".contains(&b)) => {
+    // 빈 값은 범위 없음과 같다. 그 밖에는 스냅샷 ini에 그대로 쓸 수 있는 문자만 받는다.
+    let scopes = match name.and_then(|_| settings.get("sso_registration_scopes")).filter(|scopes| !scopes.is_empty()) {
+        Some(scopes) if scopes.bytes().all(|b| b.is_ascii_alphanumeric() || b":,._- ".contains(&b)) => {
             Some((*scopes).to_owned())
         }
         Some(_) => return None,

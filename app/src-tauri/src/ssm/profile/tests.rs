@@ -16,7 +16,7 @@ fn profile_fixture() {
     let profiles = Profiles::load().unwrap();
     let candidates = b"direct team\r\ndefault\r\nstatic\r\nvia-process\r\nvia-role\r\nweb\r\nshared\r\nbroken\r\nambiguous\r\nmultiline\r\nshared-indent\r\n";
     assert_eq!(
-        filter_profiles(&profiles, candidates).unwrap(),
+        filter_profiles(&profiles, candidates, true).unwrap(),
         ["direct team", "default"]
     );
     assert_eq!(
@@ -230,6 +230,13 @@ fn aws_login_profiles_export_only_their_login_session() {
     ] {
         assert_eq!(profiles.require(name), Err(CliError::UnsupportedProfile), "{name}");
     }
+    // aws login을 모르는 CLI에서는 목록에서 뺀다.
+    assert_eq!(filter_profiles(&profiles, b"default
+no-region
+", true).unwrap(), ["default", "no-region"]);
+    assert!(filter_profiles(&profiles, b"default
+no-region
+", false).unwrap().is_empty());
     // S3처럼 SSO 토큰을 직접 쓰는 기능은 aws login 프로필을 받지 않는다.
     assert_eq!(profiles.take_sso_config("default").err(), Some(CliError::UnsupportedProfile));
 }

@@ -26,6 +26,10 @@ fn request() -> StartRequest {
     }
 }
 
+fn request_with(credentials: Arc<Credentials>) -> StartRequest {
+    StartRequest { credentials, ..request() }
+}
+
 fn session() -> Value {
     json!({"SessionId": SESSION_ID, "Reason": REASON, "Owner": OWNER,
            "Target": TARGET, "Status": "Terminated"})
@@ -821,4 +825,49 @@ async fn port_forward_and_terminal_permits_do_not_cross() {
     shell.command_issued = false;
     assert_eq!(shell.authorize_forward_with(&cli.0, &scope, async |_| panic!("unexpected command")).await.err(),
         Some(CliError::InvalidTarget));
+}
+
+fn expiring_in(after: Duration) -> Arc<Credentials> {
+    let mut credentials = fixture_credentials();
+    Arc::get_mut(&mut credentials).unwrap().expire_in_for_test(after);
+    credentials
+}
+
+#[test]
+fn renewed_credentials_replace_only_for_the_same_caller() {
+    // 같은 신원이고 더 늦게 끝나면 바꾼다.
+    let mut request = request();
+    request.credentials = expiring_in(Duration::from_secs(60));
+    let fresh = expiring_in(Duration::from_secs(900));
+    assert_eq!(request.adopt(Ok((fresh.clone(), OWNER.into()))), Ok(()));
+    assert!(Arc::ptr_eq(&request.credentials, &fresh));
+
+    // 다른 신원이면 거부하고 기존 자격을 그대로 둔다.
+    let mut request = request_with(expiring_in(Duration::from_secs(60)));
+    let before = request.credentials.clone();
+    let other = "arn:aws:sts::123456789012:assumed-role/Other/Other";
+    assert_eq!(request.adopt(Ok((expiring_in(Duration::from_secs(900)), other.into()))), Err(VerificationError::Unconfirmed));
+    assert!(Arc::ptr_eq(&request.credentials, &before));
+
+    // 새 자격이 더 일찍 끝나면 기존 자격을 유지한다.
+    let mut request = request_with(expiring_in(Duration::from_secs(90)));
+    let before = request.credentials.clone();
+    assert_eq!(request.adopt(Ok((expiring_in(Duration::from_secs(30)), OWNER.into()))), Ok(()));
+    assert!(Arc::ptr_eq(&request.credentials, &before));
+}
+
+#[test]
+fn failed_renewal_continues_with_still_valid_credentials() {
+    let mut valid = request_with(expiring_in(Duration::from_secs(60)));
+    assert_eq!(valid.adopt(Err(CliError::SsoLoginRequired)), Ok(()));
+    let mut expired = request();
+    Arc::get_mut(&mut expired.credentials).unwrap().expire_for_test();
+    assert_eq!(expired.adopt(Err(CliError::EndpointUnavailable)), Err(VerificationError::Unconfirmed));
+}
+
+#[tokio::test]
+async fn long_lived_credentials_skip_renewal_without_a_cli_call() {
+    // 남은 수명이 넉넉하면 프로필을 읽지도 않는다. 이 범위의 프로필은 시험 환경에 없다.
+    let mut request = request();
+    assert_eq!(fixture_cli().renew_credentials(&mut request, &CancellationToken::new()).await, Ok(()));
 }

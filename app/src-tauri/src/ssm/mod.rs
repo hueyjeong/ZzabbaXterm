@@ -129,7 +129,8 @@ impl AwsCli {
     pub async fn profiles(&self, cancel: &CancellationToken) -> Result<Vec<String>, CliError> {
         let profiles = Profiles::load()?;
         let output = self.profiles_command().capture(cancel).await?.success()?;
-        filter_profiles(&profiles, &output)
+        // `aws login`을 모르는 CLI에서는 login 프로필을 고를 수 없게 목록에서 뺀다.
+        filter_profiles(&profiles, &output, self.1)
     }
 
     pub async fn configured_region(
@@ -302,10 +303,11 @@ impl AwsCli {
     }
 }
 
-fn filter_profiles(profiles: &Profiles, output: &[u8]) -> Result<Vec<String>, CliError> {
+fn filter_profiles(profiles: &Profiles, output: &[u8], login: bool) -> Result<Vec<String>, CliError> {
     Ok(text(output)?
         .lines()
         .filter(|line| validate_profile(line).is_ok() && profiles.require(line).is_ok())
+        .filter(|line| login || !profiles.is_login(line))
         .map(str::to_owned)
         .collect())
 }
