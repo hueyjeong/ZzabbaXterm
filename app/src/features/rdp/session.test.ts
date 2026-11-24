@@ -2,8 +2,8 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { createRemoteDesktopViewSession } from "../remoteDesktop/session";
 import { scanCode } from "./keys";
-import { APPROVAL_NOTICE } from "../remoteDesktop/session";
-import { BUSY_NOTICE, connect, DROPPED_NOTICE, type Connection } from "./session";
+import { APPROVAL_NOTICE, approvalSignal } from "../remoteDesktop/session";
+import { BUSY_NOTICE, connect, DROPPED_NOTICE, STALLED_MESSAGE, type Connection } from "./session";
 
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({
@@ -348,7 +348,7 @@ it("3초 넘게 busy인 입력은 버리고 큐가 빈 뒤 해제한다", async 
   const f = await fixture();
   const view = await f.live();
   let now = 1_000;
-  vi.spyOn(Date, "now").mockImplementation(() => now);
+  vi.spyOn(performance, "now").mockImplementation(() => now);
   f.sendInput.mockResolvedValue("busy");
   view.send(input);
   await vi.waitFor(() => expect(f.calls("rdp_input").length).toBeGreaterThan(2));
@@ -393,4 +393,57 @@ it("연결 종료 이벤트의 전송 끊김 종류를 탭에 넘긴다", async 
   });
   connect({ host: "rdp.example.invalid", port: 3389 }, vi.fn(), vi.fn(), vi.fn(), vi.fn(), ended);
   await vi.waitFor(() => expect(ended).toHaveBeenCalledWith("RDP 전송 연결이 끊겼습니다", true, "transport"));
+});
+
+it("수정키 keyup이 3초 넘게 busy면 뒤 키를 보내지 않고 바로 해제한다", async () => {
+  const f = await fixture();
+  const view = await f.live();
+  let now = 1_000;
+  vi.spyOn(performance, "now").mockImplementation(() => now);
+  const ctrl = { ...input, code: "ControlLeft", key: "Control" };
+  view.send(ctrl);
+  await vi.waitFor(() => expect(f.inputs()).toHaveLength(2));
+  f.sendInput.mockResolvedValue("busy");
+  f.sendBatch.mockImplementation(() => Promise.resolve(["busy"]));
+  view.send({ ...ctrl, down: false });
+  view.send({ ...input, code: "KeyC" });
+  await vi.waitFor(() => expect(f.calls("rdp_input_batch").length).toBeGreaterThan(1));
+  now += 3_000;
+  f.sendInput.mockResolvedValue("ok");
+  await vi.waitFor(() => expect(f.inputs().slice(-1)[0]).toMatchObject({ action: { kind: "release" } }));
+  const sent = f.inputs();
+  const release = sent.slice(-1)[0];
+  // 수정키 keyup의 순번을 release가 그대로 이어받고, KeyC는 수정키가 눌린 채로 적용되지 않는다.
+  expect(release.sequence).toBe(3);
+  expect(sent.filter((item) => item.action.code === scanCode("KeyC")?.code).every((item) => item.sequence === 4)).toBe(true);
+  expect(f.calls("rdp_input_batch").every((call) => call.inputs[0].action.code === scanCode("ControlLeft")?.code)).toBe(true);
+  expect(f.notice).toHaveBeenCalledExactlyOnceWith(DROPPED_NOTICE);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  expect(f.inputs()).toHaveLength(sent.length);
+  expect(f.ended).not.toHaveBeenCalled();
+  view.dispose();
+});
+
+it("활성 전환이 3초 넘게 busy면 분명한 문구로 끝낸다", async () => {
+  const f = await fixture();
+  const view = await f.live();
+  let now = 1_000;
+  vi.spyOn(performance, "now").mockImplementation(() => now);
+  f.sendInput.mockResolvedValue("busy");
+  f.connection.setActive(false);
+  await vi.waitFor(() => expect(f.calls("rdp_input").length).toBeGreaterThan(2));
+  expect(f.ended).not.toHaveBeenCalled();
+  now += 3_000;
+  await vi.waitFor(() => expect(f.ended).toHaveBeenCalledWith(STALLED_MESSAGE, true));
+  expect(f.calls("rdp_input").slice(1).every((call) => call.input.action.kind === "active" && call.input.sequence === 2)).toBe(true);
+  view.dispose();
+});
+
+it("승인 대기 끝은 승인 대기 알림만 지운다", () => {
+  const notice = vi.fn();
+  expect(approvalSignal("approval-done", notice, () => "RDP 클립보드 교환 실패")).toBe(true);
+  expect(notice).not.toHaveBeenCalled();
+  expect(approvalSignal("approval-done", notice, () => APPROVAL_NOTICE)).toBe(true);
+  expect(notice).toHaveBeenCalledExactlyOnceWith("");
+  expect(approvalSignal("c".repeat(32), notice, () => "")).toBe(false);
 });

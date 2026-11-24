@@ -203,10 +203,14 @@ fn confirm_native(window: &WebviewWindow, description: &str, _: impl Fn() -> boo
     crate::desktop_dialog::confirm_box(window, "VNC 연결 승인", description, true)
 }
 
+/// NSAlert는 첫 단추를 Return 기본 단추로 둔다. 취소를 첫 단추로 두어 Enter로 승인되지 않게 하고, 승인은 단추 이름으로만 판정한다.
 #[cfg(not(any(windows, target_os = "linux")))]
 fn confirm_native(window: &WebviewWindow, description: &str, _: impl Fn() -> bool) -> bool {
+    const APPROVE: &str = "연결";
     rfd::MessageDialog::new().set_parent(window).set_title("VNC 연결 승인").set_description(description)
-        .set_level(rfd::MessageLevel::Warning).set_buttons(rfd::MessageButtons::OkCancel).show() == rfd::MessageDialogResult::Ok
+        .set_level(rfd::MessageLevel::Warning)
+        .set_buttons(rfd::MessageButtons::OkCancelCustom("취소".into(), APPROVE.into()))
+        .show() == rfd::MessageDialogResult::Custom(APPROVE.into())
 }
 
 impl Approved {

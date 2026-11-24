@@ -315,8 +315,9 @@ impl Session {
                                 let _ = ack.send(Err(Error::StaleDisplay));
                                 continue;
                             }
+                            // 화면 이벤트가 밀린 상태는 복사 진행 중이 아니다. busy로 답하고 탭은 알림만 띄운다.
                             if matches!(command, Input::ReadClipboardText) && !pending.is_empty() {
-                                let _ = ack.send(Err(Error::CopyPending));
+                                let _ = ack.send(Err(Error::Busy));
                                 continue;
                             }
                             let data = encode(&mut active, &graphics, channels, command);

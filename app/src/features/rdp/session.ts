@@ -16,10 +16,11 @@ const MAX_CLIPBOARD_BYTES = 64 * 1024;
 const MAX_QUEUE = 512;
 const MAX_BATCH = 64;
 const BUSY_RETRY_MS = 15;
-/** 같은 입력이 이 시간 넘게 busy면 버리고 큐가 빈 뒤 해제한다. */
+/** 같은 입력이 이 시간 넘게 busy면 같은 epoch의 남은 입력을 모두 버리고 바로 해제한다. */
 const BUSY_LIMIT_MS = 3000;
 export const DROPPED_NOTICE = "RDP 입력 일부를 버렸습니다";
 export const BUSY_NOTICE = "RDP 세션이 작업 중입니다";
+export const STALLED_MESSAGE = "RDP 세션이 입력 활성화를 받지 않아 연결을 닫았습니다";
 /** `transport`는 전송 연결이 끊긴 종료다. 터널 경로는 경로를 다시 열어야 재연결할 수 있다. */
 export type EndKind = "transport";
 const token = /^[a-f0-9]{32}$/;
@@ -50,10 +51,15 @@ function failure(error: unknown): { message: string; kind?: EndKind } {
 }
 
 export function connect(draft: Draft, opened: (connection: Connection) => void,
-  caps: (value: Capabilities) => void, ready: (value: boolean) => void, notice: (message: string) => void,
+  caps: (value: Capabilities) => void, ready: (value: boolean) => void, showNotice: (message: string) => void,
   ended: (message: string, closed: boolean, kind?: EndKind) => void, clipboard: Pick<Clipboard, "readText" | "writeText"> = navigator.clipboard): () => Promise<void> {
   const document = proof();
   const life = new AbortController();
+  let shown = "";
+  const notice = (message: string) => {
+    shown = message;
+    showNotice(message);
+  };
   let output: Channel<string> | undefined;
   const run = <T = void>(name: string, args: InvokeArgs = {}) => {
     if (!document || proof() !== document) return Promise.reject("RDP 문서가 교체되었거나 아직 준비되지 않았습니다");
@@ -151,12 +157,18 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
               rest(index + 1);
               break;
             }
-            const now = Date.now();
+            const now = performance.now();
             if (busySince?.item !== next) busySince = { item: next, at: now };
-            else if (now - busySince.at >= BUSY_LIMIT_MS) {
+            else if (now - busySince.at >= BUSY_LIMIT_MS && next.action.kind === "active") {
+              // 활성 전환을 버리면 이후 입력이 모두 거부되므로 분명히 끝낸다.
+              end(STALLED_MESSAGE); return;
+            } else if (now - busySince.at >= BUSY_LIMIT_MS && next.action.kind !== "release") {
+              // 한 항목만 버리면 수정키 keyup 같은 상태가 어긋난다. 같은 epoch의 남은 입력을 모두 버리고 바로 해제한다.
               busySince = undefined;
+              const kept = queue.filter((item) => item.epoch !== next.epoch);
+              queue.length = 0;
+              queue.push(...kept);
               markDropped();
-              rest(index + 1);
               break;
             }
             rest(index);
@@ -330,7 +342,7 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
       const assigned = await prepared;
       if (done) return;
       output = new Channel<string>((ticket: unknown) => {
-        if (!approvalSignal(ticket, notice)) void packet(ticket);
+        if (!approvalSignal(ticket, notice, () => shown)) void packet(ticket);
       });
       const completion = run("rdp_connect", { id, draft, output });
       opened({

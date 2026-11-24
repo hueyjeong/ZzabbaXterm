@@ -161,6 +161,8 @@ export function Workspace() {
   const sftpPanels = useRef(new Map<string, SftpPanelActions>());
   const editorActions = useRef(new Map<number, EditorTabActions>());
   const desktopActions = useRef(new Map<number, RdpTabActions | VncTabActions>());
+  /** 경로를 다시 여는 중인 화면 탭이다. 같은 탭의 두 번째 요청은 받지 않는다. */
+  const reopeningRoutes = useRef(new Set<number>());
   const cliMounts = useRef(new Map<number, (mounted: boolean) => void>());
   const pendingEditorMounts = useRef(new Set<number>());
   const closingWindow = useRef(false);
@@ -578,7 +580,8 @@ export function Workspace() {
     if ((tab?.kind !== "rdp" && tab?.kind !== "vnc") || !tab.targetId || closingTabs.current.has(id)) return false;
     const target = profileLoad.profiles?.targets.find(({ profile }) => profile.id === tab.targetId)?.profile;
     if (target?.defaultMethod !== "rdp" && target?.defaultMethod !== "vnc") return false;
-    if (desktopOpening?.id === target.id) return false;
+    if (desktopOpening?.id === target.id || reopeningRoutes.current.has(id)) return false;
+    reopeningRoutes.current.add(id);
     setWindowError("");
     const pending = { id: target.id, label: target.displayName, controller: new AbortController() };
     desktopOpening?.controller.abort();
@@ -606,6 +609,7 @@ export function Workspace() {
       }
       return false;
     } finally {
+      reopeningRoutes.current.delete(id);
       setDesktopOpening(current => current === pending ? undefined : current);
     }
   }

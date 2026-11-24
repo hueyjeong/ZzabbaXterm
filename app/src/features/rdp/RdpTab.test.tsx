@@ -161,3 +161,21 @@ it("전송 오류라도 종류 코드가 없으면 같은 경로로 다시 연�
   expect(onReopenRoute).not.toHaveBeenCalled();
   expect(connect).toHaveBeenCalledTimes(2);
 });
+
+it("다시 연결을 빠르게 두 번 눌러도 경로는 한 번만 다시 연다", async () => {
+  const host = document.createElement("div");
+  document.body.appendChild(host);
+  root = createRoot(host);
+  const source = { tabHandle: "route-tab", tunnelId: "9", targetId: "ssh-server", destination: { host: "127.0.0.1", port: 3389 } };
+  const reopened = Promise.withResolvers<boolean>();
+  const onReopenRoute = vi.fn(() => reopened.promise);
+  await act(async () => {
+    root!.render(<RdpTab active autoStart label="RDP 1" source={source} preset={{ host: "xrdp.example.test", port: 3389 }} onReopenRoute={onReopenRoute} />);
+  });
+  await act(async () => { ended(0)("RDP 전송 연결이 끊겼습니다", true, "transport"); });
+  const button = host.querySelector<HTMLButtonElement>('button[aria-label="다시 연결"]')!;
+  await act(async () => { button.click(); button.click(); });
+  expect(onReopenRoute).toHaveBeenCalledOnce();
+  expect(connect).toHaveBeenCalledTimes(1);
+  await act(async () => { reopened.resolve(true); });
+});

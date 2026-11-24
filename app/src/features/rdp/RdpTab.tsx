@@ -126,7 +126,7 @@ export function RdpTab({ active, label, source, preset, autoStart, onSecurityMod
 
   function reconnect() {
     const draft = last.current;
-    if (!draft) return;
+    if (!draft || awaitingRoute.current) return;
     if (routeLost && onReopenRoute) {
       awaitingRoute.current = true;
       void onReopenRoute().then((reopened) => { if (!reopened) awaitingRoute.current = false; });
