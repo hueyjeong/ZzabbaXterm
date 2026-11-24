@@ -1,13 +1,16 @@
 import { Channel, convertFileSrc, invoke, type InvokeArgs } from "@tauri-apps/api/core";
-import { approvalSignal, type RemoteDesktopEvent, type RemoteDesktopIdentity, type RemoteDesktopSession } from "../remoteDesktop/session";
+import type { DesktopFit } from "../remoteDesktop/fit";
+import { approvalSignal, type RemoteDesktopEvent, type RemoteDesktopIdentity, type RemoteDesktopSession, type RemoteDesktopSize } from "../remoteDesktop/session";
 import type { DesktopTunnelSource } from "../tunnels/tunnelIpc";
 import { scanCode } from "./keys";
 
-interface Draft { readonly host: string; readonly port: number; readonly tlsOnly?: boolean; readonly source?: DesktopTunnelSource }
+interface Draft { readonly host: string; readonly port: number; readonly tlsOnly?: boolean; readonly source?: DesktopTunnelSource; readonly size?: DesktopFit }
+export type ResizeResult = "sent" | "retry" | "failed";
 export interface Capabilities { readonly copy: boolean; readonly paste: boolean; readonly resize: boolean }
 export interface Connection extends RemoteDesktopSession {
   clipboard(action: "copy" | "paste"): void;
-  resize(width: number, height: number): void;
+  /** `sent`는 서버에 보냈다는 뜻이다. `retry`는 화면 전환·작업 중이라 보내지 못한 경우, `failed`는 오류 응답이나 세션 종료다. */
+  resize(size: DesktopFit): Promise<ResizeResult>;
 }
 
 const CHUNK = 256 * 1024;
@@ -36,7 +39,7 @@ const record = (value: unknown): value is Record<string, unknown> => typeof valu
 type Action = { kind: "active"; active: boolean } | { kind: "release" } | { kind: "copy" } |
 { kind: "key"; code: number; extended: boolean; down: boolean } |
 { kind: "pointer"; x: number; y: number; buttons: number } |
-{ kind: "paste"; text: string } | { kind: "resize"; width: number; height: number };
+{ kind: "paste"; text: string } | { kind: "resize"; width: number; height: number; scale: number };
 type Frame = Extract<RemoteDesktopEvent, { kind: "full" | "patch" }>;
 type Queued = { action: Action; epoch: number; displayGeneration: number };
 /** 입력 한 건의 결과다. busy는 Rust가 순번을 쓰지 않았으므로 같은 순번으로 다시 보낸다. */
@@ -50,9 +53,11 @@ function failure(error: unknown): { message: string; kind?: EndKind } {
   return { message: String(error) };
 }
 
+/** `ready`는 새 화면을 적용한 뒤 서버가 정한 크기와 함께 불린다. `initialSize`가 있으면 그 크기를 받은 뒤 연결을 시작한다. */
 export function connect(draft: Draft, opened: (connection: Connection) => void,
-  caps: (value: Capabilities) => void, ready: (value: boolean) => void, showNotice: (message: string) => void,
-  ended: (message: string, closed: boolean, kind?: EndKind) => void, clipboard: Pick<Clipboard, "readText" | "writeText"> = navigator.clipboard): () => Promise<void> {
+  caps: (value: Capabilities) => void, ready: (value: boolean, size?: RemoteDesktopSize) => void, showNotice: (message: string) => void,
+  ended: (message: string, closed: boolean, kind?: EndKind) => void, clipboard: Pick<Clipboard, "readText" | "writeText"> = navigator.clipboard,
+  initialSize?: Promise<DesktopFit | undefined>): () => Promise<void> {
   const document = proof();
   const life = new AbortController();
   let shown = "";
@@ -78,7 +83,18 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
   let serial = 0;
   let lastPacket = 0;
   let lastFrame = 0;
+  let lastSize: RemoteDesktopSize | undefined;
   const queue: Queued[] = [];
+  /** 해상도 요청의 결과를 기다리는 쪽이다. 큐에서 빠졌는데 보내는 중도 아니면 `retry`로 끝낸다. */
+  const results = new Map<Queued, (result: ResizeResult) => void>();
+  let inFlight: readonly Queued[] = [];
+  const settle = (item: Queued, result: ResizeResult) => {
+    results.get(item)?.(result);
+    results.delete(item);
+  };
+  const sweep = (result: ResizeResult = "retry") => {
+    for (const item of [...results.keys()]) if (!queue.includes(item) && !inFlight.includes(item)) settle(item, result);
+  };
   let sending = false;
   let dropped = false;
   let busySince: { item: Queued; at: number } | undefined;
@@ -90,6 +106,8 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
     waiting?.();
     if (output) output.onmessage = () => { };
     queue.length = 0;
+    inFlight = [];
+    sweep("failed");
     pending = undefined;
   };
   const close = () => {
@@ -130,7 +148,7 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
         // copy·paste·resize는 단건으로만 보내 한 항목의 형식 오류가 묶음 전체를 실패시키지 않게 한다.
         let count = 1;
         if (!control(queue[0].action)) while (count < queue.length && count < MAX_BATCH && !control(queue[count].action)) count++;
-        const batch = queue.splice(0, count);
+        const batch = inFlight = queue.splice(0, count);
         const inputs = batch.map((next, index) => ({ ...next, sequence: serial + index + 1 }));
         let replies: unknown;
         try {
@@ -153,7 +171,9 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
             // 적용되지 않은 항목은 같은 순번으로 다시 보낸다. 그 사이 화면이나 활성 상태가 바뀌었으면 버린다.
             const rest = (from: number) => queue.unshift(...batch.slice(from).filter((item) => item.epoch === epoch));
             if (control(next.action)) {
-              notice(BUSY_NOTICE);
+              // 해상도 요청은 부른 쪽이 결과를 받아 다시 요청한다.
+              if (results.has(next)) settle(next, "retry");
+              else notice(BUSY_NOTICE);
               rest(index + 1);
               break;
             }
@@ -180,6 +200,7 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
           }
           if (busySince?.item === next) busySince = undefined;
           serial++;
+          settle(next, reply === "ok" ? "sent" : reply === "stale" ? "retry" : "failed");
           if (reply === "stale") {
             if (next.displayGeneration === displayGeneration) {
               displayGeneration = 0;
@@ -192,6 +213,8 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
             else { end(error, reply.kind === "transport" ? "transport" : undefined); return; }
           }
         }
+        inFlight = [];
+        sweep();
         if (busy) await pause(BUSY_RETRY_MS);
       }
     } finally { sending = false; }
@@ -209,17 +232,20 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
     }
     return false;
   }
-  function send(action: Action) {
-    if (done || !displayGeneration || (action.kind !== "active" && !active)) return;
+  function send(action: Action, result?: (result: ResizeResult) => void) {
+    if (done || !displayGeneration || (action.kind !== "active" && !active)) { result?.(done ? "failed" : "retry"); return; }
     const last = queue[queue.length - 1];
     if (action.kind === "pointer" && last?.action.kind === "pointer" && last.action.buttons === action.buttons) {
       last.action = action;
     } else {
       if (queue.length >= MAX_QUEUE && action.kind !== "active" && action.kind !== "release" && !dropMove()) {
         markDropped();
+        result?.("retry");
         return;
       }
-      queue.push({ action, epoch, displayGeneration });
+      const item = { action, epoch, displayGeneration };
+      if (result) results.set(item, result);
+      queue.push(item);
     }
     void flush();
   }
@@ -228,6 +254,7 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
     active = next;
     epoch++;
     queue.length = 0;
+    sweep();
     send({ kind: "active", active });
   }
   function clipboardAction(action: "copy" | "paste") {
@@ -277,6 +304,7 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
           if (done || proof() !== document) return;
           if (!receive?.(pending.frame)) throw new Error();
           lastFrame = pending.frame.sequence;
+          lastSize = pending.frame.size;
           pending = undefined;
         }
       } else if (type === "application/json") {
@@ -295,6 +323,7 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
               frameGeneration = generation;
               displayGeneration = 0;
               queue.length = 0;
+              sweep();
               epoch++;
             }
             pending = {
@@ -309,7 +338,7 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
             if (!lastFrame || value.displayGeneration !== frameGeneration || displayGeneration) throw new Error();
             displayGeneration = frameGeneration;
             send({ kind: "active", active });
-            ready(true);
+            ready(true, lastSize);
             break;
           case "channels":
             if (typeof value.copy !== "boolean" || typeof value.paste !== "boolean" || typeof value.resize !== "boolean") throw new Error();
@@ -344,7 +373,6 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
       output = new Channel<string>((ticket: unknown) => {
         if (!approvalSignal(ticket, notice, () => shown)) void packet(ticket);
       });
-      const completion = run("rdp_connect", { id, draft, output });
       opened({
         ...assigned,
         subscribe(listener) {
@@ -367,9 +395,14 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
           }
         },
         clipboard: clipboardAction,
-        resize(width, height) { send({ kind: "resize", width, height }); },
+        resize({ width, height, scale }) {
+          return new Promise<ResizeResult>((resolve) => send({ kind: "resize", width, height, scale }, resolve));
+        },
       });
-      await completion;
+      // 탭 화면 영역을 잰 뒤 그 크기로 연결한다.
+      const size = initialSize && await initialSize;
+      if (done) return;
+      await run("rdp_connect", { id, draft: size ? { ...draft, size } : draft, output });
       end("RDP 연결이 종료되었습니다");
     } catch (error) {
       const { message, kind } = failure(error);

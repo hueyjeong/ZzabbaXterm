@@ -2,17 +2,25 @@
 import { act, StrictMode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, expect, it, vi } from "vitest";
-import { RdpTab } from "./RdpTab";
+import { NOT_APPLIED_NOTICE, RdpTab } from "./RdpTab";
 
-const { connect } = vi.hoisted(() => ({ connect: vi.fn(() => () => Promise.resolve()) }));
+const { connect, view } = vi.hoisted(() => ({
+  connect: vi.fn(() => () => Promise.resolve()),
+  view: { onViewport: undefined as ((size: { width: number; height: number }) => void) | undefined },
+}));
 vi.mock("./session", () => ({ connect }));
-vi.mock("../remoteDesktop/RemoteDesktopView", () => ({ RemoteDesktopView: () => null }));
+vi.mock("../remoteDesktop/RemoteDesktopView", () => ({
+  RemoteDesktopView: (props: { onViewport?: typeof view.onViewport }) => { view.onViewport = props.onViewport; return null; },
+}));
 
 let root: Root | undefined;
 afterEach(() => {
   act(() => root?.unmount());
   root = undefined;
+  view.onViewport = undefined;
   vi.clearAllMocks();
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
 });
 
 function dispatchTrusted(target: HTMLElement, event: Event) {
@@ -46,6 +54,7 @@ it("TLS 전용 opt-in은 기본 꺼짐이고 켠 값이 초안과 연결 상태�
   expect(connect).toHaveBeenCalledWith(
     { host: "rdp.example.invalid", port: 3389, tlsOnly: true },
     expect.any(Function), expect.any(Function), expect.any(Function), expect.any(Function), expect.any(Function),
+    undefined, expect.any(Promise),
   );
   expect(host.textContent).toContain("NLA, 미지원 시 TLS 전용(표준 RDP 보안 없음)");
   expect(onSecurityMode).toHaveBeenCalledWith(true);
@@ -178,4 +187,107 @@ it("다시 연결을 빠르게 두 번 눌러도 경로는 한 번만 다시 연
   expect(onReopenRoute).toHaveBeenCalledOnce();
   expect(connect).toHaveBeenCalledTimes(1);
   await act(async () => { reopened.resolve(true); });
+});
+
+type Arguments = [unknown, (connection: unknown) => void, (caps: unknown) => void, (value: boolean, size?: unknown) => void,
+  (message: string) => void, Ended, unknown, Promise<unknown>];
+
+/** 저장 프로필로 연 탭을 띄우고 연결 객체를 넘겨 화면을 붙인 상태로 만든다. */
+async function opened() {
+  vi.stubGlobal("devicePixelRatio", 1.25);
+  const host = document.createElement("div");
+  document.body.appendChild(host);
+  root = createRoot(host);
+  await act(async () => { root!.render(<RdpTab active autoStart label="RDP 1" preset={{ host: "xrdp.example.test", port: 3389 }} />); });
+  const [, open, caps, ready, , , , initial] = connect.mock.calls[0] as unknown as Arguments;
+  const connection = {
+    sessionId: "s", generation: 1, resize: vi.fn((_size: unknown) => Promise.resolve("sent")), clipboard: vi.fn(), send: vi.fn(), setActive: vi.fn(), subscribe: vi.fn(),
+  };
+  await act(async () => { open(connection); });
+  return { host, connection, caps, ready, initial };
+}
+
+it("첫 연결은 화면 영역의 장치 픽셀 크기와 배율로 요청한다", async () => {
+  const { initial } = await opened();
+  await act(async () => { view.onViewport!({ width: 800, height: 600.4 }); });
+  await expect(initial).resolves.toEqual({ width: 1000, height: 750, scale: 125 });
+});
+
+it("창에 맞춤은 크기 변경이 멈춘 뒤 한 번만 해상도를 요청하고 같은 크기는 다시 요청하지 않는다", async () => {
+  const { connection, caps, ready } = await opened();
+  vi.useFakeTimers();
+  await act(async () => { view.onViewport!({ width: 800, height: 600 }); });
+  await act(async () => { caps({ copy: false, paste: false, resize: true }); ready(true, { width: 1000, height: 750 }); });
+  expect(connection.resize).not.toHaveBeenCalled();
+  await act(async () => {
+    view.onViewport!({ width: 900, height: 600 });
+    vi.advanceTimersByTime(300);
+    view.onViewport!({ width: 1000, height: 640 });
+    vi.advanceTimersByTime(300);
+  });
+  expect(connection.resize).not.toHaveBeenCalled();
+  await act(async () => { vi.advanceTimersByTime(100); });
+  expect(connection.resize).toHaveBeenCalledExactlyOnceWith({ width: 1250, height: 800, scale: 125 });
+  // 서버가 다른 크기를 적용해도 같은 요청을 되풀이하지 않는다.
+  await act(async () => { ready(true, { width: 1248, height: 800 }); });
+  await act(async () => { view.onViewport!({ width: 1000, height: 640 }); vi.advanceTimersByTime(400); });
+  expect(connection.resize).toHaveBeenCalledOnce();
+});
+
+it("고정 크기는 창 크기를 따르지 않고 입력한 해상도를 요청하며 서버가 바꾸지 않으면 알린다", async () => {
+  const { host, connection, caps, ready } = await opened();
+  vi.useFakeTimers();
+  await act(async () => { view.onViewport!({ width: 800, height: 600 }); });
+  await act(async () => { caps({ copy: false, paste: false, resize: true }); ready(true, { width: 1000, height: 750 }); });
+  const fit = [...host.querySelectorAll("label")].find((label) => label.textContent?.includes("창에 맞춤"))!.querySelector("input")!;
+  const width = () => [...host.querySelectorAll("label")].find((label) => label.textContent?.startsWith("너비"))!.querySelector("input")!;
+  const height = () => [...host.querySelectorAll("label")].find((label) => label.textContent?.startsWith("높이"))!.querySelector("input")!;
+  expect(fit.checked).toBe(true);
+  expect(width().disabled).toBe(true);
+  await act(async () => { fit.click(); });
+  expect(width().value).toBe("1000");
+  await act(async () => { view.onViewport!({ width: 600, height: 400 }); vi.advanceTimersByTime(1000); });
+  expect(connection.resize).not.toHaveBeenCalled();
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
+  setter.call(width(), "1280");
+  setter.call(height(), "720");
+  await act(async () => { dispatchTrusted(width().form!, new Event("submit", { bubbles: true, cancelable: true })); });
+  expect(connection.resize).toHaveBeenCalledExactlyOnceWith({ width: 1280, height: 720, scale: 125 });
+  await act(async () => { vi.advanceTimersByTime(5000); });
+  expect(host.textContent).toContain(NOT_APPLIED_NOTICE);
+});
+
+it("재활성화 중이라 보내지 못한 창 맞춤 요청은 잠시 뒤 같은 크기로 다시 요청한다", async () => {
+  const { connection, caps, ready } = await opened();
+  vi.useFakeTimers();
+  await act(async () => { view.onViewport!({ width: 800, height: 600 }); });
+  await act(async () => { caps({ copy: false, paste: false, resize: true }); ready(true, { width: 1000, height: 750 }); });
+  connection.resize.mockResolvedValueOnce("retry");
+  await act(async () => { view.onViewport!({ width: 1000, height: 640 }); vi.advanceTimersByTime(400); });
+  expect(connection.resize).toHaveBeenCalledOnce();
+  await act(async () => { vi.advanceTimersByTime(400); });
+  expect(connection.resize).toHaveBeenCalledTimes(2);
+  expect(connection.resize).toHaveBeenLastCalledWith({ width: 1250, height: 800, scale: 125 });
+  // 보낸 뒤에는 같은 크기를 다시 요청하지 않는다.
+  await act(async () => { vi.advanceTimersByTime(2000); });
+  expect(connection.resize).toHaveBeenCalledTimes(2);
+});
+
+it("고정 크기로 다시 연결하면 서버가 정한 홀수 폭을 짝수로 내린다", async () => {
+  const { host, caps, ready } = await opened();
+  await act(async () => { view.onViewport!({ width: 800, height: 600 }); });
+  await act(async () => { caps({ copy: false, paste: false, resize: true }); ready(true, { width: 1281, height: 150 }); });
+  const fit = [...host.querySelectorAll("label")].find((label) => label.textContent?.includes("창에 맞춤"))!.querySelector("input")!;
+  await act(async () => { fit.click(); });
+  await act(async () => { ended(0)("RDP 연결이 종료되었습니다", true); });
+  await act(async () => { host.querySelector<HTMLButtonElement>('button[aria-label="다시 연결"]')!.click(); });
+  const initial = (connect.mock.calls[1] as unknown as Arguments)[7];
+  await expect(initial).resolves.toEqual({ width: 1280, height: 200, scale: 125 });
+});
+
+it("알림은 화면 영역 위의 겹침 영역에 표시한다", async () => {
+  const { host } = await opened();
+  const [, , , , notice] = connect.mock.calls[0] as unknown as Arguments;
+  await act(async () => { notice("RDP 세션이 작업 중입니다"); });
+  expect(host.querySelector(".remote-desktop-notices [role=status]")?.textContent).toBe("RDP 세션이 작업 중입니다");
 });

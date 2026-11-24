@@ -33,10 +33,11 @@ use super::{Account, Error, Target, clipboard::TextClipboard, ipc::AuthIo, route
 
 pub(super) type Transport = TokioFramed<TlsStream<TcpStream>>;
 
-fn config(size: DesktopSize, tls_only: bool) -> connector::Config {
+fn config(size: DesktopSize, scale: u32, tls_only: bool) -> connector::Config {
     connector::Config {
         desktop_size: size,
-        desktop_scale_factor: 0,
+        // 100~500%가 아니면 0으로 알려 서버 기본 배율을 쓴다.
+        desktop_scale_factor: super::display::scale(scale).unwrap_or(0),
         // NLA-first requests HYBRID|HYBRID_EX only, so the server cannot downgrade to TLS.
         // TLS-only requests PROTOCOL_SSL and skips CredSSP; the caller must opt in.
         enable_tls: tls_only,
@@ -47,7 +48,9 @@ fn config(size: DesktopSize, tls_only: bool) -> connector::Config {
             config: None,
         },
         domain: None,
-        client_build: 0,
+        // xrdp는 빌드 번호 419 이하를 크기를 바꿀 수 없는 옛 클라이언트로 보고 Deactivate All 없이 화면만 바꾼다.
+        // Windows 10 22H2(19045)로 알려 Display Control 해상도 변경이 재활성화로 이어지게 한다.
+        client_build: 19045,
         client_name: "ZzabbaXterm".into(),
         keyboard_type: KeyboardType::IbmEnhanced,
         keyboard_subtype: 0,
@@ -307,7 +310,7 @@ async fn negotiate(target: &mut Target, credssp: bool) -> Result<Negotiated, Err
     let local = stream.local_addr().map_err(|_| Error::Tcp)?;
     stream.set_nodelay(true).map_err(|_| Error::Tcp)?;
     let mut framed = TokioFramed::new(stream);
-    let mut connector = ClientConnector::new(config(target.size, !credssp), local);
+    let mut connector = ClientConnector::new(config(target.size, target.scale, !credssp), local);
     // 연결 요청만 보내고, 선택된 프로토콜을 직접 읽어 TLS 전용 선택을 구분한다.
     step(&mut framed, &mut connector, Error::Negotiation).await?;
     let hint = connector.next_pdu_hint().ok_or(Error::Negotiation)?;
@@ -473,7 +476,6 @@ pub(super) async fn connect<F, Fut, A, AFut>(
     tls: Tls,
     trust: trust::Trust<A>,
     resolve: F,
-    display: ironrdp::displaycontrol::client::DisplayControlClient,
     auth: AuthIo<'_>,
 ) -> Result<(ConnectionResult, Transport), Error>
 where
@@ -494,7 +496,7 @@ where
         ));
     verified
         .connector
-        .attach_static_channel(ironrdp::dvc::DrdynvcClient::new().with_dynamic_channel(display));
+        .attach_static_channel(ironrdp::dvc::DrdynvcClient::new().with_dynamic_channel(super::display::DisplayControl::default()));
     let result = tokio::time::timeout(super::CONNECT_TIMEOUT, async {
         loop {
             step(
@@ -616,12 +618,55 @@ pub(super) async fn step<S: AsyncRead + AsyncWrite + Send + Sync + Unpin>(
     sequence: &mut dyn Sequence,
     failure: Error,
 ) -> Result<(), Error> {
+    let pdu = match sequence.next_pdu_hint() {
+        Some(hint) => Some(read_bounded(transport, hint, failure, None).await?),
+        None => None,
+    };
+    apply(transport, sequence, pdu.as_deref(), failure).await
+}
+
+/// 재활성화 순서의 한 단계다. xrdp는 Deactivate All 뒤에도 화면 갱신(fast-path와 slow-path Update·Pointer)을 보내므로
+/// 활성화 PDU만 순서에 넘기고 화면 갱신은 버린다. 재활성화가 끝나면 서버가 새 크기의 전체 화면을 다시 보낸다.
+/// 재활성화 중에 온 xrdp의 짧은 Deactivate All도 세션 루프와 같이 고쳐 넘긴다.
+pub(super) async fn reactivation_step<S: AsyncRead + AsyncWrite + Send + Sync + Unpin>(
+    transport: &mut TokioFramed<S>,
+    sequence: &mut dyn Sequence,
+    io_id: u16,
+) -> Result<(), Error> {
+    if sequence.next_pdu_hint().is_none() {
+        return apply(transport, sequence, None, Error::Activation).await;
+    }
+    loop {
+        let pdu = read_bounded(transport, &ironrdp::pdu::RDP_HINT, Error::Activation, None).await?;
+        if !graphics_update(&pdu) {
+            let pdu = super::frame::complete_deactivate(&pdu, io_id)?.unwrap_or(pdu);
+            return apply(transport, sequence, Some(&pdu), Error::Activation).await;
+        }
+    }
+}
+
+fn graphics_update(pdu: &[u8]) -> bool {
+    use ironrdp::pdu::{Action, mcs::decode_send_data_indication, rdp::headers::{IoChannelPdu, ShareDataPdu, decode_io_channel}};
+    match ironrdp::pdu::find_size(pdu) {
+        Ok(Some(info)) if info.action == Action::FastPath => true,
+        Ok(Some(_)) => decode_send_data_indication(pdu)
+            .ok()
+            .and_then(|data| decode_io_channel(data).ok())
+            .is_some_and(|io| matches!(io, IoChannelPdu::Data(ctx) if matches!(ctx.pdu, ShareDataPdu::Update(_) | ShareDataPdu::Pointer(_)))),
+        _ => false,
+    }
+}
+
+async fn apply<S: AsyncRead + AsyncWrite + Send + Sync + Unpin>(
+    transport: &mut TokioFramed<S>,
+    sequence: &mut dyn Sequence,
+    pdu: Option<&[u8]>,
+    failure: Error,
+) -> Result<(), Error> {
     let mut output = WriteBuf::new();
-    let written = if let Some(hint) = sequence.next_pdu_hint() {
-        let pdu = read_bounded(transport, hint, failure, None).await?;
-        sequence.step(&pdu, &mut output)
-    } else {
-        sequence.step_no_input(&mut output)
+    let written = match pdu {
+        Some(pdu) => sequence.step(pdu, &mut output),
+        None => sequence.step_no_input(&mut output),
     }
     .map_err(|_| failure)?;
     if written.size().is_some() {

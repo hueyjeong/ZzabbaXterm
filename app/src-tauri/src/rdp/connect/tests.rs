@@ -124,7 +124,7 @@ fn listener() -> TcpListener {
 async fn fixture_target(listener: &TcpListener, size: DesktopSize, tls_only: bool, dns: &str) -> Target {
     let stream = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
     let listen = stream.peer_addr().unwrap();
-    Target { endpoint: Endpoint::Forwarded { stream: Some(stream), listen }, server_name: dns.into(), size, tls_only }
+    Target { endpoint: Endpoint::Forwarded { stream: Some(stream), listen }, server_name: dns.into(), size, scale: 0, tls_only }
 }
 
 fn fixture_policy(_: &str, _: &[rustls::pki_types::CertificateDer<'_>]) -> Result<(), Error> {
@@ -206,6 +206,7 @@ async fn exercise(
             endpoint: Endpoint::Direct(listener.local_addr().unwrap().port()),
             server_name: server_name.into(),
             size,
+            scale: 0,
             tls_only: false,
         },
     };
@@ -224,7 +225,6 @@ async fn exercise(
                 password: zeroize::Zeroizing::new("fixture-only".into()),
             })
         },
-        ironrdp::displaycontrol::client::DisplayControlClient::new(|_| Ok(Vec::new())),
         AuthIo::new(&slot, None),
     );
     let client = TEST_PEER_POLICY.scope(policy, client);
@@ -361,6 +361,8 @@ async fn tls_only_server(
     tls_server: Arc<rustls::ServerConfig>,
     size: DesktopSize,
     activate: bool,
+    bitmaps: &[InclusiveRectangle],
+    acknowledged: bool,
 ) -> Option<ClientInfo> {
     let (socket, _) = listener.accept().await.unwrap();
     let mut framed = TokioFramed::new(socket);
@@ -422,15 +424,18 @@ async fn tls_only_server(
         .write_all(&crate::rdp::frame::tests::marker_frame(false))
         .await
         .ok()?;
-    framed
-        .write_all(&crate::rdp::frame::tests::bitmap_frame(InclusiveRectangle {
-            left: 1,
-            top: 0,
-            right: 1,
-            bottom: 1,
-        }))
-        .await
-        .ok()?;
+    for rect in bitmaps {
+        framed
+            .write_all(&crate::rdp::frame::tests::bitmap_frame(rect.clone()))
+            .await
+            .ok()?;
+    }
+    if acknowledged {
+        // 프레임 끝 표식에 대한 클라이언트 응답은 앞서 보낸 PDU를 모두 처리했다는 뜻이다.
+        framed.write_all(&crate::rdp::frame::tests::marked_bitmap_frame()).await.ok()?;
+        let (action, _) = framed.read_pdu().await.ok()?;
+        assert_eq!(action, ironrdp::pdu::Action::X224);
+    }
     credentials
 }
 
@@ -448,7 +453,12 @@ async fn tls_only_retries_once_and_activates_with_client_info_credentials() {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(ca.der().clone()).unwrap();
     let listener = listener();
-    let server = tls_only_server(&listener, tls_server(key, cert.der().clone()), size, true);
+    let server = tls_only_server(&listener, tls_server(key, cert.der().clone()), size, true, &[InclusiveRectangle {
+        left: 1,
+        top: 0,
+        right: 1,
+        bottom: 1,
+    }], false);
     let client = async {
         let slot = Slot::new(1);
         let mut session = Session::open_with_tls(
@@ -493,6 +503,67 @@ async fn tls_only_retries_once_and_activates_with_client_info_credentials() {
 }
 
 #[tokio::test]
+async fn updates_received_while_the_tab_is_busy_are_merged_into_one_frame() {
+    use crate::rdp::{Event, SLOTS, Session};
+
+    // R5: xrdp는 글자 하나에 5줄 밴드 PDU를 수십 개 보낸다. 탭이 앞 화면을 처리하는 동안 받은 갱신은 한 프레임으로 합친다.
+    let size = DesktopSize { width: 800, height: 600 };
+    let ca = root();
+    let key = KeyPair::generate().unwrap();
+    let cert = CertificateParams::new(vec![REMOTE.to_owned()])
+        .unwrap()
+        .signed_by(&key, &ca)
+        .unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca.der().clone()).unwrap();
+    let listener = listener();
+    let tiles: Vec<_> = (0..32)
+        .map(|index| InclusiveRectangle { left: index * 2, top: 0, right: index * 2, bottom: 1 })
+        .collect();
+    let server = tls_only_server(&listener, tls_server(key, cert.der().clone()), size, true, &tiles, true);
+    let client = async {
+        let slot = Slot::new(1);
+        let session = Session::open_with_tls(
+            fixture_target(&listener, size, true, REMOTE).await,
+            REMOTE.try_into().unwrap(),
+            tls_config(roots),
+            no_trust(),
+            || async {
+                Ok(Account {
+                    username: "fixture".into(),
+                    domain: None,
+                    password: zeroize::Zeroizing::new("fixture-only".into()),
+                })
+            },
+            SLOTS.try_acquire().unwrap(),
+            AuthIo::new(&slot, None),
+        )
+        .await?;
+        Ok::<_, Error>(session)
+    };
+    let client = TEST_PEER_POLICY.scope(fixture_policy, client);
+    let (session, credentials) = timeout(Duration::from_secs(5), async { tokio::join!(client, server) })
+        .await
+        .unwrap();
+    assert!(credentials.is_some());
+    let mut session = session.unwrap();
+    // 서버는 세션 작업이 타일과 프레임 끝 표식을 모두 처리한 응답을 받은 뒤 닫았다. 그 전에는 이벤트를 받지 않았다.
+    let mut frames = Vec::new();
+    while let Some(event) = timeout(Duration::from_secs(5), session.next()).await.unwrap() {
+        if let Event::Frame(frame) = event {
+            frames.push(frame);
+        }
+    }
+    assert!(!frames.is_empty() && frames.len() <= 2, "{} frames for {} updates", frames.len(), tiles.len());
+    // 첫 프레임은 전체 화면이고, 마지막 프레임은 마지막 타일(62, 0)을 포함한다. 그 화소는 서버가 보낸 빨간색이다.
+    assert_eq!((frames[0].rect.width, frames[0].rect.height), (800, 600));
+    let last = frames.last().unwrap();
+    assert!(last.rect.x <= 62 && last.rect.x + last.rect.width > 62 && last.rect.y == 0);
+    let offset = usize::from(62 - last.rect.x) * 4;
+    assert_eq!(&last.rgba[offset..offset + 4], &[255, 0, 0, 255]);
+}
+
+#[tokio::test]
 async fn tls_only_stops_before_credentials_when_the_certificate_name_differs() {
     let size = DesktopSize { width: 800, height: 600 };
     let ca = root();
@@ -504,7 +575,7 @@ async fn tls_only_stops_before_credentials_when_the_certificate_name_differs() {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(ca.der().clone()).unwrap();
     let listener = listener();
-    let server = tls_only_server(&listener, tls_server(key, cert.der().clone()), size, false);
+    let server = tls_only_server(&listener, tls_server(key, cert.der().clone()), size, false, &[], false);
     let calls = AtomicUsize::new(0);
     let slot = Slot::new(1);
     let client = connect(
@@ -520,7 +591,6 @@ async fn tls_only_stops_before_credentials_when_the_certificate_name_differs() {
                 password: zeroize::Zeroizing::new("fixture-only".into()),
             })
         },
-        ironrdp::displaycontrol::client::DisplayControlClient::new(|_| Ok(Vec::new())),
         AuthIo::new(&slot, None),
     );
     let client = TEST_PEER_POLICY.scope(fixture_policy, client);
@@ -859,7 +929,6 @@ async fn unknown_certificate_requires_one_time_approval_and_is_pinned() {
             Ok(Account { username: "fixture".into(), domain: None,
                 password: zeroize::Zeroizing::new("fixture-only".into()) })
         },
-        ironrdp::displaycontrol::client::DisplayControlClient::new(|_| Ok(Vec::new())),
         AuthIo::new(&slot, None),
     );
     let client = TEST_PEER_POLICY.scope(fixture_policy, client);
@@ -933,7 +1002,6 @@ async fn rejecting_a_changed_fingerprint_keeps_the_old_pin_without_credentials()
             Ok(Account { username: "fixture".into(), domain: None,
                 password: zeroize::Zeroizing::new("fixture-only".into()) })
         },
-        ironrdp::displaycontrol::client::DisplayControlClient::new(|_| Ok(Vec::new())),
         AuthIo::new(&slot, None),
     );
     let client = TEST_PEER_POLICY.scope(fixture_policy, client);
@@ -946,4 +1014,30 @@ async fn rejecting_a_changed_fingerprint_keeps_the_old_pin_without_credentials()
 
 fn size_of_desktop() -> DesktopSize {
     DesktopSize { width: 800, height: 600 }
+}
+
+#[test]
+fn client_core_data_lets_xrdp_reactivate_after_a_resize_and_carries_the_scale() {
+    // xrdp 0.9.24 libxrdp_reset은 빌드 번호 419 이하이면 Deactivate All 없이 서버 화면만 바꾼다(R6b).
+    let size = DesktopSize { width: 1280, height: 720 };
+    let client = config(size, 125, false);
+    assert!(client.client_build > 419);
+    assert_eq!((client.desktop_size.width, client.desktop_size.height, client.desktop_scale_factor), (1280, 720, 125));
+    assert_eq!(config(size, 90, true).desktop_scale_factor, 0);
+}
+
+#[test]
+fn reactivation_skips_screen_updates_but_keeps_activation_pdus() {
+    use ironrdp::pdu::{mcs::SendDataIndication, x224::X224};
+
+    // xrdp는 Deactivate All 뒤 Demand Active 사이에도 화면 갱신을 보낸다.
+    let bitmap = crate::rdp::frame::tests::bitmap_frame(InclusiveRectangle { left: 1000, top: 0, right: 1000, bottom: 1 });
+    assert!(super::graphics_update(&bitmap));
+    let deactivate = ironrdp::core::encode_vec(&X224(SendDataIndication {
+        initiator_id: 1002,
+        channel_id: 1003,
+        user_data: std::borrow::Cow::Owned(vec![13, 0, 0x16, 0, 0xea, 0x03, 0, 0, 0, 0, 1, 0, 0]),
+    }))
+    .unwrap();
+    assert!(!super::graphics_update(&deactivate));
 }

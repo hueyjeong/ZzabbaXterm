@@ -1,5 +1,5 @@
 import { useLayoutEffect, useRef, useState, type KeyboardEvent, type PointerEvent } from "react";
-import { createRemoteDesktopViewSession, type RemoteDesktopSession, type RemoteDesktopStatus, type RemoteDesktopViewSession } from "./session";
+import { createRemoteDesktopViewSession, type RemoteDesktopSession, type RemoteDesktopSize, type RemoteDesktopStatus, type RemoteDesktopViewSession } from "./session";
 import { modifierEvents, releasedModifiers, type ModifierState } from "./input";
 import "./remoteDesktop.css";
 
@@ -7,6 +7,8 @@ interface RemoteDesktopViewProps {
   readonly session: RemoteDesktopSession;
   readonly active: boolean;
   readonly label: string;
+  /** 원격 화면을 그릴 영역의 CSS 픽셀 크기를 처음 한 번과 바뀔 때마다 알린다. 숨겨지면 0이다. */
+  readonly onViewport?: (size: RemoteDesktopSize) => void;
 }
 
 function statusText(status: RemoteDesktopStatus) {
@@ -18,8 +20,10 @@ function statusText(status: RemoteDesktopStatus) {
   }
 }
 
-export function RemoteDesktopView({ session, active, label }: RemoteDesktopViewProps) {
+export function RemoteDesktopView({ session, active, label, onViewport }: RemoteDesktopViewProps) {
   const canvas = useRef<HTMLCanvasElement>(null);
+  const screen = useRef<HTMLDivElement>(null);
+  const viewport = useRef(onViewport);
   const bound = useRef<RemoteDesktopViewSession>(null);
   const [status, setStatus] = useState<RemoteDesktopStatus>({ kind: "waiting" });
   const keys = useRef(new Map<string, string>());
@@ -57,6 +61,36 @@ export function RemoteDesktopView({ session, active, label }: RemoteDesktopViewP
       connection.dispose();
     };
   }, [session]);
+
+  useLayoutEffect(() => { viewport.current = onViewport; });
+  useLayoutEffect(() => {
+    const element = screen.current;
+    if (!element) return;
+    const report = () => {
+      const { width, height } = element.getBoundingClientRect();
+      viewport.current?.({ width, height });
+    };
+    report();
+    const observer = typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(report);
+    observer?.observe(element);
+    // 창을 배율이 다른 모니터로 옮기면 CSS 크기는 그대로여도 장치 픽셀 크기가 바뀐다.
+    const view = element.ownerDocument.defaultView;
+    let media: MediaQueryList | undefined;
+    const rescaled = () => {
+      watch();
+      report();
+    };
+    const watch = () => {
+      media?.removeEventListener("change", rescaled);
+      media = view?.matchMedia?.(`(resolution: ${view.devicePixelRatio}dppx)`);
+      media?.addEventListener("change", rescaled);
+    };
+    watch();
+    return () => {
+      observer?.disconnect();
+      media?.removeEventListener("change", rescaled);
+    };
+  }, []);
 
   const connected = status.kind === "connected";
   useLayoutEffect(() => {
@@ -129,20 +163,22 @@ export function RemoteDesktopView({ session, active, label }: RemoteDesktopViewP
           }}>{action === "copy" ? "복사" : "붙여넣기"}</button>
         ))}
       </div>
-      <canvas
-        ref={canvas}
-        aria-label="원격 화면"
-        tabIndex={active && connected ? 0 : -1}
-        onBlur={release}
-        onKeyDown={(event) => sendKey(event, true)}
-        onKeyUp={(event) => sendKey(event, false)}
-        onPointerDown={sendPointer}
-        onPointerMove={sendPointer}
-        onPointerUp={sendPointer}
-        onPointerCancel={(event) => { if (pointer.current === event.pointerId) release(); }}
-        onLostPointerCapture={(event) => { if (pointer.current === event.pointerId) release(); }}
-        onContextMenu={(event) => { if (active && connected) event.preventDefault(); }}
-      />
+      <div className="remote-desktop-screen" ref={screen}>
+        <canvas
+          ref={canvas}
+          aria-label="원격 화면"
+          tabIndex={active && connected ? 0 : -1}
+          onBlur={release}
+          onKeyDown={(event) => sendKey(event, true)}
+          onKeyUp={(event) => sendKey(event, false)}
+          onPointerDown={sendPointer}
+          onPointerMove={sendPointer}
+          onPointerUp={sendPointer}
+          onPointerCancel={(event) => { if (pointer.current === event.pointerId) release(); }}
+          onLostPointerCapture={(event) => { if (pointer.current === event.pointerId) release(); }}
+          onContextMenu={(event) => { if (active && connected) event.preventDefault(); }}
+        />
+      </div>
     </section>
   );
 }

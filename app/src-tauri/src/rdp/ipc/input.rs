@@ -23,7 +23,7 @@ enum Action {
     Release,
     Copy,
     Paste { text: String },
-    Resize { width: u16, height: u16 },
+    Resize { width: u16, height: u16, scale: u32 },
 }
 
 #[derive(Default)]
@@ -103,7 +103,7 @@ impl Controls {
                     if !self.channels.cliprdr_ready { return Err(Error::ChannelUnavailable); }
                     self.write(Input::OfferClipboardText(text)).await?;
                 }
-                Action::Resize { width, height } => self.write(Input::Resize { width, height }).await?,
+                Action::Resize { width, height, scale } => self.write(Input::Resize { width, height, scale }).await?,
             }
             Ok(())
         };

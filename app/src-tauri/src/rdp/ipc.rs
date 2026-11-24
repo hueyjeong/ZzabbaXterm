@@ -112,7 +112,14 @@ struct Draft {
     tls_only: bool,
     #[serde(default, deserialize_with = "read_source")]
     source: Option<Source>,
+    /// 탭 화면 영역의 장치 픽셀 크기와 배율(%)이다. 없으면 1024×768로 시작한다.
+    #[serde(default)]
+    size: Option<DisplaySize>,
 }
+
+#[derive(Deserialize, Clone, Copy)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DisplaySize { width: u16, height: u16, scale: u32 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -127,6 +134,13 @@ fn read_source<'de, D: serde::Deserializer<'de>>(value: D) -> Result<Option<Sour
 }
 
 impl Draft {
+    /// 첫 연결 크기도 해상도 변경과 같은 범위를 쓴다. 서버 최대 면적은 연결 뒤에야 알 수 있다.
+    fn desktop(&self) -> Result<(DesktopSize, u32), Error> {
+        let Some(DisplaySize { width, height, scale }) = self.size else { return Ok((DesktopSize { width: 1024, height: 768 }, 0)) };
+        super::display::check(width, height, u64::MAX)?;
+        Ok((DesktopSize { width, height }, scale))
+    }
+
     #[cfg(test)]
     fn approval_text(&self, dns: &str) -> Result<String, Error> {
         self.route_approval_text(dns, false)
@@ -404,7 +418,7 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
     };
     let description = draft.route_approval_text(&dns, matches!(saved, Some(SavedRoute::Ssm(_)))).map_err(message)?;
     let trust_path = window.path().app_config_dir().map_err(|error| error.to_string())?.join("rdp-trust.json");
-    let size = DesktopSize { width: 1024, height: 768 };
+    let (size, scale) = draft.desktop().map_err(message)?;
     let (target, loss, target_name, endpoint, pin_route) = if let (Some(source), Some(saved)) = (draft.source, saved) {
         let directory = window.path().app_config_dir().map_err(|error| error.to_string())?;
         let destination = Destination { host: source.destination.host, port: source.destination.port };
@@ -427,14 +441,14 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
         let lease = lease.insert(issued);
         if life.is_cancelled() { return Err(CLOSED.into()); }
         let loss = lease.loss();
-        let target = route::forwarded(dns.clone(), &approved_destination, size, lease, draft.tls_only).map_err(message)?;
+        let target = route::forwarded(dns.clone(), &approved_destination, size, scale, lease, draft.tls_only).map_err(message)?;
         let endpoint = route::host_port(&approved_destination.host, approved_destination.port);
         (target, Some(loss), target_name, endpoint, pin_route)
     } else {
         native::confirm(window.clone(), description, prompt.clone(), approval.clone(), notify.clone()).await.map_err(message)?;
         let target_name = route::host_port(&dns, draft.port);
         let endpoint = target_name.clone();
-        (route::direct(dns.clone(), draft.port, size, draft.tls_only), None, target_name, endpoint, None)
+        (route::direct(dns.clone(), draft.port, size, scale, draft.tls_only), None, target_name, endpoint, None)
     };
     let stopped = async {
         tokio::select! { biased;
@@ -632,8 +646,9 @@ async fn input_batch(slot: &Slot, commands: Vec<Command>) -> Result<Vec<Reply>, 
 
 pub(super) fn message(error: Error) -> &'static str {
     match error {
-        Error::Bounds => "RDP 화면 또는 입력 범위가 올바르지 않습니다",
+        Error::Bounds | Error::OutOfImage { .. } => "RDP 화면 또는 입력 범위가 올바르지 않습니다",
         Error::Busy => "RDP 세션이 작업 중입니다",
+        Error::DisplayLimit => "서버가 허용하는 최대 화면 면적을 넘습니다",
         Error::CopyPending => "RDP 복사가 진행 중입니다",
         Error::ChannelUnavailable => "서버가 이 RDP 채널을 열지 않았습니다",
         Error::Clipboard => "RDP 클립보드 교환 실패",
@@ -756,6 +771,24 @@ mod tests {
         })).unwrap();
         assert_eq!(forwarded_opt_in.approval_text(&forwarded_opt_in.host).unwrap(),
             "경로: R01 SSH 전달\nSSH 대상 ID: ssh-server\n포워드 목적지: 127.0.0.1:3390\nTLS 인증 이름: rdp.example.invalid\n로그인: NLA, 미지원 시 TLS 전용(표준 RDP 보안 없음)");
+    }
+
+    #[test]
+    fn rdp_connect_uses_the_tab_size_and_scale_within_display_bounds() {
+        let draft = |size: serde_json::Value| -> Draft {
+            serde_json::from_value(serde_json::json!({ "host": "rdp.example.invalid", "port": 3389, "size": size })).unwrap()
+        };
+        let default: Draft = serde_json::from_value(serde_json::json!({ "host": "rdp.example.invalid", "port": 3389 })).unwrap();
+        assert_eq!(default.desktop().map(|(size, scale)| (size.width, size.height, scale)), Ok((1024, 768, 0)));
+        let fitted = draft(serde_json::json!({ "width": 1474, "height": 812, "scale": 125 }));
+        assert_eq!(fitted.desktop().map(|(size, scale)| (size.width, size.height, scale)), Ok((1474, 812, 125)));
+        for size in [(1475, 812), (198, 812), (1474, 199), (4098, 812)] {
+            let invalid = draft(serde_json::json!({ "width": size.0, "height": size.1, "scale": 100 }));
+            assert_eq!(invalid.desktop().map(|_| ()), Err(Error::Bounds), "{size:?}");
+        }
+        assert!(serde_json::from_value::<Draft>(serde_json::json!({
+            "host": "rdp.example.invalid", "port": 3389, "size": { "width": 1280, "height": 720 }
+        })).is_err());
     }
 
     #[test]
