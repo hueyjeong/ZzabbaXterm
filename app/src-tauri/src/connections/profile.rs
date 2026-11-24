@@ -2,14 +2,16 @@ use std::{net::IpAddr, num::NonZeroU64, path::{Component, Path, PathBuf}};
 
 use serde::{Deserialize, Serialize};
 
-pub(super) const VERSION: u32 = 1;
+pub(super) const VERSION: u32 = 2;
+/// 최상위 그룹을 1단계로 센 그룹 중첩 한도다.
+pub(super) const MAX_GROUP_DEPTH: usize = 8;
 pub(super) type Revision = NonZeroU64;
 
-#[derive(Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(transparent)]
 pub(crate) struct GroupId(String);
 
-#[derive(Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(transparent)]
 pub(crate) struct TargetId(String);
 
@@ -30,13 +32,18 @@ impl TargetId {
 pub(super) struct Group {
     pub(super) id: GroupId,
     pub(super) display_name: String,
+    /// 없으면 최상위 그룹이다. v1 파일의 그룹은 모두 최상위 그룹으로 읽는다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) parent_id: Option<GroupId>,
 }
 
 #[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct Target {
     pub(super) id: TargetId,
-    pub(super) group_id: GroupId,
+    /// 없으면 그룹 없는 최상위 세션이다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) group_id: Option<GroupId>,
     pub(super) display_name: String,
     #[serde(flatten)]
     pub(super) method: Method,
@@ -233,11 +240,14 @@ pub(crate) enum SshAuth {
 impl Ssh {
     fn validate(&self) -> Result<(), ValidationError> {
         let dns = self.host.strip_suffix('.').unwrap_or(&self.host);
-        if self.port == 0 || (self.host.parse::<IpAddr>().is_err() &&
+        if self.port == 0 {
+            return Err(ValidationError::SshPort);
+        }
+        if self.host.parse::<IpAddr>().is_err() &&
             (dns.len() > 253 || !dns.split('.').all(|label| {
                 !label.is_empty() && label.len() <= 63 && !label.starts_with('-') && !label.ends_with('-')
                     && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-            }))) {
+            })) {
             return Err(ValidationError::SshEndpoint);
         }
         if self.account.len() > 64
@@ -274,6 +284,7 @@ fn valid_ssh_path(path: &Path) -> bool {
         && path.to_str().is_some_and(|value| !value.chars().any(|c| c.is_control() || "\"%$`*?[{".contains(c)))
 }
 
+/// 그룹과 대상을 한 번에 저장하는 초안이다. 연결 시험 뒤 저장과 CLI 등록이 쓰며 v1과 v2를 받는다.
 #[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Draft {
@@ -284,11 +295,31 @@ pub(crate) struct Draft {
     pub(super) target: Target,
 }
 
+/// 그룹 없이 대상만 저장하는 v2 초안이다. 연결 시험 없이 입력 검증만 거친다.
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct TargetDraft {
+    version: u32,
+    target_revision: Option<Revision>,
+    target: Target,
+}
+
+/// 그룹 추가, 이름 바꾸기, 이동(`parentId` 변경)에 쓰는 v2 초안이다.
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct GroupDraft {
+    version: u32,
+    revision: Option<Revision>,
+    group: Group,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ValidationError {
     Version(u32),
     GroupId,
+    GroupParent,
     TargetId,
+    TargetGroup,
     DisplayName,
     GroupMismatch,
     UnsupportedShell,
@@ -297,6 +328,7 @@ pub(crate) enum ValidationError {
     SsmRegion,
     SsmInstanceId,
     SshEndpoint,
+    SshPort,
     SshAccount,
     SshHostKeyFingerprint,
     SshKeyPath,
@@ -308,6 +340,37 @@ pub(crate) enum ValidationError {
     DesktopHost,
     DesktopPort,
     DesktopRoute,
+}
+
+impl ValidationError {
+    /// 편집 창이 오류를 표시할 입력 필드 경로다.
+    pub(crate) fn field(&self) -> &'static str {
+        match self {
+            Self::Version(_) => "version",
+            Self::GroupId | Self::TargetId => "id",
+            Self::GroupParent => "parentId",
+            Self::TargetGroup | Self::GroupMismatch => "groupId",
+            Self::DisplayName => "displayName",
+            Self::UnsupportedShell => "local.shell",
+            Self::StartDirectory => "local.startDirectory",
+            Self::SsmProfile => "ssm.profile",
+            Self::SsmRegion => "ssm.region",
+            Self::SsmInstanceId => "ssm.instanceId",
+            Self::SshEndpoint => "ssh.host",
+            Self::SshPort => "ssh.port",
+            Self::SshAccount => "ssh.account",
+            Self::SshHostKeyFingerprint => "ssh.hostKeyFingerprint",
+            Self::SshKeyPath => "ssh.auth.keyPath",
+            Self::SshItemId => "ssh.auth.itemId",
+            Self::S3Profile => "s3.profile",
+            Self::S3Region => "s3.region",
+            Self::S3Bucket => "s3.bucket",
+            Self::S3Prefix => "s3.prefix",
+            Self::DesktopHost => "desktop.host",
+            Self::DesktopPort => "desktop.port",
+            Self::DesktopRoute => "desktop.route",
+        }
+    }
 }
 
 // 구조 검증과 실제 연결 시험은 별개다.
@@ -333,16 +396,66 @@ impl ValidatedDraft {
 
 impl Draft {
     pub(crate) fn validate(self) -> Result<ValidatedDraft, ValidationError> {
-        if self.version != VERSION {
+        // AI CLI와 기존 마법사가 보내는 v1 JSON도 받는다. 기존 그룹의 상위 그룹은 저장소가 유지한다.
+        if !matches!(self.version, 1 | VERSION) {
             return Err(ValidationError::Version(self.version));
         }
         self.group.validate()?;
         self.target.validate()?;
-        if self.target.group_id != self.group.id {
+        if self.target.group_id.as_ref() != Some(&self.group.id) {
             return Err(ValidationError::GroupMismatch);
         }
         Ok(ValidatedDraft(self))
     }
+}
+
+pub(crate) struct ValidatedTarget(TargetDraft);
+
+impl TargetDraft {
+    pub(crate) fn validate(self) -> Result<ValidatedTarget, ValidationError> {
+        if self.version != VERSION {
+            return Err(ValidationError::Version(self.version));
+        }
+        self.target.validate()?;
+        Ok(ValidatedTarget(self))
+    }
+}
+
+impl ValidatedTarget {
+    /// 저장에 성공했을 때의 개정이다. 저장은 보낸 개정이 저장본과 같을 때만 일어난다.
+    pub(crate) fn next_revision(&self) -> Option<Revision> {
+        next_revision(self.0.target_revision)
+    }
+
+    pub(super) fn into_parts(self) -> (Target, Option<Revision>) {
+        (self.0.target, self.0.target_revision)
+    }
+}
+
+pub(crate) struct ValidatedGroup(GroupDraft);
+
+impl GroupDraft {
+    pub(crate) fn validate(self) -> Result<ValidatedGroup, ValidationError> {
+        if self.version != VERSION {
+            return Err(ValidationError::Version(self.version));
+        }
+        self.group.validate()?;
+        Ok(ValidatedGroup(self))
+    }
+}
+
+impl ValidatedGroup {
+    pub(crate) fn next_revision(&self) -> Option<Revision> {
+        next_revision(self.0.revision)
+    }
+
+    pub(super) fn into_parts(self) -> (Group, Option<Revision>) {
+        (self.0.group, self.0.revision)
+    }
+}
+
+fn next_revision(revision: Option<Revision>) -> Option<Revision> {
+    revision.map_or(Some(Revision::MIN), |revision| revision.checked_add(1))
 }
 
 impl ValidatedDraft {
@@ -372,6 +485,9 @@ impl Group {
         if !valid_id(self.id.as_str()) {
             return Err(ValidationError::GroupId);
         }
+        if self.parent_id.as_ref().is_some_and(|parent| !valid_id(parent.as_str()) || *parent == self.id) {
+            return Err(ValidationError::GroupParent);
+        }
         validate_name(&self.display_name)
     }
 }
@@ -391,8 +507,8 @@ impl Target {
         if !valid_id(self.id.as_str()) {
             return Err(ValidationError::TargetId);
         }
-        if !valid_id(self.group_id.as_str()) {
-            return Err(ValidationError::GroupId);
+        if self.group_id.as_ref().is_some_and(|group| !valid_id(group.as_str())) {
+            return Err(ValidationError::TargetGroup);
         }
         validate_name(&self.display_name)?;
         match &self.method {

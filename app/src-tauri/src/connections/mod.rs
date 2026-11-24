@@ -13,14 +13,13 @@ pub(crate) fn register(directory: &Path, draft: profile::ValidatedDraft) -> Resu
 
     ipc::prepare_config_parent(directory).map_err(|_| Error::StoreUnavailable)?;
     let id = draft.target_id().to_owned();
-    let store = store::Store::new(directory);
-    if !probe::desktop_route_ready(&draft, &store).map_err(|_| Error::StoreUnavailable)? {
-        return Err(Error::InvalidRequest);
-    }
-    match store.register(draft).map_err(|_| Error::StoreUnavailable)? {
-        store::SaveStatus::Saved => Ok((id, profile::Revision::MIN.to_string())),
-        store::SaveStatus::GroupConflict => Err(Error::GroupConflict),
-        store::SaveStatus::TargetConflict => Err(Error::TargetConflict),
+    match store::Store::new(directory).register(draft) {
+        Ok(store::SaveStatus::Saved) => Ok((id, profile::Revision::MIN.to_string())),
+        Ok(store::SaveStatus::GroupConflict) => Err(Error::GroupConflict),
+        Ok(store::SaveStatus::TargetConflict) => Err(Error::TargetConflict),
+        // 원격 화면의 SSH 경로는 Agent·키 파일 인증의 저장된 직접 SSH 대상만 가리킨다.
+        Ok(store::SaveStatus::Referenced(_)) | Err(store::StoreError::DesktopRoute) => Err(Error::InvalidRequest),
+        Err(_) => Err(Error::StoreUnavailable),
     }
 }
 

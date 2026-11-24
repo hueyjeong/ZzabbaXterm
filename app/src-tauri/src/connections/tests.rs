@@ -90,7 +90,7 @@ fn c02_local_v1_and_ssm_references_round_trip_in_one_file() {
     assert_eq!(save(&store, ssm.clone()).unwrap(), SaveStatus::Saved);
     let stored = serde_json::to_value(store.load().unwrap()).unwrap();
     assert_eq!(stored, json!({
-        "version": 1,
+        "version": 2,
         "groups": [{"revision": 7, "profile": local["group"]}],
         "targets": [{"revision": 9, "profile": local["target"]}, {"revision": 1, "profile": ssm["target"]}],
     }));
@@ -161,6 +161,7 @@ fn f01_loads_existing_local_and_ssm_v1_with_ssh_reference() {
     ssh["target"]["ssh"]["auth"] = json!({"kind": "agent", "publicKeyPath": dir.path().join("test.pub")});
     assert_eq!(save(&store, ssh.clone()).unwrap(), SaveStatus::Saved);
     file["targets"].as_array_mut().unwrap().push(json!({"revision": 1, "profile": ssh["target"]}));
+    file["version"] = json!(2);
     assert_eq!(serde_json::to_value(store.load().unwrap()).unwrap(), file);
 }
 
@@ -228,6 +229,7 @@ fn desktop_profiles_extend_existing_v1_files_without_migration() {
         assert_eq!(save(&store, input.clone()).unwrap(), SaveStatus::Saved);
         file["targets"].as_array_mut().unwrap().push(json!({"revision": 1, "profile": input["target"]}));
     }
+    file["version"] = json!(2);
     assert_eq!(serde_json::to_value(store.load().unwrap()).unwrap(), file);
     assert!(matches!(store.load().unwrap().targets[3].profile.method(),
         super::profile::MethodRef::Desktop { route: super::profile::DesktopRoute::Ssm(_) }));
@@ -313,7 +315,7 @@ fn s3_v1_round_trip_preserves_references_and_verified_account() {
 
     let mut file = serde_json::to_value(store.load().unwrap()).unwrap();
     assert_eq!(file, json!({
-        "version": 1,
+        "version": 2,
         "groups": [{"revision": 1, "profile": local["group"]}],
         "targets": [
             {"revision": 1, "profile": local["target"]},
@@ -596,7 +598,7 @@ fn c01_simultaneous_saves_preserve_two_same_named_targets() {
     assert_eq!(file.targets.len(), 2);
     for (id, group) in [("first", "work"), ("second", "personal")] {
         let target = file.targets.iter().find(|entry| entry.profile.id.as_str() == id).unwrap();
-        assert_eq!(target.profile.group_id.as_str(), group);
+        assert_eq!(target.profile.group_id.as_ref().unwrap().as_str(), group);
         assert_eq!(target.profile.display_name, "작업 셸");
         assert_eq!(serde_json::to_value(&target.profile).unwrap(), draft(&dir.0, group, id)["target"]);
     }
@@ -674,14 +676,14 @@ fn c01_unknown_and_corrupt_files_refuse_a_save() {
     let dir = TestDir::new();
     let store = Store::new(&dir.0);
     for bytes in [
-        br#"{"futureField":{"new":true},"version":2}"#.as_slice(),
+        br#"{"futureField":{"new":true},"version":3}"#.as_slice(),
         br#"{"version":1,"futureField":[],"groups":[],"targets":[]}"#,
         b"{",
     ] {
         fs::write(dir.file(), bytes).unwrap();
         let result = save(&store, draft(&dir.0, "work", "first"));
         if bytes.starts_with(br#"{"futureField"#) {
-            assert!(matches!(result, Err(StoreError::Version(2))), "{result:?}");
+            assert!(matches!(result, Err(StoreError::Version(3))), "{result:?}");
         } else {
             assert!(matches!(result, Err(StoreError::Format(_))), "{result:?}");
         }
@@ -774,4 +776,405 @@ fn c01_failed_unix_replacement_preserves_previous_bytes() {
     assert_eq!(file.targets.len(), 1);
     assert_eq!(file.targets[0].profile.id.as_str(), "first");
     assert!(!dir.0.join("connections.json.tmp").exists());
+}
+
+mod schema_v2 {
+    use super::*;
+    use crate::connections::{profile::{GroupDraft, Revision, TargetDraft, ValidatedGroup, ValidatedTarget, ValidationError}, store::Expected};
+
+    fn group(id: &str, parent: Option<&str>, revision: Option<u64>) -> ValidatedGroup {
+        serde_json::from_value::<GroupDraft>(json!({
+            "version": 2, "revision": revision, "group": {"id": id, "displayName": id, "parentId": parent},
+        })).unwrap().validate().unwrap()
+    }
+
+    fn target(value: &Value, revision: Option<u64>) -> ValidatedTarget {
+        serde_json::from_value::<TargetDraft>(json!({"version": 2, "targetRevision": revision, "target": value}))
+            .unwrap().validate().unwrap()
+    }
+
+    fn local(dir: &Path, group: Option<&str>, id: &str) -> Value {
+        let mut value = draft(dir, group.unwrap_or("unused"), id)["target"].clone();
+        if group.is_none() {
+            value.as_object_mut().unwrap().remove("groupId");
+        }
+        value
+    }
+
+    fn revision(value: u64) -> Revision {
+        Revision::new(value).unwrap()
+    }
+
+    fn ok() -> Result<(), String> {
+        Ok(())
+    }
+
+    fn save_target(store: &Store, value: &Value, revision: Option<u64>) -> Result<SaveStatus, StoreError> {
+        store.save_validated(target(value, revision), |_, _| None, ok)
+    }
+
+    fn expected(entries: &[(&str, &str, u64)]) -> Vec<Expected> {
+        serde_json::from_value(Value::Array(entries.iter().map(|(kind, id, revision)| {
+            json!({"kind": kind, "id": id, "revision": revision})
+        }).collect())).unwrap()
+    }
+
+    #[test]
+    fn v1_file_loads_as_top_level_groups_and_first_write_keeps_a_v1_backup() {
+        let dir = TestDir::new();
+        let store = Store::new(dir.path());
+        let backup = dir.path().join("connections.v1.json");
+        let v1 = draft(dir.path(), "work", "local-shell");
+        let original = serde_json::to_vec(&json!({
+            "version": 1,
+            "groups": [{"revision": 3, "profile": v1["group"]}],
+            "targets": [{"revision": 4, "profile": v1["target"]}],
+        })).unwrap();
+        fs::write(dir.file(), &original).unwrap();
+
+        let loaded = serde_json::to_value(store.load().unwrap()).unwrap();
+        assert_eq!(loaded["version"], json!(2));
+        assert_eq!(loaded["groups"][0]["profile"], json!({"id": "work", "displayName": "개발"}));
+        assert!(!backup.exists());
+        assert_eq!(fs::read(dir.file()).unwrap(), original);
+
+        assert_eq!(store.save_group(group("child", Some("work"), None), ok).unwrap(), SaveStatus::Saved);
+        assert_eq!(fs::read(&backup).unwrap(), original);
+        let saved: Value = serde_json::from_slice(&fs::read(dir.file()).unwrap()).unwrap();
+        assert_eq!(saved["version"], json!(2));
+        assert_eq!(saved["groups"][1]["profile"], json!({"id": "child", "displayName": "child", "parentId": "work"}));
+
+        // 이후 쓰기와 다시 나타난 v1 파일 모두 처음 백업을 덮어쓰지 않는다.
+        assert_eq!(save_target(&store, &local(dir.path(), None, "top"), None).unwrap(), SaveStatus::Saved);
+        let mut other = serde_json::from_slice::<Value>(&original).unwrap();
+        other["groups"][0]["revision"] = json!(9);
+        fs::write(dir.file(), serde_json::to_vec(&other).unwrap()).unwrap();
+        assert_eq!(store.save_group(group("next", None, None), ok).unwrap(), SaveStatus::Saved);
+        assert_eq!(fs::read(&backup).unwrap(), original);
+        assert_eq!(store.load().unwrap().groups[0].revision.get(), 9);
+    }
+
+    #[test]
+    fn group_parent_must_exist_and_cycles_and_depth_are_rejected() {
+        let dir = TestDir::new();
+        let store = Store::new(dir.path());
+        let self_parent = json!({"version": 2, "revision": null, "group": {"id": "a", "displayName": "a", "parentId": "a"}});
+        assert_eq!(serde_json::from_value::<GroupDraft>(self_parent).unwrap().validate().err(), Some(ValidationError::GroupParent));
+        assert!(matches!(store.save_group(group("a", Some("missing"), None), ok), Err(StoreError::MissingGroup)));
+
+        for depth in 1..=8 {
+            let parent = (depth > 1).then(|| format!("g{}", depth - 1));
+            assert_eq!(store.save_group(group(&format!("g{depth}"), parent.as_deref(), None), ok).unwrap(), SaveStatus::Saved);
+        }
+        assert!(matches!(store.save_group(group("g9", Some("g8"), None), ok), Err(StoreError::GroupDepth)));
+        // 최상위 그룹을 다른 그룹 아래로 옮겨 9단계가 되는 이동도 거부한다.
+        assert_eq!(store.save_group(group("top", None, None), ok).unwrap(), SaveStatus::Saved);
+        let original = fs::read(dir.file()).unwrap();
+        assert!(matches!(store.save_group(group("g1", Some("top"), Some(1)), ok), Err(StoreError::GroupDepth)));
+        // 2단 순환: g1 → g2 → g1
+        assert!(matches!(store.save_group(group("g1", Some("g2"), Some(1)), ok), Err(StoreError::GroupCycle)));
+        assert_eq!(fs::read(dir.file()).unwrap(), original);
+
+        // 순환이 있는 파일은 읽지 않는다.
+        let mut file: Value = serde_json::from_slice(&original).unwrap();
+        file["groups"][0]["profile"]["parentId"] = json!("g2");
+        fs::write(dir.file(), serde_json::to_vec(&file).unwrap()).unwrap();
+        assert!(matches!(store.load(), Err(StoreError::GroupCycle)));
+    }
+
+    #[test]
+    fn group_save_detects_revision_conflict_renames_and_moves_with_parent_id() {
+        let dir = TestDir::new();
+        let store = Store::new(dir.path());
+        let named = |name: &str, parent: Option<&str>, revision: Option<u64>| {
+            serde_json::from_value::<GroupDraft>(json!({
+                "version": 2, "revision": revision, "group": {"id": "a", "displayName": name, "parentId": parent},
+            })).unwrap().validate().unwrap()
+        };
+        let created = named("처음", None, None);
+        assert_eq!(created.next_revision(), Some(revision(1)));
+        assert_eq!(store.save_group(created, ok).unwrap(), SaveStatus::Saved);
+        assert_eq!(store.save_group(named("중복", None, None), ok).unwrap(), SaveStatus::GroupConflict);
+        let renamed = named("바뀐 이름", None, Some(1));
+        assert_eq!(renamed.next_revision(), Some(revision(2)));
+        assert_eq!(store.save_group(renamed, ok).unwrap(), SaveStatus::Saved);
+        assert_eq!(store.save_group(named("늦은 이름", None, Some(1)), ok).unwrap(), SaveStatus::GroupConflict);
+        assert_eq!(store.save_group(group("b", None, None), ok).unwrap(), SaveStatus::Saved);
+        assert_eq!(store.save_group(named("바뀐 이름", Some("b"), Some(2)), ok).unwrap(), SaveStatus::Saved);
+        let file = store.load().unwrap();
+        let moved = &file.groups[0];
+        assert_eq!((moved.revision.get(), moved.profile.display_name.as_str()), (3, "바뀐 이름"));
+        assert_eq!(moved.profile.parent_id.as_ref().map(|parent| parent.as_str()), Some("b"));
+        assert!(matches!(store.save_group(group("b", Some("a"), Some(1)), ok), Err(StoreError::GroupCycle)));
+
+        // 그룹을 함께 보내는 기존 초안은 상위 그룹을 바꾸지 않는다.
+        let mut combined = draft(dir.path(), "a", "shell");
+        combined["group"]["displayName"] = json!("바뀐 이름");
+        combined["groupRevision"] = json!(3);
+        assert_eq!(save(&store, combined).unwrap(), SaveStatus::Saved);
+        let file = store.load().unwrap();
+        assert_eq!(file.groups[0].revision.get(), 3);
+        assert_eq!(file.groups[0].profile.parent_id.as_ref().map(|parent| parent.as_str()), Some("b"));
+    }
+
+    #[test]
+    fn group_delete_cascades_only_with_the_exact_descendant_snapshot() {
+        let dir = TestDir::new();
+        let store = Store::new(dir.path());
+        for (id, parent) in [("a", None), ("b", Some("a")), ("c", None)] {
+            assert_eq!(store.save_group(group(id, parent, None), ok).unwrap(), SaveStatus::Saved);
+        }
+        for (group, id) in [(Some("a"), "t1"), (Some("b"), "t2"), (Some("c"), "t3"), (None, "t4")] {
+            assert_eq!(save_target(&store, &local(dir.path(), group, id), None).unwrap(), SaveStatus::Saved);
+        }
+        let snapshot = [("group", "b", 1), ("target", "t1", 1), ("target", "t2", 1)];
+        let original = fs::read(dir.file()).unwrap();
+        for (root, seen) in [
+            (1, &snapshot[..2]),
+            (1, &[snapshot[0], snapshot[1], snapshot[2], ("target", "t3", 1)][..]),
+            (1, &[snapshot[0], snapshot[1], ("target", "t2", 2)][..]),
+            (1, &[snapshot[0], snapshot[1], snapshot[2], snapshot[2]][..]),
+            (2, &snapshot[..]),
+        ] {
+            assert_eq!(store.delete_group("a", revision(root), expected(seen), ok).unwrap(), SaveStatus::GroupConflict, "{seen:?}");
+        }
+        assert_eq!(store.delete_group("missing", revision(1), Vec::new(), ok).unwrap(), SaveStatus::GroupConflict);
+        assert_eq!(fs::read(dir.file()).unwrap(), original);
+
+        // 클라이언트가 본 뒤에 하위 세션이 추가되면 지우지 않는다.
+        assert_eq!(save_target(&store, &local(dir.path(), Some("b"), "t5"), None).unwrap(), SaveStatus::Saved);
+        assert_eq!(store.delete_group("a", revision(1), expected(&snapshot), ok).unwrap(), SaveStatus::GroupConflict);
+        let mut seen = snapshot.to_vec();
+        seen.push(("target", "t5", 1));
+        assert_eq!(store.delete_group("a", revision(1), expected(&seen), ok).unwrap(), SaveStatus::Saved);
+        let file = store.load().unwrap();
+        assert_eq!(file.groups.iter().map(|entry| entry.profile.id.as_str()).collect::<Vec<_>>(), ["c"]);
+        assert_eq!(file.targets.iter().map(|entry| entry.profile.id.as_str()).collect::<Vec<_>>(), ["t3", "t4"]);
+    }
+
+    #[test]
+    fn target_delete_checks_revision_and_rejects_a_desktop_ssh_route_reference() {
+        let dir = TestDir::new();
+        let store = Store::new(dir.path());
+        assert_eq!(store.save_group(group("work", None, None), ok).unwrap(), SaveStatus::Saved);
+        let mut ssh = ssh_draft(dir.path())["target"].clone();
+        ssh["ssh"]["auth"] = json!({"kind": "keyFile", "privateKeyPath": dir.path().join("private-key")});
+        assert_eq!(save_target(&store, &ssh, None).unwrap(), SaveStatus::Saved);
+        let rdp = desktop_draft(dir.path(), "rdp", json!({
+            "host": "xrdp.example.test", "port": 3389, "tlsOnly": false, "route": {"kind": "ssh", "targetId": "ssh-server"},
+        }))["target"].clone();
+        assert_eq!(save_target(&store, &rdp, None).unwrap(), SaveStatus::Saved);
+        let original = fs::read(dir.file()).unwrap();
+
+        assert_eq!(store.delete_target("ssh-server", revision(2), ok).unwrap(), SaveStatus::TargetConflict);
+        assert_eq!(store.delete_target("missing", revision(1), ok).unwrap(), SaveStatus::TargetConflict);
+        let referenced = SaveStatus::Referenced(vec!["rdp-desktop".into()]);
+        assert_eq!(store.delete_target("ssh-server", revision(1), ok).unwrap(), referenced);
+        // SSH 세션을 수동 암호 인증으로 바꾸는 저장도 경로를 끊으므로 거부한다.
+        let mut manual = ssh.clone();
+        manual["ssh"]["auth"] = json!({"kind": "manualPassword"});
+        assert_eq!(save_target(&store, &manual, Some(1)).unwrap(), referenced);
+        let mut broken = rdp.clone();
+        broken["rdp"]["route"]["targetId"] = json!("missing");
+        assert!(matches!(save_target(&store, &broken, Some(1)), Err(StoreError::DesktopRoute)));
+        assert!(matches!(store.delete_target("rdp-desktop", revision(1), || Err("문서가 바뀌었습니다".into())),
+            Err(StoreError::Authorization(_))));
+        assert_eq!(fs::read(dir.file()).unwrap(), original);
+
+        assert_eq!(store.delete_target("rdp-desktop", revision(1), ok).unwrap(), SaveStatus::Saved);
+        assert_eq!(store.delete_target("ssh-server", revision(1), ok).unwrap(), SaveStatus::Saved);
+        assert!(store.load().unwrap().targets.is_empty());
+    }
+
+    #[test]
+    fn validated_save_records_configured_sso_account_and_keeps_it_when_scope_is_unchanged() {
+        let dir = TestDir::new();
+        let store = Store::new(dir.path());
+        assert_eq!(store.save_group(group("work", None, None), ok).unwrap(), SaveStatus::Saved);
+        let account = || store.load().unwrap().targets[0].tested_account_id.clone();
+        let calls = std::cell::RefCell::new(Vec::new());
+        let configured = |value: &'static str| {
+            let calls = &calls;
+            move |profile: &str, region: &str| {
+                calls.borrow_mut().push(format!("{profile}/{region}"));
+                Some(value.to_owned())
+            }
+        };
+        let mut s3 = s3_draft(dir.path())["target"].clone();
+        assert_eq!(store.save_validated(target(&s3, None), configured("012345678901"), ok).unwrap(), SaveStatus::Saved);
+        assert_eq!(account().as_deref(), Some("012345678901"));
+        s3["s3"]["bucket"] = json!("other.bucket");
+        assert_eq!(store.save_validated(target(&s3, Some(1)), configured("999999999999"), ok).unwrap(), SaveStatus::Saved);
+        assert_eq!(account().as_deref(), Some("012345678901"));
+        s3["s3"]["region"] = json!("us-east-1");
+        assert_eq!(store.save_validated(target(&s3, Some(2)), configured("999999999999"), ok).unwrap(), SaveStatus::Saved);
+        assert_eq!(account().as_deref(), Some("999999999999"));
+        assert_eq!(*calls.borrow(), ["company-sso/ap-northeast-2", "company-sso/us-east-1"]);
+        assert_eq!(store.save_validated(target(&s3, Some(1)), configured("012345678901"), ok).unwrap(), SaveStatus::TargetConflict);
+
+        // 프로필과 리전이 같아도 방식이 바뀌면 계정을 다시 정한다.
+        let mut ssm = ssm_draft(dir.path())["target"].clone();
+        ssm["id"] = json!("s3-bucket");
+        ssm["ssm"]["region"] = json!("us-east-1");
+        assert_eq!(store.save_validated(target(&ssm, Some(3)), configured("111111111111"), ok).unwrap(), SaveStatus::Saved);
+        assert_eq!(account().as_deref(), Some("111111111111"));
+    }
+
+    #[test]
+    fn validated_save_without_sso_config_leaves_account_empty() {
+        let dir = TestDir::new();
+        let store = Store::new(dir.path());
+        let mut ssm = ssm_draft(dir.path())["target"].clone();
+        ssm.as_object_mut().unwrap().remove("groupId");
+        assert_eq!(store.save_validated(target(&ssm, None), |_, _| None, ok).unwrap(), SaveStatus::Saved);
+        let mut s3 = s3_draft(dir.path())["target"].clone();
+        s3.as_object_mut().unwrap().remove("groupId");
+        assert_eq!(store.save_validated(target(&s3, None), |_, _| Some("not-an-account".into()), ok).unwrap(), SaveStatus::Saved);
+        let file = store.load().unwrap();
+        assert!(file.targets.iter().all(|entry| entry.tested_account_id.is_none() && entry.profile.group_id.is_none()));
+        crate::connections::with_saved_method(dir.path(), "s3-bucket", |_, account| {
+            assert_eq!(account, None);
+            Ok(())
+        }).unwrap();
+
+        // 없는 그룹을 가리키거나 v1 초안이면 저장하지 않는다.
+        let original = fs::read(dir.file()).unwrap();
+        assert!(matches!(save_target(&store, &local(dir.path(), Some("missing"), "lost"), None), Err(StoreError::MissingGroup)));
+        let v1 = json!({"version": 1, "targetRevision": null, "target": local(dir.path(), None, "old")});
+        assert_eq!(serde_json::from_value::<TargetDraft>(v1).unwrap().validate().err(), Some(ValidationError::Version(1)));
+        let mut port = ssh_draft(dir.path())["target"].clone();
+        port["ssh"]["port"] = json!(0);
+        let port = json!({"version": 2, "targetRevision": null, "target": port});
+        assert_eq!(serde_json::from_value::<TargetDraft>(port).unwrap().validate().err().map(|error| error.field()), Some("ssh.port"));
+        assert_eq!(fs::read(dir.file()).unwrap(), original);
+    }
+
+    #[test]
+    fn combined_drafts_accept_v1_and_v2_and_require_the_target_in_the_group() {
+        let dir = TestDir::new();
+        let mut input = draft(dir.path(), "work", "shell");
+        assert!(serde_json::from_value::<Draft>(input.clone()).unwrap().validate().is_ok());
+        input["version"] = json!(2);
+        input["group"]["parentId"] = json!("parent");
+        assert!(serde_json::from_value::<Draft>(input.clone()).unwrap().validate().is_ok());
+        input["version"] = json!(3);
+        assert_eq!(serde_json::from_value::<Draft>(input.clone()).unwrap().validate().err(), Some(ValidationError::Version(3)));
+        input["version"] = json!(2);
+        input["target"].as_object_mut().unwrap().remove("groupId");
+        assert_eq!(serde_json::from_value::<Draft>(input).unwrap().validate().err(), Some(ValidationError::GroupMismatch));
+    }
+
+    fn write_v1(dir: &TestDir) -> Vec<u8> {
+        let v1 = draft(dir.path(), "work", "local-shell");
+        let original = serde_json::to_vec(&json!({
+            "version": 1,
+            "groups": [{"revision": 3, "profile": v1["group"]}],
+            "targets": [{"revision": 4, "profile": v1["target"]}],
+        })).unwrap();
+        fs::write(dir.file(), &original).unwrap();
+        original
+    }
+
+    #[test]
+    fn empty_or_non_v1_backup_is_recreated_from_the_v1_original() {
+        for previous in [b"".as_slice(), br#"{"version":2,"groups":[],"targets":[]}"#] {
+            let dir = TestDir::new();
+            let store = Store::new(dir.path());
+            let original = write_v1(&dir);
+            let backup = dir.path().join("connections.v1.json");
+            fs::write(&backup, previous).unwrap();
+            assert_eq!(store.save_group(group("next", None, None), ok).unwrap(), SaveStatus::Saved);
+            assert_eq!(fs::read(&backup).unwrap(), original);
+            assert!(!dir.path().join("connections.v1.json.tmp").exists());
+        }
+    }
+
+    #[test]
+    fn backup_path_directory_rejects_the_save_and_keeps_the_original() {
+        let dir = TestDir::new();
+        let store = Store::new(dir.path());
+        let original = write_v1(&dir);
+        fs::create_dir(dir.path().join("connections.v1.json")).unwrap();
+        assert!(matches!(store.save_group(group("next", None, None), ok), Err(StoreError::Io(_))));
+        assert_eq!(fs::read(dir.file()).unwrap(), original);
+        assert!(dir.path().join("connections.v1.json").is_dir());
+        assert!(!dir.path().join("connections.json.tmp").exists());
+    }
+
+    #[test]
+    fn v1_file_with_a_parent_group_or_a_top_level_target_is_a_format_error() {
+        let dir = TestDir::new();
+        let store = Store::new(dir.path());
+        let v1 = draft(dir.path(), "work", "local-shell");
+        let mut nested = v1["group"].clone();
+        nested["parentId"] = json!("work");
+        nested["id"] = json!("child");
+        let mut top = v1["target"].clone();
+        top.as_object_mut().unwrap().remove("groupId");
+        for (groups, target) in [(json!([{"revision": 1, "profile": v1["group"]}, {"revision": 1, "profile": nested}]), v1["target"].clone()),
+            (json!([{"revision": 1, "profile": v1["group"]}]), top)] {
+            fs::write(dir.file(), serde_json::to_vec(&json!({
+                "version": 1, "groups": groups, "targets": [{"revision": 1, "profile": target}],
+            })).unwrap()).unwrap();
+            assert!(matches!(store.load(), Err(StoreError::Format(_))));
+        }
+    }
+
+    #[test]
+    fn group_delete_rejects_an_ssh_session_used_by_a_desktop_route_in_another_group() {
+        let dir = TestDir::new();
+        let store = Store::new(dir.path());
+        for id in ["servers", "desktops"] {
+            assert_eq!(store.save_group(group(id, None, None), ok).unwrap(), SaveStatus::Saved);
+        }
+        let mut ssh = ssh_draft(dir.path())["target"].clone();
+        ssh["groupId"] = json!("servers");
+        ssh["ssh"]["auth"] = json!({"kind": "agent", "publicKeyPath": dir.path().join("client.pub")});
+        assert_eq!(save_target(&store, &ssh, None).unwrap(), SaveStatus::Saved);
+        for method in ["rdp", "vnc"] {
+            let settings = if method == "rdp" {
+                json!({"host": "xrdp.example.test", "port": 3389, "tlsOnly": false, "route": {"kind": "ssh", "targetId": "ssh-server"}})
+            } else {
+                json!({"host": "", "port": 5900, "route": {"kind": "ssh", "targetId": "ssh-server"}})
+            };
+            let mut desktop = desktop_draft(dir.path(), method, settings)["target"].clone();
+            desktop["groupId"] = json!("desktops");
+            assert_eq!(save_target(&store, &desktop, None).unwrap(), SaveStatus::Saved);
+        }
+        let original = fs::read(dir.file()).unwrap();
+        assert_eq!(store.delete_group("servers", revision(1), expected(&[("target", "ssh-server", 1)]), ok).unwrap(),
+            SaveStatus::Referenced(vec!["rdp-desktop".into(), "vnc-desktop".into()]));
+        assert_eq!(fs::read(dir.file()).unwrap(), original);
+    }
+
+    #[test]
+    fn existing_broken_desktop_route_does_not_block_unrelated_saves() {
+        let dir = TestDir::new();
+        let store = Store::new(dir.path());
+        assert_eq!(store.save_group(group("work", None, None), ok).unwrap(), SaveStatus::Saved);
+        let rdp = desktop_draft(dir.path(), "rdp", json!({
+            "host": "xrdp.example.test", "port": 3389, "tlsOnly": false, "route": {"kind": "ssh", "targetId": "missing"},
+        }))["target"].clone();
+        let mut file: Value = serde_json::from_slice(&fs::read(dir.file()).unwrap()).unwrap();
+        file["targets"] = json!([{"revision": 1, "profile": rdp}]);
+        fs::write(dir.file(), serde_json::to_vec(&file).unwrap()).unwrap();
+        assert_eq!(store.load().unwrap().targets.len(), 1);
+        assert_eq!(save_target(&store, &local(dir.path(), Some("work"), "shell"), None).unwrap(), SaveStatus::Saved);
+        assert_eq!(store.save_group(group("other", None, None), ok).unwrap(), SaveStatus::Saved);
+        assert_eq!(store.load().unwrap().targets.len(), 2);
+        // 끊긴 원격 화면 세션 자체를 다시 저장할 때는 경로를 요구한다.
+        assert!(matches!(save_target(&store, &rdp, Some(1)), Err(StoreError::DesktopRoute)));
+    }
+
+    #[test]
+    fn validated_save_requeries_sso_config_when_the_stored_account_is_empty() {
+        let dir = TestDir::new();
+        let store = Store::new(dir.path());
+        let mut s3 = s3_draft(dir.path())["target"].clone();
+        s3.as_object_mut().unwrap().remove("groupId");
+        assert_eq!(store.save_validated(target(&s3, None), |_, _| None, ok).unwrap(), SaveStatus::Saved);
+        assert_eq!(store.load().unwrap().targets[0].tested_account_id, None);
+        assert_eq!(store.save_validated(target(&s3, Some(1)), |_, _| Some("012345678901".into()), ok).unwrap(), SaveStatus::Saved);
+        assert_eq!(store.load().unwrap().targets[0].tested_account_id.as_deref(), Some("012345678901"));
+    }
 }

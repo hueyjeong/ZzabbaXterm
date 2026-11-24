@@ -32,14 +32,48 @@ Tauri의 로컬 `main` 창에서만 호출한다. `Run`은 `{ draftId: string, d
 | `connection_test_wait` | `{ run: Run }` | `Run & { sessionId: string }` |
 | `connection_test_cancel` | `{ run: Run }` | `null` |
 | `connection_save` | `{ request: { run: Run, draft } }` | `null` |
-| `connections_load` | `{}` | `{ version, groups: [{ revision, profile }], targets: [{ revision, profile }] }` |
+| `connections_load` | `{}` | `{ version: 2, groups: [{ revision, profile }], targets: [{ revision, profile }] }` |
 
-`draft`는 `{ version: 1, groupRevision, targetRevision, group, target }`이다. 새 항목의 개정은 `null`이고, 저장된 항목을 수정할 때는 목록 응답의 개정을 넘긴다. `group`은 `{ id, displayName }`, `target`은 `{ id, groupId, displayName, defaultMethod: "local", local: { shell, startDirectory } }`다. `shell`은 Windows의 `"powerShell"` 또는 Ubuntu의 `"bash"`이며, `startDirectory`는 절대 경로다. 로컬 인증은 현재 사용자이므로 인증 필드는 없다.
+`draft`는 `{ version: 1 | 2, groupRevision, targetRevision, group, target }`이다. `target.groupId`는 `group.id`와 같아야 한다. 이미 있는 그룹의 `parentId`는 이 초안으로 바꾸지 않는다. 새 항목의 개정은 `null`이고, 저장된 항목을 수정할 때는 목록 응답의 개정을 넘긴다. `group`은 `{ id, displayName }`, `target`은 `{ id, groupId, displayName, defaultMethod: "local", local: { shell, startDirectory } }`다. `shell`은 Windows의 `"powerShell"` 또는 Ubuntu의 `"bash"`이며, `startDirectory`는 절대 경로다. 로컬 인증은 현재 사용자이므로 인증 필드는 없다.
 Windows의 시험과 저장 대상 열기는 일반 드라이브 절대 경로를 받는다. 확장 경로, 장치 경로, UNC 경로는 경로 오류로 반환한다.
 
 1. `start`에 현재 초안을 넘긴 뒤 반환된 `Run`을 `wait`에 그대로 전달한다. PTY 생성부터 시험 표식·정상 종료·회수까지 합쳐 8초 안에 끝나야 성공한다. 기한이 지나면 오류를 반환하고 아직 남아 있는 해당 시험은 백그라운드에서 회수한다.
 2. 편집하거나 마법사를 닫으면 이전 `Run`을 취소한다. `null`은 저장 자격 폐기와 중지 요청의 응답이다. 아직 진행 중인 OS 정리는 소유 창의 실행 목록에 남겨 완료 시 수거한다. `start` 응답이 늦으면 도착한 `Run`을 취소하며, 재시험·문서 이동·창 닫기도 해당 실행만 취소한다.
 3. 사용자가 성공한 초안에서 저장을 누를 때만 `connection_save`를 호출한다. Rust는 파일 잠금을 얻은 뒤와 최종 교체 직전에 창·문서·실행·초안이 여전히 일치하는지 확인한다. 최종 승인 전에 문서가 사라지면 기존 파일은 그대로다. 최종 승인 뒤에는 교체를 마치며, 성공한 실행의 저장 자격은 소진된다. 저장 뒤 `connections_load`로 새 개정과 목록을 받는다.
+
+## 저장 스키마 v2
+
+`connections.json`의 `version`은 2다.
+
+- 그룹: `{ id, displayName, parentId? }`. `parentId`가 없으면 최상위 그룹이다. 부모는 존재해야 하고, 순환은 거부하며, 최상위를 1단계로 최대 8단계다.
+- 대상: `groupId`는 선택이다. 없으면 그룹 없는 최상위 세션이다.
+- v1 파일은 메모리에서 v2로 읽는다. v1 그룹은 모두 최상위 그룹이다. 처음 v2로 쓰기 직전에 같은 잠금 아래에서 원본을 `connections.v1.json`으로 한 번 복사한다. 임시 파일을 다 쓴 뒤 덮어쓰지 않는 링크로 확정한다. v1으로 읽히는 백업이 이미 있으면 그 뒤에 다시 나타난 v1 파일은 백업하지 않는다. 비었거나 v1이 아닌 백업은 다시 만든다. v1 파일에 `parentId`가 있거나 `groupId`가 빠진 대상이 있으면 형식 오류다.
+- 원격 화면의 SSH 경로(`route.kind: "ssh"`)가 가리키는 대상은 Agent 또는 키 파일 인증의 직접 SSH 대상이어야 한다. 어떤 쓰기도 새로 이 조건을 깨면 저장하지 않는다.
+
+## 그룹과 세션 편집 IPC
+
+로컬 `main` 창에서만 호출한다. 모든 쓰기는 파일 잠금 아래에서 개정을 비교하고 원자적으로 교체한다.
+
+| 명령 | 인자 | 성공 응답 |
+|---|---|---|
+| `connection_group_save` | `{ draft: { version: 2, revision, group } }` | `{ revision }` |
+| `connection_group_delete` | `{ id, revision, expected: [{ kind: "group" \| "target", id, revision }] }` | `null` |
+| `connection_target_delete` | `{ id, revision }` | `null` |
+| `connection_target_save` | `{ draft: { version: 2, targetRevision, target } }` | `{ revision }` |
+
+- 새 항목의 개정은 `null`이다. 그룹 저장은 추가, 이름 바꾸기, 이동(`parentId` 변경)을 맡는다.
+- 그룹 삭제는 하위 그룹과 그 안의 세션까지 지운다. `expected`는 루트를 뺀 하위 그룹과 세션의 집합이며, 저장본과 정확히 같아야 지운다.
+- `connection_target_save`는 연결 시험 없이 입력만 검증한다. SSM과 S3는 방식, 프로필, 리전이 저장본과 같고 저장된 계정 ID가 있으면 유지하고, 아니면 로컬 SSO 설정의 `sso_account_id`를 기록한다. 설정이 없으면 비워 두며, 스토리지를 열 때 연결 재시험이 필요하다.
+- `tested_account_id`는 연결 시험(STS 확인값) 또는 시험 없는 저장 시점의 SSO 설정에서 확정한 계정이다.
+
+오류는 다음 중 하나로 거부한다.
+
+| `kind` | 추가 필드 | 의미 |
+|---|---|---|
+| `invalid` | `field` (`displayName`, `parentId`, `groupId`, `ssh.host`, `ssh.port`, `desktop.route` 등) | 입력 검증 실패 |
+| `conflict` | | 개정이나 하위 항목 집합이 저장본과 다름 |
+| `referenced` | `targets` | 원격 화면 세션이 SSH 경로로 사용 중 |
+| `failed` | `message` | 그 밖의 읽기·쓰기 실패 |
 
 ## CLI 연결 등록
 
@@ -47,7 +81,7 @@ Windows의 시험과 저장 대상 열기는 일반 드라이브 절대 경로�
 
 ## 원격 화면 프로필
 
-`defaultMethod`가 `"rdp"` 또는 `"vnc"`인 대상은 원격 화면 탭을 연다. 저장 파일 버전은 그대로 1이고, 기존 파일은 변환 없이 읽는다. 비밀번호와 계정은 저장하지 않으며 연결할 때 서비스 인증에서 받는다.
+`defaultMethod`가 `"rdp"` 또는 `"vnc"`인 대상은 원격 화면 탭을 연다. 비밀번호와 계정은 저장하지 않으며 연결할 때 서비스 인증에서 받는다.
 
 - `rdp: { host, port, tlsOnly, route }`, `vnc: { host, port, route }`. 기본 포트는 3389와 5900이다. `tlsOnly`는 RDP의 **NLA를 지원하지 않는 서버(TLS 전용) 허용** 값이다.
 - `route`는 `{ kind: "direct" }`, `{ kind: "ssh", targetId }`, `{ kind: "ssm", profile, region, instanceId }` 중 하나다.
@@ -58,5 +92,5 @@ Windows의 시험과 저장 대상 열기는 일반 드라이브 절대 경로�
 | `ssh` | SSH 서버의 `127.0.0.1:port` | TLS 인증 DNS 이름 | 빈 값 |
 | `ssm` | `host`가 비면 노드 자신의 `port`, 있으면 노드에서 접속하는 `host:port` | 빈 값, DNS 이름 또는 IP | 빈 값 |
 
-- `ssh` 경로의 `targetId`는 Agent 또는 키 파일 인증을 쓰는 저장된 직접 SSH 대상이어야 한다. Rust가 저장할 때와 터널을 열 때 각각 확인한다.
+- `ssh` 경로의 `targetId`는 Agent 또는 키 파일 인증을 쓰는 저장된 직접 SSH 대상이어야 한다. Rust가 저장할 때와 터널을 열 때 각각 확인한다. 참조 중인 SSH 대상은 지우거나 다른 인증으로 바꿀 수 없다.
 - 원격 화면 프로필은 연결 시험 없이 저장한다. `connection_test_start`는 거부하고, `connection_save`가 스키마와 SSH 참조를 검증한다. 서버 인증서와 터널 승인은 열 때 확인한다.

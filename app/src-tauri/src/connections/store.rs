@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::{self, File, Metadata, OpenOptions},
     io::{self, BufWriter, Read, Write},
     path::{Path, PathBuf},
@@ -14,13 +14,34 @@ use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, FILE
 
 use serde::{Deserialize, Serialize};
 
-use super::profile::{Group, Revision, Target, VERSION, ValidatedDraft, ValidationError};
+use super::profile::{
+    DesktopRoute, Group, MAX_GROUP_DEPTH, Method, MethodRef, Revision, SshAuth, SshTransport, Target, TargetId, VERSION,
+    ValidatedDraft, ValidatedGroup, ValidatedTarget, ValidationError,
+};
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum SaveStatus {
     Saved,
     GroupConflict,
     TargetConflict,
+    /// 이 변경으로 SSH 경로가 끊기는 원격 화면 세션 ID다.
+    Referenced(Vec<String>),
+}
+
+/// 하위 포함 그룹 삭제에서 클라이언트가 본 하위 항목과 개정이다.
+#[derive(Debug, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct Expected {
+    kind: EntryKind,
+    id: String,
+    revision: Revision,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) enum EntryKind {
+    Group,
+    Target,
 }
 
 #[derive(Debug)]
@@ -31,6 +52,10 @@ pub(super) enum StoreError {
     InvalidProfile(ValidationError),
     DuplicateId,
     MissingGroup,
+    GroupCycle,
+    GroupDepth,
+    /// 원격 화면의 SSH 경로가 Agent·키 파일 인증의 저장된 직접 SSH 대상을 가리키지 않는다.
+    DesktopRoute,
     RevisionExhausted,
     Replace(io::Error),
     Authorization(String),
@@ -54,6 +79,9 @@ pub(super) struct ProfileFile {
     version: u32,
     pub(super) groups: Vec<Entry<Group>>,
     pub(super) targets: Vec<Entry<Target>>,
+    /// v1 파일에서 읽어 메모리에서 v2로 올렸다. 처음 v2로 쓰기 직전에 원본을 백업한다.
+    #[serde(skip)]
+    from_v1: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -104,17 +132,28 @@ impl Store {
         let mut input = match open_regular(&path, &mut OpenOptions::new().read(true)) {
             Ok(input) => input,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(ProfileFile { version: VERSION, groups: Vec::new(), targets: Vec::new() });
+                return Ok(ProfileFile { version: VERSION, groups: Vec::new(), targets: Vec::new(), from_v1: false });
             }
             Err(error) => return Err(error.into()),
         };
         let mut contents = Vec::new();
         input.read_to_end(&mut contents)?;
         let header: FileVersion = serde_json::from_slice(&contents).map_err(StoreError::Format)?;
-        if header.version != VERSION {
-            return Err(StoreError::Version(header.version));
+        // v1 그룹에는 상위 그룹이 없으므로 그대로 최상위 그룹이 된다.
+        let from_v1 = match header.version {
+            1 => true,
+            VERSION => false,
+            other => return Err(StoreError::Version(other)),
+        };
+        let mut file: ProfileFile = serde_json::from_slice(&contents).map_err(StoreError::Format)?;
+        if from_v1 && (file.groups.iter().any(|entry| entry.profile.parent_id.is_some())
+            || file.targets.iter().any(|entry| entry.profile.group_id.is_none()))
+        {
+            use serde::de::Error;
+            return Err(StoreError::Format(serde_json::Error::custom("v1 파일에는 parentId가 없고 모든 대상에 groupId가 있습니다")));
         }
-        let file: ProfileFile = serde_json::from_slice(&contents).map_err(StoreError::Format)?;
+        file.version = VERSION;
+        file.from_v1 = from_v1;
         file.validate()?;
         Ok(file)
     }
@@ -141,14 +180,175 @@ impl Store {
         self.save_with_rename(draft, true, None, || Ok(()), || {}, |from, to| fs::rename(from, to))
     }
 
+    /// 그룹을 추가하거나 이름을 바꾸거나 상위 그룹을 바꾼다.
+    pub(super) fn save_group(
+        &self,
+        draft: ValidatedGroup,
+        authorize: impl FnMut() -> Result<(), String>,
+    ) -> Result<SaveStatus, StoreError> {
+        let (group, revision) = draft.into_parts();
+        self.modify(authorize, || {}, |from, to| fs::rename(from, to), |file| {
+            match file.groups.iter_mut().find(|entry| entry.profile.id == group.id) {
+                entry if entry.as_ref().map(|entry| entry.revision) != revision => return Ok(SaveStatus::GroupConflict),
+                Some(entry) => entry.update(group)?,
+                None => file.groups.push(Entry::new(group)),
+            }
+            Ok(SaveStatus::Saved)
+        })
+    }
+
+    /// 그룹과 하위 그룹, 그 안의 세션을 지운다. 클라이언트가 본 하위 항목과 개정이 저장본과 정확히 같아야 한다.
+    pub(super) fn delete_group(
+        &self,
+        id: &str,
+        revision: Revision,
+        expected: Vec<Expected>,
+        authorize: impl FnMut() -> Result<(), String>,
+    ) -> Result<SaveStatus, StoreError> {
+        self.modify(authorize, || {}, |from, to| fs::rename(from, to), |file| {
+            if !file.groups.iter().any(|entry| entry.profile.id.as_str() == id && entry.revision == revision) {
+                return Ok(SaveStatus::GroupConflict);
+            }
+            let mut removed = HashSet::from([id.to_owned()]);
+            loop {
+                let before = removed.len();
+                for entry in &file.groups {
+                    if entry.profile.parent_id.as_ref().is_some_and(|parent| removed.contains(parent.as_str())) {
+                        removed.insert(entry.profile.id.as_str().to_owned());
+                    }
+                }
+                if removed.len() == before { break; }
+            }
+            let in_removed = |group: Option<&super::profile::GroupId>| group.is_some_and(|group| removed.contains(group.as_str()));
+            let actual: HashSet<Expected> = file.groups.iter().filter(|entry| entry.profile.id.as_str() != id && removed.contains(entry.profile.id.as_str()))
+                .map(|entry| Expected { kind: EntryKind::Group, id: entry.profile.id.as_str().into(), revision: entry.revision })
+                .chain(file.targets.iter().filter(|entry| in_removed(entry.profile.group_id.as_ref()))
+                    .map(|entry| Expected { kind: EntryKind::Target, id: entry.profile.id.as_str().into(), revision: entry.revision }))
+                .collect();
+            let count = expected.len();
+            let expected: HashSet<Expected> = expected.into_iter().collect();
+            if expected.len() != count || expected != actual {
+                return Ok(SaveStatus::GroupConflict);
+            }
+            file.targets.retain(|entry| !in_removed(entry.profile.group_id.as_ref()));
+            file.groups.retain(|entry| !removed.contains(entry.profile.id.as_str()));
+            Ok(SaveStatus::Saved)
+        })
+    }
+
+    pub(super) fn delete_target(
+        &self,
+        id: &str,
+        revision: Revision,
+        authorize: impl FnMut() -> Result<(), String>,
+    ) -> Result<SaveStatus, StoreError> {
+        self.modify(authorize, || {}, |from, to| fs::rename(from, to), |file| {
+            match file.targets.iter().position(|entry| entry.profile.id.as_str() == id) {
+                Some(index) if file.targets[index].revision == revision => {
+                    file.targets.remove(index);
+                    Ok(SaveStatus::Saved)
+                }
+                _ => Ok(SaveStatus::TargetConflict),
+            }
+        })
+    }
+
+    /// 연결 시험 없이 입력 검증만 거쳐 대상을 저장한다. SSM과 S3의 계정은 방식, 프로필, 리전이 같으면 저장본을
+    /// 유지하고, 아니면 `configured_account`(로컬 SSO 설정의 계정)를 기록한다. 없으면 비워 둔다.
+    pub(super) fn save_validated(
+        &self,
+        draft: ValidatedTarget,
+        configured_account: impl FnOnce(&str, &str) -> Option<String>,
+        authorize: impl FnMut() -> Result<(), String>,
+    ) -> Result<SaveStatus, StoreError> {
+        let (target, revision) = draft.into_parts();
+        let id = target.id.clone();
+        self.modify(authorize, || {}, |from, to| fs::rename(from, to), |file| {
+            let old = file.targets.iter_mut().find(|entry| entry.profile.id == target.id);
+            if old.as_ref().map(|entry| entry.revision) != revision {
+                return Ok(SaveStatus::TargetConflict);
+            }
+            let account = match (&old, account_scope(&target)) {
+                (_, None) => None,
+                // 저장된 계정이 없으면 같은 범위라도 로컬 SSO 설정을 다시 읽는다.
+                (Some(entry), scope) if account_scope(&entry.profile) == scope && entry.tested_account_id.is_some() => {
+                    entry.tested_account_id.clone()
+                }
+                (_, Some((_, profile, region))) => configured_account(profile, region)
+                    .filter(|account| validate_tested_account(Some(account), true).is_ok()),
+            };
+            let entry = match old {
+                Some(entry) => { entry.update(target)?; entry }
+                None => {
+                    file.targets.push(Entry::new(target));
+                    file.targets.last_mut().unwrap()
+                }
+            };
+            entry.tested_account_id = account;
+            file.require_route(&id)?;
+            Ok(SaveStatus::Saved)
+        })
+    }
+
     fn save_with_rename(
         &self,
         draft: ValidatedDraft,
         insert_only: bool,
         tested_account_id: Option<String>,
+        authorize: impl FnMut() -> Result<(), String>,
+        committed: impl FnOnce(),
+        rename: impl FnOnce(&Path, &Path) -> io::Result<()>,
+    ) -> Result<SaveStatus, StoreError> {
+        let (mut group, group_revision, target, target_revision) = draft.into_parts();
+        let id = target.id.clone();
+        self.modify(authorize, committed, rename, |file| {
+            validate_tested_account(tested_account_id.as_deref(), target.method().uses_tested_account())?;
+            let old_group = file.groups.iter_mut().find(|entry| entry.profile.id == group.id);
+            let old_target = file.targets.iter_mut().find(|entry| entry.profile.id == target.id);
+
+            if insert_only && old_target.is_some() {
+                return Ok(SaveStatus::TargetConflict);
+            }
+            if old_target.as_ref().map(|entry| entry.revision) != target_revision {
+                return Ok(SaveStatus::TargetConflict);
+            }
+            // 그룹을 함께 보내는 초안은 상위 그룹을 바꾸지 않는다. 이동은 그룹 저장에서만 한다.
+            if let Some(entry) = &old_group {
+                group.parent_id = entry.profile.parent_id.clone();
+            }
+            match old_group {
+                // 같은 그룹을 동시에 추가한 두 초안도 이름이 같으면 각 대상을 보존한다.
+                Some(entry) if entry.profile == group && group_revision.is_none() => {}
+                entry if entry.as_ref().map(|entry| entry.revision) != group_revision => {
+                    return Ok(SaveStatus::GroupConflict);
+                }
+                Some(entry) if entry.profile != group => {
+                    if insert_only { return Ok(SaveStatus::GroupConflict); }
+                    entry.update(group)?;
+                }
+                Some(_) => {}
+                None => file.groups.push(Entry::new(group)),
+            }
+            let entry = match old_target {
+                Some(entry) => { entry.update(target)?; entry }
+                None => {
+                    file.targets.push(Entry::new(target));
+                    file.targets.last_mut().unwrap()
+                }
+            };
+            entry.tested_account_id = tested_account_id;
+            file.require_route(&id)?;
+            Ok(SaveStatus::Saved)
+        })
+    }
+
+    /// 잠금 아래에서 파일을 읽고 바꾼 뒤 검증해 원자적으로 교체한다. `change`가 `Saved`가 아니면 쓰지 않는다.
+    fn modify(
+        &self,
         mut authorize: impl FnMut() -> Result<(), String>,
         committed: impl FnOnce(),
         rename: impl FnOnce(&Path, &Path) -> io::Result<()>,
+        change: impl FnOnce(&mut ProfileFile) -> Result<SaveStatus, StoreError>,
     ) -> Result<SaveStatus, StoreError> {
         let lock = self.open_lock()?;
         #[cfg(test)]
@@ -161,38 +361,17 @@ impl Store {
         lock.lock()?;
         authorize().map_err(StoreError::Authorization)?;
         let mut file = self.read_file()?;
-        let (group, group_revision, target, target_revision) = draft.into_parts();
-        validate_tested_account(tested_account_id.as_deref(), target.method().uses_tested_account())?;
-        let old_group = file.groups.iter_mut().find(|entry| entry.profile.id == group.id);
-        let old_target = file.targets.iter_mut().find(|entry| entry.profile.id == target.id);
-
-        if insert_only && old_target.is_some() {
-            return Ok(SaveStatus::TargetConflict);
+        let broken = file.broken_routes();
+        let status = change(&mut file)?;
+        if status != SaveStatus::Saved {
+            return Ok(status);
         }
-        if old_target.as_ref().map(|entry| entry.revision) != target_revision {
-            return Ok(SaveStatus::TargetConflict);
+        file.validate()?;
+        // 이번 변경으로 새로 끊기는 원격 화면 SSH 경로가 있으면 쓰지 않는다.
+        let referenced: Vec<String> = file.broken_routes().into_iter().filter(|id| !broken.contains(id)).collect();
+        if !referenced.is_empty() {
+            return Ok(SaveStatus::Referenced(referenced));
         }
-        match old_group {
-            // 같은 그룹을 동시에 추가한 두 초안도 이름이 같으면 각 대상을 보존한다.
-            Some(entry) if entry.profile == group && group_revision.is_none() => {}
-            entry if entry.as_ref().map(|entry| entry.revision) != group_revision => {
-                return Ok(SaveStatus::GroupConflict);
-            }
-            Some(entry) if entry.profile != group => {
-                if insert_only { return Ok(SaveStatus::GroupConflict); }
-                entry.update(group)?;
-            }
-            Some(_) => {}
-            None => file.groups.push(Entry::new(group)),
-        }
-        let entry = match old_target {
-            Some(entry) => { entry.update(target)?; entry }
-            None => {
-                file.targets.push(Entry::new(target));
-                file.targets.last_mut().unwrap()
-            }
-        };
-        entry.tested_account_id = tested_account_id;
 
         self.replace(&file, |from, to| {
             // 이 승인 뒤의 원자 교체는 창을 닫더라도 이미 승인한 작업으로 끝낸다.
@@ -250,6 +429,9 @@ impl Store {
     ) -> Result<(), StoreError> {
         let destination = self.directory.join("connections.json");
         let temporary = self.directory.join("connections.json.tmp");
+        if file.from_v1 {
+            self.backup_v1(&destination)?;
+        }
         // 잠금 아래에서 이전 비정상 종료가 남긴 임시 파일을 회수한다.
         match fs::symlink_metadata(&temporary) {
             Ok(metadata) if is_link(&metadata) || !metadata.is_file() => return Err(unsafe_path().into()),
@@ -277,6 +459,53 @@ impl Store {
             let _ = fs::remove_file(&temporary);
         }
         result
+    }
+}
+
+impl Store {
+    /// v1 원본을 `connections.v1.json`으로 한 번만 복사한다. v1으로 읽히는 백업이 이미 있으면 덮어쓰지 않는다.
+    /// 임시 파일을 끝까지 쓴 뒤 덮어쓰지 않는 하드 링크로 확정하므로, 중간에 끝나도 불완전한 백업이 남지 않는다.
+    fn backup_v1(&self, source: &Path) -> Result<(), StoreError> {
+        let backup = self.directory.join("connections.v1.json");
+        let temporary = self.directory.join("connections.v1.json.tmp");
+        match fs::symlink_metadata(&backup) {
+            Ok(metadata) if is_link(&metadata) || !metadata.is_file() => return Err(unsafe_path().into()),
+            Ok(_) => {
+                let mut contents = Vec::new();
+                open_regular(&backup, OpenOptions::new().read(true))?.read_to_end(&mut contents)?;
+                if serde_json::from_slice::<FileVersion>(&contents).is_ok_and(|header| header.version == 1) {
+                    return Ok(());
+                }
+                // 비었거나 v1이 아닌 백업은 다시 만든다.
+                fs::remove_file(&backup)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        match fs::symlink_metadata(&temporary) {
+            Ok(metadata) if is_link(&metadata) || !metadata.is_file() => return Err(unsafe_path().into()),
+            Ok(_) => fs::remove_file(&temporary)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(windows)]
+        options.access_mode(windows_sys::Win32::Foundation::GENERIC_WRITE | windows_sys::Win32::Storage::FileSystem::WRITE_DAC);
+        let mut output = open_regular(&temporary, &mut options)?;
+        let result = (|| {
+            // 원본의 권한을 적용할 때까지 임시 파일은 비워 둔다.
+            #[cfg(windows)]
+            preserve_dacl(source, &output)?;
+            let mut contents = Vec::new();
+            open_regular(source, OpenOptions::new().read(true))?.read_to_end(&mut contents)?;
+            output.write_all(&contents)?;
+            output.sync_all()?;
+            drop(output);
+            fs::hard_link(&temporary, &backup)
+        })();
+        let _ = fs::remove_file(&temporary);
+        result.map_err(StoreError::Io)
     }
 }
 
@@ -356,12 +585,26 @@ fn preserve_dacl(destination: &Path, output: &File) -> io::Result<()> {
 
 impl ProfileFile {
     fn validate(&self) -> Result<(), StoreError> {
-        let mut groups = HashSet::with_capacity(self.groups.len());
+        let mut parents = HashMap::with_capacity(self.groups.len());
         for entry in &self.groups {
             entry.profile.validate().map_err(StoreError::InvalidProfile)?;
             validate_tested_account(entry.tested_account_id.as_deref(), false)?;
-            if !groups.insert(&entry.profile.id) {
+            if parents.insert(&entry.profile.id, entry.profile.parent_id.as_ref()).is_some() {
                 return Err(StoreError::DuplicateId);
+            }
+        }
+        // 상위 그룹을 따라 올라가며 존재, 순환, 깊이를 확인한다.
+        for entry in &self.groups {
+            let mut seen = HashSet::new();
+            let mut current = Some(&entry.profile.id);
+            while let Some(id) = current {
+                if !seen.insert(id) {
+                    return Err(StoreError::GroupCycle);
+                }
+                if seen.len() > MAX_GROUP_DEPTH {
+                    return Err(StoreError::GroupDepth);
+                }
+                current = *parents.get(id).ok_or(StoreError::MissingGroup)?;
             }
         }
         let mut targets = HashSet::with_capacity(self.targets.len());
@@ -371,11 +614,41 @@ impl ProfileFile {
             if !targets.insert(&entry.profile.id) {
                 return Err(StoreError::DuplicateId);
             }
-            if !groups.contains(&entry.profile.group_id) {
+            if entry.profile.group_id.as_ref().is_some_and(|group| !parents.contains_key(group)) {
                 return Err(StoreError::MissingGroup);
             }
         }
         Ok(())
+    }
+
+    /// 원격 화면의 SSH 경로는 자신이 아닌, Agent·키 파일 인증의 저장된 직접 SSH 대상만 가리킨다.
+    fn route_ready(&self, target: &Target) -> bool {
+        let MethodRef::Desktop { route: DesktopRoute::Ssh { target_id } } = target.method() else { return true };
+        self.targets.iter().any(|entry| entry.profile.id.as_str() == target_id && entry.profile.id != target.id
+            && matches!(&entry.profile.method, Method::Ssh { ssh } if matches!(ssh.transport, SshTransport::Direct {})
+                && matches!(ssh.auth, SshAuth::Agent { .. } | SshAuth::KeyFile { .. })))
+    }
+
+    /// 쓰기 전에 기존 파일에 이미 끊겨 있던 경로와 새로 끊긴 경로를 구별하는 데 쓴다.
+    fn broken_routes(&self) -> Vec<String> {
+        self.targets.iter().filter(|entry| !self.route_ready(&entry.profile))
+            .map(|entry| entry.profile.id.as_str().to_owned()).collect()
+    }
+
+    fn require_route(&self, id: &TargetId) -> Result<(), StoreError> {
+        match self.targets.iter().find(|entry| entry.profile.id == *id) {
+            Some(entry) if !self.route_ready(&entry.profile) => Err(StoreError::DesktopRoute),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// SSM과 S3 대상의 계정을 정하는 방식, 프로필, 리전이다.
+fn account_scope(target: &Target) -> Option<(&'static str, &str, &str)> {
+    match target.method() {
+        MethodRef::Ssm { profile, region, .. } => Some(("ssm", profile, region)),
+        MethodRef::S3 { s3 } => Some(("s3", &s3.profile, &s3.region)),
+        _ => None,
     }
 }
 

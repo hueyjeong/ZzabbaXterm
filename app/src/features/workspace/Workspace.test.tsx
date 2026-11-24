@@ -67,7 +67,7 @@ let observeWorkspace: () => void;
 let observeTabs: () => void;
 const channels = new Map<string, (message: unknown) => void>();
 const starts = new Map<string, Promise<void>>();
-const emptyStore: SavedConnections = { version: 1, groups: [], targets: [] };
+const emptyStore: SavedConnections = { version: 2, groups: [], targets: [] };
 let loadProfiles: () => Promise<SavedConnections>;
 let runConnectionCommand: (command: string, args: unknown) => Promise<unknown>;
 let closeTerminal: (id: string) => Promise<unknown>;
@@ -1126,7 +1126,7 @@ describe("L02", () => {
 describe("C01 저장된 로컬 연결", () => {
   it("동명 그룹의 동명 대상을 검색해 Enter·더블클릭·문맥 메뉴로 정확한 저장 ID를 연다", async () => {
     loadProfiles = async () => ({
-      version: 1,
+      version: 2,
       groups: ["alpha", "beta"].map((id) => ({ revision: 1, profile: { id, displayName: "회사 개발" } })),
       targets: ["alpha", "beta"].map((groupId) => ({
         revision: 1, profile: {
@@ -1184,7 +1184,7 @@ describe("C01 저장된 로컬 연결", () => {
         });
         await save.promise;
         const { group, target } = request.draft;
-        store = { version: 1, groups: [{ revision: 1, profile: group }], targets: [{ revision: 1, profile: target }] };
+        store = { version: 2, groups: [{ revision: 1, profile: group }], targets: [{ revision: 1, profile: target }] };
         return null;
       }
       throw command;
@@ -1461,7 +1461,7 @@ describe("C02 SSM 연결", () => {
 
   it("구 SSO 연결의 스토리지 개설 거부에서 저장된 대상을 재시험할 수 있다", async () => {
     loadProfiles = async () => ({
-      version: 1,
+      version: 2,
       groups: [{ revision: 1, profile: { id: "dev", displayName: "개발" } }],
       targets: [{ revision: 2, profile: { id: "legacy", groupId: "dev", displayName: "관리 노드", defaultMethod: "ssm", ssm: node } }],
     });
@@ -1477,7 +1477,7 @@ describe("C02 SSM 연결", () => {
 
   it("개설 응답을 기다리지 않고 정확한 스토리지 탭을 취소한다", async () => {
     loadProfiles = async () => ({
-      version: 1,
+      version: 2,
       groups: [{ revision: 1, profile: { id: "dev", displayName: "개발" } }],
       targets: [{ revision: 1, profile: { id: "saved-ssm", groupId: "dev", displayName: "관리 노드", defaultMethod: "ssm", ssm: node } }],
     });
@@ -1496,7 +1496,7 @@ describe("C02 SSM 연결", () => {
 
   it("SSO 만료 응답의 ID만 재로그인에 보내고 개설이나 전송을 재시도하지 않는다", async () => {
     loadProfiles = async () => ({
-      version: 1,
+      version: 2,
       groups: [{ revision: 1, profile: { id: "dev", displayName: "개발" } }],
       targets: [{ revision: 1, profile: { id: "saved-ssm", groupId: "dev", displayName: "관리 노드", defaultMethod: "ssm", ssm: node } }],
     });
@@ -1527,7 +1527,7 @@ describe("C02 SSM 연결", () => {
 
   it("S3 탭은 로컬 파일 편집과 터미널 전환 중에도 다운로드를 계속한다", async () => {
     loadProfiles = async () => ({
-      version: 1,
+      version: 2,
       groups: [{ revision: 1, profile: { id: "dev", displayName: "개발" } }],
       targets: [{ revision: 1, profile: { id: "saved-ssm", groupId: "dev", displayName: "관리 노드", defaultMethod: "ssm", ssm: node } }],
     });
@@ -1594,7 +1594,7 @@ describe("C02 SSM 연결", () => {
   it("SSM 탭은 종료 확인 전 남고 같은 앱 세션 ID로만 다시 확인한다", async () => {
     const close = Promise.withResolvers<null>();
     loadProfiles = async () => ({
-      version: 1,
+      version: 2,
       groups: [{ revision: 1, profile: { id: "dev", displayName: "개발" } }],
       targets: [{ revision: 1, profile: { id: "saved-ssm", groupId: "dev", displayName: "관리 노드", defaultMethod: "ssm", ssm: node } }],
     });
@@ -1675,7 +1675,7 @@ describe("C02 SSM 연결", () => {
     const saving = Promise.withResolvers<null>();
     saveFile = () => saving.promise;
     loadProfiles = async () => ({
-      version: 1,
+      version: 2,
       groups: [{ revision: 1, profile: { id: "dev", displayName: "개발" } }],
       targets: [{ revision: 1, profile: { id: "saved-ssm", groupId: "dev", displayName: "관리 노드", defaultMethod: "ssm", ssm: node } }],
     });
@@ -1852,7 +1852,7 @@ describe("F01 직접 SSH", () => {
     const registration = Promise.withResolvers<null>();
     runConnectionCommand = vi.fn().mockRejectedValueOnce("SSH 호스트 키 등록이 취소되었습니다").mockReturnValueOnce(registration.promise);
     loadProfiles = async () => ({
-      version: 1,
+      version: 2,
       groups: [{ revision: 1, profile: { id: "work", displayName: "작업" } }],
       targets: [{
         revision: 1, profile: {
@@ -1896,7 +1896,7 @@ describe("F01 직접 SSH", () => {
 
   it("SSH 종료가 미확인이면 탭을 남기고 같은 PTY ID로만 다시 확인한다", async () => {
     loadProfiles = async () => ({
-      version: 1,
+      version: 2,
       groups: [{ revision: 1, profile: { id: "work", displayName: "작업" } }],
       targets: [{
         revision: 1, profile: {
@@ -1931,7 +1931,7 @@ describe("F01 직접 SSH", () => {
     const offerId = "1".repeat(32);
     const handle = "f".repeat(32);
     loadProfiles = async () => ({
-      version: 1,
+      version: 2,
       groups: [{ revision: 1, profile: { id: "work", displayName: "작업" } }],
       targets: [{
         revision: 1, profile: {
@@ -2045,7 +2045,7 @@ describe("F01 직접 SSH", () => {
 describe("현재 SSH 세션의 SFTP", () => {
   beforeEach(async () => {
     loadProfiles = async () => ({
-      version: 1,
+      version: 2,
       groups: [{ revision: 1, profile: { id: "work", displayName: "작업" } }],
       targets: [
         ...["서버 A", "서버 B"].map<SavedConnections["targets"][number]>((displayName, index) => ({
@@ -2580,7 +2580,7 @@ describe("현재 SSH 세션의 SFTP", () => {
 describe("SSO 만료로 열지 못한 원격 화면", () => {
   it("AWS 로그인 뒤 같은 RDP 프로필의 SSM 경로를 다시 열고 로그인 실패를 표시한다", async () => {
     loadProfiles = async () => ({
-      version: 1,
+      version: 2,
       groups: [{ revision: 1, profile: { id: "work", displayName: "작업" } }],
       targets: [{
         revision: 1,
@@ -2630,7 +2630,7 @@ describe("SSO 만료로 열지 못한 원격 화면", () => {
 
   it("다른 열기 시도가 시작되면 진행 중인 AWS 로그인을 취소하고 그 로그인으로 다시 열지 않는다", async () => {
     loadProfiles = async () => ({
-      version: 1,
+      version: 2,
       groups: [{ revision: 1, profile: { id: "work", displayName: "작업" } }],
       targets: [{
         revision: 1,

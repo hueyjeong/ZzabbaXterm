@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc, thread};
 use serde::{Deserialize, Serialize};
 
 use crate::terminal::{Sessions, probe::Probe};
-use super::{profile::{DesktopRoute, Draft, Method, MethodRef, SshAuth, SshTransport, ValidatedDraft}, store::{SaveStatus, Store, StoreError}};
+use super::{profile::{Draft, Method, MethodRef, SshAuth, ValidatedDraft}, store::{SaveStatus, Store, StoreError}};
 
 const UNTESTED: &str = "이 초안의 현재 시험이 없습니다";
 
@@ -209,15 +209,6 @@ fn remove_run(runs: &mut Runs, owner: &str, document: u64, key: &RunKey) -> Resu
     Ok(())
 }
 
-/// 원격 화면의 SSH 경로는 Agent·키 파일 인증의 저장된 직접 SSH 대상만 가리킨다. 마법사와 CLI 등록이 같이 쓴다.
-pub(super) fn desktop_route_ready(draft: &ValidatedDraft, store: &Store) -> Result<bool, StoreError> {
-    let MethodRef::Desktop { route: DesktopRoute::Ssh { target_id } } = draft.method() else { return Ok(true) };
-    let file = store.load()?;
-    Ok(file.targets.iter().any(|entry| entry.profile.id.as_str() == target_id && entry.profile.id.as_str() != draft.target_id()
-        && matches!(&entry.profile.method, Method::Ssh { ssh } if matches!(ssh.transport, SshTransport::Direct {})
-            && matches!(ssh.auth, SshAuth::Agent { .. } | SshAuth::KeyFile { .. }))))
-}
-
 pub(super) fn save_confirmed(sessions: &Sessions, owner: &str, document: u64, request: SaveRequest, store: &Store) -> Result<(), String> {
     let SaveRequest { run: key, draft } = request;
     let draft = draft.validate().map_err(|error| format!("초안 검증: {error:?}"))?;
@@ -225,14 +216,11 @@ pub(super) fn save_confirmed(sessions: &Sessions, owner: &str, document: u64, re
     if cfg!(all(feature = "stored-auth", any(windows, target_os = "linux")))
         && matches!(draft.method(), MethodRef::Ssh { ssh } if matches!(ssh.auth, SshAuth::StoredPassword { .. }))
     {
-        return saved(store.save_authorized(draft, None, || Ok(()), || {}));
+        return saved(store.save_authorized(draft, None, || sessions.with_probes(owner, document, |_| Ok(())), || {}));
     }
-    // 원격 화면 프로필은 비밀 없이 경로만 저장한다. 서버 신원과 터널은 열 때 다시 확인한다.
-    if !desktop_route_ready(&draft, store).map_err(|error| format!("프로필 읽기: {error:?}"))? {
-        return Err("Agent 또는 키 파일 인증의 저장된 직접 SSH 대상이 필요합니다".into());
-    }
+    // 원격 화면 프로필은 비밀 없이 경로만 저장한다. SSH 경로는 저장소가 확인하고, 서버 신원과 터널은 열 때 다시 확인한다.
     if matches!(draft.method(), MethodRef::Desktop { .. }) {
-        return saved(store.save_authorized(draft, None, || Ok(()), || {}));
+        return saved(store.save_authorized(draft, None, || sessions.with_probes(owner, document, |_| Ok(())), || {}));
     }
     let expected = sessions.with_probes(owner, document, |runs| {
         let run = runs.get(owner, &key)?;
@@ -265,10 +253,12 @@ pub(super) fn save_confirmed(sessions: &Sessions, owner: &str, document: u64, re
 fn saved(result: Result<SaveStatus, StoreError>) -> Result<(), String> {
     match result.map_err(|error| match error {
         StoreError::Authorization(reason) => reason,
+        StoreError::DesktopRoute => "Agent 또는 키 파일 인증의 저장된 직접 SSH 대상이 필요합니다".into(),
         other => format!("프로필 저장: {other:?}"),
     })? {
         SaveStatus::GroupConflict => Err("다른 작업이 그룹을 변경했습니다".into()),
         SaveStatus::TargetConflict => Err("다른 작업이 대상을 변경했습니다".into()),
+        SaveStatus::Referenced(_) => Err("원격 화면 세션이 이 SSH 세션을 연결 경로로 사용합니다".into()),
         SaveStatus::Saved => Ok(()),
     }
 }
