@@ -323,3 +323,20 @@ async fn edit_waits_use_separate_slots_until_document_close() {
     assert_eq!(edit_response(&mut next).await, edit::Response::Opened);
     service.abort();
 }
+
+#[test]
+fn cli_register_accepts_v1_and_v2_drafts() {
+    let root = connections::tests::TestDir::new();
+    for (index, version) in [1, 2].into_iter().enumerate() {
+        let mut input = connections::tests::draft(root.path(), "work", &format!("dev-{index}"));
+        input["version"] = serde_json::json!(version);
+        let Command::Register(draft) = parse("register", input.to_string().as_bytes()).unwrap() else {
+            panic!("등록 명령이 필요합니다");
+        };
+        register(&root.path().join("config"), draft).unwrap();
+    }
+    let mut future = connections::tests::draft(root.path(), "work", "dev-3");
+    future["version"] = serde_json::json!(3);
+    assert_eq!(parse("register", future.to_string().as_bytes()).err(), Some(Error::InvalidRequest));
+    assert_eq!(connections::ai_aliases(&root.path().join("config")).unwrap().len(), 2);
+}

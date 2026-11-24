@@ -477,7 +477,7 @@ export function Workspace() {
     setWizard({
       draftId: crypto.randomUUID(), initialDraft: {
         version: 1, groupRevision: group.revision, targetRevision: target.revision,
-        group: group.profile, target: target.profile,
+        group: group.profile, target: { ...target.profile, groupId: group.profile.id },
       }
     });
   }

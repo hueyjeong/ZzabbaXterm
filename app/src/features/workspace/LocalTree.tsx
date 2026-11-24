@@ -25,37 +25,41 @@ export function LocalTree({ profiles, openCounts, onOpen, onElevate, onLocalElev
 
   const term = query.trim().toLocaleLowerCase();
   const matches = (name: string) => name.toLocaleLowerCase().includes(term);
+  const item = ({ profile: target }: SavedConnections["targets"][number]) => ({
+    key: `target:${target.id}`, name: target.displayName, id: target.id, open: () => onOpen(target),
+    kind: (target.defaultMethod === "local" ? "local" : target.defaultMethod) as ProtocolKind,
+    viaSsm: (target.defaultMethod === "ssh" && target.ssh.transport.kind === "ssm")
+      || (target.defaultMethod === "rdp" && target.rdp.route.kind === "ssm")
+      || (target.defaultMethod === "vnc" && target.vnc.route.kind === "ssm"),
+    method: target.defaultMethod === "ssm" ? "AWS Systems Manager" : target.defaultMethod === "ssh" ? "SSH"
+      : target.defaultMethod === "s3" ? "S3" : target.defaultMethod === "rdp" ? "RDP"
+        : target.defaultMethod === "vnc" ? "VNC" : "로컬",
+    sshTargetId: target.defaultMethod === "ssh" ? target.id : undefined,
+    openRemoteEditor: target.defaultMethod === "ssh" && target.ssh.transport.kind === "direct" &&
+      (target.ssh.auth.kind === "agent" || target.ssh.auth.kind === "keyFile")
+      ? () => onOpen(target, { remoteEditor: true }) : undefined,
+    s3TargetId: target.defaultMethod === "s3" && onRetestS3 ? target.id : undefined,
+    openTunnel: target.defaultMethod === "ssm" || (target.defaultMethod === "ssh" && target.ssh.transport.kind === "direct")
+      ? () => onOpenTunnel(target.id, target.displayName, target.defaultMethod) : undefined,
+    openStorage: target.defaultMethod === "ssm" && onOpenStorage ? () => onOpenStorage(target.id, target.displayName) : undefined,
+    elevate: onElevate && target.defaultMethod === "ssh" ? () => onElevate(target) : undefined,
+  });
+  // 중첩 그룹은 아직 평면으로 표시한다. 그룹 없는 세션은 그룹 뒤 최상위에 둔다.
   const groups = [
     { key: "local", name: "로컬", id: "", targets: [{ key: "pc", name: "내 PC", id: "", kind: "local" as ProtocolKind, method: "로컬", open: () => onOpen(), elevate: onLocalElevate }] },
     ...(profiles?.groups.map(({ profile }) => ({
       key: `group:${profile.id}`, name: profile.displayName, id: profile.id,
-      targets: profiles.targets.filter(({ profile: target }) => target.groupId === profile.id).map(({ profile: target }) => ({
-        key: `target:${target.id}`, name: target.displayName, id: target.id, open: () => onOpen(target),
-        kind: (target.defaultMethod === "local" ? "local" : target.defaultMethod) as ProtocolKind,
-        viaSsm: (target.defaultMethod === "ssh" && target.ssh.transport.kind === "ssm")
-          || (target.defaultMethod === "rdp" && target.rdp.route.kind === "ssm")
-          || (target.defaultMethod === "vnc" && target.vnc.route.kind === "ssm"),
-        method: target.defaultMethod === "ssm" ? "AWS Systems Manager" : target.defaultMethod === "ssh" ? "SSH"
-          : target.defaultMethod === "s3" ? "S3" : target.defaultMethod === "rdp" ? "RDP"
-            : target.defaultMethod === "vnc" ? "VNC" : "로컬",
-        sshTargetId: target.defaultMethod === "ssh" ? target.id : undefined,
-        openRemoteEditor: target.defaultMethod === "ssh" && target.ssh.transport.kind === "direct" &&
-          (target.ssh.auth.kind === "agent" || target.ssh.auth.kind === "keyFile")
-          ? () => onOpen(target, { remoteEditor: true }) : undefined,
-        s3TargetId: target.defaultMethod === "s3" && onRetestS3 ? target.id : undefined,
-        openTunnel: target.defaultMethod === "ssm" || (target.defaultMethod === "ssh" && target.ssh.transport.kind === "direct")
-          ? () => onOpenTunnel(target.id, target.displayName, target.defaultMethod) : undefined,
-        openStorage: target.defaultMethod === "ssm" && onOpenStorage ? () => onOpenStorage(target.id, target.displayName) : undefined,
-        elevate: onElevate && target.defaultMethod === "ssh" ? () => onElevate(target) : undefined,
-      })),
+      targets: profiles.targets.filter(({ profile: target }) => target.groupId === profile.id).map(item),
     })) ?? []),
   ].flatMap((group) => {
     if (matches(group.name)) return [group];
     const targets = group.targets.filter((target) => matches(target.name));
     return targets.length ? [{ ...group, targets }] : [];
   });
+  const topLevel = (profiles?.targets.filter(({ profile }) => profile.groupId === undefined).map(item) ?? [])
+    .filter((target) => matches(target.name));
   const expanded = (key: string) => Boolean(term) || !collapsed.has(key);
-  const tabStop = groups.some((group) => group.key === selected ||
+  const tabStop = topLevel.some((target) => target.key === selected) || groups.some((group) => group.key === selected ||
     (expanded(group.key) && group.targets.some((target) => target.key === selected))) ? selected : groups[0]?.key;
 
   function toggle(key: string) {
@@ -129,12 +133,29 @@ export function LocalTree({ profiles, openCounts, onOpen, onElevate, onLocalElev
     event.preventDefault();
   }
 
+  function targetRow(target: MenuTarget & { key: string; name: string; id: string; viaSsm?: boolean }, siblings: readonly { key: string; name: string }[]) {
+    const count = openCounts?.get(target.id) ?? 0;
+    return <li key={target.key} role="treeitem" aria-selected={selected === target.key} tabIndex={tabStop === target.key ? 0 : -1}
+      onFocus={() => setSelected(target.key)} onClick={(event) => event.currentTarget.focus()}
+      onDoubleClick={target.open} onKeyDown={(event) => navigate(event, undefined, target)}
+      onContextMenu={(event) => {
+        event.preventDefault();
+        showMenu(event.currentTarget, target, event.clientX, event.clientY);
+      }}>
+      <div className="tree-row"><ProtocolIcon kind={target.kind} /><span>{target.name}</span>
+        {target.viaSsm && <span className="tree-via" role="img" title="SSM 경유" aria-label="SSM 경유" />}
+        {siblings.some((other) => other.key !== target.key && other.name === target.name) && <small title={target.id}>{target.id.slice(0, 8)}</small>}
+        {count > 0 && <span className="tree-open" role="img" title={`열린 탭 ${count}개`} aria-label={`열린 탭 ${count}개`} />}
+      </div>
+    </li>;
+  }
+
   return <>
     <div className="connection-search">
       <input className="ui-field" type="search" aria-label="연결 검색" placeholder="검색" value={query}
         onChange={(event) => setQuery(event.target.value)} />
     </div>
-    {term && !groups.length && <div className="connection-status" role="status">검색 결과 없음</div>}
+    {term && !groups.length && !topLevel.length && <div className="connection-status" role="status">검색 결과 없음</div>}
     <ul ref={tree} className="local-tree" role="tree" aria-label="연결">
       {groups.map((group) => {
         const open = expanded(group.key);
@@ -152,25 +173,11 @@ export function LocalTree({ profiles, openCounts, onOpen, onElevate, onLocalElev
               <small title={group.id || undefined}>{group.id.slice(0, 8) || "내 PC"}</small>}
           </div>
           <ul role="group" hidden={!open}>
-            {group.targets.map((target) => {
-              const count = openCounts?.get(target.id) ?? 0;
-              return <li key={target.key} role="treeitem" aria-selected={selected === target.key} tabIndex={tabStop === target.key ? 0 : -1}
-                onFocus={() => setSelected(target.key)} onClick={(event) => event.currentTarget.focus()}
-                onDoubleClick={target.open} onKeyDown={(event) => navigate(event, undefined, target)}
-                onContextMenu={(event) => {
-                  event.preventDefault();
-                  showMenu(event.currentTarget, target, event.clientX, event.clientY);
-                }}>
-                <div className="tree-row"><ProtocolIcon kind={target.kind} /><span>{target.name}</span>
-                  {"viaSsm" in target && target.viaSsm && <span className="tree-via" role="img" title="SSM 경유" aria-label="SSM 경유" />}
-                  {group.targets.some((other) => other.key !== target.key && other.name === target.name) && <small title={target.id}>{target.id.slice(0, 8)}</small>}
-                  {count > 0 && <span className="tree-open" role="img" title={`열린 탭 ${count}개`} aria-label={`열린 탭 ${count}개`} />}
-                </div>
-              </li>;
-            })}
+            {group.targets.map((target) => targetRow(target, group.targets))}
           </ul>
         </li>;
       })}
+      {topLevel.map((target) => targetRow(target, topLevel))}
     </ul>
     {menu && <Menu x={menu.x} y={menu.y} label={`${menu.target.method} 메뉴`} items={menuItems(menu)} restoreFocus={menu.row}
       onClose={() => setMenu(undefined)} />}

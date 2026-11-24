@@ -2,11 +2,25 @@ import { invoke } from "@tauri-apps/api/core";
 import type { ConnectionProfileDraft, ConnectionRequest, ConnectionTestDraft, ConnectionTestRun, LocalConnectionActions } from "./profiles";
 
 type SavedEntry<T> = Readonly<{ revision: number; profile: T }>;
+// parentId가 없으면 최상위 그룹, groupId가 없으면 그룹 없는 최상위 세션이다.
+export type SavedGroup = ConnectionProfileDraft["group"] & Readonly<{ parentId?: string }>;
+type WithoutGroup<T> = T extends unknown ? Omit<T, "groupId"> & Readonly<{ groupId?: string }> : never;
+export type SavedTarget = WithoutGroup<ConnectionProfileDraft["target"]>;
 export type SavedConnections = Readonly<{
-  version: 1;
-  groups: readonly SavedEntry<ConnectionProfileDraft["group"]>[];
-  targets: readonly SavedEntry<ConnectionProfileDraft["target"]>[];
+  version: 2;
+  groups: readonly SavedEntry<SavedGroup>[];
+  targets: readonly SavedEntry<SavedTarget>[];
 }>;
+
+export type GroupDraft = Readonly<{ version: 2; revision: number | null; group: SavedGroup }>;
+export type TargetDraft = Readonly<{ version: 2; targetRevision: number | null; target: SavedTarget }>;
+// 하위 포함 그룹 삭제에서 클라이언트가 본 하위 그룹과 세션이다. 저장본과 정확히 같아야 지운다.
+export type ExpectedEntry = Readonly<{ kind: "group" | "target"; id: string; revision: number }>;
+export type ConnectionEditError =
+  | Readonly<{ kind: "invalid"; field: string }>
+  | Readonly<{ kind: "conflict" }>
+  | Readonly<{ kind: "referenced"; targets: readonly string[] }>
+  | Readonly<{ kind: "failed"; message: string }>;
 
 type WaitReply = ConnectionTestRun & Readonly<{ sessionId: string | null }>;
 type Execution = {
@@ -19,6 +33,10 @@ export function createLocalConnectionIpc(): Omit<LocalConnectionActions, "onClos
   load(): Promise<SavedConnections>;
   registerSavedSshHost(targetId: string): Promise<null>;
   capabilities(): Promise<{ storedAuth: boolean }>;
+  saveGroup(draft: GroupDraft): Promise<{ revision: number }>;
+  deleteGroup(id: string, revision: number, expected: readonly ExpectedEntry[]): Promise<null>;
+  deleteTarget(id: string, revision: number): Promise<null>;
+  saveTarget(draft: TargetDraft): Promise<{ revision: number }>;
 } {
   const attempts = new WeakMap<ConnectionTestDraft, Execution>();
   const tested = new WeakMap<ConnectionTestRun, { attempt: ConnectionTestDraft; execution: Execution }>();
@@ -27,6 +45,11 @@ export function createLocalConnectionIpc(): Omit<LocalConnectionActions, "onClos
     load: () => invoke<SavedConnections>("connections_load", {}),
     registerSavedSshHost: (targetId) => invoke<null>("register_saved_ssh_host", { targetId }),
     capabilities: () => invoke<{ storedAuth: boolean }>("connection_capabilities", {}),
+    // 아래 편집 명령은 실패하면 ConnectionEditError로 거부한다.
+    saveGroup: (draft) => invoke<{ revision: number }>("connection_group_save", { draft }),
+    deleteGroup: (id, revision, expected) => invoke<null>("connection_group_delete", { id, revision, expected }),
+    deleteTarget: (id, revision) => invoke<null>("connection_target_delete", { id, revision }),
+    saveTarget: (draft) => invoke<{ revision: number }>("connection_target_save", { draft }),
     async verifySshHost({ targetId, host, port, hostKeyFingerprint }, draft, attempt, signal) {
       type Reply = { targetId: string; host: string; port: number; fingerprint: string };
       const request = { targetId, host, port, expectedFingerprint: hostKeyFingerprint };

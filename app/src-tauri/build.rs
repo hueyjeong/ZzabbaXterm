@@ -17,6 +17,7 @@ fn main() {
         "connections_load",
         "verify_ssh_host", "commit_ssh_host", "cancel_ssh_host",
         "register_saved_ssh_host",
+        "connection_group_save", "connection_group_delete", "connection_target_delete", "connection_target_save",
         "tunnel_tab_open", "tunnel_start", "tunnel_status", "tunnel_share", "tunnel_tab_close",
         "rdp_prepare", "rdp_connect", "rdp_input", "rdp_ack", "rdp_close",
         "vnc_create", "vnc_connect", "vnc_input", "vnc_ack", "vnc_close",
