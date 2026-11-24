@@ -1,6 +1,7 @@
 import { useLayoutEffect, useRef, useState } from "react";
 import { Check, ChevronDown, Cloud, PlugZap, X } from "lucide-react";
 import { IconButton, type MenuItem } from "../ui/controls";
+import { useContextMenu } from "../ui/useContextMenu";
 import { AnchoredMenu, useAnchoredMenu } from "./AnchoredMenu";
 
 export type SessionSelectionCandidate = Readonly<{ id: string; label: string; region: string; node: string }>;
@@ -36,6 +37,7 @@ function sameSession(a: Omit<SessionSelectionCandidate, "label">, b: Omit<Sessio
 export function SessionSelection({ candidates, visible = true, actions }: SessionSelectionProps) {
   const [state, setState] = useState<State>({ kind: "empty" });
   const menu = useAnchoredMenu<HTMLButtonElement>();
+  const context = useContextMenu();
   const live = useRef<State>(state);
   const mounted = useRef(false);
   const identity = state.kind === "selecting" ? state.candidate : "selection" in state ? state.selection : undefined;
@@ -144,6 +146,9 @@ export function SessionSelection({ candidates, visible = true, actions }: Sessio
       },
     })),
   ];
+  const contextItems: MenuItem[] = selected
+    ? [...items, { kind: "separator" }, { label: "선택 해제", icon: X, onSelect: () => void select("") }]
+    : items;
 
   return <div className="a01-session" hidden={!visible}>
     {candidates.length > 0
@@ -151,7 +156,9 @@ export function SessionSelection({ candidates, visible = true, actions }: Sessio
         <button type="button" ref={menu.anchor} className="a01-chip" data-value={shown?.id ?? ""}
           aria-label={`AI 작업 세션: ${name}`} title={selected ? `${selected.region} / ${selected.node}` : undefined}
           aria-haspopup="menu" aria-expanded={menu.open} disabled={busy} onClick={menu.toggle}
+          onContextMenu={(event) => context.open(event, contextItems, "AI 작업 세션")}
           onKeyDown={(event) => {
+            if (context.open(event, contextItems, "AI 작업 세션")) return;
             if (event.key === "ArrowDown" || event.key === "ArrowUp") {
               event.preventDefault();
               menu.show();
@@ -174,5 +181,6 @@ export function SessionSelection({ candidates, visible = true, actions }: Sessio
     {error && <p className="a01-inline-alert" role="alert">{error}</p>}
     {menu.open && visible && candidates.length > 0 && <AnchoredMenu anchor={menu.anchor} placement="above"
       items={items} label="AI 작업 세션" onClose={menu.close} />}
+    {visible && context.element}
   </div>;
 }
