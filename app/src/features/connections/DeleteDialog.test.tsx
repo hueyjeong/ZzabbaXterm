@@ -18,6 +18,9 @@ it("삭제 확인 창이 열리면 첫 포커스를 취소에 둔다", async () 
   await act(async () => root.render(<DeleteDialog name="작업 셸" onDelete={onDelete} onClose={vi.fn()} />));
   expect(document.activeElement?.textContent).toBe("취소");
   expect(onDelete).not.toHaveBeenCalled();
+  expect(host.querySelector(".delete-contents")).toBeNull();
+  await act(async () => root.render(<DeleteDialog name="운영" contents={{ groups: 2, targets: 5 }} onDelete={onDelete} onClose={vi.fn()} />));
+  expect([...host.querySelectorAll("dialog h2, dialog p")].map(item => item.textContent)).toEqual(["운영", "하위 그룹 2개, 세션 5개"]);
   await act(async () => root.unmount());
   host.remove();
 });

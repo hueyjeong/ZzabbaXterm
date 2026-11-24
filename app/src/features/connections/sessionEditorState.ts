@@ -13,8 +13,10 @@ export type EditorActions = LocalConnectionActions & Readonly<{
   saveTarget(draft: TargetDraft): Promise<{ revision: number }>;
   onClose(result: ConnectionClose): void;
 }>;
-/** groupId만 있으면 새 세션, target이 있으면 저장된 세션 편집이다. */
-export type EditorRequest = Readonly<{ groupId?: string; target?: never }> | Readonly<{ target: SavedTarget; revision: number }>;
+/** groupId만 있으면 새 세션, target이 있으면 저장된 세션 편집, copy가 있으면 그 설정을 복제한 새 세션이다. */
+export type EditorRequest = Readonly<{ groupId?: string; target?: never; copy?: never }>
+  | Readonly<{ target: SavedTarget; revision: number; copy?: never }>
+  | Readonly<{ copy: SavedTarget; target?: never }>;
 export type FieldError = Readonly<{ text: string; required?: true }>;
 export type FieldErrors = Readonly<Record<string, FieldError>>;
 export type EditorState = TestState & Readonly<{ draft: EditorTarget; touched: ReadonlySet<string> }>;
@@ -195,9 +197,9 @@ export function createSessionEditor(request: EditorRequest, actions: EditorActio
   const draftId = options.draftId ?? crypto.randomUUID();
   const shell = options.shell ?? (/Windows/.test(navigator.userAgent) ? "powerShell" : "bash");
   const targetRevision = request.target ? request.revision : null;
-  const initial: EditorTarget = request.target ? editorTarget(request.target) : {
-    ...blankMethod("local", shell), id: crypto.randomUUID(), ...(request.groupId ? { groupId: request.groupId } : {}),
-  };
+  const initial: EditorTarget = request.target ? editorTarget(request.target)
+    : request.copy ? { ...editorTarget(request.copy), id: crypto.randomUUID(), displayName: `${request.copy.displayName} (복사본)` }
+      : { ...blankMethod("local", shell), id: crypto.randomUUID(), ...(request.groupId ? { groupId: request.groupId } : {}) };
   let state: EditorState = { draft: initial, touched: new Set(), status: { kind: "idle" } };
   let draftVersion = 0;
   // 방식을 바꿨다가 돌아오면 그 방식에서 입력한 값을 되살린다.

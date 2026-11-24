@@ -9,6 +9,7 @@ import { sshTestIpc } from "../terminal/session";
 import { IconButton, ProtocolIcon } from "../ui/controls";
 import type { ConnectionMethod } from "./profiles";
 import { createSessionEditor, shownError, shownFields, testSupported, validate, type EditorActions, type EditorRequest } from "./sessionEditorState";
+import { groupOptions } from "./groupTree";
 import { Field } from "./fields/Field";
 import { DesktopFields } from "./fields/DesktopFields";
 import { LocalFields } from "./fields/LocalFields";
@@ -29,8 +30,6 @@ const methods: readonly (readonly [ConnectionMethod, string])[] = [
   ["local", "로컬"], ["ssh", "SSH"], ["ssm", "AWS SSM"], ["s3", "S3"], ["rdp", "RDP"], ["vnc", "VNC"],
 ];
 const discovery = createSsmDiscovery();
-// select의 option은 일반 공백을 접으므로 NBSP로 들여 쓴다.
-const INDENT = "\u00a0".repeat(3);
 
 function MethodTiles({ value, disabled, onSelect }: Readonly<{ value: ConnectionMethod; disabled: boolean; onSelect(method: ConnectionMethod): void }>) {
   const group = useRef<HTMLDivElement>(null);
@@ -52,31 +51,6 @@ function MethodTiles({ value, disabled, onSelect }: Readonly<{ value: Connection
       <span>{label}</span>
     </button>)}
   </div>;
-}
-
-/** 중첩 그룹을 부모 아래에 깊이만큼 들여 쓴 선택지로 펼친다. 부모가 없는 그룹은 최상위에 둔다. 이름이 겹치면 트리처럼 ID 앞 8자를 붙인다. */
-export function groupOptions(groups: SavedConnections["groups"]) {
-  const known = new Set(groups.map(({ profile }) => profile.id));
-  const names = new Map<string, number>();
-  for (const { profile } of groups) names.set(profile.displayName, (names.get(profile.displayName) ?? 0) + 1);
-  const children = new Map<string | undefined, SavedConnections["groups"][number]["profile"][]>();
-  for (const { profile } of groups) {
-    const parent = profile.parentId && known.has(profile.parentId) ? profile.parentId : undefined;
-    children.set(parent, [...children.get(parent) ?? [], profile]);
-  }
-  const options: { id: string; label: string }[] = [];
-  const seen = new Set<string>();
-  const walk = (parent: string | undefined, depth: number) => {
-    for (const group of children.get(parent) ?? []) {
-      if (seen.has(group.id)) continue;
-      seen.add(group.id);
-      const suffix = (names.get(group.displayName) ?? 0) > 1 ? ` ${group.id.slice(0, 8)}` : "";
-      options.push({ id: group.id, label: INDENT.repeat(depth) + group.displayName + suffix });
-      walk(group.id, depth + 1);
-    }
-  };
-  walk(undefined, 0);
-  return options;
 }
 
 export function SessionEditor(props: SessionEditorProps) {

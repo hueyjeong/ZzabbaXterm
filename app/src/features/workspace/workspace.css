@@ -138,7 +138,8 @@
 .connection-search { flex: none; padding: 0 10px 8px; }
 .connection-search input { width: 100%; }
 .local-tree, .local-tree [role="group"] { list-style: none; margin: 0; padding: 0; }
-.local-tree { padding-block: 2px 8px; font-size: 14px; user-select: none; }
+/* 빈 곳 우클릭을 받도록 사이드바의 남은 높이를 채운다. */
+.local-tree { flex: 1 0 auto; padding-block: 2px 8px; font-size: 14px; user-select: none; }
 .workspace-tabstrip, .workspace-rail, .workspace-side-head { user-select: none; }
 .tree-via::after { content: "SSM"; }
 .tree-via { flex: none; display: inline-flex; align-items: center; gap: 3px; padding: 0 5px; border-radius: 3px; background: rgb(242 163 58 / 12%); color: var(--proto-ssm); font-size: 10.5px; font-weight: 600; }
@@ -146,7 +147,8 @@
   display: flex; align-items: center; gap: 7px; height: 30px; padding-inline: 8px 10px; cursor: default; border-radius: var(--radius-sm);
   margin-inline: 4px;
 }
-[role="group"] .tree-row { padding-inline-start: 34px; }
+/* aria-level과 같은 --tree-level만큼 들여 쓴다. 하위 행은 상위 그룹의 폴더 아이콘 아래에서 시작한다. */
+.local-tree .tree-row { padding-inline-start: calc(8px + (var(--tree-level, 1) - 1) * 22px); }
 .tree-row > span:not([aria-hidden]):not(.tree-open) { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tree-row > small { flex: none; color: var(--text-faint); font: 11px var(--font-mono); }
 .tree-chevron { flex: none; width: 14px; height: 14px; color: var(--text-faint); transition: transform .12s; }

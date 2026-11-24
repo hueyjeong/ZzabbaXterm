@@ -4,14 +4,16 @@ import "./editor.css";
 
 export type DeleteDialogProps = Readonly<{
   name: string;
+  /** 그룹 삭제에서 함께 지워질 하위 그룹과 세션 수다. */
+  contents?: Readonly<{ groups: number; targets: number }>;
   onDelete(): Promise<void>;
   onClose(): void;
   /** 참조 오류의 세션 ID를 이름으로 바꾼다. */
   nameOf?(id: string): string;
 }>;
 
-/** 삭제 확인 창이다. 대상 이름과 "삭제", "취소"만 둔다. */
-export function DeleteDialog({ name, onDelete, onClose, nameOf = id => id }: DeleteDialogProps) {
+/** 삭제 확인 창이다. 대상 이름, 그룹이면 하위 항목 수, "삭제"와 "취소"만 둔다. */
+export function DeleteDialog({ name, contents, onDelete, onClose, nameOf = id => id }: DeleteDialogProps) {
   const dialog = useRef<HTMLDialogElement>(null);
   const cancel = useRef<HTMLButtonElement>(null);
   const [busy, setBusy] = useState(false);
@@ -44,6 +46,7 @@ export function DeleteDialog({ name, onDelete, onClose, nameOf = id => id }: Del
     if (!busy) onClose();
   }}>
     <h2>{name}</h2>
+    {contents && <p className="delete-contents">하위 그룹 {contents.groups}개, 세션 {contents.targets}개</p>}
     {error && <div role="alert">{error}</div>}
     <footer>
       <button type="button" className="danger" disabled={busy} onClick={() => void remove()}>삭제</button>

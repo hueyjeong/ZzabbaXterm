@@ -58,6 +58,23 @@ describe("세션 편집 창 상태", () => {
     expect(actions.onClose).toHaveBeenCalledExactlyOnceWith({ kind: "saved", draftId: "draft", targetId: editor.getSnapshot().draft.id });
   });
 
+  it("복제는 같은 설정과 새 ID, \"이름 (복사본)\"으로 새 세션을 저장한다", async () => {
+    const ssh: SavedTarget = {
+      id: "dev", groupId: "work", displayName: "개발 서버", defaultMethod: "ssh",
+      ssh: { host: "ssh.actual.test", port: 2222, account: "deploy", hostKeyFingerprint: fingerprint, transport: { kind: "direct" },
+        auth: { kind: "keyFile", privateKeyPath: "C:\\keys\\id" } },
+    };
+    const { editor, actions } = open({ copy: ssh });
+    expect(editor.targetRevision).toBeNull();
+    expect(editor.getSnapshot().draft).toMatchObject({ groupId: "work", displayName: "개발 서버 (복사본)", ssh: { port: "2222" } });
+    expect(editor.getSnapshot().draft.id).not.toBe("dev");
+    expect(editor.canSave()).toBe(true);
+    await editor.save();
+    expect(actions.saveTarget).toHaveBeenCalledExactlyOnceWith({
+      version: 2, targetRevision: null, target: { ...ssh, id: editor.getSnapshot().draft.id, displayName: "개발 서버 (복사본)" },
+    });
+  });
+
   it("시험에 성공한 뒤 저장하면 티켓 저장을 호출한다", async () => {
     const { editor, actions } = open({ target: local, revision: 3 });
     await editor.test();
