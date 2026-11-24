@@ -8,12 +8,14 @@ export type DeleteDialogProps = Readonly<{
   contents?: Readonly<{ groups: number; targets: number }>;
   onDelete(): Promise<void>;
   onClose(): void;
+  /** 충돌 오류 문구다. 기본값은 세션 충돌 문구다. */
+  conflictText?: string;
   /** 참조 오류의 세션 ID를 이름으로 바꾼다. */
   nameOf?(id: string): string;
 }>;
 
 /** 삭제 확인 창이다. 대상 이름, 그룹이면 하위 항목 수, "삭제"와 "취소"만 둔다. */
-export function DeleteDialog({ name, contents, onDelete, onClose, nameOf = id => id }: DeleteDialogProps) {
+export function DeleteDialog({ name, contents, conflictText, onDelete, onClose, nameOf = id => id }: DeleteDialogProps) {
   const dialog = useRef<HTMLDialogElement>(null);
   const cancel = useRef<HTMLButtonElement>(null);
   const [busy, setBusy] = useState(false);
@@ -34,7 +36,8 @@ export function DeleteDialog({ name, contents, onDelete, onClose, nameOf = id =>
     } catch (failure) {
       const referenced = failure as { kind?: string; targets?: readonly string[] } | null;
       setError(referenced?.kind === "referenced" && referenced.targets
-        ? `참조 중인 세션: ${referenced.targets.map(nameOf).join(", ")}` : editError(failure).error);
+        ? `참조 중인 세션: ${referenced.targets.map(nameOf).join(", ")}`
+        : referenced?.kind === "conflict" && conflictText ? conflictText : editError(failure).error);
       setBusy(false);
       return;
     }

@@ -286,3 +286,12 @@ fn inherited_agent_session_markers_are_removed_but_user_settings_stay() {
     let plain = [(OsString::from("GIT_EDITOR"), OsString::from("true"))];
     assert!(super::inherited_agent_env(plain, builder(&[("GIT_EDITOR", "true")])).is_empty());
 }
+
+#[test]
+fn empty_saved_start_directory_starts_in_the_home_directory() {
+    let home = dirs::home_dir().expect("홈 디렉터리");
+    assert_eq!(start_directory(std::path::Path::new("")).unwrap().as_ref(), home.as_path());
+    let dir = std::env::temp_dir();
+    assert_eq!(start_directory(&dir).unwrap().as_ref(), dir.as_path());
+    assert!(start_directory(&dir.join("zzabba-missing-start-directory")).is_err());
+}

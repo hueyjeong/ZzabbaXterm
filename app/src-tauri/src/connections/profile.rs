@@ -529,8 +529,9 @@ impl Target {
                 if !matches!((cfg!(windows), local.shell), (true, Shell::PowerShell) | (false, Shell::Bash)) {
                     return Err(ValidationError::UnsupportedShell);
                 }
+                // 빈 경로는 사용자 홈 디렉터리에서 시작한다.
                 let path = &local.start_directory;
-                if !path.is_absolute() || path.as_os_str().as_encoded_bytes().contains(&0) {
+                if !path.as_os_str().is_empty() && (!path.is_absolute() || path.as_os_str().as_encoded_bytes().contains(&0)) {
                     return Err(ValidationError::StartDirectory);
                 }
                 Ok(())

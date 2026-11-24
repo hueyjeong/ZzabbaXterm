@@ -4,7 +4,7 @@ import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { GroupDraft, SavedConnections } from "./connectionIpc";
 import { GroupDialog, type GroupRequest } from "./GroupDialog";
-import { groupContents, groupDepth, subtreeHeight } from "./groupTree";
+import { groupChildren, groupContents, groupDepth, groupOptions, subtreeHeight } from "./groupTree";
 
 let host: HTMLDivElement;
 
@@ -151,7 +151,7 @@ it("Rust 오류는 이름·상위 그룹 필드 아래나 상태 줄에 짧게 �
     expect(view.errors()).toEqual(["이름 형식 오류"]);
     expect(view.name.getAttribute("aria-invalid")).toBe("true");
     await view.submit();
-    expect(view.errors()).toEqual(["상위 그룹 순환 또는 깊이 초과"]);
+    expect(view.errors()).toEqual(["상위 그룹 오류"]);
     await view.submit();
     expect(view.errors()).toEqual(["다른 작업이 그룹을 변경했습니다"]);
     await view.submit();
@@ -191,4 +191,28 @@ it("그룹 깊이와 하위 높이, 하위 포함 삭제 집합을 계산한다"
       { kind: "target", id: "in-a", revision: 2 }, { kind: "target", id: "in-c", revision: 2 },
     ],
   });
+});
+
+it("없는 부모를 가리키는 고아 그룹은 최상위로 다루고 순환 데이터에서도 계산이 끝난다", () => {
+  const orphan: SavedConnections["groups"] = [
+    { revision: 1, profile: { id: "top", displayName: "위" } },
+    { revision: 1, profile: { id: "orphan", displayName: "고아", parentId: "missing" } },
+    { revision: 1, profile: { id: "child", displayName: "아래", parentId: "orphan" } },
+  ];
+  expect(groupChildren(orphan).get(undefined)?.map(({ id }) => id)).toEqual(["top", "orphan"]);
+  expect(groupOptions(orphan).map(({ id }) => id)).toEqual(["top", "orphan", "child"]);
+  expect(groupDepth(orphan, "orphan")).toBe(1);
+  expect(groupDepth(orphan, "child")).toBe(2);
+  expect(subtreeHeight(orphan, "orphan")).toBe(2);
+
+  // x → y → x 순환은 최상위에서 닿지 않으므로 선택지에 없다. 깊이와 높이, 삭제 집합은 한 바퀴에서 멈춘다.
+  const cycle: SavedConnections["groups"] = [
+    { revision: 1, profile: { id: "top", displayName: "위" } },
+    { revision: 2, profile: { id: "x", displayName: "엑스", parentId: "y" } },
+    { revision: 3, profile: { id: "y", displayName: "와이", parentId: "x" } },
+  ];
+  expect(groupOptions(cycle).map(({ id }) => id)).toEqual(["top"]);
+  expect(groupDepth(cycle, "x")).toBe(2);
+  expect(subtreeHeight(cycle, "x")).toBe(2);
+  expect(groupContents({ version: 2, groups: cycle, targets: [] }, "x").expected).toEqual([{ kind: "group", id: "y", revision: 3 }]);
 });

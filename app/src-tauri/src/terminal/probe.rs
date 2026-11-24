@@ -336,7 +336,8 @@ fn combine_cleanup<T>(result: Result<T, String>, cleanup: Result<(), String>) ->
 }
 
 fn command(shell: Shell, directory: &std::path::Path) -> Result<CommandBuilder, String> {
-    super::validate_working_directory(directory)?;
+    let directory = super::start_directory(directory)?;
+    let directory = &*directory;
     let mut command = match shell {
         #[cfg(windows)]
         Shell::PowerShell => {

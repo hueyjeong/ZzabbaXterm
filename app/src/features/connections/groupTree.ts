@@ -13,7 +13,9 @@ export function groupChildren(groups: Groups) {
   const children = new Map<string | undefined, SavedGroup[]>();
   for (const { profile } of groups) {
     const parent = profile.parentId && known.has(profile.parentId) ? profile.parentId : undefined;
-    children.set(parent, [...children.get(parent) ?? [], profile]);
+    const siblings = children.get(parent);
+    if (siblings) siblings.push(profile);
+    else children.set(parent, [profile]);
   }
   return children;
 }

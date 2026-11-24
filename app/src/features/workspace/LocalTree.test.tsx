@@ -262,7 +262,7 @@ it("중첩 트리에서 화살표·Home·End·Enter·Space·F2·Delete로 이동
   }
 });
 
-it("빈 곳은 최상위 추가, 그룹은 그 안의 추가·이름 바꾸기·삭제, 세션은 편집·복제·삭제 메뉴를 띄운다", () => {
+it("빈 곳은 최상위 추가, 그룹은 그 안의 추가·편집·삭제, 세션은 편집·복제·삭제 메뉴를 띄운다", () => {
   const view = renderTree();
   try {
     view.contextMenu(view.tree);
@@ -281,9 +281,9 @@ it("빈 곳은 최상위 추가, 그룹은 그 안의 추가·이름 바꾸기·
 
     view.contextMenu(view.row("하위").querySelector(".tree-row")!);
     expect(view.menu()?.getAttribute("aria-label")).toBe("하위 그룹 메뉴");
-    expect(view.menuItems()).toEqual(["세션 추가…", "그룹 추가…", "이름 바꾸기…", "삭제"]);
+    expect(view.menuItems()).toEqual(["세션 추가…", "그룹 추가…", "편집…", "삭제"]);
     expect(view.menu()!.querySelectorAll("[role=separator]")).toHaveLength(2);
-    for (const label of ["세션 추가…", "그룹 추가…", "이름 바꾸기…", "삭제"]) {
+    for (const label of ["세션 추가…", "그룹 추가…", "편집…", "삭제"]) {
       view.contextMenu(view.row("하위"));
       view.choose(label);
     }
@@ -323,7 +323,7 @@ it("메뉴 키와 Shift+F10으로 그룹·로컬 메뉴를 열고 닫으면 원�
 
     // 메뉴 항목을 고르면 동작 전에 행으로 포커스를 돌린다.
     view.contextMenu(view.row("기타"));
-    view.choose("이름 바꾸기…");
+    view.choose("편집…");
     expect(document.activeElement).toBe(view.row("기타"));
   } finally {
     view.unmount();
@@ -381,5 +381,35 @@ it("세션 행 메뉴의 편집…과 삭제는 세션 ID를 넘기고 내 PC에
     act(() => root.unmount());
     host.remove();
     vi.unstubAllGlobals();
+  }
+});
+
+it("이미 8단계인 그룹의 그룹 추가는 비활성이고 빈 곳 메뉴를 Escape로 닫으면 트리의 현재 행으로 포커스를 돌린다", () => {
+  const deep: SavedConnections = {
+    version: 2, targets: [],
+    groups: Array.from({ length: 8 }, (_, index) => ({
+      revision: 1, profile: { id: `l${index + 1}`, displayName: `단계 ${index + 1}`, ...(index ? { parentId: `l${index}` } : {}) },
+    })),
+  };
+  const view = renderTree({ profiles: deep });
+  try {
+    const addGroup = () => [...view.host.querySelectorAll<HTMLButtonElement>("button[role=menuitem]")].find(item => item.textContent === "그룹 추가…")!;
+    view.contextMenu(view.row("단계 7"));
+    expect(addGroup().disabled).toBe(false);
+    view.press(view.menu()!, "Escape");
+    view.contextMenu(view.row("단계 8"));
+    expect(view.row("단계 8").getAttribute("aria-level")).toBe("8");
+    expect(addGroup().disabled).toBe(true);
+    expect(view.menuItems()).toEqual(["세션 추가…", "그룹 추가…", "편집…", "삭제"]);
+    view.press(view.menu()!, "Escape");
+
+    act(() => (document.activeElement as HTMLElement).blur());
+    expect(document.activeElement).toBe(document.body);
+    view.contextMenu(view.tree);
+    view.press(view.menu()!, "Escape");
+    expect(view.menu()).toBeNull();
+    expect(document.activeElement).toBe(view.row("단계 8"));
+  } finally {
+    view.unmount();
   }
 });

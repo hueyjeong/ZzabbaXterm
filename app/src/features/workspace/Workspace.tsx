@@ -499,6 +499,30 @@ export function Workspace() {
     setTreeFocus(value => value + 1);
   }
 
+  /** 저장 충돌 뒤 목록을 바로 다시 읽어 화면에 반영하고 돌려준다. */
+  async function refreshProfiles() {
+    const profiles = await connections.load();
+    setProfileLoad({ kind: "ready", profiles });
+    return profiles;
+  }
+
+  /** 삭제 충돌이면 목록을 다시 읽어 개정과 하위 항목을 새로 계산한다. 다음 삭제는 새 값으로 나간다. */
+  async function refreshDeleting(failure: unknown): Promise<never> {
+    if ((failure as { kind?: string } | null)?.kind !== "conflict" || !deleting) throw failure;
+    const profiles = await refreshProfiles();
+    const id = deleting.entry.profile.id;
+    if (deleting.kind === "group") {
+      const entry = profiles.groups.find(({ profile }) => profile.id === id);
+      if (!entry) throw { kind: "failed", message: "이미 삭제되었습니다" };
+      setDeleting({ kind: "group", entry, contents: groupContents(profiles, id) });
+    } else {
+      const entry = profiles.targets.find(({ profile }) => profile.id === id);
+      if (!entry) throw { kind: "failed", message: "이미 삭제되었습니다" };
+      setDeleting({ kind: "target", entry });
+    }
+    throw failure;
+  }
+
   const savedTarget = (id: string) => profileLoad.profiles?.targets.find(({ profile }) => profile.id === id);
   const savedGroup = (id: string) => profileLoad.profiles?.groups.find(({ profile }) => profile.id === id);
 
@@ -1188,19 +1212,27 @@ export function Workspace() {
       {sessionEditor && <SessionEditor key={sessionEditor.key} request={sessionEditor.request}
         groups={profileLoad.profiles?.groups ?? []} targets={profileLoad.profiles?.targets} capabilities={connections.capabilities}
         test={connections.test} cancelTest={connections.cancelTest} save={connections.save} saveTarget={connections.saveTarget}
+        latestRevision={async (id) => (await refreshProfiles()).targets.find(({ profile }) => profile.id === id)?.revision}
         onClose={closeSessionEditor} />}
       {groupDialog && <GroupDialog key={groupDialog.key} request={groupDialog.request} groups={profileLoad.profiles?.groups ?? []}
-        save={connections.saveGroup} onClose={(saved) => {
+        save={connections.saveGroup}
+        latestRevision={async (id) => (await refreshProfiles()).groups.find(({ profile }) => profile.id === id)?.revision}
+        onClose={(saved) => {
           setGroupDialog(undefined);
           returnToTree(saved);
         }} />}
       {deleting && <DeleteDialog name={deleting.entry.profile.displayName}
         contents={deleting.kind === "group" ? deleting.contents : undefined}
+        conflictText={deleting.kind === "group" ? "다른 작업이 그룹을 변경했습니다" : undefined}
         nameOf={id => savedTarget(id)?.profile.displayName ?? id}
         onDelete={async () => {
           const { profile, revision } = deleting.entry;
-          if (deleting.kind === "group") await connections.deleteGroup(profile.id, revision, deleting.contents.expected);
-          else await connections.deleteTarget(profile.id, revision);
+          try {
+            if (deleting.kind === "group") await connections.deleteGroup(profile.id, revision, deleting.contents.expected);
+            else await connections.deleteTarget(profile.id, revision);
+          } catch (failure) {
+            await refreshDeleting(failure);
+          }
           refocusAfterLoad.current = true;
           reloadProfiles();
         }}

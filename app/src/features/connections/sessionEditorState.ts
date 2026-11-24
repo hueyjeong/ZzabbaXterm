@@ -12,6 +12,8 @@ export type EditorActions = LocalConnectionActions & Readonly<{
   // 시험하지 않은 초안을 입력 검증만 거쳐 저장한다.
   saveTarget(draft: TargetDraft): Promise<{ revision: number }>;
   onClose(result: ConnectionClose): void;
+  /** 저장 충돌 뒤 목록을 다시 읽어 세션의 현재 개정을 돌려준다. 없으면 undefined다. */
+  latestRevision?(targetId: string): Promise<number | undefined>;
 }>;
 /** groupId만 있으면 새 세션, target이 있으면 저장된 세션 편집, copy가 있으면 그 설정을 복제한 새 세션이다. */
 export type EditorRequest = Readonly<{ groupId?: string; target?: never; copy?: never }>
@@ -68,6 +70,14 @@ export function validate(target: EditorTarget, storedAuth: boolean): FieldErrors
   };
   need("displayName", target.displayName);
   switch (target.defaultMethod) {
+    case "local": {
+      // 비우면 홈 디렉터리에서 시작한다. 입력하면 드라이브나 /로 시작하는 절대 경로여야 한다. OS별 검사는 Rust가 한다.
+      const { startDirectory } = target.local;
+      if (startDirectory && !/^([A-Za-z]:[\\/]|\/)/.test(startDirectory)) {
+        errors["local.startDirectory"] = { text: "절대 경로 필요" };
+      }
+      break;
+    }
     case "ssm":
       if (!target.ssm) errors["ssm.instanceId"] = required;
       break;
@@ -134,6 +144,7 @@ function serverFieldText(field: string) {
   if (/port$/i.test(field)) return "포트 형식 오류";
   if (/host$/i.test(field)) return "호스트 형식 오류";
   if (field === "ssh.hostKeyFingerprint") return "지문 형식 오류";
+  if (field === "local.startDirectory") return "경로 형식 오류";
   return "입력 오류";
 }
 
@@ -196,7 +207,7 @@ export function createSessionEditor(request: EditorRequest, actions: EditorActio
 }> = {}) {
   const draftId = options.draftId ?? crypto.randomUUID();
   const shell = options.shell ?? (/Windows/.test(navigator.userAgent) ? "powerShell" : "bash");
-  const targetRevision = request.target ? request.revision : null;
+  let targetRevision = request.target ? request.revision : null;
   const initial: EditorTarget = request.target ? editorTarget(request.target)
     : request.copy ? { ...editorTarget(request.copy), id: crypto.randomUUID(), displayName: `${request.copy.displayName} (복사본)` }
       : { ...blankMethod("local", shell), id: crypto.randomUUID(), ...(request.groupId ? { groupId: request.groupId } : {}) };
@@ -273,7 +284,18 @@ export function createSessionEditor(request: EditorRequest, actions: EditorActio
       if (passed) await actions.save(passed.request);
       else await actions.saveTarget({ version: 2, targetRevision, target });
     } catch (error) {
-      if (state.status === saving) update({ status: { kind: "saveFailed", ...editError(error), ...passed } });
+      if (state.status !== saving) return;
+      if ((error as Partial<ConnectionEditError> | null)?.kind === "conflict" && targetRevision !== null && actions.latestRevision) {
+        // 다음 저장은 저장본의 새 개정으로 보낸다. 시험 티켓은 이전 개정에 묶여 있으므로 버리고 실행을 회수한다.
+        const latest = await actions.latestRevision(target.id).catch(() => undefined);
+        if (latest !== undefined) targetRevision = latest;
+        if (state.status !== saving) return;
+        if (passed) draftVersion += 1;
+        update({ status: { kind: "saveFailed", ...editError(error) } });
+        if (passed) void tester.cancelPending();
+        return;
+      }
+      update({ status: { kind: "saveFailed", ...editError(error), ...passed } });
       return;
     }
     if (passed) tester.settle(passed.attempt);
@@ -284,7 +306,7 @@ export function createSessionEditor(request: EditorRequest, actions: EditorActio
 
   return {
     draftId,
-    targetRevision,
+    get targetRevision() { return targetRevision; },
     getSnapshot: () => state,
     subscribe(listener: () => void) {
       listeners.add(listener);

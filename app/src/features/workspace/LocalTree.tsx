@@ -4,7 +4,7 @@ import {
   SquarePen, SquareTerminal, Trash2, Waypoints, type LucideIcon,
 } from "lucide-react";
 import type { SavedConnections } from "../connections/connectionIpc";
-import { groupChildren } from "../connections/groupTree";
+import { groupChildren, MAX_GROUP_DEPTH } from "../connections/groupTree";
 import { Menu, ProtocolIcon, type MenuItem, type ProtocolKind } from "../ui/controls";
 
 type OpenTarget = (target?: SavedConnections["targets"][number]["profile"], options?: { readonly remoteEditor?: true }) => void;
@@ -15,7 +15,8 @@ type MenuTarget = {
 };
 type TreeTarget = MenuTarget & { key: string; name: string; id: string; viaSsm?: boolean };
 // local은 "내 PC"를 담는 합성 그룹이다. 추가·이름 바꾸기·삭제 대상이 아니다.
-type TreeGroup = { key: string; name: string; id: string; local?: true; groups: readonly TreeGroup[]; targets: readonly TreeTarget[] };
+// depth는 최상위를 1로 센 그룹 깊이다.
+type TreeGroup = { key: string; name: string; id: string; depth: number; local?: true; groups: readonly TreeGroup[]; targets: readonly TreeTarget[] };
 
 export function LocalTree({
   profiles, openCounts, onOpen, onElevate, onLocalElevate, onRegisterSshHost, onTrustSshHost, onEdit, onDelete, onDuplicate,
@@ -79,14 +80,19 @@ export function LocalTree({
   // 그룹은 parentId로 중첩한다. 하위 그룹을 세션보다 먼저 두고, 그룹 없는 세션은 최상위 그룹 뒤에 둔다.
   const targetsByGroup = new Map<string | undefined, TreeTarget[]>();
   for (const entry of profiles?.targets ?? []) {
-    targetsByGroup.set(entry.profile.groupId, [...targetsByGroup.get(entry.profile.groupId) ?? [], item(entry)]);
+    const siblings = targetsByGroup.get(entry.profile.groupId);
+    if (siblings) siblings.push(item(entry));
+    else targetsByGroup.set(entry.profile.groupId, [item(entry)]);
   }
   const children = groupChildren(profiles?.groups ?? []);
   const built = new Set<string>();
-  const build = (id: string | undefined): TreeGroup[] => (children.get(id) ?? []).flatMap((group) => {
+  const build = (id: string | undefined, depth: number): TreeGroup[] => (children.get(id) ?? []).flatMap((group) => {
     if (built.has(group.id)) return [];
     built.add(group.id);
-    return [{ key: `group:${group.id}`, name: group.displayName, id: group.id, groups: build(group.id), targets: targetsByGroup.get(group.id) ?? [] }];
+    return [{
+      key: `group:${group.id}`, name: group.displayName, id: group.id, depth,
+      groups: build(group.id, depth + 1), targets: targetsByGroup.get(group.id) ?? [],
+    }];
   });
   // 검색하면 일치하는 항목과 그 조상 그룹을 남긴다. 이름이 일치하는 그룹은 내용을 모두 보인다.
   const filter = (group: TreeGroup): TreeGroup[] => {
@@ -96,9 +102,9 @@ export function LocalTree({
     return groups.length || targets.length ? [{ ...group, groups, targets }] : [];
   };
   const groups = [
-    { key: "local", name: "로컬", id: "", local: true as const, groups: [],
+    { key: "local", name: "로컬", id: "", depth: 1, local: true as const, groups: [],
       targets: [{ key: "pc", name: "내 PC", id: "", kind: "local" as ProtocolKind, method: "로컬", open: () => onOpen(), elevate: onLocalElevate }] },
-    ...build(undefined),
+    ...build(undefined, 1),
   ].flatMap(filter);
   const topLevel = (targetsByGroup.get(undefined) ?? []).filter((target) => matches(target.name));
   const expanded = (key: string) => Boolean(term) || !collapsed.has(key);
@@ -146,10 +152,11 @@ export function LocalTree({
     if (group.local) return blankMenu();
     const items: MenuItem[] = [];
     if (onAddSession) items.push({ label: "세션 추가…", icon: Plus, onSelect: () => onAddSession(group.id) });
-    if (onAddGroup) items.push({ label: "그룹 추가…", icon: FolderPlus, onSelect: () => onAddGroup(group.id) });
+    // 이미 최대 깊이인 그룹에는 하위 그룹을 만들 수 없다.
+    if (onAddGroup) items.push({ label: "그룹 추가…", icon: FolderPlus, disabled: group.depth >= MAX_GROUP_DEPTH, onSelect: () => onAddGroup(group.id) });
     if (onEditGroup) {
       if (items.length) items.push({ kind: "separator" });
-      items.push({ label: "이름 바꾸기…", icon: SquarePen, onSelect: () => onEditGroup(group.id) });
+      items.push({ label: "편집…", icon: SquarePen, onSelect: () => onEditGroup(group.id) });
     }
     if (onDeleteGroup) {
       if (items.length) items.push({ kind: "separator" });
@@ -282,7 +289,9 @@ export function LocalTree({
     <ul ref={tree} className="local-tree" role="tree" aria-label="연결" onContextMenu={(event) => {
       // 행 밖의 빈 곳이다. 행의 메뉴는 행에서 전파를 멈춘다.
       event.preventDefault();
-      const active = document.activeElement instanceof HTMLElement && document.activeElement !== document.body ? document.activeElement : null;
+      // 포커스가 없었으면 메뉴를 닫을 때 트리의 현재 행으로 돌린다.
+      const active = document.activeElement instanceof HTMLElement && document.activeElement !== document.body ? document.activeElement
+        : tree.current?.querySelector<HTMLElement>('[role="treeitem"][tabindex="0"]') ?? null;
       showMenu(active, "연결 메뉴", blankMenu(), event.clientX, event.clientY, false);
     }}>
       {groups.map((group) => groupRow(group, groups, 1))}

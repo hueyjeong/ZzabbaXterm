@@ -2693,6 +2693,27 @@ describe("세션 편집 창", () => {
     expect(tree().textContent).toContain("새 셸");
   });
 
+  it("세션 편집 창의 저장 충돌 뒤에는 목록을 다시 읽어 새 개정으로 저장한다", async () => {
+    let revision = 5;
+    loadProfiles = async () => ({ version: 2, groups: [], targets: [shell(revision)] });
+    runConnectionCommand = async (command) => {
+      if (command !== "connection_target_save") throw command;
+      if (revision === 5) {
+        revision = 9;
+        throw { kind: "conflict" };
+      }
+      return { revision: 10 };
+    };
+    await restartWorkspace();
+    await treeMenuAction("작업 셸", "편집…");
+    await changeInput("이름", "바꾼 셸");
+    await press("저장");
+    expect(find("dialog[open] [role=alert]").textContent).toBe("다른 작업이 세션을 변경했습니다");
+    await press("저장");
+    expect(connectionCalls("connection_target_save").map(([, args]) => (args as { draft: { targetRevision: number } }).draft.targetRevision)).toEqual([5, 9]);
+    expect(host.querySelector("dialog")).toBeNull();
+  });
+
   it("세션 행의 편집…은 저장본과 개정으로 편집 창을 연다", async () => {
     loadProfiles = async () => ({ version: 2, groups: [], targets: [shell(5)] });
     runConnectionCommand = async (command) => {
@@ -2709,12 +2730,15 @@ describe("세션 편집 창", () => {
     } }]]);
   });
 
-  it("세션 행의 삭제는 확인 뒤 개정과 함께 지우고 참조 오류와 충돌을 표시한다", async () => {
-    loadProfiles = async () => ({ version: 2, groups: [], targets: [shell(2)] });
+  it("세션 행의 삭제는 확인 뒤 개정과 함께 지우고 참조 오류와 충돌을 표시하며 충돌 뒤에는 새 개정으로 지운다", async () => {
+    let revision = 2;
+    loadProfiles = async () => ({ version: 2, groups: [], targets: [shell(revision)] });
     const replies: unknown[] = [{ kind: "referenced", targets: ["shell"] }, { kind: "conflict" }];
     runConnectionCommand = async (command) => {
       if (command !== "connection_target_delete") throw command;
       const reply = replies.shift();
+      // 충돌은 다른 작업이 세션을 먼저 저장해 개정이 3이 된 경우다.
+      if ((reply as { kind?: string } | undefined)?.kind === "conflict") revision = 3;
       if (reply) throw reply;
       return null;
     };
@@ -2730,7 +2754,7 @@ describe("세션 편집 창", () => {
     expect(dialog.querySelector("[role=alert]")?.textContent).toBe("다른 작업이 세션을 변경했습니다");
     const loads = connectionCalls("connections_load").length;
     await act(async () => { dialog.querySelector("button")!.click(); });
-    expect(connectionCalls("connection_target_delete")).toEqual(Array(3).fill(["connection_target_delete", { id: "shell", revision: 2 }]));
+    expect(connectionCalls("connection_target_delete").map(([, args]) => args)).toEqual([2, 2, 3].map(revision => ({ id: "shell", revision })));
     expect(host.querySelector('dialog[aria-label="삭제"]')).toBeNull();
     expect(connectionCalls("connections_load")).toHaveLength(loads + 1);
   });
@@ -2813,7 +2837,7 @@ describe("연결 트리 메뉴", () => {
     await restartWorkspace();
     await contextMenu(treeGroup("작업"));
     expect(openMenu().getAttribute("aria-label")).toBe("작업 그룹 메뉴");
-    expect(menuItemNames()).toEqual(["세션 추가…", "그룹 추가…", "이름 바꾸기…", "삭제"]);
+    expect(menuItemNames()).toEqual(["세션 추가…", "그룹 추가…", "편집…", "삭제"]);
     await chooseMenuItem("세션 추가…");
     expect(find("dialog[open] h2").textContent).toBe("세션 추가");
     expect(selected("그룹")).toBe("work");
@@ -2832,39 +2856,46 @@ describe("연결 트리 메뉴", () => {
     }]]);
   });
 
-  it("그룹 편집에서 이름과 상위 그룹을 바꾸면 개정과 함께 이동하고 충돌은 상태 줄에 보인다", async () => {
+  it("그룹 편집에서 이름과 상위 그룹을 바꾸면 개정과 함께 이동하고 충돌 뒤에는 새 개정으로 다시 보낸다", async () => {
+    let groupA = { revision: 4, profile: { id: "a", displayName: "가" } };
     loadProfiles = async () => ({
       version: 2, targets: [],
       groups: [
-        { revision: 4, profile: { id: "a", displayName: "가" } },
+        groupA,
         { revision: 2, profile: { id: "b", displayName: "나", parentId: "a" } },
         { revision: 1, profile: { id: "c", displayName: "다" } },
       ],
     });
-    const replies: unknown[] = [{ kind: "conflict" }];
+    let conflict = true;
     runConnectionCommand = async (command) => {
       if (command !== "connection_group_save") throw command;
-      const reply = replies.shift();
-      if (reply) throw reply;
-      return { revision: 5 };
+      if (conflict) {
+        // 다른 작업이 먼저 이름을 바꿔 저장본의 개정이 6이 됐다.
+        conflict = false;
+        groupA = { revision: 6, profile: { id: "a", displayName: "다른 이름" } };
+        throw { kind: "conflict" };
+      }
+      return { revision: 7 };
     };
     await restartWorkspace();
     expect(treeGroup("나").getAttribute("aria-level")).toBe("2");
-    await groupMenuAction("가", "이름 바꾸기…");
+    await groupMenuAction("가", "편집…");
     const dialog = find<HTMLDialogElement>('dialog[aria-label="그룹 편집"]');
     expect([...dialog.querySelectorAll("option")].map(item => item.value)).toEqual(["", "c"]);
     await changeInput("이름", "가가");
     await chooseSelect("상위 그룹", "c");
     await press("저장");
     expect(dialog.querySelector("[role=alert]")?.textContent).toBe("다른 작업이 그룹을 변경했습니다");
+    // 입력은 그대로 두고 다음 저장만 새 개정으로 보낸다.
+    expect(dialog.querySelector("input")?.value).toBe("가가");
     await press("저장");
-    expect(connectionCalls("connection_group_save")).toEqual(Array(2).fill(["connection_group_save", {
-      draft: { version: 2, revision: 4, group: { id: "a", displayName: "가가", parentId: "c" } },
-    }]));
+    expect(connectionCalls("connection_group_save").map(([, args]) => args)).toEqual([4, 6].map(revision => ({
+      draft: { version: 2, revision, group: { id: "a", displayName: "가가", parentId: "c" } },
+    })));
     expect(host.querySelector("dialog")).toBeNull();
   });
 
-  it("그룹 삭제는 하위 그룹·세션 수를 보이고 본 하위 집합을 expected로 보낸다", async () => {
+  it("그룹 삭제는 하위 그룹·세션 수를 보이고 본 하위 집합을 expected로 보내며 충돌 뒤에는 다시 계산한다", async () => {
     let store: SavedConnections = {
       version: 2,
       groups: [
@@ -2879,8 +2910,13 @@ describe("연결 트리 메뉴", () => {
     runConnectionCommand = async (command) => {
       if (command !== "connection_group_delete") throw command;
       const reply = replies.shift();
+      if (reply && (reply as { kind: string }).kind === "conflict") {
+        // 다른 작업이 그룹 이름을 바꾸고 하위 그룹에 세션을 하나 더 넣었다.
+        store = { ...store, groups: [{ revision: 5, profile: { id: "a", displayName: "가" } }, ...store.groups.slice(1)],
+          targets: [...store.targets, shell("s4", 1, "b")] };
+      }
       if (reply) throw reply;
-      store = { ...store, groups: store.groups.slice(2), targets: store.targets.slice(2) };
+      store = { ...store, groups: store.groups.slice(2), targets: store.targets.filter(({ profile }) => profile.id === "s3" || profile.id === "top") };
       return null;
     };
     await restartWorkspace();
@@ -2891,12 +2927,15 @@ describe("연결 트리 메뉴", () => {
     await act(async () => { dialog.querySelector("button")!.click(); });
     expect(dialog.querySelector("[role=alert]")?.textContent).toBe("참조 중인 세션: s2 셸");
     await act(async () => { dialog.querySelector("button")!.click(); });
-    expect(dialog.querySelector("[role=alert]")?.textContent).toBe("다른 작업이 세션을 변경했습니다");
+    expect(dialog.querySelector("[role=alert]")?.textContent).toBe("다른 작업이 그룹을 변경했습니다");
+    expect(dialog.querySelector("p")?.textContent).toBe("하위 그룹 1개, 세션 3개");
     await act(async () => { dialog.querySelector("button")!.click(); });
-    expect(connectionCalls("connection_group_delete")).toEqual(Array(3).fill(["connection_group_delete", {
-      id: "a", revision: 4,
-      expected: [{ kind: "group", id: "b", revision: 2 }, { kind: "target", id: "s1", revision: 1 }, { kind: "target", id: "s2", revision: 3 }],
-    }]));
+    const seen = [{ kind: "group", id: "b", revision: 2 }, { kind: "target", id: "s1", revision: 1 }, { kind: "target", id: "s2", revision: 3 }];
+    expect(connectionCalls("connection_group_delete").map(([, args]) => args)).toEqual([
+      { id: "a", revision: 4, expected: seen },
+      { id: "a", revision: 4, expected: seen },
+      { id: "a", revision: 5, expected: [...seen, { kind: "target", id: "s4", revision: 1 }] },
+    ]);
     expect(host.querySelector('dialog[aria-label="삭제"]')).toBeNull();
     expect(tree().textContent).not.toContain("s1 셸");
     // 지운 행 대신 트리의 현재 행으로 포커스를 돌린다.

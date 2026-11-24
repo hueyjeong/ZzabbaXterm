@@ -73,6 +73,7 @@ export function SessionEditor(props: SessionEditorProps) {
     save: request => latest.current.save(request),
     saveTarget: draft => latest.current.saveTarget(draft),
     onClose: result => latest.current.onClose(result),
+    latestRevision: props.latestRevision && (id => latest.current.latestRevision!(id)),
   }, { storedAuth: () => storedAuthRef.current }));
   const state = useSyncExternalStore(editor.subscribe, editor.getSnapshot);
   const { draft, status, remoteCleanup } = state;
