@@ -55,7 +55,9 @@ export function createLocalConnectionIpc(): Omit<LocalConnectionActions, "onClos
       const request = { targetId, host, port, expectedFingerprint: hostKeyFingerprint };
       const cancel = () => { void invoke("cancel_ssh_host", { attempt }).catch(() => { }); };
       const check = (result: Reply) => {
-        if (result?.targetId !== targetId || result.port !== port || result.fingerprint !== hostKeyFingerprint || result.host !== host) {
+        // 입력한 지문이 없으면 선택한 공개 키 파일의 지문이 그대로 돌아온다.
+        if (result?.targetId !== targetId || result.port !== port || result.host !== host
+          || (hostKeyFingerprint !== undefined && result.fingerprint !== hostKeyFingerprint)) {
           throw new Error("SSH 호스트 키 확인 응답이 현재 초안과 일치하지 않습니다");
         }
       };

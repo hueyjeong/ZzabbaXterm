@@ -51,11 +51,13 @@ export type SshSettings = Readonly<{
   host: string;
   port: number;
   account: string;
-  hostKeyFingerprint: string;
+  /** 입력하지 않으면 첫 연결에서 서버 키를 확인한다. */
+  hostKeyFingerprint?: string;
   transport: SshTransport;
   auth: SshAuth;
 }>;
-export type SshInput = Omit<SshSettings, "port" | "transport" | "auth"> & Readonly<{
+export type SshInput = Omit<SshSettings, "port" | "transport" | "auth" | "hostKeyFingerprint"> & Readonly<{
+  hostKeyFingerprint: string;
   port: string;
   auth: SshAuth | null;
   transport: SshTransport | Readonly<{ kind: "ssm"; profile?: never; region?: never; instanceId?: never }>;
@@ -68,7 +70,7 @@ type WizardDraft = ProfileDraft<TargetIdentity & (LocalMethod | SsmMethod<SsmTar
 export type SshHostApproval = Readonly<{
   host: string;
   port: number;
-  hostKeyFingerprint: string;
+  hostKeyFingerprint?: string;
   targetId: string;
 }>;
 
@@ -110,14 +112,20 @@ type SshPin = { kind: "idle" | "checking" | "verified" } | { kind: "failed"; err
 type RemoteCleanup = Readonly<{ kind: "cancelling" | "unconfirmed"; target: SsmTarget }>;
 type State = Readonly<{ step: Step; draft: WizardDraft; status: Status; sshPin: SshPin; remoteCleanup?: RemoteCleanup }>;
 
-function completeSsh(input: SshInput): SshSettings | null {
+/** 지문은 선택 항목이다. 입력했을 때만 형식을 검사한다. */
+export function fingerprintValid(fingerprint: string) {
+  return fingerprint === "" || /^SHA256:[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]$/.test(fingerprint);
+}
+
+export function completeSsh(input: SshInput): SshSettings | null {
   const { host, account, hostKeyFingerprint, transport, auth } = input;
   const port = Number(input.port);
-  if (!auth || !host.trim() || !account.trim() || !/^SHA256:[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]$/.test(hostKeyFingerprint)
+  if (!auth || !host.trim() || !account.trim() || !fingerprintValid(hostKeyFingerprint)
     || !/^\d+$/.test(input.port) || port < 1 || port > 65535 || (transport.kind === "ssm" && !transport.instanceId)) return null;
   if ((auth.kind === "agent" && !auth.publicKeyPath.trim()) || (auth.kind === "keyFile" && !auth.privateKeyPath.trim())
     || (auth.kind === "storedPassword" && !auth.itemId.trim())) return null;
-  return { host, port, account, hostKeyFingerprint, transport, auth };
+  // 빈 지문은 필드를 생략해 보낸다.
+  return { host, port, account, ...(hostKeyFingerprint ? { hostKeyFingerprint } : {}), transport, auth };
 }
 
 function completeS3({ profile, region, bucket }: S3Settings) {
@@ -405,7 +413,7 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Initi
 
   function completedDraft() {
     const { target } = state.draft;
-    const ssh = target.defaultMethod === "ssh" && state.sshPin.kind === "verified" ? completeSsh(target.ssh) : null;
+    const ssh = target.defaultMethod === "ssh" ? completeSsh(target.ssh) : null;
     if (target.defaultMethod === "rdp") {
       const rdp = completeDesktop("rdp", target.rdp);
       return rdp && { ...target, rdp };
@@ -454,9 +462,9 @@ export function createLocalConnectionWizard(draftId: string, initialDraft: Initi
     const { status } = state;
     const stored = storedAuthAvailable && state.draft.target.defaultMethod === "ssh" && state.draft.target.ssh.auth?.kind === "storedPassword";
     const passed = status.kind === "passed" || status.kind === "saveFailed";
-    // 저장 암호는 승인 기반 로그인이라 연결 시험 대신 호스트 키 확인 뒤 참조만 저장한다.
+    // 저장 암호는 승인 기반 로그인이라 연결 시험 없이 참조만 저장한다. 호스트 키는 첫 연결에서 확인한다.
     // 원격 화면은 비밀 없이 경로만 저장하고 서버 신원·터널은 열 때 확인한다.
-    const untested = (stored && state.sshPin.kind === "verified") || !!desktopOf(state.draft.target);
+    const untested = stored || !!desktopOf(state.draft.target);
     if (state.step !== "verify" || (!passed && !untested) || locked()) return;
     let attempt: ConnectionTestDraft;
     let request: ConnectionRequest;

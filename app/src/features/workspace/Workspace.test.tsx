@@ -1737,7 +1737,7 @@ describe("C02 SSM 연결", () => {
 describe("F01 직접 SSH", () => {
   const fingerprint = `SHA256:${"A".repeat(43)}`;
 
-  it("네이티브 PIN 등록을 취소하면 연결 시험과 저장을 차단한다", async () => {
+  it("네이티브 PIN 등록을 취소해도 연결 시험은 켜 두고 저장은 시험 전까지 막는다", async () => {
     runConnectionCommand = async (command) => {
       if (command === "connection_capabilities") return { storedAuth: true };
       throw "cancelled";
@@ -1761,7 +1761,7 @@ describe("F01 직접 SSH", () => {
     await changeInput("서버 호스트", "dev.example.invalid");
     await changeInput("SSH 포트", "2222");
     await changeInput("SSH 계정", "deploy");
-    await changeInput("호스트 키 SHA256 지문", fingerprint);
+    await changeInput("호스트 키 SHA256 지문 (선택)", fingerprint);
     await press("다음");
     const auth = await select("SSH 인증 방식", "manualPassword");
     expect(auth.querySelector<HTMLOptionElement>('option[value="storedPassword"]')?.disabled).toBe(false);
@@ -1781,7 +1781,8 @@ describe("F01 직접 SSH", () => {
       }),
     }]]);
     expect(find("dialog [role=alert]").textContent).toBe("SSH 호스트 키 등록이 취소되었습니다");
-    expect(button("연결 테스트")?.disabled).toBe(true);
+    // 호스트 키 등록은 선택 항목이다. 핀이 없으면 연결 시험이 첫 연결 확인 창을 띄운다.
+    expect(button("연결 테스트")?.disabled).toBe(false);
     expect(button("저장")?.disabled).toBe(true);
     expect(connectionCalls("connection_test_start")).toEqual([]);
     expect(connectionCalls("ssm_discovery")).toEqual([]);
@@ -1827,7 +1828,7 @@ describe("F01 직접 SSH", () => {
     await chooseMethod("ssh");
     await changeInput("서버 호스트", "dev.example.invalid");
     await changeInput("SSH 계정", "deploy");
-    await changeInput("호스트 키 SHA256 지문", fingerprint);
+    await changeInput("호스트 키 SHA256 지문 (선택)", fingerprint);
     await press("다음");
     await select("SSH 인증 방식", "manualPassword");
     await press("다음");

@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use tauri::Window;
+use tauri::{WebviewWindow, Window};
 
 use super::Rejection;
 
@@ -93,4 +93,46 @@ fn native_dialogs_are_modal_transients_of_the_same_window() {
         assert!(dialog.must_destroy_with_parent());
         dialog.close();
     }
+}
+
+/// SSH 서버 키 신뢰·교체 창이다. RDP·VNC 승인 창처럼 메인 스레드에서 주 창을 앞으로 올린 뒤 띄우고, 기본 버튼은 취소다.
+/// 작업 스레드에서만 부른다.
+pub(super) fn decide(window: &WebviewWindow, title: &'static str, description: String, accept: &'static str, warning: bool)
+    -> Result<bool, Rejection>
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let parent = window.clone();
+    window.run_on_main_thread(move || {
+        crate::desktop_dialog::raise(&parent);
+        let _ = tx.send(decide_native(&parent, title, &description, accept, warning));
+    }).map_err(|_| Rejection::StoreUnavailable)?;
+    rx.recv().map_err(|_| Rejection::StoreUnavailable)
+}
+
+/// Windows 메시지 상자는 단추 이름을 바꿀 수 없어 확인과 취소로 표시된다.
+#[cfg(windows)]
+fn decide_native(window: &WebviewWindow, title: &str, description: &str, _accept: &str, warning: bool) -> bool {
+    crate::desktop_dialog::confirm_box(window, title, description, warning)
+}
+
+#[cfg(target_os = "linux")]
+fn decide_native(window: &WebviewWindow, title: &str, description: &str, accept: &str, warning: bool) -> bool {
+    let Ok(parent) = window.gtk_window() else { return false; };
+    let kind = if warning { gtk::MessageType::Warning } else { gtk::MessageType::Question };
+    let dialog = gtk::MessageDialog::new(Some(&parent), gtk::DialogFlags::MODAL | gtk::DialogFlags::DESTROY_WITH_PARENT,
+        kind, gtk::ButtonsType::None, description);
+    dialog.add_button("취소", gtk::ResponseType::Cancel);
+    dialog.add_button(accept, gtk::ResponseType::Accept);
+    dialog.set_title(title);
+    dialog.set_default_response(gtk::ResponseType::Cancel);
+    let accepted = dialog.run() == gtk::ResponseType::Accept;
+    dialog.close();
+    accepted
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn decide_native(window: &WebviewWindow, title: &str, description: &str, accept: &str, _warning: bool) -> bool {
+    rfd::MessageDialog::new().set_parent(window).set_title(title).set_description(description)
+        .set_buttons(rfd::MessageButtons::OkCancelCustom(accept.into(), "취소".into()))
+        .show() == rfd::MessageDialogResult::Custom(accept.into())
 }

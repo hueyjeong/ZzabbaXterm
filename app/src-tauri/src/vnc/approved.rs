@@ -71,7 +71,8 @@ impl Draft {
                 if password { return Err("이 운영체제는 VNC 비밀번호 연결을 지원하지 않습니다".into()); }
                 let lease = source.lease(window, &life, epoch, auth, held, notify).await?;
                 let destination = lease.destination();
-                let target = Target { profile_id: routed_scope(lease.route(), destination), host: destination.host.clone(), port: destination.port };
+                let directory = window.path().app_config_dir().map_err(|_| "터널 대상 설정을 읽을 수 없습니다")?;
+                let target = Target { profile_id: routed_scope(lease.route(), destination, &directory), host: destination.host.clone(), port: destination.port };
                 let password = if auth == Auth::VncPassword {
                     lease.while_live(|| ()).ok_or(ROUTE_LOST)?;
                     let loss = lease.loss();
@@ -104,8 +105,8 @@ const ROUTE_LOST: &str = "VNC SSH 터널 연결이 끊겼습니다";
 
 fn auth_for(password: bool) -> Auth { if password { Auth::VncPassword } else { Auth::ExplicitNone } }
 
-fn routed_scope(route: &SavedRoute, destination: &Destination) -> String {
-    format!("{}|vnc://[{}]:{}", route_scope(route), destination.host, destination.port)
+fn routed_scope(route: &SavedRoute, destination: &Destination, directory: &std::path::Path) -> String {
+    format!("{}|vnc://[{}]:{}", route_scope(route, directory), destination.host, destination.port)
 }
 
 impl Source {
@@ -130,7 +131,7 @@ impl Source {
         };
         let service = match auth { Auth::VncPassword => "VNC 비밀번호", Auth::ExplicitNone => "없음" };
         let description = format!("경로: 터널 {tunnel_id}\n{}\n원격 VNC 목적지: [{}]:{}\n서비스 인증: {service}",
-            describe_route(&snapshot), destination.host, destination.port);
+            describe_route(&snapshot, &directory), destination.host, destination.port);
         app.state::<TunnelTabs>().preflight_desktop(epoch, (&tab_handle, &tunnel_id),
             &target_id, &destination, Protocol::Vnc)?;
         if !confirm(window, description, life, None, notify).await {
@@ -336,30 +337,50 @@ mod tests {
     #[test]
     fn vnc_routed_scope_binds_ssh_identity_and_exact_service() {
         use crate::connections::{SavedSsm, profile::{Ssh, SshAuth, SshTransport, Ssm}};
-        let routed_scope = |ssh: Ssh, destination: &Destination| routed_scope(&SavedRoute::Ssh((std::num::NonZeroU64::MIN, ssh)), destination);
+        use crate::ssh::{ApprovedHost, Endpoint, TRUST_DIRECTORY, TrustStore};
+        let directory = tempfile::tempdir().unwrap();
+        let routed_scope = |ssh: Ssh, destination: &Destination| routed_scope(&SavedRoute::Ssh((std::num::NonZeroU64::MIN, ssh)), destination, directory.path());
 
         let ssh = Ssh { host: "server.example".into(), port: 22, account: "operator".into(),
-            host_key_fingerprint: "SHA256:pin".into(), transport: SshTransport::Direct {}, auth: SshAuth::ManualPassword {} };
+            host_key_fingerprint: Some("SHA256:pin".into()), transport: SshTransport::Direct {}, auth: SshAuth::ManualPassword {} };
         let destination = Destination { host: "127.0.0.1".into(), port: 5900 };
         let scope = routed_scope(ssh, &destination);
         assert_eq!(scope, "ssh://operator@[server.example]:22#SHA256:pin|vnc://[127.0.0.1]:5900");
         for change in 0..6 {
             let mut ssh = Ssh { host: "server.example".into(), port: 22, account: "operator".into(),
-                host_key_fingerprint: "SHA256:pin".into(), transport: SshTransport::Direct {}, auth: SshAuth::ManualPassword {} };
+                host_key_fingerprint: Some("SHA256:pin".into()), transport: SshTransport::Direct {}, auth: SshAuth::ManualPassword {} };
             let mut destination = Destination { host: "127.0.0.1".into(), port: 5900 };
             match change {
                 0 => ssh.host = "other.example".into(),
                 1 => ssh.port = 2222,
                 2 => ssh.account = "other".into(),
-                3 => ssh.host_key_fingerprint = "SHA256:other".into(),
+                3 => ssh.host_key_fingerprint = Some("SHA256:other".into()),
                 4 => destination.host = "::1".into(),
                 _ => destination.port = 5901,
             }
             assert_ne!(routed_scope(ssh, &destination), scope);
         }
+
+        // 지문을 입력하지 않은 세션은 실제 핀 지문으로 범위를 묶어 핀이 바뀌면 범위도 바뀐다.
+        const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti";
+        const SHA: &str = "SHA256:UCUiLr7Pjs9wFFJMDByLgc3NrtdU344OgUM45wZPcIQ";
+        const NEW_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOIlkaatyE67xu4EHyRVTE4sDP2jV6I47yQt41UrC6LE";
+        let unpinned = || Ssh { host: "server.example".into(), port: 22, account: "operator".into(),
+            host_key_fingerprint: None, transport: SshTransport::Direct {}, auth: SshAuth::ManualPassword {} };
+        let store = TrustStore::create(&directory.path().join(TRUST_DIRECTORY)).unwrap();
+        let endpoint = Endpoint::new("server.example", 22).unwrap();
+        let approved = ApprovedHost::confirm(&endpoint, &endpoint, SHA).unwrap();
+        store.register(&approved, KEY).unwrap();
+        let pinned = routed_scope(unpinned(), &destination);
+        assert_eq!(pinned, format!("ssh://operator@[server.example]:22#{SHA}|vnc://[127.0.0.1]:5900"));
+        let new_sha = ssh_key::PublicKey::from_openssh(NEW_KEY).unwrap().fingerprint(ssh_key::HashAlg::Sha256).to_string();
+        let replaced = ApprovedHost::confirm(&endpoint, &endpoint, &new_sha).unwrap();
+        store.replace(&replaced, &ssh_key::PublicKey::from_openssh(KEY).unwrap(), NEW_KEY).unwrap();
+        assert_eq!(routed_scope(unpinned(), &destination), format!("ssh://operator@[server.example]:22#{new_sha}|vnc://[127.0.0.1]:5900"));
+
         let ssm = SavedRoute::Ssm(SavedSsm { revision: std::num::NonZeroU64::MIN, desktop: None,
             target: Ssm { profile: "zzabba-demo".into(), region: "ap-northeast-1".into(), instance_id: "i-07c8e1d461943e5f3".into() } });
-        assert_eq!(super::routed_scope(&ssm, &destination),
+        assert_eq!(super::routed_scope(&ssm, &destination, directory.path()),
             "ssm://zzabba-demo@ap-northeast-1/i-07c8e1d461943e5f3|vnc://[127.0.0.1]:5900");
     }
 }

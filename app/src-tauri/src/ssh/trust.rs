@@ -154,20 +154,67 @@ impl TrustStore {
 
     pub(super) fn pin(&self, approved: &ApprovedHost<'_>) -> Result<(String, &'static str, RootGuard), Error> {
         let root = self.checked_root()?;
-        let alias = approved.endpoint.alias();
-        let record = read_pin(&self.pin_path(&alias))?;
-        let key_text = record
-            .strip_prefix(&alias)
-            .and_then(|value| value.strip_prefix(' '))
-            .ok_or(Error::InvalidTrustRecord)?;
-        let key = plain_public_key(key_text).map_err(|_| Error::InvalidTrustRecord)?;
-        if pin_record(&alias, &key)? != record {
-            return Err(Error::InvalidTrustRecord);
-        }
+        let (record, key) = self.read_record(&approved.endpoint.alias())?;
         if key.fingerprint(HashAlg::Sha256) != approved.fingerprint {
             return Err(Error::FingerprintMismatch);
         }
         Ok((record, host_algorithms(&key)?, root))
+    }
+
+    /// 지문 비교 없이 등록된 키를 돌려준다. 등록되지 않았으면 `None`이다.
+    pub(crate) fn pinned(&self, endpoint: &Endpoint) -> Result<Option<PublicKey>, Error> {
+        let _root = self.checked_root()?;
+        match self.read_record(&endpoint.alias()) {
+            Ok((_, key)) => Ok(Some(key)),
+            Err(Error::UnregisteredHost) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// 등록된 키가 `previous`일 때만 승인한 새 키로 바꾼다. 교체 확인 창에서만 쓴다.
+    pub(crate) fn replace(
+        &self,
+        approved: &ApprovedHost<'_>,
+        previous: &PublicKey,
+        new_key: &str,
+    ) -> Result<(), Error> {
+        let key = plain_public_key(new_key)?;
+        if key.fingerprint(HashAlg::Sha256) != approved.fingerprint {
+            return Err(Error::FingerprintMismatch);
+        }
+        host_algorithms(&key)?;
+        let alias = approved.endpoint.alias();
+        let path = self.pin_path(&alias);
+        let record = pin_record(&alias, &key)?;
+        let _root = self.checked_root()?;
+        let (current, _) = self.read_record(&alias)?;
+        if current != pin_record(&alias, previous)? {
+            return Err(Error::ExistingPinConflict);
+        }
+        #[cfg(windows)]
+        let mut staged = tempfile::Builder::new().make_in(&self.root, super::trust_windows::create_file)?;
+        #[cfg(unix)]
+        let mut staged = tempfile::NamedTempFile::new_in(&self.root)?;
+        staged.write_all(record.as_bytes())?;
+        staged.as_file().sync_all()?;
+        let file = staged.persist(&path).map_err(|error| Error::Io(error.error))?;
+        drop(file);
+        #[cfg(windows)]
+        super::trust_windows::pin(&path)?;
+        Ok(())
+    }
+
+    fn read_record(&self, alias: &str) -> Result<(String, PublicKey), Error> {
+        let record = read_pin(&self.pin_path(alias))?;
+        let key_text = record
+            .strip_prefix(alias)
+            .and_then(|value| value.strip_prefix(' '))
+            .ok_or(Error::InvalidTrustRecord)?;
+        let key = plain_public_key(key_text).map_err(|_| Error::InvalidTrustRecord)?;
+        if pin_record(alias, &key)? != record {
+            return Err(Error::InvalidTrustRecord);
+        }
+        Ok((record, key))
     }
 
     fn pin_path(&self, alias: &str) -> PathBuf {

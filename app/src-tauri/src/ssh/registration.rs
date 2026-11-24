@@ -1,13 +1,13 @@
 mod dialogs;
 
-use std::{path::{Path, PathBuf}, sync::Mutex};
+use std::{path::{Path, PathBuf}, sync::{Arc, Mutex}};
 
 use serde::{Deserialize, Serialize};
 use ssh_key::{Fingerprint, HashAlg};
 use tauri::{Manager, Webview, ipc::{CommandArg, CommandItem, Invoke}};
 use crate::{connections::profile::Draft, terminal::Sessions};
 
-use super::{ApprovedHost, Endpoint, Error, TrustStore, trust::plain_public_key};
+use super::{ApprovedHost, Endpoint, Error, TrustStore, host_trust::{self, Checked, Confirm, Via}, trust::plain_public_key};
 
 pub(crate) const COMMAND: &str = "verify_ssh_host";
 pub(crate) const COMMIT: &str = "commit_ssh_host";
@@ -21,7 +21,9 @@ struct Request {
     target_id: String,
     host: String,
     port: u16,
-    expected_fingerprint: String,
+    /// 입력한 지문이 없으면 선택한 공개 키 파일의 지문을 확인 창에 보여 준다.
+    #[serde(default)]
+    expected_fingerprint: Option<String>,
 }
 
 #[derive(Deserialize, PartialEq, Eq)]
@@ -184,6 +186,68 @@ impl Registration {
                 .map_err(|_| Rejection::StaleDocument)?
         }).map_err(|_| Rejection::StoreUnavailable)?
     }
+
+    /// 메뉴 "호스트 키 확인…"이다. 열려 있는 확인 창이 있으면 새 창을 띄우지 않는다.
+    fn trust_saved(
+        &self,
+        directory: &Path,
+        target_id: &str,
+        sessions: &Sessions,
+        document: u64,
+        check: impl FnOnce(&crate::connections::profile::Ssh) -> Result<(String, Checked), String>,
+    ) -> Result<Trusted, String> {
+        let ticket = self.begin(document, None).map_err(|error| error.saved_message())?;
+        let _reservation = Pending { state: self, ticket: &ticket };
+        sessions.with_probes("main", document, |_| Ok(())).map_err(|_| Rejection::StaleDocument.saved_message())?;
+        let (_, ssh) = crate::connections::with_saved_ssh(directory, target_id, |saved| saved)
+            .map_err(|_| Rejection::StoreUnavailable.saved_message())?
+            .ok_or(Rejection::InvalidTarget.saved_message())?;
+        let (fingerprint, checked) = check(&ssh)?;
+        let status = match checked {
+            Checked::Registered => "registered",
+            Checked::Unchanged => "unchanged",
+            Checked::Replaced => "replaced",
+        };
+        Ok(Trusted { fingerprint, status })
+    }
+}
+
+/// `trust_saved_ssh_host` 응답이다. `status`는 `registered`, `unchanged`, `replaced` 중 하나다.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct Trusted {
+    fingerprint: String,
+    status: &'static str,
+}
+
+/// 첫 연결 확인 창이다. 단추는 신뢰와 취소이고 기본 단추는 취소다.
+pub(crate) fn host_key_trust(window: tauri::WebviewWindow) -> Confirm {
+    Arc::new(move |description| dialogs::decide(&window, host_trust::TRUST_TITLE, description, "신뢰", false)
+        .map_err(|_| "SSH 서버 키 확인 창을 열 수 없습니다".into()))
+}
+
+fn host_key_replace(window: tauri::WebviewWindow) -> Confirm {
+    Arc::new(move |description| dialogs::decide(&window, host_trust::REPLACE_TITLE, description, "교체", true)
+        .map_err(|_| "SSH 서버 키 변경 창을 열 수 없습니다".into()))
+}
+
+/// 저장된 SSH 세션의 서버 키를 다시 받아 등록하거나, 이전·새 지문을 보여 준 뒤 교체한다.
+/// SSM 경유면 앱이 연 포트 전달로 키를 받고 바로 닫는다.
+pub(crate) fn trust_saved(caller: &Webview, document: u64, target_id: String) -> Result<Trusted, String> {
+    use crate::{connections::profile::SshTransport, tunnels::Transport};
+    let config = caller.path().app_config_dir().map_err(|error| format!("앱 설정 디렉터리: {error}"))?;
+    let state = caller.try_state::<Registration>().ok_or(Rejection::StoreUnavailable.saved_message())?;
+    let window = caller.app_handle().get_webview_window(caller.label()).ok_or(Rejection::StoreUnavailable.saved_message())?;
+    let (trust, replace) = (host_key_trust(window.clone()), host_key_replace(window));
+    state.trust_saved(&config, &target_id, &caller.state::<Sessions>(), document, |ssh| match &ssh.transport {
+        SshTransport::Direct {} => host_trust::check(&config, ssh, Via::Direct, &host_trust::keyscan, &trust, &replace),
+        SshTransport::Ssm(target) => {
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let (port, mut forward) = crate::tunnels::ssm::open_ssh_forward(target, ssh.port, &cancel)?;
+            let result = host_trust::check(&config, ssh, Via::Forward(port), &host_trust::keyscan, &trust, &replace);
+            let _ = forward.close();
+            result
+        }
+    })
 }
 
 pub(crate) fn register_saved(caller: &Webview, document: u64, target_id: String) -> Result<(), String> {
@@ -297,7 +361,7 @@ pub(crate) fn dispatch(invoke: Invoke) {
             let expected_fingerprint = request.expected_fingerprint.clone();
             let prepared = reservation.verify(
                 request,
-                |id| draft.ssh_pin_endpoint(id, &expected_fingerprint),
+                |id| draft.ssh_pin_endpoint(id, expected_fingerprint.as_deref()),
                 || dialogs::pick(&window),
                 |endpoint, fingerprint| dialogs::confirm(&window, HOST_CONFIRM_TITLE, confirmation_message(endpoint, fingerprint)),
             )?;
@@ -342,15 +406,17 @@ impl Pending<'_> {
         }
         let endpoint = resolve(&request.target_id).ok_or(Rejection::InvalidTarget)?;
         let shown = Endpoint::new(&request.host, request.port).map_err(|_| Rejection::InvalidEndpoint)?;
-        if request.expected_fingerprint.len() != 50 {
-            return Err(Rejection::InvalidFingerprint);
+        match &request.expected_fingerprint {
+            Some(expected) if expected.len() != 50 => return Err(Rejection::InvalidFingerprint),
+            Some(expected) => { ApprovedHost::confirm(&endpoint, &shown, expected).map_err(registration_error)?; }
+            None if endpoint != shown => return Err(Rejection::EndpointMismatch),
+            None => {}
         }
-        ApprovedHost::confirm(&endpoint, &shown, &request.expected_fingerprint).map_err(registration_error)?;
         let path = pick()?.ok_or(Rejection::Cancelled)?;
         self.current()?;
         let key = read_public_key(&path)?;
         let fingerprint = plain_public_key(&key).map_err(registration_error)?.fingerprint(HashAlg::Sha256);
-        if fingerprint.to_string() != request.expected_fingerprint {
+        if request.expected_fingerprint.as_ref().is_some_and(|expected| *expected != fingerprint.to_string()) {
             return Err(Rejection::FingerprintMismatch);
         }
         self.current()?;
@@ -361,7 +427,7 @@ impl Pending<'_> {
         if resolve(&request.target_id).as_ref() != Some(&endpoint) {
             return Err(Rejection::EndpointMismatch);
         }
-        let host = VerifiedHost { host: request.host, port: endpoint.port, fingerprint: request.expected_fingerprint, target_id: request.target_id };
+        let host = VerifiedHost { host: request.host, port: endpoint.port, fingerprint: fingerprint.to_string(), target_id: request.target_id };
         Ok(Prepared { host, endpoint, key })
     }
 

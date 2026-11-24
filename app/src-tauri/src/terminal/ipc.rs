@@ -53,14 +53,16 @@ pub(crate) fn terminal_open(invoke: Invoke) {
             let Some(window) = window else {
                 return sessions.open_document(owner, document, size, saved::launch(&directory, &id)?, send);
             };
+            // 첫 연결의 서버 키 확인 창이다. SSM 경유 탭은 전달을 연 뒤 PTY 작업자에서 띄운다.
+            let trust = crate::ssh::registration::host_key_trust(webview.clone());
             if !remote_editor {
-                let launch = saved::launch_interactive(&directory, &id, owner, document, |message| {
+                let launch = saved::launch_interactive(&directory, &id, owner, document, &trust, |message| {
                     crate::ssh::registration::confirm_stored_auth(&window, message)
                 })?;
                 return sessions.open_document(owner, document, size, launch, send);
             }
             validate_size(size)?;
-            let (registration, command, parent) = saved::approve_remote_editor(&directory, &id, |message| {
+            let (registration, command, parent) = saved::approve_remote_editor(&directory, &id, &trust, |message| {
                 sessions.with_probe_access(owner, document, true, |_| Ok(()))?;
                 crate::ssh::registration::confirm_remote_editor(&window, message)
             }, |mut launch| {

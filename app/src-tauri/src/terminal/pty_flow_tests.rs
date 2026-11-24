@@ -166,7 +166,7 @@ fn f01_two_saved_ssh_launches_reap_only_the_owned_plan_and_child() {
         let profile = config.join("connections.json");
         let save = |file: &serde_json::Value| std::fs::write(&profile, serde_json::to_vec(file).unwrap()).unwrap();
         save(&file);
-        assert!(matches!(super::saved::launch(config, "ssh"), Err(error) if error == "등록된 SSH 호스트 키가 없습니다"));
+        assert!(matches!(super::saved::launch(config, "ssh"), Err(error) if error == "호스트 키 확인 필요"));
         let store = TrustStore::create(&config.join(TRUST_DIRECTORY)).unwrap();
         let endpoint = Endpoint::new("dev.example.invalid", 2222).unwrap();
         store.register(&ApprovedHost::confirm(&endpoint, &endpoint, sha).unwrap(), key).unwrap();

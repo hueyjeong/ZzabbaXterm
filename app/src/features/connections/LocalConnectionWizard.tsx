@@ -109,7 +109,7 @@ function Wizard(props: LocalConnectionWizardProps) {
   const locked = status.kind === "saving" || status.kind === "closing" || status.kind === "closeFailed";
   const ssh = target.defaultMethod === "ssh" ? target.ssh : null;
   const canSave = status.kind === "passed" || status.kind === "saveFailed"
-    || (storedAuth && ssh?.auth?.kind === "storedPassword" && sshPin.kind === "verified")
+    || (storedAuth && ssh?.auth?.kind === "storedPassword")
     || (!!desktop && status.kind === "idle");
   const s3 = target.defaultMethod === "s3" ? target.s3 : null;
   const retestingS3 = props.initialDraft.targetRevision !== null && props.initialDraft.target.defaultMethod === "s3";
@@ -225,7 +225,7 @@ function Wizard(props: LocalConnectionWizardProps) {
               {sshPin.kind === "failed" && <div role="alert">{sshPin.error}</div>}
             </>}
             <div className="wizard-actions">
-              {!desktop && <button type="button" disabled={status.kind === "testing" || !!remoteCleanup || (!!ssh && sshPin.kind !== "verified")}
+              {!desktop && <button type="button" disabled={status.kind === "testing" || !!remoteCleanup}
                 onClick={() => void wizard.test(props)}>연결 테스트</button>}
               <button type="button" disabled={!canSave} onClick={() => void wizard.save(props)}>저장</button>
             </div>

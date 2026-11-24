@@ -2,6 +2,7 @@ mod public_key_file;
 pub(crate) mod nano;
 pub(crate) mod registration;
 pub(crate) mod terminal;
+pub(crate) mod host_trust;
 mod trust;
 #[cfg(windows)]
 mod trust_windows;

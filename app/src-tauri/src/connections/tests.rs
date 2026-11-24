@@ -137,9 +137,9 @@ fn f01_pin_registration_resolves_only_the_validated_draft_target() {
     let input = ssh_draft(dir.path());
     let fingerprint = input["target"]["ssh"]["hostKeyFingerprint"].as_str().unwrap();
     let draft = serde_json::from_value::<Draft>(input.clone()).unwrap().validate().unwrap();
-    assert_eq!(draft.ssh_pin_endpoint("ssh-server", fingerprint), Some(crate::ssh::Endpoint::new("dev.example.test", 2222).unwrap()));
-    assert_eq!(draft.ssh_pin_endpoint("other-server", fingerprint), None);
-    assert_eq!(draft.ssh_pin_endpoint("ssh-server", "SHA256:other"), None);
+    assert_eq!(draft.ssh_pin_endpoint("ssh-server", Some(fingerprint)), Some(crate::ssh::Endpoint::new("dev.example.test", 2222).unwrap()));
+    assert_eq!(draft.ssh_pin_endpoint("other-server", Some(fingerprint)), None);
+    assert_eq!(draft.ssh_pin_endpoint("ssh-server", Some("SHA256:other")), None);
 }
 
 #[test]

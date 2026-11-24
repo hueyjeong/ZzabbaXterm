@@ -119,19 +119,20 @@ pub(crate) fn load_route(directory: &Path, target: &str) -> Result<SavedRoute, S
 }
 
 /// 승인 창에 표시할 경로 신원이다.
-pub(crate) fn describe_route(saved: &SavedRoute) -> String {
+pub(crate) fn describe_route(saved: &SavedRoute, directory: &Path) -> String {
     match saved {
         SavedRoute::Ssh((_, ssh)) => format!("SSH 서버: {}:{}\nSSH 계정: {}\nSSH 호스트 키: {}",
-            ssh.host, ssh.port, ssh.account, ssh.host_key_fingerprint),
+            ssh.host, ssh.port, ssh.account, crate::ssh::host_trust::shown(directory, ssh)),
         SavedRoute::Ssm(ssm) => format!("SSM 프로필: {}\nSSM 리전: {}\nSSM 관리 노드: {}",
             ssm.target.profile, ssm.target.region, ssm.target.instance_id),
     }
 }
 
 /// 같은 경로 신원에만 묶는 짧은 범위 이름이다.
-pub(crate) fn route_scope(saved: &SavedRoute) -> String {
+/// 범위에는 실제 핀 지문을 넣어 핀이 바뀌면 범위도 바뀐다.
+pub(crate) fn route_scope(saved: &SavedRoute, directory: &Path) -> String {
     match saved {
-        SavedRoute::Ssh((_, ssh)) => format!("ssh://{}@[{}]:{}#{}", ssh.account, ssh.host, ssh.port, ssh.host_key_fingerprint),
+        SavedRoute::Ssh((_, ssh)) => format!("ssh://{}@[{}]:{}#{}", ssh.account, ssh.host, ssh.port, crate::ssh::host_trust::shown(directory, ssh)),
         SavedRoute::Ssm(ssm) => format!("ssm://{}@{}/{}", ssm.target.profile, ssm.target.region, ssm.target.instance_id),
     }
 }
@@ -488,7 +489,15 @@ impl TunnelTabs {
         Ok(handle)
     }
 
+    #[cfg(test)]
     fn start(&self, epoch: u64, directory: &Path, handle: &str, request: PortRequest,
+             confirm: impl FnOnce(String) -> Result<bool, String>) -> Result<Option<String>, String> {
+        self.start_trusting(epoch, directory, handle, request, None, confirm)
+    }
+
+    /// `trust`는 SSH 서버 키가 등록되지 않았을 때 터널 승인 창보다 먼저 띄우는 첫 연결 확인 창이다.
+    fn start_trusting(&self, epoch: u64, directory: &Path, handle: &str, request: PortRequest,
+             trust: Option<&crate::ssh::host_trust::Confirm>,
              confirm: impl FnOnce(String) -> Result<bool, String>) -> Result<Option<String>, String> {
         let (target, owner, saved) = {
             let doc = self.writable_document(epoch)?;
@@ -517,6 +526,8 @@ impl TunnelTabs {
             SshServerPolicy::DestinationRestrictedSocks => "\n승인 전 서버 설정 확인: PermitOpen으로 SOCKS 목적지 제한",
         };
         let service = match protocol { Some(Protocol::Rdp) => "\n서비스: RDP", Some(Protocol::Vnc) => "\n서비스: VNC", None => "" };
+        let fingerprint = crate::ssh::host_trust::trusted(directory, ssh, crate::ssh::host_trust::Via::Direct,
+            &crate::ssh::host_trust::keyscan, trust)?;
         {
             let mut doc = self.writable_document(epoch)?;
             if !doc.tunnels.is_open(&owner) { return Err(STALE.into()); }
@@ -524,7 +535,7 @@ impl TunnelTabs {
             if doc.entries.len() >= LIMIT { return Err("열 수 있는 터널 수를 초과했습니다".into()); }
             doc.approving = true;
         }
-        let accepted = confirm(format!("{endpoint}\n{}\n{}{policy_label}{service}", ssh.host_key_fingerprint, route_label(&route)));
+        let accepted = confirm(format!("{endpoint}\n{fingerprint}\n{}{policy_label}{service}", route_label(&route)));
         let mut doc = self.0.lock().unwrap();
         doc.approving = false;
         if doc.destroyed || doc.epoch != epoch || !doc.tunnels.is_open(&owner) { return Err(STALE.into()); }
@@ -572,7 +583,7 @@ impl TunnelTabs {
             doc.approving = true;
         }
         let accepted = confirm(format!("{}\n문서: {}\n매개변수: {}\n{}{service}",
-            describe_route(&saved), plan.document(), plan.parameters(), route_label(&route)));
+            describe_route(&saved, directory), plan.document(), plan.parameters(), route_label(&route)));
         let mut doc = self.0.lock().unwrap();
         doc.approving = false;
         if doc.destroyed || doc.epoch != epoch || !doc.tunnels.is_open(&owner) { return Err(STALE.into()); }
@@ -790,7 +801,9 @@ pub(crate) fn dispatch(invoke: Invoke) {
             let Start { tab, request } = parse!(Start);
             job(invoke, move |caller, epoch| {
                 let directory = caller.path().app_config_dir().map_err(|error| error.to_string())?;
-                caller.state::<TunnelTabs>().start(epoch, &directory, &tab, request, |description| confirm_tunnel(&caller.window(), description))
+                let trust = caller.app_handle().get_webview_window(caller.label()).map(crate::ssh::registration::host_key_trust);
+                caller.state::<TunnelTabs>().start_trusting(epoch, &directory, &tab, request, trust.as_ref(),
+                    |description| confirm_tunnel(&caller.window(), description))
             });
         }
         STATUS => {

@@ -216,7 +216,9 @@ pub(crate) struct Ssh {
     pub(crate) host: String,
     pub(crate) port: u16,
     pub(crate) account: String,
-    pub(crate) host_key_fingerprint: String,
+    /// 입력한 SHA256 지문이다. 비어 있으면 첫 연결에서 서버 키를 확인한다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) host_key_fingerprint: Option<String>,
     pub(crate) transport: SshTransport,
     pub(crate) auth: SshAuth,
 }
@@ -256,14 +258,16 @@ impl Ssh {
         {
             return Err(ValidationError::SshAccount);
         }
-        // 앱의 신뢰 저장소가 실제 서버와 지문을 확인한다. 이곳에서는 참조 형식만 검사한다.
-        let Some(digest) = self.host_key_fingerprint.strip_prefix("SHA256:") else {
-            return Err(ValidationError::SshHostKeyFingerprint);
-        };
-        if digest.len() != 43 || !digest.bytes().all(|b| b.is_ascii_alphanumeric() || b"+/".contains(&b))
-            || !b"AEIMQUYcgkosw048".contains(&digest.as_bytes()[42])
-        {
-            return Err(ValidationError::SshHostKeyFingerprint);
+        // 앱의 신뢰 저장소가 실제 서버와 지문을 확인한다. 이곳에서는 입력한 지문의 형식만 검사한다.
+        if let Some(fingerprint) = &self.host_key_fingerprint {
+            let Some(digest) = fingerprint.strip_prefix("SHA256:") else {
+                return Err(ValidationError::SshHostKeyFingerprint);
+            };
+            if digest.len() != 43 || !digest.bytes().all(|b| b.is_ascii_alphanumeric() || b"+/".contains(&b))
+                || !b"AEIMQUYcgkosw048".contains(&digest.as_bytes()[42])
+            {
+                return Err(ValidationError::SshHostKeyFingerprint);
+            }
         }
         if let SshTransport::Ssm(target) = &self.transport {
             target.validate()?;
@@ -462,9 +466,9 @@ impl ValidatedDraft {
     pub(super) fn target_id(&self) -> &str {
         self.0.target.id.as_str()
     }
-    pub(crate) fn ssh_pin_endpoint(&self, target_id: &str, fingerprint: &str) -> Option<crate::ssh::Endpoint> {
+    pub(crate) fn ssh_pin_endpoint(&self, target_id: &str, fingerprint: Option<&str>) -> Option<crate::ssh::Endpoint> {
         let MethodRef::Ssh { ssh } = self.method() else { return None; };
-        if self.0.target.id.as_str() != target_id || ssh.host_key_fingerprint != fingerprint {
+        if self.0.target.id.as_str() != target_id || ssh.host_key_fingerprint.as_deref() != fingerprint {
             return None;
         }
         crate::ssh::Endpoint::new(&ssh.host, ssh.port).ok()

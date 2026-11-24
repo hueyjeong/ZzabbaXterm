@@ -25,7 +25,7 @@ fn target(id: &str) -> Option<Endpoint> {
 fn request() -> Request {
     Request {
         target_id: "dev".into(), host: "DEV.example.invalid".into(), port: 2222,
-        expected_fingerprint: SHA.into(),
+        expected_fingerprint: Some(SHA.into()),
     }
 }
 
@@ -62,7 +62,7 @@ fn checks_current_target_and_fingerprint_before_opening_the_picker() {
         (Request { port: 22, ..request() }, Rejection::EndpointMismatch),
         (Request { port: 0, ..request() }, Rejection::InvalidEndpoint),
         (Request { host: "host\nInjectedOption".into(), ..request() }, Rejection::InvalidEndpoint),
-        (Request { expected_fingerprint: "SHA256:invalid".into(), ..request() }, Rejection::InvalidFingerprint),
+        (Request { expected_fingerprint: Some("SHA256:invalid".into()), ..request() }, Rejection::InvalidFingerprint),
     ] {
         assert_eq!(verify(&state, request, target, || panic!("picker"), |_, _| panic!("confirm")), Err(error));
     }
@@ -152,7 +152,7 @@ fn commits_exactly_the_confirmed_key_without_automatic_replacement() {
     let sessions = Sessions::default();
     assert_eq!(state.commit(0, &attempt(0), &ticket, &sessions), Ok(expected));
     assert_eq!(state.commit(0, &attempt(0), &ticket, &sessions), Err(Rejection::Cancelled));
-    let replacement = Request { expected_fingerprint: OTHER_SHA.into(), ..request() };
+    let replacement = Request { expected_fingerprint: Some(OTHER_SHA.into()), ..request() };
     let replacement = verify(&state, replacement, target, || Some(path), |_, _| true).unwrap();
     assert_eq!(state.commit(0, &attempt(0), &replacement, &sessions), Err(Rejection::ExistingPinConflict));
     let endpoint = endpoint();
