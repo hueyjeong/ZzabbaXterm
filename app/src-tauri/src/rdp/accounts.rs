@@ -5,6 +5,7 @@ use std::{collections::BTreeMap, fs, io::Write as _, path::Path, sync::Mutex};
 use serde::{Deserialize, Serialize};
 
 const MAX_LOGIN: usize = 256;
+pub(crate) const FILE: &str = "rdp-accounts.json";
 /// 여러 탭이 거의 동시에 연결을 마쳐도 읽고 고쳐 쓰기가 겹치지 않게 한다.
 static WRITE: Mutex<()> = Mutex::new(());
 
@@ -38,21 +39,46 @@ pub(super) fn save(path: &Path, dns: &str, endpoint: &str, route: Option<&str>, 
         return Err(std::io::ErrorKind::InvalidInput.into());
     }
     let _write = WRITE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut file: File = fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default();
+    let mut file = read(path);
     let key = key(dns, endpoint, route);
     if file.logins.get(&key).is_some_and(|saved| saved == login) {
         return Ok(());
     }
-    file.version = 1;
     file.logins.insert(key, login.to_owned());
+    write(path, file)
+}
+
+/// 지운 연결 대상을 전달 경로로 쓰던 계정 이름을 지운다. 직접 연결 키에는 경로 대상 ID가 없어 그대로 둔다.
+pub(crate) fn forget(path: &Path, routes: &[&str]) -> std::io::Result<()> {
+    if routes.is_empty() || !path.exists() {
+        return Ok(());
+    }
+    let _write = WRITE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut file = read(path);
+    let before = file.logins.len();
+    file.logins.retain(|key, _| !key.splitn(3, '\n').nth(2).is_some_and(|route| routes.contains(&route)));
+    if file.logins.len() == before {
+        return Ok(());
+    }
+    write(path, file)
+}
+
+fn read(path: &Path) -> File {
+    fs::read(path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default()
+}
+
+/// 임시 파일에 쓴 뒤 바꿔 넣는다. Unix에서는 소유자만 읽고 쓰게 만든다.
+fn write(path: &Path, mut file: File) -> std::io::Result<()> {
     if let Some(directory) = path.parent() {
         fs::create_dir_all(directory)?;
     }
     let temporary = path.with_extension("tmp");
-    let mut out = fs::File::create(&temporary)?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut out = options.open(&temporary)?;
+    file.version = 1;
     out.write_all(&serde_json::to_vec(&file)?)?;
     out.sync_all().ok();
     fs::rename(&temporary, path)
@@ -80,6 +106,31 @@ mod tests {
             "rdp.example\nrdp.example:3389": "other",
             "rdp.example\n127.0.0.1:3390\nssh-a": "tunnel",
         }}));
+    }
+
+    #[test]
+    fn forgetting_deleted_routes_keeps_direct_and_other_route_logins() {
+        let dir = TestDir::new();
+        let path = dir.path().join("rdp-accounts.json");
+        assert!(forget(&path, &["ssm-a"]).is_ok());
+        assert!(!path.exists());
+        save(&path, "rdp.example", "rdp.example:3389", None, "direct").unwrap();
+        save(&path, "rdp.example", "127.0.0.1:3389", Some("ssm-a"), "a").unwrap();
+        save(&path, "rdp.example", "127.0.0.1:3389", Some("ssm-b"), "b").unwrap();
+        forget(&path, &["ssm-a", "missing"]).unwrap();
+        assert_eq!(load(&path, "rdp.example", "127.0.0.1:3389", Some("ssm-a")), None);
+        assert_eq!(load(&path, "rdp.example", "127.0.0.1:3389", Some("ssm-b")).as_deref(), Some("b"));
+        assert_eq!(load(&path, "rdp.example", "rdp.example:3389", None).as_deref(), Some("direct"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_is_readable_only_by_the_owner() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = TestDir::new();
+        let path = dir.path().join("rdp-accounts.json");
+        save(&path, "rdp.example", "rdp.example:3389", None, "demo").unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
     }
 
     #[test]

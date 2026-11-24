@@ -1,6 +1,6 @@
 #[cfg(windows)]
 mod account_dialog;
-mod accounts;
+pub(crate) mod accounts;
 mod clipboard;
 mod connect;
 mod display;

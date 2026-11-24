@@ -3,13 +3,16 @@
 
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, WPARAM},
+    System::SystemServices::{SS_ENDELLIPSIS, SS_NOPREFIX},
     UI::{
         Controls::EM_LIMITTEXT,
+        Input::KeyboardAndMouse::EnableWindow,
         WindowsAndMessaging::{
-            BS_DEFPUSHBUTTON, DS_CENTER, DS_MODALFRAME, DS_SETFONT, DialogBoxIndirectParamW, ES_AUTOHSCROLL,
-            ES_PASSWORD, EndDialog, GWLP_USERDATA, GetDlgItem, GetDlgItemTextW, GetWindowLongPtrW, IDCANCEL, IDOK,
-            SendDlgItemMessageW, SendMessageW, SetDlgItemTextW, SetWindowLongPtrW, WM_COMMAND, WM_INITDIALOG,
-            WM_NEXTDLGCTL, WS_BORDER, WS_CAPTION, WS_CHILD, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+            BS_DEFPUSHBUTTON, DS_CENTER, DS_MODALFRAME, DS_SETFONT, DialogBoxIndirectParamW, EN_CHANGE, ES_AUTOHSCROLL,
+            ES_PASSWORD, EndDialog, GWLP_USERDATA, GetDlgItem, GetDlgItemTextW, GetWindowLongPtrW, GetWindowTextLengthW,
+            IDCANCEL, IDOK, SendDlgItemMessageW, SendMessageW, SetDlgItemTextW, SetWindowLongPtrW, WM_COMMAND,
+            WM_INITDIALOG, WM_NEXTDLGCTL, WS_BORDER, WS_CAPTION, WS_CHILD, WS_DISABLED, WS_POPUP, WS_SYSMENU, WS_TABSTOP,
+            WS_VISIBLE,
         },
     },
 };
@@ -17,21 +20,23 @@ use zeroize::Zeroizing;
 
 const LOGIN: i32 = 101;
 const PASSWORD: i32 = 102;
+const ERROR: i32 = 103;
 const MAX_FIELD: usize = 256;
-const SS_NOPREFIX: u32 = 0x80;
 const BUTTON: u16 = 0x80;
 const EDIT: u16 = 0x81;
 const STATIC: u16 = 0x82;
 
 struct State<'a> {
     remembered: Option<&'a str>,
+    valid: fn(&str) -> bool,
     answer: Option<(String, Zeroizing<String>)>,
 }
 
 /// 확인을 누르면 `(계정, 비밀번호)`를 돌려준다. `remembered`는 계정 칸에 미리 채우고 비밀번호 칸에 포커스를 둔다.
-pub(super) fn prompt(parent: HWND, target: &str, remembered: Option<&str>) -> Option<(String, Zeroizing<String>)> {
+/// 두 칸이 모두 차야 로그인 단추가 켜지고, `valid`가 거부한 계정은 창을 닫지 않고 오류를 표시한다.
+pub(super) fn prompt(parent: HWND, target: &str, remembered: Option<&str>, valid: fn(&str) -> bool) -> Option<(String, Zeroizing<String>)> {
     let template = template(&format!("검증된 서버: {target}"));
-    let mut state = State { remembered, answer: None };
+    let mut state = State { remembered, valid, answer: None };
     unsafe {
         DialogBoxIndirectParamW(std::ptr::null_mut(), template.as_ptr().cast(), parent, Some(procedure),
             &mut state as *mut State as LPARAM);
@@ -48,13 +53,15 @@ fn template(server: &str) -> Vec<u32> {
     let mut words: Vec<u16> = Vec::new();
     let long = |words: &mut Vec<u16>, value: u32| words.extend([value as u16, (value >> 16) as u16]);
     let text = |words: &mut Vec<u16>, value: &str| words.extend(value.encode_utf16().chain([0]));
-    let items: [(u16, u32, [i16; 4], i32, &str); 7] = [
-        (STATIC, SS_NOPREFIX, [7, 7, 226, 18], -1, server),
+    let items: [(u16, u32, [i16; 4], i32, &str); 8] = [
+        // 긴 대상 이름은 잘리지 않고 끝을 줄임표로 표시한다.
+        (STATIC, SS_NOPREFIX | SS_ENDELLIPSIS, [7, 9, 226, 9], -1, server),
         (STATIC, SS_NOPREFIX, [7, 29, 226, 9], -1, "계정 (또는 도메인\\계정)"),
         (EDIT, WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL as u32, [7, 40, 226, 14], LOGIN, ""),
         (STATIC, SS_NOPREFIX, [7, 59, 226, 9], -1, "비밀번호"),
         (EDIT, WS_BORDER | WS_TABSTOP | (ES_AUTOHSCROLL | ES_PASSWORD) as u32, [7, 70, 226, 14], PASSWORD, ""),
-        (BUTTON, WS_TABSTOP | BS_DEFPUSHBUTTON as u32, [129, 92, 50, 14], IDOK, "로그인"),
+        (STATIC, SS_NOPREFIX | SS_ENDELLIPSIS, [7, 95, 118, 9], ERROR, ""),
+        (BUTTON, WS_TABSTOP | WS_DISABLED | BS_DEFPUSHBUTTON as u32, [129, 92, 50, 14], IDOK, "로그인"),
         (BUTTON, WS_TABSTOP, [183, 92, 50, 14], IDCANCEL, "취소"),
     ];
     long(&mut words, WS_POPUP | WS_CAPTION | WS_SYSMENU | (DS_MODALFRAME | DS_SETFONT | DS_CENTER) as u32);
@@ -84,6 +91,15 @@ fn read(dialog: HWND, id: i32) -> Option<Zeroizing<String>> {
     Some(text)
 }
 
+/// 계정과 비밀번호 칸이 모두 찼을 때만 로그인 단추를 켠다.
+fn filled(dialog: HWND) -> bool {
+    unsafe {
+        let filled = [LOGIN, PASSWORD].into_iter().all(|id| GetWindowTextLengthW(GetDlgItem(dialog, id)) > 0);
+        EnableWindow(GetDlgItem(dialog, IDOK), filled.into());
+        filled
+    }
+}
+
 unsafe extern "system" fn procedure(dialog: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> isize {
     match message {
         WM_INITDIALOG => unsafe {
@@ -93,6 +109,7 @@ unsafe extern "system" fn procedure(dialog: HWND, message: u32, wparam: WPARAM, 
             match state.remembered {
                 Some(login) => {
                     SetDlgItemTextW(dialog, LOGIN, wide(login).as_ptr());
+                    filled(dialog);
                     SendMessageW(dialog, WM_NEXTDLGCTL, GetDlgItem(dialog, PASSWORD) as WPARAM, 1);
                     0
                 }
@@ -101,11 +118,23 @@ unsafe extern "system" fn procedure(dialog: HWND, message: u32, wparam: WPARAM, 
         },
         WM_COMMAND => {
             let id = (wparam & 0xFFFF) as i32;
+            if (id == LOGIN || id == PASSWORD) && (wparam >> 16) as u32 == EN_CHANGE {
+                filled(dialog);
+                unsafe { SetDlgItemTextW(dialog, ERROR, wide("").as_ptr()); }
+                return 1;
+            }
             if id != IDOK && id != IDCANCEL { return 0; }
             unsafe {
                 if id == IDOK {
+                    // 단추가 꺼져 있어도 Enter가 올 수 있으므로 다시 확인한다.
+                    if !filled(dialog) { return 1; }
                     let state = &mut *(GetWindowLongPtrW(dialog, GWLP_USERDATA) as *mut State);
-                    state.answer = read(dialog, LOGIN).zip(read(dialog, PASSWORD)).map(|(login, password)| (login.to_string(), password));
+                    let Some(login) = read(dialog, LOGIN).filter(|login| (state.valid)(login)) else {
+                        SetDlgItemTextW(dialog, ERROR, wide("계정 형식이 올바르지 않습니다").as_ptr());
+                        SendMessageW(dialog, WM_NEXTDLGCTL, GetDlgItem(dialog, LOGIN) as WPARAM, 1);
+                        return 1;
+                    };
+                    state.answer = read(dialog, PASSWORD).map(|password| (login.to_string(), password));
                 }
                 SetDlgItemTextW(dialog, PASSWORD, wide("").as_ptr());
                 EndDialog(dialog, id as isize);

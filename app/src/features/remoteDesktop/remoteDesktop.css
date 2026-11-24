@@ -96,7 +96,8 @@
   opacity: 1;
 }
 
-.remote-desktop-keyboard:focus-visible + canvas {
+/* 연결된 화면이 키보드 입력을 받는 동안 표시한다. 마우스로 눌러 포커스를 옮겨도 보인다. */
+.remote-desktop-view canvas[data-keyboard] {
   outline: 2px solid #9cd9bf;
   outline-offset: -2px;
 }

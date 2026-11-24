@@ -229,7 +229,7 @@ function connectedKeyboard() {
   act(() => root.render(<RemoteDesktopView session={session} active label="원격 데스크톱" />));
   act(() => emit(full(1)));
   const keyboard = host.querySelector("textarea")!;
-  keyboard.focus();
+  act(() => keyboard.focus());
   const sent = () => session.send.mock.calls.map(([input]) =>
     input.kind === "text" ? `text ${input.text}` : input.kind === "key" ? `${input.code} ${input.down ? "down" : "up"}` : input.kind);
   return { keyboard, sent };
@@ -286,21 +286,91 @@ it("IME가 조합을 끝내며 넘긴 Enter는 Enter 키 한 번으로 보낸다
   expect(sent()).toEqual(["Enter down", "Enter up"]);
 });
 
-it("조합 중 클릭은 조합을 먼저 확정해 글자를 클릭보다 먼저 보내고 입력칸 포커스와 눌린 상태를 유지한다", () => {
-  const { keyboard, sent } = connectedKeyboard();
+function pointerCanvas() {
   const canvas = host.querySelector("canvas")!;
   vi.spyOn(canvas, "getBoundingClientRect").mockReturnValue({ left: 0, top: 0, width: 2, height: 1 } as DOMRect);
   Object.assign(canvas, { setPointerCapture: vi.fn(), hasPointerCapture: () => false, releasePointerCapture: vi.fn() });
+  const press = (type: string, buttons: number) => {
+    const event = new MouseEvent(type, { bubbles: true, cancelable: true, clientX: 1, clientY: 0, buttons });
+    Object.assign(event, { pointerId: 1, isPrimary: true });
+    act(() => { dispatchTrusted(canvas, event); });
+  };
+  return { canvas, press };
+}
+
+/** 조합을 시작하고, Chromium처럼 포커스를 잃을 때 신뢰되지 않은 compositionend로 확정하게 한다. */
+function composeUntilBlur(keyboard: HTMLTextAreaElement, text: string) {
   act(() => { dispatchTrusted(keyboard, new CompositionEvent("compositionstart", { bubbles: true, data: "" })); });
-  dispatchTrusted(keyboard, new CompositionEvent("compositionupdate", { bubbles: true, data: "하" }));
-  // Chromium은 포커스를 잃을 때 조합을 확정하고 신뢰되지 않은 compositionend를 보낸다.
-  keyboard.addEventListener("blur", () => keyboard.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: "하" })), { once: true });
-  const down = new MouseEvent("pointerdown", { bubbles: true, cancelable: true, clientX: 1, clientY: 0, buttons: 1 });
-  Object.assign(down, { pointerId: 1, isPrimary: true });
-  act(() => { dispatchTrusted(canvas, down); });
-  expect(sent()).toEqual(["text 하", "pointer"]);
+  dispatchTrusted(keyboard, new CompositionEvent("compositionupdate", { bubbles: true, data: text }));
+  keyboard.addEventListener("blur", () => keyboard.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: text })), { once: true });
+}
+
+it("조합 중 클릭은 조합을 먼저 확정해 글자를 클릭보다 먼저 보내고 다음 작업에서 입력칸 포커스를 돌린다", async () => {
+  const { keyboard, sent } = connectedKeyboard();
+  const { canvas, press } = pointerCanvas();
+  composeUntilBlur(keyboard, "하");
+  press("pointerdown", 1);
+  // 포커스를 돌리기 전에 오는 이동과 뗌도 같은 클릭으로 보낸다.
+  press("pointerup", 0);
+  expect(sent()).toEqual(["text 하", "pointer", "pointer"]);
+  expect(document.activeElement).not.toBe(keyboard);
+  await act(async () => { await new Promise((resolve) => setTimeout(resolve)); });
   expect(document.activeElement).toBe(keyboard);
+  expect(sent()).toEqual(["text 하", "pointer", "pointer"]);
   expect(host.querySelector("textarea")?.dataset.composing).toBeUndefined();
   // 일반 클릭은 입력칸에 포커스를 두고 mousedown 기본 동작을 막는다.
   expect(dispatchTrusted(canvas, new MouseEvent("mousedown", { bubbles: true, cancelable: true }))).toBe(true);
+});
+
+it("창이 포커스를 잃으면 조합 중인 글자를 한 번 보내고 눌린 상태를 해제한다", () => {
+  const { keyboard, sent } = connectedKeyboard();
+  dispatchTrusted(keyboard, new KeyboardEvent("keydown", { bubbles: true, cancelable: true, code: "ShiftLeft", key: "Shift", shiftKey: true }));
+  composeUntilBlur(keyboard, "하");
+  act(() => { window.dispatchEvent(new Event("blur")); });
+  expect(sent()).toEqual(["ShiftLeft down", "text 하", "ShiftLeft up", "release-input"]);
+});
+
+it("신뢰되지 않은 compositionend는 직전 신뢰 compositionupdate와 같은 글자일 때만 보낸다", () => {
+  const { keyboard, sent } = connectedKeyboard();
+  const composition = (type: string, data: string) => new CompositionEvent(type, { bubbles: true, data });
+  act(() => { dispatchTrusted(keyboard, composition("compositionstart", "")); });
+  dispatchTrusted(keyboard, composition("compositionupdate", "가"));
+  // 취소한 조합은 빈 글자로 끝난다.
+  act(() => { keyboard.dispatchEvent(composition("compositionend", "")); });
+  act(() => { dispatchTrusted(keyboard, composition("compositionstart", "")); });
+  dispatchTrusted(keyboard, composition("compositionupdate", "가"));
+  // 스크립트가 다른 글자로 앞당겨 끝낸 조합도 보내지 않는다.
+  act(() => { keyboard.dispatchEvent(composition("compositionend", "각")); });
+  expect(sent()).toEqual([]);
+});
+
+it("첫 화면 전에도 원격 화면을 누르면 입력칸에 포커스를 두고 키는 보내지 않는다", () => {
+  const { session } = fakeSession();
+  act(() => root.render(<RemoteDesktopView session={session} active label="원격 데스크톱" />));
+  const keyboard = host.querySelector("textarea")!;
+  const canvas = host.querySelector("canvas")!;
+  const down = new MouseEvent("pointerdown", { bubbles: true, cancelable: true, buttons: 1 });
+  Object.assign(down, { pointerId: 1, isPrimary: true });
+  act(() => { dispatchTrusted(canvas, down); });
+  expect(document.activeElement).toBe(keyboard);
+  expect(canvas.dataset.keyboard).toBeUndefined();
+  dispatchTrusted(keyboard, new KeyboardEvent("keydown", { bubbles: true, cancelable: true, code: "KeyA", key: "a" }));
+  expect(session.send).not.toHaveBeenCalled();
+});
+
+it("연결된 화면의 입력칸에 포커스가 있을 때만 테두리 상태를 둔다", () => {
+  const { keyboard } = connectedKeyboard();
+  const canvas = host.querySelector("canvas")!;
+  expect(canvas.dataset.keyboard).toBe("focused");
+  act(() => keyboard.blur());
+  expect(canvas.dataset.keyboard).toBeUndefined();
+});
+
+it("입력칸에 쌓인 확정 글자가 길어지면 조합이 끝날 때 바로 비운다", () => {
+  const { keyboard } = connectedKeyboard();
+  expect(keyboard.getAttribute("wrap")).toBe("off");
+  keyboard.value = "가".repeat(300);
+  act(() => { dispatchTrusted(keyboard, new CompositionEvent("compositionstart", { bubbles: true, data: "" })); });
+  act(() => { dispatchTrusted(keyboard, new CompositionEvent("compositionend", { bubbles: true, data: "가" })); });
+  expect(keyboard.value).toBe("");
 });

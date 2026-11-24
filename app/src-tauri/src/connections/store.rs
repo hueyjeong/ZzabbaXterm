@@ -37,6 +37,13 @@ pub(super) struct Expected {
     revision: Revision,
 }
 
+impl Expected {
+    /// 그룹과 함께 지워지는 연결 대상의 ID다.
+    pub(super) fn target_id(&self) -> Option<&str> {
+        matches!(self.kind, EntryKind::Target).then_some(self.id.as_str())
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) enum EntryKind {

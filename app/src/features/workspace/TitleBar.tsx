@@ -46,7 +46,7 @@ export function TitleBar({ focused, sidebar, aiPanel, newTabItems, onNewTerminal
 
   // 터미널·원격 화면의 키보드 포커스를 제목줄 단추 클릭으로 빼앗지 않는다.
   const keepFocus = (event: MouseEvent) => {
-    if (event.button === 0 && document.activeElement?.closest(".terminal-screen, .remote-desktop-view canvas")) event.preventDefault();
+    if (event.button === 0 && document.activeElement?.closest(".terminal-screen, .remote-desktop-keyboard")) event.preventDefault();
   };
 
   return (

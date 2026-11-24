@@ -60,18 +60,20 @@ async fn dialog<T: Send + 'static>(window: WebviewWindow, live: CancellationToke
     }
 }
 
+/// 계정 칸 값이 `계정` 또는 `도메인\계정` 형식인지 본다.
+#[cfg(any(windows, target_os = "linux"))]
+fn valid_login(login: &str) -> bool {
+    login.trim() == login && !login.is_empty() && match login.split_once('\\') {
+        Some((domain, user)) => !domain.is_empty() && !user.is_empty() && !user.contains('\\'),
+        None => true,
+    }
+}
+
 #[cfg(any(windows, target_os = "linux"))]
 fn account_from_login(mut login: String, password: zeroize::Zeroizing<String>) -> Option<Account> {
-    if login.trim() != login || login.is_empty() || password.is_empty() { return None; }
-    let domain = match login.split_once('\\') {
-        Some((domain, user)) if !domain.is_empty() && !user.is_empty() && !user.contains('\\') => {
-            let domain = domain.to_owned();
-            login.drain(..=domain.len());
-            Some(domain)
-        }
-        Some(_) => return None,
-        None => None,
-    };
+    if !valid_login(&login) || password.is_empty() { return None; }
+    let domain = login.split_once('\\').map(|(domain, _)| domain.to_owned());
+    if let Some(domain) = &domain { login.drain(..=domain.len()); }
     Some(Account { username: login, domain, password })
 }
 
@@ -104,19 +106,41 @@ fn account_native(window: &WebviewWindow, target: &str, remembered: Option<&str>
     password.set_visibility(false);
     password.set_input_purpose(gtk::InputPurpose::Password);
     let label = gtk::Label::new(Some(&format!("검증된 서버: {target}")));
+    // 긴 대상 이름은 끝을 줄임표로 표시한다.
+    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    let error = gtk::Label::new(None);
     let area = dialog.content_area();
     area.add(&label);
     area.add(&gtk::Label::new(Some("계정 (또는 도메인\\계정)")));
     area.add(&login);
     area.add(&gtk::Label::new(Some("비밀번호")));
     area.add(&password);
+    area.add(&error);
+    // 두 칸이 모두 차야 로그인 단추를 켠다.
+    let update = {
+        let (dialog, login, password, error) = (dialog.clone(), login.clone(), password.clone(), error.clone());
+        move || {
+            dialog.set_response_sensitive(gtk::ResponseType::Ok, !login.text().is_empty() && !password.text().is_empty());
+            error.set_text("");
+        }
+    };
+    login.connect_changed({ let update = update.clone(); move |_| update() });
+    password.connect_changed({ let update = update.clone(); move |_| update() });
     dialog.show_all();
     if let Some(remembered) = remembered {
         login.set_text(remembered);
         password.grab_focus();
     }
-    let account = (dialog.run() == gtk::ResponseType::Ok)
-        .then(|| account_from_login(login.text().to_string(), zeroize::Zeroizing::new(password.text().to_string()))).flatten();
+    update();
+    // 계정 형식이 틀리면 창을 닫지 않고 오류를 표시한다.
+    let account = loop {
+        if dialog.run() != gtk::ResponseType::Ok { break None; }
+        if valid_login(login.text().as_str()) {
+            break account_from_login(login.text().to_string(), zeroize::Zeroizing::new(password.text().to_string()));
+        }
+        error.set_text("계정 형식이 올바르지 않습니다");
+        login.grab_focus();
+    };
     password.set_text("");
     dialog.close();
     account
@@ -136,7 +160,7 @@ fn confirm_native(window: &WebviewWindow, description: &str) -> bool {
 /// 앱이 직접 만든 계정 창이다. 자격 증명 관리자의 다른 항목을 목록으로 보이지 않고 비밀번호를 저장하지 않는다.
 #[cfg(windows)]
 fn account_native(window: &WebviewWindow, target: &str, remembered: Option<&str>) -> Option<Account> {
-    let (login, password) = super::account_dialog::prompt(window.hwnd().ok()?.0 as _, target, remembered)?;
+    let (login, password) = super::account_dialog::prompt(window.hwnd().ok()?.0 as _, target, remembered, valid_login)?;
     account_from_login(login, password)
 }
 
