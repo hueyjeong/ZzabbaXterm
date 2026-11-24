@@ -654,4 +654,125 @@ describe("우클릭 메뉴", () => {
     await choose("개발 (b)");
     expect(chip("조회 대상")?.getAttribute("aria-label")).toBe("조회 대상: 개발 (b)");
   });
+
+  it("붙여넣기와 잘라내기 뒤 같은 값으로 다시 입력해도 초안이 화면과 맞는다", async () => {
+    const props = setup();
+    await render(props);
+    await type("abc");
+    input().focus();
+    input().setSelectionRange(0, 1);
+    await contextMenu(input());
+    await choose("잘라내기");
+    expect(input().value).toBe("bc");
+    await type("abc");
+    expect(input().value).toBe("abc");
+    await click("전송");
+    expect(props.onSendChat.mock.calls[0]).toEqual([{ model: "local:latest", messages: [{ role: "user", content: "abc" }] }]);
+
+    input().focus();
+    await contextMenu(input());
+    await choose("붙여넣기");
+    expect(input().value).toBe("붙임");
+    await type("");
+    expect(input().value).toBe("");
+    expect(button("전송")?.disabled).toBe(true);
+  });
+
+  it("입력창에 넣은 뒤 모두 지우면 초안도 빈다", async () => {
+    const props = setup();
+    await render(props);
+    await chat(props, "질문");
+    await contextMenu(host.querySelector('.a01-msg[data-role="user"]')!);
+    await choose("입력창에 넣기");
+    expect(input().value).toBe("질문");
+    expect(button("전송")?.disabled).toBe(false);
+    await type("");
+    expect(input().value).toBe("");
+    expect(button("전송")?.disabled).toBe(true);
+  });
+
+  it("늦게 온 붙여넣기 응답은 그사이 입력이 바뀌었으면 버리고 겹친 붙여넣기는 무시한다", async () => {
+    await render(setup());
+    const late = Promise.withResolvers<string>();
+    clipboard.readText.mockReturnValueOnce(late.promise);
+    await type("처음");
+    input().focus();
+    await contextMenu(input());
+    await choose("붙여넣기");
+    await contextMenu(input());
+    await choose("붙여넣기");
+    expect(clipboard.readText).toHaveBeenCalledTimes(1);
+    await type("바뀐 값");
+    await act(async () => { late.resolve("늦은 글자"); });
+    expect(input().value).toBe("바뀐 값");
+
+    await contextMenu(input());
+    await choose("붙여넣기");
+    expect(clipboard.readText).toHaveBeenCalledTimes(2);
+    expect(input().value).toBe("바뀐 값붙임");
+  });
+
+  it("열린 메뉴는 상태가 바뀌면 사라진 동작을 바로 뺀다", async () => {
+    const props = setup();
+    const stop = vi.fn<NonNullable<AiPanelProps["onStopExecution"]>>().mockResolvedValue(undefined);
+    const running: ExecutionStatus = { proposalId: "p1", approvalId: "3", phase: "running", output: "" };
+    await render({ ...props, proposals: [card] });
+    await select("조회 대상", "개발 (a)");
+    await contextMenu(host.querySelector("article")!);
+    expect(items()).toEqual(["명령 복사", "대상 복사", "거절", "취소"]);
+    await render({ ...props, proposals: [card], history: [{ proposal: card, decision: "rejected" }] });
+    expect(items()).toEqual(["명령 복사", "대상 복사"]);
+    await escape();
+
+    const approved = { ...props, history: [{ proposal: card, decision: "approved" as const }], onStopExecution: stop };
+    await render({ ...approved, execution: running });
+    await contextMenu(host.querySelector(".a01-execution")!);
+    expect(items()).toEqual(["출력 복사", "중지"]);
+    await render({ ...approved, execution: { ...running, phase: "exited", code: 0 } });
+    expect(items()).toEqual(["출력 복사"]);
+    expect(stop).not.toHaveBeenCalled();
+  });
+
+  it("켜진 항목이 없는 메뉴도 키보드로 닫고 메뉴 키를 뗄 때 오는 contextmenu로 다시 열지 않는다", async () => {
+    await render(setup());
+    await select("조회 대상", "개발 (a)");
+    const suggestion = button("가동 시간 확인")!;
+    suggestion.focus();
+    await keyMenu(suggestion, { key: "ContextMenu" });
+    expect(menu()?.getAttribute("aria-label")).toBe("대화 기록 메뉴");
+    expect(menuItems().every((item) => item.disabled)).toBe(true);
+    expect(document.activeElement).toBe(menu());
+    const after = await contextMenu(document.activeElement!);
+    expect(after.defaultPrevented).toBe(true);
+    expect(host.querySelectorAll('[role="menu"]')).toHaveLength(1);
+    await escape();
+    expect(document.activeElement).toBe(suggestion);
+  });
+
+  it("메시지에 포커스를 두고 메뉴 키로 메뉴를 연다", async () => {
+    const props = setup();
+    await render(props);
+    await chat(props, "질문");
+    const message = host.querySelector<HTMLElement>('.a01-msg[data-role="assistant"]')!;
+    message.focus();
+    expect(document.activeElement).toBe(message);
+    await keyMenu(message, { key: "F10", shiftKey: true });
+    expect(menu()?.getAttribute("aria-label")).toBe("AI 메시지 메뉴");
+    await escape();
+    expect(document.activeElement).toBe(message);
+  });
+
+  it("실행 출력의 선택 영역을 복사한다", async () => {
+    const props = setup();
+    await render({ ...props, history: [{ proposal: card, decision: "approved" }],
+      execution: { proposalId: "p1", phase: "exited", output: "10:32 up 2 days" } });
+    await select("조회 대상", "개발 (a)");
+    const output = host.querySelector("pre")!.firstChild!;
+    document.getSelection()!.setBaseAndExtent(output, 6, output, 15);
+    await contextMenu(host.querySelector("pre")!);
+    expect(items()).toEqual(["출력 복사", "선택 영역 복사"]);
+    await choose("선택 영역 복사");
+    expect(clipboard.writeText.mock.calls).toEqual([["up 2 days"]]);
+    document.getSelection()!.removeAllRanges();
+  });
 });

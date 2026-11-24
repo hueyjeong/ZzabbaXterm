@@ -217,6 +217,19 @@ it("칩 우클릭 메뉴로 세션을 고르고 선택을 해제한다", async (
   expect(value()).toBe("");
 });
 
+it("숨겨지면 열린 우클릭 메뉴를 닫고 다시 보일 때 되살리지 않는다", async () => {
+  const port = actions();
+  await render(port);
+  await act(async () => {
+    field().dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 10, clientY: 20 }));
+  });
+  expect(host.querySelector('[role="menu"]')).not.toBeNull();
+  await render(port, [alpha, beta], false);
+  expect(host.querySelector('[role="menu"]')).toBeNull();
+  await render(port);
+  expect(host.querySelector('[role="menu"]')).toBeNull();
+});
+
 it("메뉴 키와 Shift+F10으로 칩 메뉴를 열고 닫으면 칩으로 포커스를 돌린다", async () => {
   await render(actions());
   for (const init of [{ key: "ContextMenu" }, { key: "F10", shiftKey: true }]) {

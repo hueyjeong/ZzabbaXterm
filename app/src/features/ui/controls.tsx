@@ -63,7 +63,8 @@ export function Menu({ x, y, items, label, onClose, restoreFocus }: {
     const { width, height } = menu.getBoundingClientRect();
     menu.style.left = `${Math.max(4, Math.min(x, window.innerWidth - width - 4))}px`;
     menu.style.top = `${Math.max(4, Math.min(y, window.innerHeight - height - 4))}px`;
-    menu.querySelector<HTMLButtonElement>('[role="menuitem"]:not(:disabled)')?.focus();
+    // 켜진 항목이 없으면 메뉴 자체에 포커스를 두어 Escape로 닫을 수 있게 한다.
+    (menu.querySelector<HTMLButtonElement>('[role="menuitem"]:not(:disabled)') ?? menu).focus();
     const outside = (event: PointerEvent) => {
       if (!menu.contains(event.target as Node)) onClose();
     };
@@ -96,7 +97,7 @@ export function Menu({ x, y, items, label, onClose, restoreFocus }: {
     next?.focus();
   }
 
-  return <div ref={element} className="ui-menu" role="menu" aria-label={label} style={{ left: x, top: y }}
+  return <div ref={element} className="ui-menu" role="menu" aria-label={label} tabIndex={-1} style={{ left: x, top: y }}
     onKeyDown={navigate} onContextMenu={event => event.preventDefault()}>
     {items.map((item, index) => {
       if (item.kind === "separator") return <div key={index} role="separator" />;

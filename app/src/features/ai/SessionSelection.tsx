@@ -37,7 +37,8 @@ function sameSession(a: Omit<SessionSelectionCandidate, "label">, b: Omit<Sessio
 export function SessionSelection({ candidates, visible = true, actions }: SessionSelectionProps) {
   const [state, setState] = useState<State>({ kind: "empty" });
   const menu = useAnchoredMenu<HTMLButtonElement>();
-  const context = useContextMenu();
+  const context = useContextMenu<null>();
+  const closeContext = context.close;
   const live = useRef<State>(state);
   const mounted = useRef(false);
   const identity = state.kind === "selecting" ? state.candidate : "selection" in state ? state.selection : undefined;
@@ -63,6 +64,11 @@ export function SessionSelection({ candidates, visible = true, actions }: Sessio
     mounted.current = true;
     return () => { mounted.current = false; };
   }, []);
+
+  // 숨겨지면 우클릭 메뉴를 닫는다. 다시 보일 때 예전 메뉴가 살아나지 않는다.
+  useLayoutEffect(() => {
+    if (!visible) closeContext();
+  }, [visible, closeContext]);
 
   useLayoutEffect(() => {
     const current = live.current;
@@ -156,9 +162,9 @@ export function SessionSelection({ candidates, visible = true, actions }: Sessio
         <button type="button" ref={menu.anchor} className="a01-chip" data-value={shown?.id ?? ""}
           aria-label={`AI 작업 세션: ${name}`} title={selected ? `${selected.region} / ${selected.node}` : undefined}
           aria-haspopup="menu" aria-expanded={menu.open} disabled={busy} onClick={menu.toggle}
-          onContextMenu={(event) => context.open(event, contextItems, "AI 작업 세션")}
+          onContextMenu={(event) => context.open(event, null, "AI 작업 세션")}
           onKeyDown={(event) => {
-            if (context.open(event, contextItems, "AI 작업 세션")) return;
+            if (context.open(event, null, "AI 작업 세션")) return;
             if (event.key === "ArrowDown" || event.key === "ArrowUp") {
               event.preventDefault();
               menu.show();
@@ -181,6 +187,6 @@ export function SessionSelection({ candidates, visible = true, actions }: Sessio
     {error && <p className="a01-inline-alert" role="alert">{error}</p>}
     {menu.open && visible && candidates.length > 0 && <AnchoredMenu anchor={menu.anchor} placement="above"
       items={items} label="AI 작업 세션" onClose={menu.close} />}
-    {visible && context.element}
+    {visible && candidates.length > 0 && context.element(() => contextItems)}
   </div>;
 }
