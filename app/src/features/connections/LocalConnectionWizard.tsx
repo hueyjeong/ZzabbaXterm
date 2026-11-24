@@ -195,7 +195,7 @@ function Wizard(props: LocalConnectionWizardProps) {
             <div>{draft.group.displayName} / {target.displayName}</div>
             {target.defaultMethod === "local" && <div>{target.local.startDirectory}</div>}
             {target.defaultMethod === "ssm" && target.ssm && <dl aria-label="SSM 연결 대상">
-              <div><dt>SSO 프로필</dt><dd>{target.ssm.profile}</dd></div>
+              <div><dt>AWS 프로필</dt><dd>{target.ssm.profile}</dd></div>
               <div><dt>리전</dt><dd>{target.ssm.region}</dd></div>
               <div><dt>인스턴스 ID</dt><dd>{target.ssm.instanceId}</dd></div>
             </dl>}
@@ -210,7 +210,7 @@ function Wizard(props: LocalConnectionWizardProps) {
               {desktop.route.kind === "ssh" && <div><dt>SSH 대상</dt><dd>
                 {sshTargets.find(profile => profile.id === routeTarget)?.displayName ?? routeTarget}</dd></div>}
               {desktop.route.kind === "ssm" && "profile" in desktop.route && <>
-                <div><dt>SSO 프로필</dt><dd>{desktop.route.profile}</dd></div>
+                <div><dt>AWS 프로필</dt><dd>{desktop.route.profile}</dd></div>
                 <div><dt>리전</dt><dd>{desktop.route.region}</dd></div>
                 <div><dt>인스턴스 ID</dt><dd>{desktop.route.instanceId}</dd></div>
               </>}

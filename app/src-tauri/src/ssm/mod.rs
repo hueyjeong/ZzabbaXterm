@@ -12,7 +12,7 @@ pub(crate) mod windows_acl;
 
 pub use cli::{CliError, CommandSpec};
 pub(crate) use home::{sso_cache_entry, user_home};
-pub(crate) use profile::DirectSsoConfig;
+pub(crate) use profile::{DirectSsoConfig, ProfileAuth};
 pub use session::{SessionLookup, StartPermit, StartRequest, VerificationError, VerifiedSession};
 pub(crate) use session::{AssumedRole, ForwardGuard, ForwardPermit, SessionDocument, start_rejection, valid_session_id};
 #[cfg(test)]
@@ -25,12 +25,15 @@ use profile::Profiles;
 use serde::{Deserialize, de::DeserializeOwned};
 use std::{path::Path, sync::Arc};
 
-/// 실제 노드 시험 전용이다. 이 프로필은 SSO 직접 프로필이 아니어도 사용자 AWS 설정으로 자격만 내보내고,
+/// 실제 노드 시험 전용이다. 이 프로필은 앱이 지원하는 프로필이 아니어도 사용자 AWS 설정으로 자격만 내보내고,
 /// 신원 확인·노드 조회·세션 시작과 종료는 앱 경로를 그대로 쓴다.
 #[cfg(test)]
 pub(crate) static LIVE_EXPORT_PROFILE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-pub struct AwsCli(Arc<Path>);
+/// 두 번째 값은 `aws login` 프로필 지원 여부(AWS CLI 2.32.0 이상)다.
+pub struct AwsCli(Arc<Path>, bool);
+
+const LOGIN_CLI_MINIMUM: &str = "2.32.0";
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct Scope {
@@ -59,7 +62,11 @@ impl Scope {
     }
 
     pub(crate) fn direct_sso_config(&self) -> Result<DirectSsoConfig, CliError> {
-        Profiles::load()?.take_export_config(self.profile())
+        Profiles::load()?.take_sso_config(self.profile())
+    }
+
+    pub(crate) fn auth(&self) -> Result<ProfileAuth, CliError> {
+        Profiles::load()?.auth(self.profile())
     }
 
     fn command(
@@ -89,19 +96,27 @@ impl AwsCli {
         let result = CommandSpec::version(Tool::Aws, program.clone())
             .capture(cancel)
             .await?;
-        let supported = [&result.stdout, &result.stderr].into_iter().any(|output| {
+        let version = [&result.stdout, &result.stderr].into_iter().find_map(|output| {
             std::str::from_utf8(output)
                 .ok()
                 .and_then(|line| line.trim().strip_prefix("aws-cli/"))
                 .and_then(|line| line.split_ascii_whitespace().next())
                 .and_then(plugin::numeric_version)
-                .is_some_and(|version| version[0] == 2 && version >= [2, 31, 0, 0])
+                .filter(|version| version[0] == 2 && *version >= [2, 31, 0, 0])
         });
         result.success()?;
-        if !supported {
+        let Some(version) = version else {
             return Err(CliError::AwsCliNotV2);
+        };
+        Ok(Self(program, version >= [2, 32, 0, 0]))
+    }
+
+    /// `aws login` 프로필은 `login_session`을 아는 CLI에서만 내보내거나 로그인할 수 있다.
+    fn require_auth_support(&self, auth: &ProfileAuth) -> Result<(), CliError> {
+        match auth {
+            ProfileAuth::Login(_) if !self.1 => Err(CliError::AwsCliUpgradeRequired { minimum: LOGIN_CLI_MINIMUM }),
+            _ => Ok(()),
         }
-        Ok(Self(program))
     }
 
     pub async fn check_plugin(&self, cancel: &CancellationToken) -> Result<(), CliError> {
@@ -114,7 +129,8 @@ impl AwsCli {
     pub async fn profiles(&self, cancel: &CancellationToken) -> Result<Vec<String>, CliError> {
         let profiles = Profiles::load()?;
         let output = self.profiles_command().capture(cancel).await?.success()?;
-        filter_profiles(&profiles, &output)
+        // `aws login`을 모르는 CLI에서는 login 프로필을 고를 수 없게 목록에서 뺀다.
+        filter_profiles(&profiles, &output, self.1)
     }
 
     pub async fn configured_region(
@@ -123,7 +139,7 @@ impl AwsCli {
         cancel: &CancellationToken,
     ) -> Result<Option<String>, CliError> {
         validate_profile(profile)?;
-        require_direct_profile(profile)?;
+        require_supported_profile(profile)?;
         parse_region(self.region_command(profile).capture(cancel).await?)
     }
 
@@ -142,27 +158,26 @@ impl AwsCli {
                 spec.capture(cancel).await
             }).await;
         }
-        let profiles = Profiles::load()?;
-        let config = profiles.export_config(scope.profile())?;
-        let home = home::CliHome::new()?;
-        home.import_sso_token(&home::user_home()?, config.cache_key())?;
-        self.online_nodes_with(scope, &config.cli_ini(), Arc::new(home), |spec| async move {
+        let auth = scope.auth()?;
+        self.require_auth_support(&auth)?;
+        let home = export_home(&auth, cancel).await?;
+        self.online_nodes_with(scope, &auth.cli_ini_for("default", scope.region()), Arc::new(home), |spec| async move {
             spec.capture(cancel).await
         })
         .await
     }
 
-    /// SSO 자격을 내보내고 STS 신원 확인만 한다. 노드 조회는 하지 않는다.
+    /// 프로필 자격을 내보내고 STS 신원 확인만 한다. 노드 조회는 하지 않는다.
     pub(crate) async fn check_identity(
         &self,
         scope: &Scope,
-        config: &DirectSsoConfig,
+        auth: &ProfileAuth,
         cancel: &CancellationToken,
     ) -> Result<(), CliError> {
-        let home = home::CliHome::new()?;
-        home.import_sso_token(&home::user_home()?, config.cache_key())?;
+        self.require_auth_support(auth)?;
+        let home = export_home(auth, cancel).await?;
         let mut capture = |spec: CommandSpec| async move { spec.capture(cancel).await };
-        self.caller_with(scope, &config.cli_ini(), Arc::new(home), &mut capture).await.map(drop)
+        self.caller_with(scope, &auth.cli_ini_for("default", scope.region()), Arc::new(home), &mut capture).await.map(drop)
     }
 
     // Tauri 작업은 캡처 클로저를 빌리지 않는 Send 퓨처를 사용한다.
@@ -216,18 +231,19 @@ impl AwsCli {
         .with_config(snapshot.path(), home.clone());
         let credentials = Arc::new(Credentials::parse(capture(export).await?)?);
         drop(snapshot);
+        // 마지막 참조이므로 `aws login` 갱신 잠금도 여기서 풀린다. 신원 조회는 잠금 밖에서 한다.
         drop(home);
         let identity = session::identity_command(&self.0, scope, &credentials);
         let (owner, role) = session::captured_caller(capture(identity).await?)?;
         Ok((credentials, owner, role))
     }
 
+    #[cfg(test)]
     pub fn relogin_command(&self, scope: &Scope, cause: CliError) -> Result<CommandSpec, CliError> {
         if cause != CliError::SsoLoginRequired {
             return Err(CliError::SsoLoginNotApplicable);
         }
-        require_direct_profile(scope.profile())?;
-        Ok(self.login_command(scope.profile()))
+        Ok(self.login_command(scope, &scope.auth()?))
     }
 
     pub async fn relogin(
@@ -236,23 +252,39 @@ impl AwsCli {
         cause: CliError,
         cancel: &CancellationToken,
     ) -> Result<(), CliError> {
-        self.relogin_command(scope, cause)?.login(cancel).await
+        if cause != CliError::SsoLoginRequired {
+            return Err(CliError::SsoLoginNotApplicable);
+        }
+        self.relogin_saved(scope, &scope.auth()?, cancel).await
     }
 
     pub(crate) async fn relogin_saved(
-        &self, scope: &Scope, approved: &DirectSsoConfig, cancel: &CancellationToken,
+        &self, scope: &Scope, approved: &ProfileAuth, cancel: &CancellationToken,
     ) -> Result<(), CliError> {
         use std::io::Write;
 
-        if scope.direct_sso_config()? != *approved { return Err(CliError::CallerChanged); }
+        if scope.auth()? != *approved { return Err(CliError::CallerChanged); }
+        self.require_auth_support(approved)?;
         let mut snapshot = tempfile::NamedTempFile::new().map_err(|_| CliError::ProcessIo)?;
-        snapshot.write_all(approved.cli_ini_for(scope.profile()).as_bytes()).map_err(|_| CliError::ProcessIo)?;
-        self.login_command(scope.profile()).login_with_config(snapshot.path(), cancel).await
+        snapshot.write_all(approved.cli_ini_for(scope.profile(), scope.region()).as_bytes()).map_err(|_| CliError::ProcessIo)?;
+        let cache = match approved {
+            ProfileAuth::Sso(_) => None,
+            ProfileAuth::Login(_) => Some(profile::login_cache_dir()?),
+        };
+        self.login_command(scope, approved).login_with_config(snapshot.path(), cache.as_deref(), cancel).await
     }
 
-    fn login_command(&self, profile: &str) -> CommandSpec {
-        // 로그인 리전은 관리 노드 리전이 아니라 프로필의 IAM Identity Center 설정을 따른다.
-        CommandSpec::aws(&self.0, &["sso", "login", "--profile", profile])
+    fn login_command(&self, scope: &Scope, auth: &ProfileAuth) -> CommandSpec {
+        let profile = scope.profile();
+        match auth {
+            // 로그인 리전은 관리 노드 리전이 아니라 프로필의 IAM Identity Center 설정을 따른다.
+            ProfileAuth::Sso(_) => CommandSpec::aws(&self.0, &["sso", "login", "--profile", profile]),
+            // 리전을 넘겨 CLI의 대화형 리전 질문을 막는다. 다른 계정으로 로그인하면 CLI가 덮어쓰기를 묻고,
+            // 입력이 닫혀 있으므로 실패한다.
+            ProfileAuth::Login(config) => CommandSpec::aws(
+                &self.0, &["login", "--profile", profile, "--region", config.login_region(scope.region())],
+            ),
+        }
     }
 
     fn profiles_command(&self) -> CommandSpec {
@@ -271,15 +303,43 @@ impl AwsCli {
     }
 }
 
-fn filter_profiles(profiles: &Profiles, output: &[u8]) -> Result<Vec<String>, CliError> {
+fn filter_profiles(profiles: &Profiles, output: &[u8], login: bool) -> Result<Vec<String>, CliError> {
     Ok(text(output)?
         .lines()
         .filter(|line| validate_profile(line).is_ok() && profiles.require(line).is_ok())
+        .filter(|line| login || !profiles.is_login(line))
         .map(str::to_owned)
         .collect())
 }
-fn require_direct_profile(profile: &str) -> Result<(), CliError> {
+fn require_supported_profile(profile: &str) -> Result<(), CliError> {
     Profiles::load()?.require(profile)
+}
+
+/// 내보내기용 격리 홈. SSO는 선택한 토큰만 복사하고, `aws login`은 사용자 로그인 캐시를 가리킨다.
+///
+/// `aws login` 갱신은 갱신 토큰을 바꿔 캐시에 다시 쓴다. 앱 안의 내보내기끼리 같은 토큰으로 동시에
+/// 갱신하지 않도록 login_session별 잠금을 홈에 담는다. 잠금은 내보내기가 끝나 홈을 버릴 때 풀린다.
+async fn export_home(auth: &ProfileAuth, cancel: &CancellationToken) -> Result<home::CliHome, CliError> {
+    let mut home = home::CliHome::new()?;
+    match auth {
+        ProfileAuth::Sso(config) => home.import_sso_token(&home::user_home()?, config.cache_key())?,
+        ProfileAuth::Login(config) => {
+            let lock = login_refresh_lock(&config.session);
+            let guard = tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Err(CliError::Cancelled),
+                guard = lock.lock_owned() => guard,
+            };
+            home.use_login_cache(profile::login_cache_dir()?, guard);
+        }
+    }
+    Ok(home)
+}
+
+fn login_refresh_lock(session: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+        std::sync::LazyLock::new(Default::default);
+    LOCKS.lock().unwrap().entry(session.to_owned()).or_default().clone()
 }
 
 pub(crate) fn validate_profile(profile: &str) -> Result<(), CliError> {

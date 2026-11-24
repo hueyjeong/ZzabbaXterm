@@ -185,7 +185,7 @@ pub(crate) fn fixture_start(program: &Path) -> (AwsCli, Scope, StartRequest, Sta
     };
     let plugin = plugin::tests::fixture_plugin();
     let command = request.start_command(credentials.home().path(), plugin.path());
-    (AwsCli(program), scope, request, StartPermit(command, credentials, plugin))
+    (AwsCli(program, true), scope, request, StartPermit(command, credentials, plugin))
 }
 
 #[cfg(test)]
@@ -353,6 +353,7 @@ impl AwsCli {
         cancel: &CancellationToken,
     ) -> Result<(), VerificationError> {
         request.require_issued_scope(&self.0, current_scope)?;
+        self.renew_credentials(request, cancel).await?;
         request
             .credentials
             .require_current()
@@ -368,9 +369,10 @@ impl AwsCli {
             .await
     }
 
-    pub(crate) async fn recheck_closed(&self, request: &StartRequest, scope: &Scope) -> Result<(), VerificationError> {
+    pub(crate) async fn recheck_closed(&self, request: &mut StartRequest, scope: &Scope) -> Result<(), VerificationError> {
         request.require_issued_scope(&self.0, scope)?;
         let cancel = CancellationToken::new();
+        self.renew_credentials(request, &cancel).await?;
         request.confirm_terminated(request.termination_id.as_deref(), async |spec| {
             #[cfg(test)]
             if request.fixture { return spec.capture_fixture(&cancel, CLOSE_LOOKUP_TIMEOUT).await; }
@@ -379,7 +381,45 @@ impl AwsCli {
     }
 }
 
+impl AwsCli {
+    /// 세션을 오래 쓰면 시작 때 내보낸 자격이 만료된다(`aws login`은 15분, SSO 역할은 역할 세션 시간).
+    /// 종료 확인 직전에 같은 프로필로 다시 내보내고, 신원이 시작 때와 같을 때만 바꾼다.
+    async fn renew_credentials(&self, request: &mut StartRequest, cancel: &CancellationToken) -> Result<(), VerificationError> {
+        if !request.credentials.expires_within(RENEW_MARGIN) {
+            return Ok(());
+        }
+        let scope = request.scope.clone();
+        let fresh = async {
+            let auth = scope.auth()?;
+            self.require_auth_support(&auth)?;
+            let home = super::export_home(&auth, cancel).await?;
+            let mut capture = |spec: CommandSpec| async move { spec.capture(cancel).await };
+            self.caller_with(&scope, &auth.cli_ini_for("default", scope.region()), Arc::new(home), &mut capture)
+                .await
+                .map(|(credentials, owner, _)| (credentials, owner))
+        }
+        .await;
+        request.adopt(fresh)
+    }
+}
+
+/// 종료 확인은 여러 번 조회하므로 이보다 수명이 짧으면 미리 다시 내보낸다.
+const RENEW_MARGIN: Duration = Duration::from_secs(120);
+
 impl StartRequest {
+    /// 다시 내보낸 자격을 받아들일지 정한다. 신원이 다르면 거부하고, 내보내기가 실패하면 아직 유효한
+    /// 기존 자격으로 계속한다. 새 자격이 기존보다 먼저 끝나면 바꾸지 않는다.
+    fn adopt(&mut self, fresh: Result<(Arc<Credentials>, Arc<str>), CliError>) -> Result<(), VerificationError> {
+        match fresh {
+            Ok((_, owner)) if owner != self.owner => Err(VerificationError::Unconfirmed),
+            Ok((credentials, _)) if credentials.expires_after(&self.credentials) => {
+                self.credentials = credentials;
+                Ok(())
+            }
+            _ => self.credentials.require_current().map_err(|_| VerificationError::Unconfirmed),
+        }
+    }
+
     pub(crate) fn account_id(&self) -> &str {
         caller_account_id(&self.owner)
     }

@@ -34,7 +34,7 @@ const stages = {
 } satisfies Record<S3Error["stage"], string>;
 
 const failures = {
-  invalidSsoProfile: "유효하지 않은 SSO 프로필", invalidRegion: "유효하지 않은 리전", invalidBucket: "유효하지 않은 버킷",
+  invalidSsoProfile: "유효하지 않은 SSO 프로필", ssoProfileRequired: "S3는 SSO 프로필만 지원", invalidRegion: "유효하지 않은 리전", invalidBucket: "유효하지 않은 버킷",
   retestRequired: "저장된 연결을 다시 시험하고 저장해야 합니다",
   accountMismatch: "SSO 프로필의 승인 계정과 AWS 신원이 다릅니다",
   invalidResponse: "잘못된 서비스 응답", credentials: "SSO 자격 증명 오류", ssoLoginRequired: "같은 SSO 프로필로 다시 로그인 필요",

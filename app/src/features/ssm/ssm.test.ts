@@ -52,7 +52,7 @@ function regionField() {
 }
 
 function reloginButton() {
-  return [...host.querySelectorAll("button")].find((button) => button.textContent === "SSO 재로그인");
+  return [...host.querySelectorAll("button")].find((button) => button.textContent === "AWS 재로그인");
 }
 
 async function choose(label: string, value: string) {
@@ -149,12 +149,12 @@ describe("SSM 선택", () => {
     await render(adapter);
     await choose("프로필", "alpha");
     await choose("리전", west);
-    expect(error()).toBe("alpha: SSO 로그인 만료");
+    expect(error()).toBe("alpha: AWS 로그인 만료");
     expect(adapter.relogin).not.toHaveBeenCalled();
     const button = reloginButton();
-    expect(button?.textContent).toBe("SSO 재로그인");
+    expect(button?.textContent).toBe("AWS 재로그인");
     await act(async () => { button?.click(); button?.click(); });
-    expect(status()).toBe("alpha: SSO 재로그인 중");
+    expect(status()).toBe("alpha: AWS 재로그인 중");
     expect(adapter.relogin.mock.calls.map(([scope, cause]) => [scope, cause])).toEqual([
       [{ profile: "alpha", region: west }, "SsoLoginRequired"],
     ]);
@@ -290,7 +290,7 @@ describe("SSM 검색 IPC", () => {
       .mockResolvedValueOnce(null).mockResolvedValueOnce("4").mockResolvedValueOnce([{ instanceId: one.instanceId }]);
     await render(createSsmDiscovery());
     await choose("프로필", "alpha");
-    expect(error()).toBe("alpha: SSO 로그인 만료");
+    expect(error()).toBe("alpha: AWS 로그인 만료");
     const button = reloginButton();
     expect(button).toBeDefined();
     await act(async () => { button?.click(); button?.click(); });
@@ -338,9 +338,9 @@ describe("SSM 검색 IPC", () => {
       .mockResolvedValueOnce(null);
     await render(createSsmDiscovery());
     await choose("프로필", "alpha");
-    expect(error()).toBe("alpha: SSO 로그인 만료");
+    expect(error()).toBe("alpha: AWS 로그인 만료");
     await choose("리전", west);
-    expect(error()).toBe("alpha: SSO 로그인 만료");
+    expect(error()).toBe("alpha: AWS 로그인 만료");
     await act(async () => root.render(null));
     expect(invokeSsm.mock.calls.slice(6).map(([, args]) => args.request)).toEqual([
       { action: "cancel", requestId: "3" }, { action: "reserve" },

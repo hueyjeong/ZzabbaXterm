@@ -30,7 +30,7 @@ export function TunnelTab({ tab, targetId, method, closeState, onShare, onOpenDe
   // 이전 렌더의 run이 대기열을 실행할 때도 현재 닫힘 상태를 읽는다.
   const closingNow = useRef(closing);
   useLayoutEffect(() => { closingNow.current = closing; }, [closing]);
-  // 이 탭에서 시작한 요청이다. SSO 로그인 뒤 같은 요청으로 다시 시작한다.
+  // 이 탭에서 시작한 요청이다. AWS 로그인 뒤 같은 요청으로 다시 시작한다.
   const requests = useRef(new Map<string, TunnelRequest>());
   const retry = useRef<TunnelRequest | undefined>(undefined);
   // 다른 작업 중에 로그인이 끝나면 그 작업이 끝난 뒤 다시 시작한다.

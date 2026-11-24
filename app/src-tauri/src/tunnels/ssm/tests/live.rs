@@ -44,7 +44,7 @@ fn live() -> Live {
         instance_id: required("ZZABBA_LIVE_NODE"),
     };
     let scope = crate::ssm::Scope::new(target.profile.clone(), target.region.clone()).unwrap();
-    if let Err(error) = scope.direct_sso_config() {
+    if let Err(error) = scope.auth() {
         println!("앱 프로필 검증 거부: {error:?} · 시험 안에서 자격 내보내기만 우회");
         let _ = crate::ssm::LIVE_EXPORT_PROFILE.set(target.profile.clone());
     }

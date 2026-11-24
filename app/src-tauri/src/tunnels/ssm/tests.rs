@@ -146,7 +146,7 @@ fn start_session_rejections_are_distinguished() {
         (rejection("UnrecognizedClientException", "invalid token"), Some("SSM: 자격 증명 사용 불가")),
         (rejection("TargetNotConnected", "offline"), Some("SSM: 노드 연결 불가")),
         (rejection("ThrottlingException", "slow down"), Some("SSM: 시작 거부 (ThrottlingException)")),
-        ("Error when retrieving token from sso: Token has expired and refresh failed\n".into(), Some("SSM: SSO 재로그인 필요")),
+        ("Error when retrieving token from sso: Token has expired and refresh failed\n".into(), Some("SSM: AWS 재로그인 필요")),
         (rejection("Bad Code", "x"), None),
         ("plugin crashed\n".into(), None),
     ] {

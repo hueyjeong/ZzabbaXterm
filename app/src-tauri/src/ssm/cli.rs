@@ -29,6 +29,7 @@ pub enum CliError {
     AwsCliNotV2,
     PluginMissing,
     PluginUpgradeRequired { minimum: &'static str },
+    AwsCliUpgradeRequired { minimum: &'static str },
     InvalidProfile,
     ProfileNotFound,
     UnsupportedProfile,
@@ -38,6 +39,7 @@ pub enum CliError {
     InvalidConfiguration,
     CredentialsUnavailable,
     CredentialsExpired,
+    /// SSO와 `aws login` 프로필 모두 브라우저 재로그인이 필요하다.
     SsoLoginRequired,
     SsoLoginNotApplicable,
     AccessDenied,
@@ -140,6 +142,8 @@ impl CommandSpec {
             "AWS_ENDPOINT_URL_SSO",
             "AWS_ENDPOINT_URL_SSO_OIDC",
             "AWS_ENDPOINT_URL_SIGNIN",
+            // 로그인 캐시 위치는 앱이 사용자 설정에서 읽어 명시한다.
+            "AWS_LOGIN_CACHE_DIRECTORY",
             "BROWSER",
             "AWS_SSM_START_SESSION_RESPONSE",
             "AWS_SSM_PLUGIN_ADDITIONAL_STREAM_HOSTS",
@@ -266,18 +270,15 @@ impl CommandSpec {
         capture(cmd, self.tool, LOOKUP_TIMEOUT, cancel).await
     }
 
-    pub(super) async fn login(&self, cancel: &CancellationToken) -> Result<(), CliError> {
-        super::plugin::validate_aws(self.program())?;
-        capture(self.command(), self.tool, LOGIN_TIMEOUT, cancel)
-            .await?
-            .success()?;
-        Ok(())
-    }
-
-    pub(super) async fn login_with_config(&self, config: &Path, cancel: &CancellationToken) -> Result<(), CliError> {
+    pub(super) async fn login_with_config(
+        &self, config: &Path, login_cache: Option<&Path>, cancel: &CancellationToken,
+    ) -> Result<(), CliError> {
         super::plugin::validate_aws(self.program())?;
         let mut command = self.command();
         super::export_env(config, |key, value| { command.env(key, value); });
+        if let Some(cache) = login_cache {
+            command.env("AWS_LOGIN_CACHE_DIRECTORY", cache);
+        }
         capture(command, self.tool, LOGIN_TIMEOUT, cancel).await?.success()?;
         Ok(())
     }
@@ -443,7 +444,13 @@ fn classify(exit_code: Option<i32>, stderr: &[u8]) -> CliError {
             || message
                 == "The SSO session associated with this profile has expired or is otherwise invalid. To refresh this SSO session run aws sso login with the corresponding profile."
             || (message.starts_with("Error loading SSO Token: Token for ")
-                && (message.ends_with(" does not exist") || message.ends_with(" is invalid"))) =>
+                && (message.ends_with(" does not exist") || message.ends_with(" is invalid")))
+            // `aws login` 세션: 캐시 없음, 갱신 토큰 만료, 암호 변경.
+            // 캐시 없음·필드 누락·키 손상 모두 `aws login`으로만 복구된다.
+            || message.starts_with("Error loading login session token: ")
+            || message == "Your session has expired. Please reauthenticate using 'aws login'."
+            || message
+                == "Unable to refresh login credentials because of a change in your password. Please reauthenticate with your new password using 'aws login'." =>
         {
             SsoLoginRequired
         }

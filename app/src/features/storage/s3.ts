@@ -28,7 +28,7 @@ type Stage = "profile" | "identity" | "listBuckets" | "headBucket" | "listObject
   "getObject" | "downloadBody" | "downloadWrite" | "downloadCommit";
 type Failure =
   | Readonly<{
-    kind: "invalidSsoProfile" | "retestRequired" | "accountMismatch" | "invalidRegion" | "invalidBucket" | "invalidResponse" |
+    kind: "invalidSsoProfile" | "ssoProfileRequired" | "retestRequired" | "accountMismatch" | "invalidRegion" | "invalidBucket" | "invalidResponse" |
     "credentials" | "ssoLoginRequired" | "loginFailed" | "request" | "timedOut" | "bodyRead" | "checksum" | "destination" | "tls" |
     "preconditionFailed" | "alreadyExists"
   }>

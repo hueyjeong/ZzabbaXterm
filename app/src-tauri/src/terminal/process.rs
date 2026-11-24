@@ -691,10 +691,14 @@ impl Session {
                 }
             }
         }
-        let mut request = self.unconfirmed.lock().unwrap();
-        if request.as_ref().is_some_and(remote::Remote::recheck_closed) {
-            request.take();
-            self.close_result.lock().unwrap().remote = remote::RemoteClose::Confirmed;
+        // 다시 확인은 자격 재발급까지 수십 초 걸릴 수 있으므로 잠금 밖에서 한다.
+        let pending = self.unconfirmed.lock().unwrap().take();
+        if let Some(mut request) = pending {
+            if request.recheck_closed() {
+                self.close_result.lock().unwrap().remote = remote::RemoteClose::Confirmed;
+            } else {
+                self.unconfirmed.lock().unwrap().get_or_insert(request);
+            }
         }
         self.close_result()
     }
