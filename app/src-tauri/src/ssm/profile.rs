@@ -21,6 +21,7 @@ pub(crate) struct DirectSsoConfig {
 }
 
 impl DirectSsoConfig {
+    #[cfg(test)]
     pub(super) fn cli_ini(&self) -> String {
         self.cli_ini_for("default")
     }
