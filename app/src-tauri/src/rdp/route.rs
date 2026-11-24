@@ -1,18 +1,28 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use ironrdp::connector::DesktopSize;
 use tokio::net::TcpStream;
-use tokio_rustls::rustls::pki_types::ServerName;
+use tokio_rustls::rustls::pki_types::{DnsName, ServerName};
 
 use crate::tunnels::{Destination, ipc::{DesktopLease, Protocol}};
 use super::{Error, Target};
 
-pub(super) fn dns_name(name: &str) -> bool {
-    !name.is_empty() && name.len() <= 253 && name.parse::<IpAddr>().is_err()
-        && matches!(ServerName::try_from(name), Ok(ServerName::DnsName(_)))
-        && name.split('.').all(|label| !label.is_empty() && label.len() <= 63
-            && !label.starts_with('-') && !label.ends_with('-')
-            && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+/// TLS 인증서를 확인할 서버 이름이다. 프로필 저장과 같은 규칙으로 DNS 이름 또는 표준 표기의 IP 주소만 받는다.
+/// IP 주소는 인증서의 IP SAN으로 확인한다.
+pub(super) fn server_name(name: &str) -> Option<ServerName<'static>> {
+    if !crate::connections::profile::rdp_server_name(name) { return None; }
+    match name.parse::<IpAddr>() {
+        Ok(ip) => Some(ServerName::from(ip)),
+        Err(_) => DnsName::try_from(name.to_owned()).ok().map(ServerName::DnsName),
+    }
+}
+
+/// 승인 창과 신뢰 창에 보이는 `호스트:포트`다. IPv6 주소는 괄호로 감싼다.
+pub(super) fn host_port(host: &str, port: u16) -> String {
+    match host.parse::<IpAddr>() {
+        Ok(ip) => SocketAddr::new(ip, port).to_string(),
+        Err(_) => format!("{host}:{port}"),
+    }
 }
 
 pub(super) enum Endpoint {
@@ -32,4 +42,23 @@ pub(super) fn forwarded(dns: String, destination: &Destination, size: DesktopSiz
     let stream = TcpStream::from_std(stream).map_err(|_| Error::Tcp)?;
     let listen = stream.peer_addr().map_err(|_| Error::Tcp)?;
     Ok(Target { endpoint: Endpoint::Forwarded { stream: Some(stream), listen }, server_name: dns, size, tls_only })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ip_server_names_are_checked_against_the_ip_san_and_numeric_tails_are_rejected() {
+        assert!(matches!(server_name("10.0.1.25"), Some(ServerName::IpAddress(_))));
+        assert!(matches!(server_name("2001:db8::25"), Some(ServerName::IpAddress(_))));
+        assert!(matches!(server_name("rdp.example.test"), Some(ServerName::DnsName(_))));
+        for name in ["", "2852039166", "127.1", "0x7f000001", "2001:0db8::25", "2001:DB8::25", "[2001:db8::25]",
+            "fe80::1%eth0", "0.0.0.0", "0.1.2.3", "0.255.255.255", "::", "::ffff:10.0.0.1", "::ffff:a00:1",
+            "::ffff:0.0.0.0", "rdp..example.test"] {
+            assert!(server_name(name).is_none(), "{name}");
+        }
+        assert_eq!(host_port("2001:db8::25", 3389), "[2001:db8::25]:3389");
+        assert_eq!(host_port("rdp.example.test", 3389), "rdp.example.test:3389");
+    }
 }

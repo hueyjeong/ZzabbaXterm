@@ -358,6 +358,11 @@ fn describe(dns: &str, endpoint: &str, cert: &CertificateDer<'_>, fingerprint: &
         .map(|(_, san)| {
             san.0.iter().filter_map(|name| match name {
                 GeneralName::DnsName(name) => Some(name.to_string()),
+                // IP 주소로 연결하는 서버는 IP SAN으로 확인하므로 함께 보여 준다.
+                GeneralName::IpAddress(ip) => match *ip.as_bytes() {
+                    [a, b, c, d] => Some(std::net::Ipv4Addr::new(a, b, c, d).to_string()),
+                    _ => <[u8; 16]>::try_from(ip.as_bytes()).ok().map(|v6| std::net::Ipv6Addr::from(v6).to_string()),
+                },
                 _ => None,
             }).collect::<Vec<_>>().join(", ")
         })
@@ -365,11 +370,11 @@ fn describe(dns: &str, endpoint: &str, cert: &CertificateDer<'_>, fingerprint: &
         .unwrap_or_else(|| "없음".into());
     let text = if let Some(previous) = previous {
         format!(
-            "RDP 서버 인증서가 바뀌었습니다\n\n원격 DNS: {dns}\n대상: {endpoint}\n주체: {subject}\nSAN: {san}\n사유: {reason}\n이전 SHA-256: {previous}\n새 SHA-256: {fingerprint}\n\n새 지문으로 교체하고 연결합니까?"
+            "RDP 서버 인증서가 바뀌었습니다\n\n원격 이름: {dns}\n대상: {endpoint}\n주체: {subject}\nSAN: {san}\n사유: {reason}\n이전 SHA-256: {previous}\n새 SHA-256: {fingerprint}\n\n새 지문으로 교체하고 연결합니까?"
         )
     } else {
         format!(
-            "RDP 서버 인증서를 신뢰합니까?\n\n원격 DNS: {dns}\n대상: {endpoint}\n주체: {subject}\nSAN: {san}\n사유: {reason}\nSHA-256: {fingerprint}\n\n이 지문을 저장하고 연결합니다."
+            "RDP 서버 인증서를 신뢰합니까?\n\n원격 이름: {dns}\n대상: {endpoint}\n주체: {subject}\nSAN: {san}\n사유: {reason}\nSHA-256: {fingerprint}\n\n이 지문을 저장하고 연결합니다."
         )
     };
     trust::Request { text, changed: previous.is_some() }
@@ -417,14 +422,14 @@ where
         Err(error) => {
             let cert = tls.seen().ok_or(Error::TlsIdentity)?;
             let fingerprint = trust::fingerprint(cert.as_ref());
-            let stored = trust::load(&trust.path, &trust.dns, &trust.endpoint);
+            let stored = trust::load(&trust.path, &trust.dns, &trust.endpoint, trust.route.as_deref());
             let known = stored.as_deref() == Some(fingerprint.as_str());
             if !known {
                 let request = describe(&trust.dns, &trust.endpoint, &cert, &fingerprint, stored.as_deref(), failure_reason(&error));
                 if !(trust.approve)(request).await? {
                     return Err(Error::TlsIdentity);
                 }
-                trust::save(&trust.path, &trust.dns, &trust.endpoint, &fingerprint)?;
+                trust::save(&trust.path, &trust.dns, &trust.endpoint, trust.route.as_deref(), &fingerprint)?;
             }
             // 같은 대상에 다시 협상한 뒤 저장된 지문으로만 TLS를 완료한다.
             let (framed, next, next_selected) = tokio::time::timeout(super::CONNECT_TIMEOUT, negotiate_rdp(&mut target))

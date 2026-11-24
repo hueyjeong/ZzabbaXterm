@@ -14,17 +14,17 @@
 
 ## 개발 순서
 
-1. **Red — 초안과 저장본을 구별한다.** `app/src/features/connections/profiles.test.ts`에 취소·시험 실패·값 수정 후 이전 성공 결과 도착·동명 대상 선택 사례를 쓴다. `app/src-tauri/src/connections/`에 허용하지 않은 필드(예: `password`, `accessToken`)를 보낸 초안의 거부, 실패한 저장 후 이전 파일을 다시 읽는 Rust 시험을 먼저 추가한다. 직렬화할 때 비밀 필드 값을 빈 문자열로 바꾸는 구현도 실패여야 한다.
+1. **Red — 초안과 저장본을 구별한다.** `app/src/features/connections/connectionTest.test.ts`와 `sessionEditor.test.ts`에 취소·시험 실패·값 수정 후 이전 성공 결과 도착·동명 대상 선택 사례를 쓴다. `app/src-tauri/src/connections/`에 허용하지 않은 필드(예: `password`, `accessToken`)를 보낸 초안의 거부, 실패한 저장 후 이전 파일을 다시 읽는 Rust 시험을 먼저 추가한다. 직렬화할 때 비밀 필드 값을 빈 문자열로 바꾸는 구현도 실패여야 한다.
 2. **Green — 데이터 경계를 만든다.** Rust가 그룹 ID·대상 ID, 표시명, 실제 대상, 접속 방식 목록과 기본 방식, 방식별 경로·서비스 인증 참조를 검증한다. 로컬 방식은 지원 셸과 시작 디렉터리만 받는다. 셸 명령 문자열이나 임의 프로그램 실행 옵션은 받지 않는다. 후속 방식에서도 AWS 프로필 이름, 키 참조·지문, 금고 항목 ID만 저장하고 비밀 값은 입력 스키마에서 제외한다. 저장 시 사용자 전용 앱 설정 경로에서 임시 파일을 완전히 쓴 뒤 기존 파일을 원자적으로 교체한다. 기록 실패는 저장 실패다.
-3. **Green — 마법사를 실제 PTY에 연결한다.** `app/src/features/connections/`에서 `+ → 대상 → 접속 방식 → 인증 → 연결 테스트·저장` 순으로 한 초안을 편집한다. 로컬 인증 값은 `현재 사용자`다. Rust는 선택한 셸과 작업 디렉터리로 시험 전용 PTY를 열어 고정된 시험 문자열을 출력하는 셸 명령의 결과와 정상 종료를 확인한다(입력 에코를 성공으로 세지 않는다). 시간 초과·취소·창 닫기에는 해당 자식만 종료·회수한다. Rust에서 시험 결과를 초안 버전에 묶고, 현재 버전이 성공한 경우에만 로컬 UI의 별도 저장 동작을 받는다. AWS 방식의 실연결 시험은 [C02](02-ssm.md)가 맡는다.
+3. **Green — 세션 편집 창을 실제 PTY에 연결한다.** `app/src/features/connections/SessionEditor.tsx`의 한 화면에서 이름·그룹·접속 방식과 방식별 필드를 편집하고 `연결 시험`·`저장`을 누른다. 로컬 인증 값은 현재 사용자다. Rust는 선택한 셸과 작업 디렉터리로 시험 전용 PTY를 열어 고정된 시험 문자열을 출력하는 셸 명령의 결과와 정상 종료를 확인한다(입력 에코를 성공으로 세지 않는다). 시간 초과·취소·창 닫기에는 해당 자식만 종료·회수한다. Rust에서 시험 결과를 초안 버전에 묶고, 현재 버전이 성공한 경우에만 시험 티켓 저장(`connection_save`)을 받는다. 시험하지 않은 초안은 입력 검증만 하는 `connection_target_save`로 저장한다. AWS 방식의 실연결 시험은 [C02](02-ssm.md)가 맡는다.
 4. **Green — 저장본으로 트리를 그린다.** 그룹 아래 대상 행을 표시하고 검색 결과도 원래 그룹에 둔다. 기존 트리 폭을 쓰고 글자 15px·행 36px·행 전체 선택을 적용한다. 화살표로 이동·접기·펼치기, Enter·더블클릭으로 기본 연결, 문맥 메뉴로 설정된 다른 방식을 연다. 트리에는 영구 대상 ID, 열리는 탭에는 매번 Rust가 발급한 세션 ID를 쓴다.
-5. **실기기에서 판정한다.** 아래 명령은 모두 후속 구현 시 `app/`에서 실행한다. `npx vitest run src/features/connections/profiles.test.ts`와 `cargo test --manifest-path src-tauri/Cargo.toml connections`에서 1단계 사례가 실제로 실행되는지 확인한다. `npm run tauri dev`로 두 OS에서 각각 정상 경로 시험·저장·재시작과 실패 경로 시험·취소를 반복한다. 정상 행을 열어 PowerShell은 `Get-Location`, Bash는 `pwd`로 선택했던 시작 경로를 대조한다.
+5. **실기기에서 판정한다.** 아래 명령은 모두 후속 구현 시 `app/`에서 실행한다. `npx vitest run src/features/connections`와 `cargo test --manifest-path src-tauri/Cargo.toml connections`에서 1단계 사례가 실제로 실행되는지 확인한다. `npm run tauri dev`로 두 OS에서 각각 정상 경로 시험·저장·재시작과 실패 경로 시험·취소를 반복한다. 정상 행을 열어 PowerShell은 `Get-Location`, Bash는 `pwd`로 선택했던 시작 경로를 대조한다.
 
 **완료 증거:** OS별로 정상 경로, 실패 이유, 재시작 후 열린 대상, 취소 전후 설정의 동일 여부와 시험용 자식 회수 결과를 남긴다. 저장 파일은 값 대신 필드 이름만 첨부한다. AWS 연결 결과는 이 증거에 포함하지 않는다.
 
-## 로컬 마법사 IPC
+## 세션 편집 창 IPC
 
-Tauri의 로컬 `main` 창에서만 호출한다. `Run`은 `{ draftId: string, draftVersion: number, runId: string }`이다. 마법사가 편집 식별자와 버전을 넘기면 Rust가 `runId`를 발급한다. `draftVersion`은 0 이상의 안전한 정수이며 파일 스키마 버전과 별개다.
+Tauri의 로컬 `main` 창에서만 호출한다. `Run`은 `{ draftId: string, draftVersion: number, runId: string }`이다. 편집 창이 편집 식별자와 버전을 넘기면 Rust가 `runId`를 발급한다. `draftVersion`은 0 이상의 안전한 정수이며 파일 스키마 버전과 별개다.
 
 | 명령 | 인자 | 성공 응답 |
 |---|---|---|
@@ -34,12 +34,12 @@ Tauri의 로컬 `main` 창에서만 호출한다. `Run`은 `{ draftId: string, d
 | `connection_save` | `{ request: { run: Run, draft } }` | `null` |
 | `connections_load` | `{}` | `{ version: 2, groups: [{ revision, profile }], targets: [{ revision, profile }] }` |
 
-`draft`는 `{ version: 1 | 2, groupRevision, targetRevision, group, target }`이다. `target.groupId`는 `group.id`와 같아야 한다. 이미 있는 그룹의 `parentId`는 이 초안으로 바꾸지 않는다. 새 항목의 개정은 `null`이고, 저장된 항목을 수정할 때는 목록 응답의 개정을 넘긴다. `group`은 `{ id, displayName }`, `target`은 `{ id, groupId, displayName, defaultMethod: "local", local: { shell, startDirectory } }`다. `shell`은 Windows의 `"powerShell"` 또는 Ubuntu의 `"bash"`이며, `startDirectory`는 절대 경로다. 로컬 인증은 현재 사용자이므로 인증 필드는 없다.
+`draft`는 `{ version: 2, targetRevision, target }`이다. `target.groupId`는 선택이며, 있으면 이미 저장된 그룹이어야 하고 없으면 최상위 세션이다. 시험 뒤 저장은 대상만 저장하고 그룹은 바꾸지 않는다. 새 대상의 개정은 `null`이고, 저장된 대상을 수정할 때는 목록 응답의 개정을 넘긴다. 로컬 `target`은 `{ id, groupId?, displayName, defaultMethod: "local", local: { shell, startDirectory } }`다. `shell`은 Windows의 `"powerShell"` 또는 Ubuntu의 `"bash"`이며, `startDirectory`는 절대 경로다. 로컬 인증은 현재 사용자이므로 인증 필드는 없다.
 Windows의 시험과 저장 대상 열기는 일반 드라이브 절대 경로를 받는다. 확장 경로, 장치 경로, UNC 경로는 경로 오류로 반환한다.
 
 1. `start`에 현재 초안을 넘긴 뒤 반환된 `Run`을 `wait`에 그대로 전달한다. PTY 생성부터 시험 표식·정상 종료·회수까지 합쳐 8초 안에 끝나야 성공한다. 기한이 지나면 오류를 반환하고 아직 남아 있는 해당 시험은 백그라운드에서 회수한다.
-2. 편집하거나 마법사를 닫으면 이전 `Run`을 취소한다. `null`은 저장 자격 폐기와 중지 요청의 응답이다. 아직 진행 중인 OS 정리는 소유 창의 실행 목록에 남겨 완료 시 수거한다. `start` 응답이 늦으면 도착한 `Run`을 취소하며, 재시험·문서 이동·창 닫기도 해당 실행만 취소한다.
-3. 사용자가 성공한 초안에서 저장을 누를 때만 `connection_save`를 호출한다. Rust는 파일 잠금을 얻은 뒤와 최종 교체 직전에 창·문서·실행·초안이 여전히 일치하는지 확인한다. 최종 승인 전에 문서가 사라지면 기존 파일은 그대로다. 최종 승인 뒤에는 교체를 마치며, 성공한 실행의 저장 자격은 소진된다. 저장 뒤 `connections_load`로 새 개정과 목록을 받는다.
+2. 편집하거나 편집 창을 닫으면 이전 `Run`을 취소한다. `null`은 저장 자격 폐기와 중지 요청의 응답이다. 아직 진행 중인 OS 정리는 소유 창의 실행 목록에 남겨 완료 시 수거한다. `start` 응답이 늦으면 도착한 `Run`을 취소하며, 재시험·문서 이동·창 닫기도 해당 실행만 취소한다.
+3. 사용자가 시험에 성공한 초안에서 저장을 누를 때만 `connection_save`를 호출한다. SSM과 S3는 이 경로로 확인한 계정 ID를 함께 저장한다. 시험하지 않았거나 시험 뒤 입력을 바꾼 초안, 저장 암호 SSH, RDP, VNC는 `connection_target_save`로 저장한다. Rust는 파일 잠금을 얻은 뒤와 최종 교체 직전에 창·문서·실행·초안이 여전히 일치하는지 확인한다. 최종 승인 전에 문서가 사라지면 기존 파일은 그대로다. 최종 승인 뒤에는 교체를 마치며, 성공한 실행의 저장 자격은 소진된다. 저장 뒤 `connections_load`로 새 개정과 목록을 받는다.
 
 ## 저장 스키마 v2
 
@@ -88,9 +88,11 @@ Windows의 시험과 저장 대상 열기는 일반 드라이브 절대 경로�
 
 | 경로 | 전달 목적지 | RDP `host` | VNC `host` |
 |---|---|---|---|
-| `direct` | `host:port` | 서버 DNS 이름(TLS 인증 이름) | DNS 이름 또는 IP |
-| `ssh` | SSH 서버의 `127.0.0.1:port` | TLS 인증 DNS 이름 | 빈 값 |
-| `ssm` | `host`가 비면 노드 자신의 `port`, 있으면 노드에서 접속하는 `host:port` | 빈 값, DNS 이름 또는 IP | 빈 값 |
+| `direct` | `host:port` | TLS 인증 이름(DNS 이름 또는 IP) | DNS 이름 또는 IP |
+| `ssh` | SSH 서버의 `127.0.0.1:port` | TLS 인증 이름(DNS 이름 또는 IP) | 빈 값 |
+| `ssm` | `host`가 비면 노드 자신의 `port`, 있으면 노드에서 접속하는 `host:port` | TLS 인증 이름(DNS 이름 또는 IP) | 빈 값 |
+
+- RDP `host`의 IP 주소는 표준 표기(`10.0.1.25`, `2001:db8::25`)만 받고 서버 인증서의 IP SAN으로 확인한다. 리졸버가 IP로 해석하는 숫자 꼬리 이름(`2852039166`, `127.1`)과 지정되지 않은 주소(`0.0.0.0`, `::`)는 거부한다.
 
 - `ssh` 경로의 `targetId`는 Agent 또는 키 파일 인증을 쓰는 저장된 직접 SSH 대상이어야 한다. Rust가 저장할 때와 터널을 열 때 각각 확인한다. 참조 중인 SSH 대상은 지우거나 다른 인증으로 바꿀 수 없다.
-- 원격 화면 프로필은 연결 시험 없이 저장한다. `connection_test_start`는 거부하고, `connection_save`가 스키마와 SSH 참조를 검증한다. 서버 인증서와 터널 승인은 열 때 확인한다.
+- 원격 화면 프로필은 연결 시험 없이 저장한다. `connection_test_start`와 `connection_save`는 거부하고, `connection_target_save`가 스키마와 SSH 참조를 검증한다. 서버 인증서와 터널 승인은 열 때 확인한다.

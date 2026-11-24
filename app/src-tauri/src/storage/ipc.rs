@@ -1593,10 +1593,10 @@ mod tests {
         ), account)).unwrap();
         write_config("123456789012");
         assert_eq!(verified_selection(&directory, "saved-sso").err().unwrap().failure, Failure::RetestRequired);
-        let input = json!({"version": 1, "groupRevision": 1, "targetRevision": 1, "group": group, "target": target});
+        let input = json!({"version": 2, "targetRevision": 1, "target": target});
         let mut forged = input.clone();
         forged["target"]["ssm"]["testedAccountId"] = json!("000000000000");
-        assert!(serde_json::from_value::<crate::connections::profile::Draft>(forged).is_err());
+        assert!(serde_json::from_value::<crate::connections::profile::TargetDraft>(forged).is_err());
         crate::connections::probe::save_ssm_fixture(&directory, input, "123456789012");
         let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
         assert_eq!(saved["targets"][0]["tested_account_id"], "123456789012");

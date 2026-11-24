@@ -132,25 +132,21 @@ impl Draft {
         self.route_approval_text(dns, false)
     }
 
-    /// SSH 경로는 서버 루프백만, SSM 경로는 노드 자신(루프백) 또는 TLS 인증 DNS 이름의 원격 호스트만 받는다.
+    /// SSH 경로는 서버 루프백만, SSM 경로는 노드 자신(루프백) 또는 TLS 인증 이름(DNS 이름 또는 IP 주소)의 원격 호스트만 받는다.
     fn route_approval_text(&self, dns: &str, ssm: bool) -> Result<String, Error> {
-        if !route::dns_name(dns) || self.port == 0 { return Err(Error::InvalidServerName); }
+        if route::server_name(dns).is_none() || self.port == 0 { return Err(Error::InvalidServerName); }
         let login = if self.tls_only { "NLA, 미지원 시 TLS 전용(표준 RDP 보안 없음)" } else { "NLA" };
         let Some(source) = &self.source else {
-            return Ok(format!("서버: {dns}:{}\n경로: 직접\n로그인: {login}", self.port));
+            return Ok(format!("서버: {}\n경로: 직접\n로그인: {login}", route::host_port(dns, self.port)));
         };
         let ForwardDestination { host, port } = &source.destination;
         let loopback = matches!(host.as_str(), "127.0.0.1" | "::1");
         if !(loopback || (ssm && host.eq_ignore_ascii_case(dns))) || *port != self.port || !valid_id(&source.target_id) {
             return Err(Error::InvalidForwardDestination);
         }
-        let destination = if loopback {
-            std::net::SocketAddr::new(host.parse().map_err(|_| Error::InvalidForwardDestination)?, *port).to_string()
-        } else {
-            format!("{host}:{port}")
-        };
+        let destination = route::host_port(host, *port);
         let (via, target) = if ssm { ("SSM", "SSM 경로 대상 ID") } else { ("SSH", "SSH 대상 ID") };
-        Ok(format!("경로: R01 {via} 전달\n{target}: {}\n포워드 목적지: {destination}\nTLS 인증 DNS: {dns}\n로그인: {login}", source.target_id))
+        Ok(format!("경로: R01 {via} 전달\n{target}: {}\n포워드 목적지: {destination}\nTLS 인증 이름: {dns}\n로그인: {login}", source.target_id))
     }
 }
 
@@ -409,14 +405,16 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
     let description = draft.route_approval_text(&dns, matches!(saved, Some(SavedRoute::Ssm(_)))).map_err(message)?;
     let trust_path = window.path().app_config_dir().map_err(|error| error.to_string())?.join("rdp-trust.json");
     let size = DesktopSize { width: 1024, height: 768 };
-    let (target, loss, target_name, endpoint) = if let (Some(source), Some(saved)) = (draft.source, saved) {
+    let (target, loss, target_name, endpoint, pin_route) = if let (Some(source), Some(saved)) = (draft.source, saved) {
         let directory = window.path().app_config_dir().map_err(|error| error.to_string())?;
         let destination = Destination { host: source.destination.host, port: source.destination.port };
         window.state::<TunnelTabs>().preflight_desktop(tunnel_epoch, (&source.tab_handle, &source.tunnel_id),
             &source.target_id, &destination, Protocol::Rdp)?;
         let description = format!("{description}\n{}", describe_route(&saved, &directory));
         native::confirm(window.clone(), description, prompt.clone(), approval.clone(), notify.clone()).await.map_err(message)?;
-        let target_name = format!("{dns} (TLS DNS)");
+        let target_name = format!("{dns} (TLS 인증 이름)");
+        // 전달 경로의 endpoint는 루프백이라 경로마다 같을 수 있다. 인증서 고정은 경로 대상 ID로 구분한다.
+        let pin_route = Some(source.target_id.clone());
         let caller = window.clone();
         let live = prompt.clone();
         // 발급 중 취소되어도 작업을 기다려 인계 소켓과 임대를 이 경로에서 정리한다.
@@ -430,13 +428,13 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
         if life.is_cancelled() { return Err(CLOSED.into()); }
         let loss = lease.loss();
         let target = route::forwarded(dns.clone(), &approved_destination, size, lease, draft.tls_only).map_err(message)?;
-        let endpoint = format!("{}:{}", approved_destination.host, approved_destination.port);
-        (target, Some(loss), target_name, endpoint)
+        let endpoint = route::host_port(&approved_destination.host, approved_destination.port);
+        (target, Some(loss), target_name, endpoint, pin_route)
     } else {
         native::confirm(window.clone(), description, prompt.clone(), approval.clone(), notify.clone()).await.map_err(message)?;
-        let target_name = format!("{dns}:{}", draft.port);
+        let target_name = route::host_port(&dns, draft.port);
         let endpoint = target_name.clone();
-        (route::direct(dns.clone(), draft.port, size, draft.tls_only), None, target_name, endpoint)
+        (route::direct(dns.clone(), draft.port, size, draft.tls_only), None, target_name, endpoint, None)
     };
     let stopped = async {
         tokio::select! { biased;
@@ -449,6 +447,7 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
         path: trust_path,
         dns: dns.clone(),
         endpoint,
+        route: pin_route,
         approve: {
             let window = window.clone();
             let live = prompt.clone();
@@ -640,7 +639,7 @@ pub(super) fn message(error: Error) -> &'static str {
         Error::Clipboard => "RDP 클립보드 교환 실패",
         Error::Closed => CLOSED,
         Error::Credentials => "RDP 계정 입력이 취소되었거나 올바르지 않습니다",
-        Error::InvalidServerName => "RDP 서버 DNS 이름 또는 포트가 올바르지 않습니다",
+        Error::InvalidServerName => "RDP 서버 이름 또는 포트가 올바르지 않습니다",
         Error::InvalidForwardDestination => "RDP 터널 목적지가 올바르지 않습니다",
         Error::Tcp => "RDP TCP 연결 실패",
         Error::Negotiation => "RDP 서버와 NLA를 협상할 수 없습니다",
@@ -734,7 +733,7 @@ mod tests {
                 "destination": { "host": "::1", "port": 3390 } }
         })).unwrap();
         assert_eq!(draft.approval_text(&draft.host).unwrap(),
-            "경로: R01 SSH 전달\nSSH 대상 ID: ssh-server\n포워드 목적지: [::1]:3390\nTLS 인증 DNS: rdp.example.invalid\n로그인: NLA");
+            "경로: R01 SSH 전달\nSSH 대상 ID: ssh-server\n포워드 목적지: [::1]:3390\nTLS 인증 이름: rdp.example.invalid\n로그인: NLA");
         draft.port = 3389;
         assert_eq!(draft.approval_text(&draft.host), Err(Error::InvalidForwardDestination));
         assert!(serde_json::from_value::<Draft>(serde_json::json!({
@@ -756,7 +755,34 @@ mod tests {
                 "destination": { "host": "127.0.0.1", "port": 3390 } }
         })).unwrap();
         assert_eq!(forwarded_opt_in.approval_text(&forwarded_opt_in.host).unwrap(),
-            "경로: R01 SSH 전달\nSSH 대상 ID: ssh-server\n포워드 목적지: 127.0.0.1:3390\nTLS 인증 DNS: rdp.example.invalid\n로그인: NLA, 미지원 시 TLS 전용(표준 RDP 보안 없음)");
+            "경로: R01 SSH 전달\nSSH 대상 ID: ssh-server\n포워드 목적지: 127.0.0.1:3390\nTLS 인증 이름: rdp.example.invalid\n로그인: NLA, 미지원 시 TLS 전용(표준 RDP 보안 없음)");
+    }
+
+    #[test]
+    fn rdp_approval_accepts_ip_server_names_and_brackets_ipv6() {
+        let draft = |host: &str, destination: Option<&str>| -> Draft {
+            let mut value = serde_json::json!({ "host": host, "port": 3389 });
+            if let Some(destination) = destination {
+                value["source"] = serde_json::json!({ "tabHandle": "owned-tab", "tunnelId": "7", "targetId": "ssm-node",
+                    "destination": { "host": destination, "port": 3389 } });
+            }
+            serde_json::from_value(value).unwrap()
+        };
+        let direct = draft("10.0.1.25", None);
+        assert_eq!(direct.approval_text(&direct.host).unwrap(), "서버: 10.0.1.25:3389\n경로: 직접\n로그인: NLA");
+        let direct = draft("2001:db8::25", None);
+        assert_eq!(direct.approval_text(&direct.host).unwrap(), "서버: [2001:db8::25]:3389\n경로: 직접\n로그인: NLA");
+        // SSM 원격 호스트는 TLS 인증 이름과 같은 IP 주소여야 한다.
+        let ssm = draft("2001:db8::25", Some("2001:db8::25"));
+        assert_eq!(ssm.route_approval_text(&ssm.host, true).unwrap(),
+            "경로: R01 SSM 전달\nSSM 경로 대상 ID: ssm-node\n포워드 목적지: [2001:db8::25]:3389\nTLS 인증 이름: 2001:db8::25\n로그인: NLA");
+        let other = draft("10.0.1.25", Some("10.0.1.26"));
+        assert_eq!(other.route_approval_text(&other.host, true), Err(Error::InvalidForwardDestination));
+        // 리졸버가 IP로 해석하는 숫자 꼬리 이름, 비표준 IPv6 표기, 지정되지 않은 주소는 받지 않는다.
+        for host in ["2852039166", "127.1", "0x7f000001", "2001:0db8::25", "[2001:db8::25]", "0.0.0.0", "::"] {
+            let invalid = draft(host, None);
+            assert_eq!(invalid.approval_text(&invalid.host), Err(Error::InvalidServerName), "{host}");
+        }
     }
 
     #[test]

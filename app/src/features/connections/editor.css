@@ -1,0 +1,82 @@
+/* 세션 편집 창: workspace.css의 .connection-wizard 기본값 위에 머리·본문·방식 타일·상태 줄·단추 줄을 덮어쓴다. */
+.session-editor {
+  display: none;
+  width: min(560px, calc(100% - 48px));
+  max-height: calc(100% - 48px);
+  padding: 0;
+}
+.session-editor[open] { display: flex; flex-direction: column; }
+
+.session-editor .editor-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 12px 12px 8px 20px;
+  border-bottom: 1px solid var(--border);
+}
+.session-editor .editor-header h2 { margin: 0; font-size: 15px; font-weight: 600; overflow-wrap: anywhere; }
+.session-editor .editor-header .icon-button { min-height: 0; padding: 0; border: 0; background: transparent; }
+.session-editor .editor-header .icon-button:hover:not(:disabled) { background: var(--bg-hover); }
+
+.session-editor > .editor-form { display: contents; }
+.session-editor > .editor-form > fieldset.editor-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  margin: 0;
+  padding: 12px 20px;
+  border: 0;
+  border-radius: 0;
+}
+.session-editor .editor-field { display: grid; gap: 4px; margin-block: 8px; }
+.session-editor .editor-field > label { margin: 0; }
+.session-editor .editor-field > span { color: var(--text-muted); }
+.session-editor .editor-field output { overflow-wrap: anywhere; }
+.session-editor .editor-method { margin-top: 4px; padding-top: 4px; border-top: 1px solid var(--border); }
+.session-editor .editor-method fieldset { margin-block: 8px; }
+.session-editor .field-error { color: var(--danger); font-size: 12px; }
+
+.session-editor .method-tiles {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 6px;
+}
+.session-editor .method-tile {
+  display: grid;
+  justify-items: center;
+  gap: 6px;
+  min-height: 64px;
+  padding: 10px 4px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--bg-panel);
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.session-editor .method-tile:hover:not(:disabled) { background: var(--bg-hover); color: var(--text); }
+.session-editor .method-tile[aria-checked="true"] { border-color: var(--accent); background: var(--accent-soft); color: var(--text); }
+.session-editor .method-tile:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.session-editor .method-tile .proto-icon { width: 22px; height: 22px; stroke-width: 1.6; }
+
+.session-editor label.editor-check { display: flex; align-items: center; gap: 6px; }
+.session-editor .ssh-test-terminal { display: grid; gap: 8px; padding: 0 20px 8px; }
+.session-editor .editor-status:not(:empty) { display: grid; gap: 4px; padding: 8px 20px 0; }
+
+.session-editor .editor-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 20px;
+  border-top: 1px solid var(--border);
+}
+
+/* 삭제 확인 창 */
+.delete-dialog { width: min(400px, calc(100% - 48px)); }
+.delete-dialog h2 { margin: 0 0 12px; font-size: 15px; font-weight: 600; overflow-wrap: anywhere; }
+.delete-dialog footer { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+.delete-dialog button.danger { border-color: transparent; background: var(--danger); color: var(--accent-fg); font-weight: 600; }
+
+@media (max-width: 520px) {
+  .session-editor .method-tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}

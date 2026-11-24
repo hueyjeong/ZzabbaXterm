@@ -45,7 +45,7 @@ const wait = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve, r
 
 /**
  * 저장된 RDP·VNC 프로필을 열 정보로 바꾼다. SSH 경로는 그 SSH 대상의 서버 루프백으로 로컬 전달을 열고,
- * SSM 경로는 프로필 자신을 경로 대상으로 공식 SSM 포트 전달을 연다(RDP는 TLS 인증 DNS 이름을 노드에서 접속할
+ * SSM 경로는 프로필 자신을 경로 대상으로 공식 SSM 포트 전달을 연다(RDP는 TLS 인증 이름을 노드에서 접속할
  * 원격 호스트로, VNC는 노드 자신의 서비스로). Rust가 준비 완료로 확인한 전달만 source로 돌려준다.
  * 서비스 연결은 탭에서 사용자가 시작한다.
  */

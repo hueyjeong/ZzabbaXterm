@@ -159,7 +159,7 @@ beforeEach(async () => {
     if (command === "connections_load") return loadProfiles();
     if (command === "ai_models") return ["local:latest"];
     if (command === "ai_targets" || command === "ai_decisions") return [];
-    if (command.startsWith("connection_") || ["verify_ssh_host", "commit_ssh_host", "cancel_ssh_host", "register_saved_ssh_host", "trust_saved_ssh_host"].includes(command)) return runConnectionCommand(command, args);
+    if (command.startsWith("connection_") || ["register_saved_ssh_host", "trust_saved_ssh_host"].includes(command)) return runConnectionCommand(command, args);
     if (command === "ssm_discovery") return runDiscovery(args);
     if (command.startsWith("storage_")) return runStorage(command, args);
     if (command.startsWith("editor_sftp_")) return runSftp(command, args);
@@ -249,7 +249,7 @@ async function closeMenu(menu = openMenu()) {
 }
 
 /** 제목줄 `새 탭 종류` 메뉴의 항목을 실행한다. */
-async function openNewTab(name: "파일 열기…" | "RDP 연결" | "VNC 연결" | "S3 호환 스토리지" | "새 연결 프로필…" | "로컬 터미널") {
+async function openNewTab(name: "파일 열기…" | "RDP 연결" | "VNC 연결" | "S3 호환 스토리지" | "세션 추가…" | "로컬 터미널") {
   await chooseMenuItem(name, await showMenu("새 탭 종류"));
 }
 
@@ -515,16 +515,16 @@ describe("작업 공간 창 닫기", () => {
   it("열린 연결 추가 모달도 승인 중에는 잠기고 닫기 실패 후 다시 조작할 수 있다", async () => {
     const response = Promise.withResolvers<boolean>();
     respondToWindowClose = () => response.promise;
-    await press("연결 추가");
-    const dialog = find<HTMLDialogElement>('dialog[aria-label="연결 추가"]');
-    await requestWindowClose("wizard-open");
+    await press("세션 추가");
+    const dialog = find<HTMLDialogElement>('dialog[aria-label="세션 추가"]');
+    await requestWindowClose("editor-open");
     expect(dialog.hasAttribute("inert")).toBe(true);
     await act(async () => { dialog.dispatchEvent(new Event("cancel", { cancelable: true })); });
     expect(dialog.open).toBe(true);
     await act(async () => response.reject("종료 실패"));
     expect(dialog.hasAttribute("inert")).toBe(false);
     await press("취소");
-    expect(host.querySelector('dialog[aria-label="연결 추가"]')).toBeNull();
+    expect(host.querySelector('dialog[aria-label="세션 추가"]')).toBeNull();
   });
 
   it("파일 선택 중에는 창 닫기를 보류하고 파일 선택은 계속한다", async () => {
@@ -1153,14 +1153,14 @@ describe("C01 저장된 로컬 연결", () => {
     await act(async () => { alpha.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); });
     expect(calls("open").slice(-1)[0]).toMatchObject({ targetId: "work-alpha" });
     await key(alpha, "ContextMenu");
-    expect([...find('[role="menu"]').querySelectorAll('[role="menuitem"]')].map((item) => item.textContent)).toEqual(["로컬"]);
+    expect([...find('[role="menu"]').querySelectorAll('[role="menuitem"]')].map((item) => item.textContent)).toEqual(["로컬", "편집…", "삭제"]);
     await press("로컬");
     expect(calls("open").filter((args) => args.targetId).map((args) => args.targetId))
       .toEqual(["work-beta", "work-alpha", "work-alpha"]);
     expect(calls("start").slice(-3).map((args) => args.id)).toEqual(["pty-12", "pty-13", "pty-14"]);
   });
 
-  it("빈 저장소에서 + 마법사로 시험한 뒤 Rust 저장 응답 이후에만 다시 읽고 재시작 시 표시한다", async () => {
+  it("빈 저장소에서 + 편집 창으로 시험한 뒤 Rust 저장 응답 이후에만 다시 읽고 재시작 시 표시한다", async () => {
     expect([...tree().querySelectorAll('[role="treeitem"] > .tree-row > span:not([aria-hidden], .tree-open, .tree-via)')].map(item => item.textContent)).toEqual(["로컬", "내 PC"]);
     expect(tree().querySelector(".tree-open")?.getAttribute("aria-label")).toBe("열린 탭 1개");
     const save = Promise.withResolvers<void>();
@@ -1184,24 +1184,18 @@ describe("C01 저장된 로컬 연결", () => {
           run: { draftId: tested?.draftId, draftVersion: tested?.draftVersion, runId: "run-approved" },
         });
         await save.promise;
-        const { group, target } = request.draft;
-        store = { version: 2, groups: [{ revision: 1, profile: group }], targets: [{ revision: 1, profile: target }] };
+        store = { version: 2, groups: [], targets: [{ revision: 1, profile: request.draft.target }] };
         return null;
       }
       throw command;
     };
-    await press("연결 추가");
-    expect(find("dialog[open]").textContent).toContain("대상");
-    await changeInput("그룹", "회사 개발");
-    await changeInput("표시명", "작업 셸");
-    await press("다음");
-    await changeInput("시작 디렉터리", "C:\\c01-test");
-    await press("다음");
-    expect(find("dialog").textContent).toContain("현재 사용자");
-    await press("다음");
+    await press("세션 추가");
+    expect(find("dialog[open] h2").textContent).toBe("세션 추가");
     expect(button("저장")?.disabled).toBe(true);
-    await press("연결 테스트");
-    expect(find("dialog").textContent).toContain("테스트 성공");
+    await changeInput("이름", "작업 셸");
+    await changeInput("시작 디렉터리", "C:\\c01-test");
+    await press("연결 시험");
+    expect(find("dialog").textContent).toContain("시험 성공");
     await press("저장");
     expect(connectionCalls("connections_load")).toHaveLength(1);
     expect(tree().textContent).not.toContain("작업 셸");
@@ -1209,11 +1203,14 @@ describe("C01 저장된 로컬 연결", () => {
     expect(host.querySelector("dialog")).toBeNull();
     expect(connectionCalls("connections_load")).toHaveLength(2);
     expect(tree().textContent).not.toContain("작업 셸");
+    expect(tested?.draft).toEqual({ version: 2, targetRevision: null, target: {
+      id: expect.any(String), displayName: "작업 셸", defaultMethod: "local", local: { shell: expect.any(String), startDirectory: "C:\\c01-test" },
+    } });
     await act(async () => { reload.resolve(store); });
-    expect(tree().textContent).toContain("회사 개발작업 셸");
+    expect(tree().textContent).toContain("작업 셸");
     loadProfiles = async () => store;
     await restartWorkspace();
-    expect(tree().textContent).toContain("회사 개발작업 셸");
+    expect(tree().textContent).toContain("작업 셸");
     expect(calls("open").every((args) => !("targetId" in args))).toBe(true);
   });
 
@@ -1240,29 +1237,22 @@ describe("C01 저장된 로컬 연결", () => {
       if (command === "connection_test_cancel") return null;
       throw command;
     };
-    await press("연결 추가");
-    await changeInput("그룹", "회사 개발");
-    await changeInput("표시명", "작업 셸");
-    await press("다음");
+    await press("세션 추가");
+    await changeInput("이름", "작업 셸");
     await changeInput("시작 디렉터리", "C:\\c01-test");
-    await press("다음");
-    await press("다음");
-    await press("연결 테스트");
-    expect(button("저장")?.disabled).toBe(false);
-    await press("이전");
-    await press("이전");
+    await press("연결 시험");
+    expect(find("dialog").textContent).toContain("시험 성공");
     await changeInput("시작 디렉터리", "C:\\c01-test\\missing");
-    await press("다음");
-    await press("다음");
-    expect(button("저장")?.disabled).toBe(true);
-    await press("연결 테스트");
+    expect(find("dialog").textContent).not.toContain("시험 성공");
+    await press("연결 시험");
     expect(find("dialog [role=alert]").textContent).toBe("시작 디렉터리를 찾을 수 없습니다");
-    expect(find("dialog").textContent).toContain("C:\\c01-test\\missing");
+    expect(find<HTMLInputElement>("dialog .editor-method input").value).toBe("C:\\c01-test\\missing");
     await press("취소");
     expect(host.querySelector("dialog")).toBeNull();
     expect(tree().textContent).toBe(before);
     expect(connectionCalls("connections_load")).toHaveLength(loads);
     expect(connectionCalls("connection_save")).toHaveLength(0);
+    expect(connectionCalls("connection_target_save")).toHaveLength(0);
     expect(connectionCalls("connection_test_cancel").map(([, args]) => args.run.runId)).toEqual(["good-run", "missing-run"]);
   });
 });
@@ -1322,49 +1312,41 @@ describe("C02 SSM 연결", () => {
       throw new Error(`예상하지 않은 연결 명령: ${command}`);
     };
 
-    await press("연결 추가");
-    await changeInput("그룹", "개발");
-    await changeInput("표시명", "관리 노드");
-    await press("다음");
+    await press("세션 추가");
+    await changeInput("이름", "관리 노드");
     expect(connectionCalls("ssm_discovery")).toHaveLength(0);
     await chooseMethod("ssm");
-    await press("다음");
-    expect(button("다음")?.disabled).toBe(true);
+    expect(button("연결 시험")?.disabled).toBe(true);
+    expect(button("저장")?.disabled).toBe(true);
     await select("프로필", node.profile);
     await changeInput("리전", node.region);
     await press("리전 적용");
     const selected = await select("온라인 노드", node.instanceId);
     expect(selected?.value).toBe(node.instanceId);
+    expect(button("연결 시험")?.disabled).toBe(false);
     await changeInput("리전", "us-west-2");
     expect(find("dialog").textContent).toContain("리전 변경 미적용");
     expect(selected.disabled).toBe(true);
-    expect(button("다음")?.disabled).toBe(true);
-    await press("다음");
-    expect(button("연결 테스트")).toBeUndefined();
+    expect(button("연결 시험")?.disabled).toBe(true);
+    expect(button("저장")?.disabled).toBe(true);
     await changeInput("리전", node.region);
-    await press("다음");
-    expect(button("저장")?.disabled).toBe(true);
-    await press("연결 테스트");
+    await press("연결 시험");
     const args = connectionCalls("connection_test_start")[0][1] as ConnectionTestDraft;
-    expect(args.draft.target).toEqual({
-      id: expect.any(String), groupId: args.draft.group.id,
-      displayName: "관리 노드", defaultMethod: "ssm", ssm: node
+    expect(args.draft).toEqual({
+      version: 2, targetRevision: null,
+      target: { id: expect.any(String), displayName: "관리 노드", defaultMethod: "ssm", ssm: node },
     });
-    expect(find("dialog [role=alert]").textContent).toBe("SSM 연결 시험을 사용할 수 없습니다");
-    expect(button("저장")?.disabled).toBe(true);
-    await press("이전");
-    expect([...find("dialog").querySelectorAll("select")].map((control) => control.value)).toEqual([node.profile, node.instanceId]);
-    expect(find<HTMLInputElement>("dialog input").value).toBe(node.region);
-    await press("다음");
-    expect([...find('[aria-label="SSM 연결 대상"]').querySelectorAll("dt, dd")].map((part) => part.textContent)).toEqual([
-      "AWS 프로필", node.profile, "리전", node.region, "인스턴스 ID", node.instanceId,
-    ]);
+    expect(find("dialog .editor-status [role=alert]").textContent).toBe("SSM 연결 시험을 사용할 수 없습니다");
+    expect([...find("dialog .editor-method").querySelectorAll("select")].map((control) => control.value)).toEqual([node.profile, node.instanceId]);
+    expect(find<HTMLInputElement>("dialog .editor-method input").value).toBe(node.region);
+    // 시험이 실패해도 입력 검증 저장은 켜진다.
+    expect(button("저장")?.disabled).toBe(false);
     await press("취소");
     expect(host.querySelector("dialog")).toBeNull();
     expect(connectionCalls("connection_save")).toHaveLength(0);
   });
 
-  it.each(["응답 대기", "시험 성공"])("A가 %s 상태에서 B를 선택하면 A 시험을 취소하고 A로 돌아가도 저장을 막는다", async (when) => {
+  it.each(["응답 대기", "시험 성공"])("A가 %s 상태에서 B를 선택하면 A 시험을 취소하고 A로 돌아가도 A의 티켓으로 저장하지 않는다", async (when) => {
     vi.stubGlobal("__ZZABBA_SSM_DOCUMENT__", "test-document");
     const otherNode = "i-00000002";
     const reply = Promise.withResolvers<ConnectionTestRun & { sessionId: string }>();
@@ -1386,32 +1368,29 @@ describe("C02 SSM 연결", () => {
       }
       if (command === "connection_test_wait") return reply.promise;
       if (command === "connection_test_cancel") return null;
+      if (command === "connection_target_save") return { revision: 1 };
       throw new Error(`예상하지 않은 연결 명령: ${command}`);
     };
-    await press("연결 추가");
-    await press("다음");
+    await press("세션 추가");
+    await changeInput("이름", "관리 노드");
     await chooseMethod("ssm");
-    await press("다음");
     await select("프로필", node.profile);
     await select("온라인 노드", node.instanceId);
-    await press("다음");
-    await press("연결 테스트");
+    await press("연결 시험");
     expect(button("저장")?.disabled).toBe(when === "응답 대기");
     const { run } = connectionCalls("connection_test_wait")[0][1] as RunArgs;
-    await press("이전");
     await select("온라인 노드", otherNode);
     expect(connectionCalls("connection_test_cancel")).toEqual([["connection_test_cancel", { run }]]);
     await act(async () => reply.resolve({ ...run, sessionId: "session-a" }));
-    expect(find("dialog").textContent).not.toContain("테스트 성공");
-    await press("다음");
-    expect(find('[aria-label="SSM 연결 대상"]').textContent).toContain(otherNode);
-    expect(button("저장")?.disabled).toBe(true);
-    await press("이전");
+    expect(find("dialog").textContent).not.toContain("시험 성공");
     await select("온라인 노드", node.instanceId);
-    await press("다음");
-    expect(button("저장")?.disabled).toBe(true);
+    expect(find("dialog").textContent).not.toContain("시험 성공");
     await press("저장");
+    // A의 시험 티켓은 쓰지 않고 입력 검증 저장으로만 저장한다.
     expect(connectionCalls("connection_save")).toHaveLength(0);
+    expect(connectionCalls("connection_target_save")).toEqual([["connection_target_save", { draft: {
+      version: 2, targetRevision: null, target: { id: expect.any(String), displayName: "관리 노드", defaultMethod: "ssm", ssm: node },
+    } }]]);
   });
 
   it("늦은 SSM 시험 ID를 기다리고 종료 미확인에서 동일 실행을 다시 확인한다", async () => {
@@ -1436,14 +1415,12 @@ describe("C02 SSM 연결", () => {
       if (command === "connection_test_cancel") return connectionCalls(command).length === 1 ? cancel.promise : null;
       throw new Error(`예상하지 않은 연결 명령: ${command}`);
     };
-    await press("연결 추가");
-    await press("다음");
+    await press("세션 추가");
+    await changeInput("이름", "관리 노드");
     await chooseMethod("ssm");
-    await press("다음");
     await select("프로필", node.profile);
     await select("온라인 노드", node.instanceId);
-    await press("다음");
-    await press("연결 테스트");
+    await press("연결 시험");
     await press("취소");
     const reference = `${node.profile} / ${node.region} / ${node.instanceId}`;
     expect(find("dialog [role=status]").textContent).toBe(`시험 취소 중: ${reference}`);
@@ -1605,7 +1582,7 @@ describe("C02 SSM 연결", () => {
     expect(row).toBeDefined();
     await key(row!, "ContextMenu");
     expect([...find('[role="menu"]').querySelectorAll('[role="menuitem"]')].map(item => item.textContent))
-      .toEqual(["AWS Systems Manager", "S3 버킷 열기", "터널 열기"]);
+      .toEqual(["AWS Systems Manager", "S3 버킷 열기", "터널 열기", "편집…", "삭제"]);
     // 메뉴 항목은 동작 뒤 포커스를 트리 행으로 돌려보내므로, 준비 후 터미널 포커스는 더블클릭 열기에서 확인한다.
     await key(find('[role="menu"]'), "Escape");
     expect(host.querySelector('[role="menu"]')).toBeNull();
@@ -1737,9 +1714,10 @@ describe("C02 SSM 연결", () => {
 describe("F01 직접 SSH", () => {
   const fingerprint = `SHA256:${"A".repeat(43)}`;
 
-  it("네이티브 PIN 등록을 취소해도 연결 시험은 켜 두고 저장은 시험 전까지 막는다", async () => {
+  it("SSH 세션은 호스트 키 등록 없이 연결 시험을 켜고 시험하지 않으면 입력 검증만 거쳐 저장한다", async () => {
     runConnectionCommand = async (command) => {
       if (command === "connection_capabilities") return { storedAuth: true };
+      if (command === "connection_target_save") return { revision: 1 };
       throw "cancelled";
     };
     const select = async (label: string, value: string) => {
@@ -1752,38 +1730,28 @@ describe("F01 직접 SSH", () => {
       });
       return control;
     };
-    await press("연결 추가");
-    await changeInput("그룹", "작업");
-    await changeInput("표시명", "개발 서버");
-    await press("다음");
+    await press("세션 추가");
+    await changeInput("이름", "개발 서버");
     await chooseMethod("ssh");
-    expect(find<HTMLOptionElement>('option[value="ssm"]:not([disabled])').textContent).toBe("SSH-over-SSM");
-    await changeInput("서버 호스트", "dev.example.invalid");
-    await changeInput("SSH 포트", "2222");
-    await changeInput("SSH 계정", "deploy");
+    expect(find<HTMLOptionElement>('dialog option[value="ssm"]:not([disabled])').textContent).toBe("AWS SSM 경유");
+    await changeInput("호스트", "dev.example.invalid");
+    await changeInput("포트", "2222");
+    await changeInput("계정", "deploy");
     await changeInput("호스트 키 SHA256 지문 (선택)", fingerprint);
-    await press("다음");
-    const auth = await select("SSH 인증 방식", "manualPassword");
+    const auth = await select("인증 방식", "manualPassword");
     expect(auth.querySelector<HTMLOptionElement>('option[value="storedPassword"]')?.disabled).toBe(false);
-    await press("다음");
-    expect(find('[aria-label="SSH 연결 대상"]').textContent).toContain("deploy");
-    await press("호스트 키 선택 및 등록");
-    expect(connectionCalls("verify_ssh_host")).toEqual([["verify_ssh_host", {
-      request: { targetId: expect.any(String), host: "dev.example.invalid", port: 2222, expectedFingerprint: fingerprint },
-      attempt: { draftId: expect.any(String), draftVersion: expect.any(Number), attemptId: "1" },
-      draft: expect.objectContaining({
-        target: expect.objectContaining({
-          ssh: {
-            host: "dev.example.invalid", port: 2222, account: "deploy", hostKeyFingerprint: fingerprint,
-            transport: { kind: "direct" }, auth: { kind: "manualPassword" },
-          }
-        })
-      }),
-    }]]);
-    expect(find("dialog [role=alert]").textContent).toBe("SSH 호스트 키 등록이 취소되었습니다");
-    // 호스트 키 등록은 선택 항목이다. 핀이 없으면 연결 시험이 첫 연결 확인 창을 띄운다.
-    expect(button("연결 테스트")?.disabled).toBe(false);
-    expect(button("저장")?.disabled).toBe(true);
+    expect(button("연결 시험")?.disabled).toBe(false);
+    expect(button("저장")?.disabled).toBe(false);
+    await press("저장");
+    expect(connectionCalls("connection_target_save")).toEqual([["connection_target_save", { draft: {
+      version: 2, targetRevision: null, target: {
+        id: expect.any(String), displayName: "개발 서버", defaultMethod: "ssh", ssh: {
+          host: "dev.example.invalid", port: 2222, account: "deploy", hostKeyFingerprint: fingerprint,
+          transport: { kind: "direct" }, auth: { kind: "manualPassword" },
+        },
+      },
+    } }]]);
+    expect(host.querySelector("dialog")).toBeNull();
     expect(connectionCalls("connection_test_start")).toEqual([]);
     expect(connectionCalls("ssm_discovery")).toEqual([]);
   });
@@ -1791,15 +1759,7 @@ describe("F01 직접 SSH", () => {
   it("시험 PTY만 입력을 받고 닫힌 시험의 늦은 성공은 저장할 수 없다", async () => {
     const waits = new Map<string, PromiseWithResolvers<unknown>>();
     let serial = 0;
-    let pin: { targetId: string; host: string; port: number; fingerprint: string } | undefined;
     runConnectionCommand = async (command, args) => {
-      if (command === "verify_ssh_host") {
-        const { request } = args as { request: { targetId: string; host: string; port: number } };
-        const { targetId, host, port } = request;
-        pin = { targetId, host, port, fingerprint };
-        return { ...pin, ticket: "a".repeat(32) };
-      }
-      if (command === "commit_ssh_host") return pin;
       if (command === "connection_test_start") {
         const { draftId, draftVersion } = args as ConnectionTestDraft;
         const runId = `attempt-${++serial}`;
@@ -1821,19 +1781,14 @@ describe("F01 직접 SSH", () => {
         control.dispatchEvent(new Event("change", { bubbles: true }));
       });
     };
-    await press("연결 추가");
-    await changeInput("그룹", "작업");
-    await changeInput("표시명", "개발 서버");
-    await press("다음");
+    await press("세션 추가");
+    await changeInput("이름", "개발 서버");
     await chooseMethod("ssh");
-    await changeInput("서버 호스트", "dev.example.invalid");
-    await changeInput("SSH 계정", "deploy");
+    await changeInput("호스트", "dev.example.invalid");
+    await changeInput("계정", "deploy");
     await changeInput("호스트 키 SHA256 지문 (선택)", fingerprint);
-    await press("다음");
-    await select("SSH 인증 방식", "manualPassword");
-    await press("다음");
-    await press("호스트 키 선택 및 등록");
-    await press("연결 테스트");
+    await select("인증 방식", "manualPassword");
+    await press("연결 시험");
     const [[, { run: first }]] = connectionCalls("connection_ssh_test_attach");
     expect(first.runId).toBe("attempt-1");
     const field = find<HTMLTextAreaElement>('[aria-label="SSH 시험 터미널"] textarea');
@@ -1843,10 +1798,10 @@ describe("F01 직접 SSH", () => {
     expect(button("저장")?.disabled).toBe(true);
     await press("SSH 시험 닫기");
     expect(connectionCalls("connection_test_cancel")).toEqual([["connection_test_cancel", { run: first }]]);
-    await press("연결 테스트");
+    await press("연결 시험");
     await act(async () => waits.get(first.runId)?.resolve({ ...first, sessionId: "trial-attempt-1" }));
     expect(button("저장")?.disabled).toBe(true);
-    await press("이전");
+    await changeInput("계정", "ops");
     expect(connectionCalls("connection_test_cancel").map(([, args]) => args.run.runId)).toEqual(["attempt-1", "attempt-2"]);
   });
 
@@ -1878,13 +1833,13 @@ describe("F01 직접 SSH", () => {
 
     await key(target, "ContextMenu");
     expect([...find('[role="menu"]').querySelectorAll('[role="menuitem"]')].map(item => item.textContent))
-      .toEqual(["SSH", "터널 열기", "호스트 키 확인…", "호스트 키 등록"]);
-    await press("호스트 키 등록");
+      .toEqual(["SSH", "터널 열기", "호스트 키 확인…", "호스트 키 파일로 등록…", "편집…", "삭제"]);
+    await press("호스트 키 파일로 등록…");
     expect(host.querySelector('[role="menu"]')).toBeNull();
     expect(find('footer [role="alert"]').textContent).toContain("SSH 호스트 키 등록이 취소되었습니다");
 
     await key(target, "ContextMenu");
-    await press("호스트 키 등록");
+    await press("호스트 키 파일로 등록…");
     expect(connectionCalls("register_saved_ssh_host")).toEqual([
       ["register_saved_ssh_host", { targetId: "server" }],
       ["register_saved_ssh_host", { targetId: "server" }],
@@ -2137,7 +2092,7 @@ describe("현재 SSH 세션의 SFTP", () => {
       .find(item => item.querySelector(":scope > .tree-row > span")?.textContent === "서버 A");
     expect(row).toBeDefined();
     await act(async () => { row?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true })); });
-    expect(button("호스트 키 등록")).toBeDefined();
+    expect(button("호스트 키 파일로 등록…")).toBeDefined();
     const openedTerminals = calls("open").length;
     await press("터널 열기");
     const title = "서버 A · 터널 3";
@@ -2707,5 +2662,76 @@ describe("SSO 만료로 열지 못한 원격 화면", () => {
     await act(async () => { finish("loggedIn"); });
     await act(async () => { await Promise.resolve(); });
     expect(connectionCalls("tunnel_tab_open")).toHaveLength(2);
+  });
+});
+
+describe("세션 편집 창", () => {
+  const shell = (revision: number, displayName = "작업 셸") => ({
+    revision, profile: { id: "shell", displayName, defaultMethod: "local" as const, local: { shell: "powerShell" as const, startDirectory: "" } },
+  });
+
+  it("+ 버튼으로 연 편집 창에서 시험 없이 저장하면 입력 검증 저장 뒤 목록을 다시 읽는다", async () => {
+    let store = emptyStore;
+    loadProfiles = async () => store;
+    runConnectionCommand = async (command, args) => {
+      if (command !== "connection_target_save") throw command;
+      const { draft } = args as { draft: { target: SavedConnections["targets"][number]["profile"] } };
+      store = { version: 2, groups: [], targets: [{ revision: 1, profile: draft.target }] };
+      return { revision: 1 };
+    };
+    await restartWorkspace();
+    const loads = connectionCalls("connections_load").length;
+    await press("세션 추가");
+    expect(find("dialog[open] h2").textContent).toBe("세션 추가");
+    await changeInput("이름", "새 셸");
+    await press("저장");
+    expect(connectionCalls("connection_target_save")).toEqual([["connection_target_save", { draft: {
+      version: 2, targetRevision: null, target: { id: expect.any(String), displayName: "새 셸", defaultMethod: "local", local: expect.any(Object) },
+    } }]]);
+    expect(host.querySelector("dialog")).toBeNull();
+    expect(connectionCalls("connections_load")).toHaveLength(loads + 1);
+    expect(tree().textContent).toContain("새 셸");
+  });
+
+  it("세션 행의 편집…은 저장본과 개정으로 편집 창을 연다", async () => {
+    loadProfiles = async () => ({ version: 2, groups: [], targets: [shell(5)] });
+    runConnectionCommand = async (command) => {
+      if (command === "connection_target_save") return { revision: 6 };
+      throw command;
+    };
+    await restartWorkspace();
+    await treeMenuAction("작업 셸", "편집…");
+    expect(find("dialog[open] h2").textContent).toBe("세션 편집");
+    await changeInput("이름", "바꾼 셸");
+    await press("저장");
+    expect(connectionCalls("connection_target_save")).toEqual([["connection_target_save", { draft: {
+      version: 2, targetRevision: 5, target: { ...shell(5).profile, displayName: "바꾼 셸" },
+    } }]]);
+  });
+
+  it("세션 행의 삭제는 확인 뒤 개정과 함께 지우고 참조 오류와 충돌을 표시한다", async () => {
+    loadProfiles = async () => ({ version: 2, groups: [], targets: [shell(2)] });
+    const replies: unknown[] = [{ kind: "referenced", targets: ["shell"] }, { kind: "conflict" }];
+    runConnectionCommand = async (command) => {
+      if (command !== "connection_target_delete") throw command;
+      const reply = replies.shift();
+      if (reply) throw reply;
+      return null;
+    };
+    await restartWorkspace();
+    await treeMenuAction("작업 셸", "삭제");
+    const dialog = find<HTMLDialogElement>('dialog[aria-label="삭제"]');
+    expect(dialog.querySelector("h2")?.textContent).toBe("작업 셸");
+    expect([...dialog.querySelectorAll("button")].map(item => item.textContent)).toEqual(["삭제", "취소"]);
+    expect(connectionCalls("connection_target_delete")).toHaveLength(0);
+    await act(async () => { dialog.querySelector("button")!.click(); });
+    expect(dialog.querySelector("[role=alert]")?.textContent).toBe("참조 중인 세션: 작업 셸");
+    await act(async () => { dialog.querySelector("button")!.click(); });
+    expect(dialog.querySelector("[role=alert]")?.textContent).toBe("다른 작업이 세션을 변경했습니다");
+    const loads = connectionCalls("connections_load").length;
+    await act(async () => { dialog.querySelector("button")!.click(); });
+    expect(connectionCalls("connection_target_delete")).toEqual(Array(3).fill(["connection_target_delete", { id: "shell", revision: 2 }]));
+    expect(host.querySelector('dialog[aria-label="삭제"]')).toBeNull();
+    expect(connectionCalls("connections_load")).toHaveLength(loads + 1);
   });
 });

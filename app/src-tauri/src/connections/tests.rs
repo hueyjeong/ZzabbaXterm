@@ -59,6 +59,13 @@ pub(crate) fn draft(dir: &Path, group: &str, target: &str) -> Value {
     })
 }
 
+/// 그룹을 포함한 초안 JSON을 그룹 없는 최상위 대상 초안(`TargetDraft`) JSON으로 바꾼다.
+pub(crate) fn target_draft(input: &Value) -> Value {
+    let mut target = input["target"].clone();
+    target.as_object_mut().unwrap().remove("groupId");
+    json!({"version": 2, "targetRevision": input["targetRevision"], "target": target})
+}
+
 fn save(store: &Store, input: Value) -> Result<SaveStatus, StoreError> {
     let draft: Draft = serde_json::from_value(input).unwrap();
     store.save(draft.validate().unwrap())
@@ -129,17 +136,6 @@ pub(crate) fn ssh_draft(dir: &Path) -> Value {
         }
     });
     value
-}
-
-#[test]
-fn f01_pin_registration_resolves_only_the_validated_draft_target() {
-    let dir = TestDir::new();
-    let input = ssh_draft(dir.path());
-    let fingerprint = input["target"]["ssh"]["hostKeyFingerprint"].as_str().unwrap();
-    let draft = serde_json::from_value::<Draft>(input.clone()).unwrap().validate().unwrap();
-    assert_eq!(draft.ssh_pin_endpoint("ssh-server", Some(fingerprint)), Some(crate::ssh::Endpoint::new("dev.example.test", 2222).unwrap()));
-    assert_eq!(draft.ssh_pin_endpoint("other-server", Some(fingerprint)), None);
-    assert_eq!(draft.ssh_pin_endpoint("ssh-server", Some("SHA256:other")), None);
 }
 
 #[test]
@@ -246,6 +242,9 @@ fn desktop_profiles_reject_secrets_unsafe_hosts_and_plaintext_routes() {
     let direct = json!({"kind": "direct"});
     for valid in [
         rdp("win.example.test", direct.clone()), rdp("xrdp.example.test", ssh.clone()), rdp("rdp.internal.example", ssm.clone()),
+        // RDP는 IP 주소도 TLS 인증 이름으로 받고 인증서의 IP SAN으로 확인한다.
+        rdp("10.0.1.25", direct.clone()), rdp("2001:db8::25", direct.clone()), rdp("127.0.0.1", ssh.clone()),
+        rdp("::1", ssh.clone()), rdp("10.0.1.25", ssm.clone()), rdp("2001:db8::25", ssm.clone()),
         vnc("vnc.example.test", direct.clone()), vnc("192.0.2.10", direct.clone()), vnc("", ssh.clone()), vnc("", ssm.clone()),
     ] {
         assert!(checked(valid.clone()), "{valid}");
@@ -263,14 +262,20 @@ fn desktop_profiles_reject_secrets_unsafe_hosts_and_plaintext_routes() {
     let mut zero = rdp("win.example.test", direct.clone());
     zero["target"]["rdp"]["port"] = json!(0);
     for invalid in [
-        zero, rdp("", direct.clone()), rdp("10.0.1.25", direct.clone()), rdp("win.example.test
+        zero, rdp("", direct.clone()), rdp("win.example.test
 other", direct.clone()),
-        rdp("127.0.0.1", ssh.clone()), rdp("a,b", ssm.clone()), rdp("host=other", ssm.clone()), rdp("host name", ssm.clone()),
+        rdp("a,b", ssm.clone()), rdp("host=other", ssm.clone()), rdp("host name", ssm.clone()),
         rdp("win.example.test", bad_ssm), rdp("win.example.test", json!({"kind": "ssh", "targetId": "--other"})),
         vnc("", direct.clone()), vnc("127.0.0.1", ssh.clone()), vnc("vnc.internal.example", ssm.clone()),
         // RDP는 SSM 경로에서도 인증서 이름이 필요하다. 숫자 최종 라벨은 리졸버가 IP로 해석한다.
-        rdp("", ssm.clone()), rdp("10.0.1.25", ssm.clone()), rdp("2852039166", ssm.clone()), rdp("127.1", direct.clone()),
+        rdp("", ssm.clone()), rdp("2852039166", ssm.clone()), rdp("127.1", direct.clone()), rdp("127.1", ssh.clone()),
         rdp("0x7f000001", direct.clone()), vnc("999.1.1.1", direct.clone()),
+        // IP 주소는 표준 표기만 받고, 지정되지 않은 주소는 서버 신원이 될 수 없다.
+        rdp("2001:0db8::25", direct.clone()), rdp("2001:DB8::25", ssm.clone()), rdp("[2001:db8::25]", direct.clone()),
+        rdp("fe80::1%eth0", direct.clone()), rdp("0.0.0.0", direct.clone()), rdp("::", ssh.clone()),
+        // 0.0.0.0/8 전체와 IPv4 매핑 IPv6도 서버 신원이 될 수 없다.
+        rdp("0.1.2.3", direct.clone()), rdp("0.255.255.255", ssm.clone()),
+        rdp("::ffff:10.0.0.1", direct.clone()), rdp("::ffff:a00:1", ssh.clone()), rdp("::ffff:0.0.0.0", direct.clone()),
     ] {
         assert!(!checked(invalid.clone()), "{invalid}");
     }
@@ -295,7 +300,9 @@ fn s3_v1_round_trip_preserves_references_and_verified_account() {
     assert_eq!(save(&store, ssm.clone()).unwrap(), SaveStatus::Saved);
 
     let s3 = s3_draft(dir.path());
-    let validate = |value: Value| serde_json::from_value::<Draft>(value).unwrap().validate().unwrap();
+    let validate = |value: Value| serde_json::from_value::<super::profile::TargetDraft>(json!({
+        "version": 2, "targetRevision": null, "target": value["target"],
+    })).unwrap().validate().unwrap();
     for account in [None, Some("12345678901x".into())] {
         assert!(matches!(store.save_authorized(validate(s3.clone()), account, || Ok(()), || {}), Err(StoreError::InvalidTestedAccount)));
     }
@@ -388,10 +395,10 @@ mod local_probe {
 
     fn start_at(sessions: &Sessions, dir: &Path, version: u64) -> RunKey {
         start(sessions, "main", sessions.document("main"), "draft".into(), version,
-            serde_json::from_value(draft(dir, "work", "first")).unwrap(), dir.to_owned()).unwrap()
+            serde_json::from_value(target_draft(&draft(dir, "work", "first"))).unwrap(), dir.to_owned()).unwrap()
     }
 
-    fn save_at(sessions: &Sessions, owner: &str, run: &RunKey, input: Value, store: &Store) -> Result<(), String> {
+    fn save_at(sessions: &Sessions, owner: &str, run: &RunKey, input: Value, store: &Store) -> Result<(), crate::connections::ipc::EditError> {
         let request: SaveRequest = serde_json::from_value(json!({"run": run, "draft": input})).unwrap();
         save_confirmed(sessions, owner, sessions.document(owner), request, store)
     }
@@ -405,7 +412,7 @@ mod local_probe {
         assert!(wait(&sessions, "main", 0, &local_run).is_ok());
         let mut input = ssm_draft(dir.path());
         input["target"]["id"] = json!("first");
-        assert!(save_at(&sessions, "main", &local_run, input, &store).is_err());
+        assert!(save_at(&sessions, "main", &local_run, target_draft(&input), &store).is_err());
         assert!(!dir.file().exists());
     }
 
@@ -414,7 +421,7 @@ mod local_probe {
         let dir = TestDir::new();
         let store = Store::new(&dir.0);
         let sessions = Sessions::default();
-        let input = draft(&dir.0, "work", "first");
+        let input = target_draft(&draft(&dir.0, "work", "first"));
         let run = start_at(&sessions, &dir.0, 1);
         assert!(save_at(&sessions, "main", &run, input.clone(), &store).is_err());
         let result = wait(&sessions, "main", 0, &run).unwrap();
@@ -450,7 +457,7 @@ mod local_probe {
         assert!(error.contains("작업 디렉터리"), "{error}");
         cancel(&sessions, "main", 0, &second).unwrap();
         cancel(&sessions, "main", 0, &run).unwrap();
-        assert!(save_at(&sessions, "main", &run, valid, &store).is_err());
+        assert!(save_at(&sessions, "main", &run, target_draft(&valid), &store).is_err());
         assert_eq!(fs::read(dir.file()).unwrap(), original);
     }
 
@@ -459,7 +466,7 @@ mod local_probe {
         let dir = TestDir::new();
         let store = Store::new(&dir.0);
         let sessions = Sessions::default();
-        let input = draft(&dir.0, "work", "first");
+        let input = target_draft(&draft(&dir.0, "work", "first"));
         let run = start_at(&sessions, &dir.0, 1);
         let other = start(&sessions, "other", 0, "draft".into(), 1,
             serde_json::from_value(input.clone()).unwrap(), dir.0.clone()).unwrap();
@@ -519,7 +526,7 @@ mod local_probe {
         lock.lock().unwrap();
         let (blocked_tx, blocked_rx) = mpsc::channel();
         let store = Store::new(&settings).observe_lock_wait(move || blocked_tx.send(()).unwrap());
-        let input = draft(&dir.0, "work", "first");
+        let input = target_draft(&draft(&dir.0, "work", "first"));
         let run = start(&sessions, "profile", 0, "draft".into(), 1,
             serde_json::from_value(input.clone()).unwrap(), dir.0.clone()).unwrap();
         wait(&sessions, "profile", 0, &run).unwrap();
@@ -541,7 +548,7 @@ mod local_probe {
             drop(lock);
             blocked.expect("저장 작업이 실제 설정 파일 잠금을 기다려야 합니다");
             progress.expect("설정 파일이 잠겨 있어도 PTY 입출력·취소·문서 이동이 끝나야 합니다");
-            assert_eq!(saving.join().unwrap(), Err("문서가 바뀌었습니다".into()));
+            assert_eq!(saving.join().unwrap(), Err(crate::connections::ipc::EditError::Failed { message: "문서가 바뀌었습니다".into() }));
         });
         assert!(!settings.join("connections.json").exists());
         assert!(!settings.join("connections.json.tmp").exists());

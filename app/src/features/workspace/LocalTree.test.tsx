@@ -145,3 +145,38 @@ it("그룹 없는 세션은 그룹 뒤 최상위에, 상위 그룹이 있는 그
     vi.unstubAllGlobals();
   }
 });
+
+it("세션 행 메뉴의 편집…과 삭제는 세션 ID를 넘기고 내 PC에는 없다", () => {
+  const profiles: SavedConnections = {
+    version: 2, groups: [],
+    targets: [{
+      revision: 4,
+      profile: { id: "bucket", displayName: "버킷", defaultMethod: "s3", s3: { profile: "company", region: "ap-northeast-2", bucket: "dev", prefix: "" } },
+    }],
+  };
+  const host = document.body.appendChild(document.createElement("div"));
+  const root = createRoot(host);
+  const onEdit = vi.fn();
+  const onDelete = vi.fn();
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  try {
+    act(() => root.render(<LocalTree profiles={profiles} onOpen={vi.fn()} onRegisterSshHost={vi.fn()} onOpenTunnel={vi.fn()}
+      onEdit={onEdit} onDelete={onDelete} />));
+    const row = (name: string) => [...host.querySelectorAll<HTMLLIElement>("li[role=treeitem]")].find(item => item.textContent === name)!;
+    const menuItems = () => [...host.querySelectorAll<HTMLButtonElement>("button[role=menuitem]")];
+    const open = (name: string) => act(() => { row(name).dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true })); });
+    open("내 PC");
+    expect(menuItems().map(item => item.textContent)).not.toContain("편집…");
+    open("버킷");
+    expect(menuItems().map(item => item.textContent)).toEqual(["S3", "편집…", "삭제"]);
+    act(() => menuItems().find(item => item.textContent === "편집…")!.click());
+    expect(onEdit).toHaveBeenCalledExactlyOnceWith("bucket");
+    open("버킷");
+    act(() => menuItems().find(item => item.textContent === "삭제")!.click());
+    expect(onDelete).toHaveBeenCalledExactlyOnceWith("bucket");
+  } finally {
+    act(() => root.unmount());
+    host.remove();
+    vi.unstubAllGlobals();
+  }
+});

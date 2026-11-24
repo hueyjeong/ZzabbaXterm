@@ -181,11 +181,7 @@ impl Session {
         AFut: Future<Output = Result<bool, Error>>,
     {
         frame::frame_len(target.size.width, target.size.height)?;
-        if !route::dns_name(&target.server_name) {
-            return Err(Error::InvalidServerName);
-        }
-        let name = ServerName::try_from(target.server_name.clone())
-            .map_err(|_| Error::InvalidServerName)?;
+        let name = route::server_name(&target.server_name).ok_or(Error::InvalidServerName)?;
         let permit = SLOTS.try_acquire().map_err(|_| Error::Busy)?;
         let roots = connect::trusted_roots(approved_roots)?;
         Self::open_with_tls(target, name, connect::tls_config(roots), trust, resolve, permit, auth).await

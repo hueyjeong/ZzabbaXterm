@@ -15,7 +15,6 @@ fn main() {
         "connection_capabilities",
         "connection_ssh_test_attach",
         "connections_load",
-        "verify_ssh_host", "commit_ssh_host", "cancel_ssh_host",
         "register_saved_ssh_host", "trust_saved_ssh_host",
         "connection_group_save", "connection_group_delete", "connection_target_delete", "connection_target_save",
         "tunnel_tab_open", "tunnel_start", "tunnel_status", "tunnel_share", "tunnel_tab_close",

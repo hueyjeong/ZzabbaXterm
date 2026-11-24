@@ -186,16 +186,27 @@ fn desktop_dns(host: &str) -> bool {
     })
 }
 
+/// RDP TLS 인증서를 확인할 서버 이름이다. DNS 이름 또는 표준 표기의 IP 주소만 받는다.
+/// IPv4는 `10.0.1.25`, IPv6는 `2001:db8::1`처럼 표준 표기여야 한다. 서버 신원이 될 수 없는 주소는 거부한다:
+/// `0.0.0.0/8`, `::`, 그리고 인증서 IP SAN과 표기가 갈리는 IPv4 매핑 IPv6(`::ffff:10.0.0.1`).
+/// 저장 검증과 연결 경로(`rdp::route::server_name`)가 이 함수 하나를 쓴다.
+pub(crate) fn rdp_server_name(host: &str) -> bool {
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => ip.to_string() == host && ip.octets()[0] != 0,
+        Ok(IpAddr::V6(ip)) => ip.to_string() == host && !ip.is_unspecified() && ip.to_ipv4_mapped().is_none(),
+        Err(_) => desktop_dns(host),
+    }
+}
+
 fn validate_desktop(protocol: DesktopProtocol, host: &str, port: u16, route: &DesktopRoute) -> Result<(), ValidationError> {
     if port == 0 {
         return Err(ValidationError::DesktopPort);
     }
     let address = host.parse::<IpAddr>().is_ok() || desktop_dns(host);
-    // RDP는 TLS 인증서 이름이 필요하다. 평문 RFB는 터널 끝과 같은 호스트의 서비스만 연다.
+    // RDP는 모든 경로에서 TLS 인증서 이름(DNS 이름 또는 IP 주소)이 필요하다. SSM 경로는 이 이름을 목적지로도 쓴다.
+    // 평문 RFB는 터널 끝과 같은 호스트의 서비스만 연다.
     let valid = match (protocol, route) {
-        (DesktopProtocol::Rdp, DesktopRoute::Direct {} | DesktopRoute::Ssh { .. }) => desktop_dns(host),
-        // SSM 경로도 RDP 인증서 이름이 필요하므로 DNS 이름을 목적지로 쓴다.
-        (DesktopProtocol::Rdp, DesktopRoute::Ssm(_)) => desktop_dns(host),
+        (DesktopProtocol::Rdp, _) => rdp_server_name(host),
         (DesktopProtocol::Vnc, DesktopRoute::Direct {}) => address,
         (DesktopProtocol::Vnc, DesktopRoute::Ssh { .. } | DesktopRoute::Ssm(_)) => host.is_empty(),
     };
@@ -288,7 +299,7 @@ fn valid_ssh_path(path: &Path) -> bool {
         && path.to_str().is_some_and(|value| !value.chars().any(|c| c.is_control() || "\"%$`*?[{".contains(c)))
 }
 
-/// 그룹과 대상을 한 번에 저장하는 초안이다. 연결 시험 뒤 저장과 CLI 등록이 쓰며 v1과 v2를 받는다.
+/// 그룹과 대상을 한 번에 저장하는 초안이다. CLI 등록이 쓰며 v1과 v2를 받는다.
 #[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Draft {
@@ -299,13 +310,13 @@ pub(crate) struct Draft {
     pub(super) target: Target,
 }
 
-/// 그룹 없이 대상만 저장하는 v2 초안이다. 연결 시험 없이 입력 검증만 거친다.
+/// 그룹 없이 대상만 저장하는 v2 초안이다. 연결 시험과 시험 뒤 저장, 시험 없는 저장이 함께 쓴다.
 #[derive(Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct TargetDraft {
     version: u32,
     target_revision: Option<Revision>,
-    target: Target,
+    pub(super) target: Target,
 }
 
 /// 그룹 추가, 이름 바꾸기, 이동(`parentId` 변경)에 쓰는 v2 초안이다.
@@ -380,7 +391,8 @@ impl ValidationError {
 // 구조 검증과 실제 연결 시험은 별개다.
 pub(crate) struct ValidatedDraft(Draft);
 
-impl ValidatedDraft {
+impl ValidatedTarget {
+    /// 시험한 초안과 저장할 초안이 같은지 본다. 경로는 OS 문자열까지 같아야 한다.
     pub(crate) fn matches(&self, other: &Self) -> bool {
         self.0 == other.0 && match (self.method(), other.method()) {
             (MethodRef::Local { start_directory: left, .. }, MethodRef::Local { start_directory: right, .. }) => {
@@ -431,6 +443,10 @@ impl ValidatedTarget {
         next_revision(self.0.target_revision)
     }
 
+    pub(crate) fn method(&self) -> MethodRef<'_> {
+        self.0.target.method()
+    }
+
     pub(super) fn into_parts(self) -> (Target, Option<Revision>) {
         (self.0.target, self.0.target_revision)
     }
@@ -465,13 +481,6 @@ fn next_revision(revision: Option<Revision>) -> Option<Revision> {
 impl ValidatedDraft {
     pub(super) fn target_id(&self) -> &str {
         self.0.target.id.as_str()
-    }
-    pub(crate) fn ssh_pin_endpoint(&self, target_id: &str, fingerprint: Option<&str>) -> Option<crate::ssh::Endpoint> {
-        let MethodRef::Ssh { ssh } = self.method() else { return None; };
-        if self.0.target.id.as_str() != target_id || ssh.host_key_fingerprint.as_deref() != fingerprint {
-            return None;
-        }
-        crate::ssh::Endpoint::new(&ssh.host, ssh.port).ok()
     }
 
     pub(crate) fn method(&self) -> MethodRef<'_> {

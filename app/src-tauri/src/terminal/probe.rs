@@ -1,4 +1,4 @@
-use crate::connections::profile::{MethodRef, Shell, ValidatedDraft};
+use crate::connections::profile::{MethodRef, Shell, ValidatedTarget};
 use crate::ssm::CancellationToken;
 use portable_pty::CommandBuilder;
 use std::{
@@ -51,7 +51,7 @@ struct State {
 }
 
 impl Probe {
-    pub(crate) fn for_draft(owner: &str, draft: &ValidatedDraft) -> Self {
+    pub(crate) fn for_draft(owner: &str, draft: &ValidatedTarget) -> Self {
         match draft.method() {
             MethodRef::Ssh { .. } => Self {
                 cancel: Some(CancellationToken::new()),
@@ -104,7 +104,7 @@ impl Probe {
     }
 
 
-    pub(crate) fn run(&self, draft: &ValidatedDraft, config: &std::path::Path, trust: Option<&crate::ssh::host_trust::Confirm>) {
+    pub(crate) fn run(&self, draft: &ValidatedTarget, config: &std::path::Path, trust: Option<&crate::ssh::host_trust::Confirm>) {
         let launch = match draft.method() {
             MethodRef::Local { shell, start_directory } => command(shell, start_directory).map(Launch::Local),
             MethodRef::Ssm { profile, region, instance_id } => remote::Target::new(profile, region, instance_id).map(Launch::Ssm),

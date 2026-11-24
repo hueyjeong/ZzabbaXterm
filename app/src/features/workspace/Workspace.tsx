@@ -4,8 +4,10 @@ import { listen } from "@tauri-apps/api/event";
 import { ChevronsDownUp, Columns2, Database, FileText, FolderTree, Maximize2, Monitor, MonitorSmartphone, PanelLeft, PanelRight, Plus, RefreshCw, Search, Server, SquareTerminal } from "lucide-react";
 import { LocalAiPanel } from "../ai/LocalAiPanel";
 import { createLocalConnectionIpc, type SavedConnections } from "../connections/connectionIpc";
-import { LocalConnectionWizard } from "../connections/LocalConnectionWizard";
-import type { ConnectionClose, InitialWizardDraft, SshTransport } from "../connections/profiles";
+import { DeleteDialog } from "../connections/DeleteDialog";
+import type { ConnectionClose, SshTransport } from "../connections/profiles";
+import { SessionEditor } from "../connections/SessionEditor";
+import type { EditorRequest } from "../connections/sessionEditorState";
 import { subscribeLocalCliOpen } from "../editor/cliOpen";
 import { EditorTab, type EditorTabActions } from "../editor/EditorTab";
 import { ElevationDialog } from "../elevation/ElevationDialog";
@@ -57,7 +59,8 @@ async function confirmEditorDiscard(source: EditorSource, { label, reason }: Par
     ? `${label}: ${source === "sftp" ? "서버" : source === "s3" ? "S3" : "디스크"}에서 다시 읽을까요? 현재 편집 내용은 사라집니다.`
     : `${label}: 미저장 편집 내용을 버리고 닫을까요?`);
 }
-type WizardRequest = { draftId: string; initialDraft: InitialWizardDraft };
+type SessionEditorState = { key: string; request: EditorRequest };
+type SavedEntry = SavedConnections["targets"][number];
 
 function terminalStatus(status: TerminalStatus) {
   switch (status.kind) {
@@ -140,7 +143,7 @@ export function Workspace() {
     const open = (event: KeyboardEvent) => {
       if (!event.ctrlKey || !event.shiftKey || event.altKey || event.metaKey || event.isComposing ||
         (event.code !== "KeyP" && event.key.toLowerCase() !== "p")) return;
-      // 모달 대화상자(마법사·승격) 밖의 문서는 inert이므로 그 위에 열지 않는다.
+      // 모달 대화상자(세션 편집 창·승격) 밖의 문서는 inert이므로 그 위에 열지 않는다.
       if (document.querySelector("dialog[open]")) return;
       event.preventDefault();
       event.stopPropagation();
@@ -228,7 +231,8 @@ export function Workspace() {
   const [loadVersion, setLoadVersion] = useState(0);
   const [profileLoad, setProfileLoad] = useState<ProfileLoad>({ kind: "loading" });
   const [hostRegistration, setHostRegistration] = useState<{ kind: "status" | "alert"; message: string }>();
-  const [wizard, setWizard] = useState<WizardRequest>();
+  const [sessionEditor, setSessionEditor] = useState<SessionEditorState>();
+  const [deleting, setDeleting] = useState<SavedEntry>();
   const [elevationContext, setElevationContext] = useState<Readonly<{ targetId?: string; target?: string; account?: string }>>();
   const [storedAuth, setStoredAuth] = useState(false);
   const elevation = elevationActions(storedAuth, navigator.userAgent);
@@ -466,42 +470,25 @@ export function Workspace() {
     return () => window.removeEventListener("focus", reloadProfiles);
   }, []);
 
-  function openWizard() {
-    if (wizard) return;
-    const groupId = crypto.randomUUID();
-    setWizard({
-      draftId: crypto.randomUUID(), initialDraft: {
-        version: 1, groupRevision: null, targetRevision: null,
-        group: { id: groupId, displayName: "" },
-        target: {
-          id: crypto.randomUUID(), groupId, displayName: "", defaultMethod: "local",
-          local: { shell: /Windows/.test(navigator.userAgent) ? "powerShell" : "bash", startDirectory: "" },
-        },
-      }
-    });
+  /** 세션 편집 창을 연다. 그룹만 주면 새 세션, 저장된 세션을 주면 그 개정으로 편집한다. */
+  function openSessionEditor(request: EditorRequest = {}) {
+    if (sessionEditor) return;
+    setSessionEditor({ key: crypto.randomUUID(), request });
   }
 
-  function retestStorageTarget(id: string) {
-    if (wizard) return;
-    const profiles = profileLoad.profiles;
-    const target = profiles?.targets.find(({ profile }) => profile.id === id);
-    const group = profiles?.groups.find(({ profile }) => profile.id === target?.profile.groupId);
-    if (!target || (target.profile.defaultMethod !== "ssm" && target.profile.defaultMethod !== "s3")) return;
-    if (!group) {
-      setWindowError("그룹 없는 세션은 연결 재시험을 할 수 없습니다");
-      return;
-    }
-    setWizard({
-      draftId: crypto.randomUUID(), initialDraft: {
-        version: 1, groupRevision: group.revision, targetRevision: target.revision,
-        group: group.profile, target: { ...target.profile, groupId: group.profile.id },
-      }
-    });
+  function editSavedTarget(id: string) {
+    const saved = profileLoad.profiles?.targets.find(({ profile }) => profile.id === id);
+    if (saved) openSessionEditor({ target: saved.profile, revision: saved.revision });
   }
 
-  function closeWizard(result: ConnectionClose) {
-    setWizard(undefined);
+  function closeSessionEditor(result: ConnectionClose) {
+    setSessionEditor(undefined);
     if (result.kind === "saved") reloadProfiles();
+  }
+
+  function deleteSavedTarget(id: string) {
+    if (deleting) return;
+    setDeleting(profileLoad.profiles?.targets.find(({ profile }) => profile.id === id));
   }
 
   useLayoutEffect(() => {
@@ -863,7 +850,7 @@ export function Workspace() {
     { label: "VNC 연결", icon: MonitorSmartphone, onSelect: () => openDesktop("vnc") },
     { label: "S3 호환 스토리지", icon: Database, onSelect: () => openStorageTarget(compatibleStorage) },
     { kind: "separator" },
-    { label: "새 연결 프로필…", icon: Plus, disabled: !!wizard, onSelect: openWizard },
+    { label: "세션 추가…", icon: Plus, disabled: !!sessionEditor, onSelect: () => openSessionEditor() },
   ];
 
   const quickItems: QuickItem[] = [
@@ -918,7 +905,7 @@ export function Workspace() {
           <div hidden={sideView !== "connections"} className="workspace-side-body">
             <div className="workspace-side-head">
               <h2>연결</h2>
-              <IconButton icon={Plus} label="연결 추가" disabled={!!wizard} onClick={openWizard} />
+              <IconButton icon={Plus} label="세션 추가" disabled={!!sessionEditor} onClick={() => openSessionEditor()} />
               <IconButton icon={RefreshCw} label="연결 새로고침" disabled={profileLoad.kind === "loading"} onClick={reloadProfiles} />
             </div>
             {profileLoad.kind === "loading" && <div className="connection-status" role="status">저장된 연결 불러오는 중</div>}
@@ -938,7 +925,7 @@ export function Workspace() {
               } : undefined}
               onRegisterSshHost={(targetId) => void registerSavedSshHost(targetId)}
               onTrustSshHost={(targetId) => void trustSavedSshHost(targetId)}
-              onRetestS3={retestStorageTarget} onOpenTunnel={(targetId, name, method) => {
+              onEdit={editSavedTarget} onDelete={deleteSavedTarget} onOpenTunnel={(targetId, name, method) => {
                 setWindowError("");
                 void openTunnel(targetId, name, method).catch(error => setWindowError(String(error)));
               }}
@@ -998,7 +985,7 @@ export function Workspace() {
                 <SquareTerminal width={40} height={40} strokeWidth={1.25} aria-hidden="true" />
                 <div className="workspace-empty-actions">
                   <button type="button" className="ui-button" onClick={() => openTab()}><SquareTerminal aria-hidden="true" />로컬 터미널</button>
-                  <button type="button" className="ui-button" disabled={!!wizard} onClick={openWizard}><Plus aria-hidden="true" />연결 추가</button>
+                  <button type="button" className="ui-button" disabled={!!sessionEditor} onClick={() => openSessionEditor()}><Plus aria-hidden="true" />세션 추가</button>
                   <button type="button" className="ui-button" disabled={filePickerBusy} onClick={() => void openEditor()}><FileText aria-hidden="true" />파일 열기</button>
                 </div>
               </div>}
@@ -1096,7 +1083,7 @@ export function Workspace() {
                   <div inert={!!tab.closeStatus}>
                     {tab.storage.kind === "compatible" ? <CompatibleStorageTab closing={!!tab.closeStatus} closeRef={bindClose} /> :
                       <StorageTab profiles={profileLoad.profiles} targetId={tab.storage.targetId} active={visible} closing={!!tab.closeStatus}
-                        closeRef={bindClose} onRetest={retestStorageTarget}
+                        closeRef={bindClose} onRetest={editSavedTarget}
                         onEditFile={({ file, transport, close }) => openEditorTab(file, transport, close, "s3")} />}
                   </div>
                 </div>
@@ -1148,10 +1135,17 @@ export function Workspace() {
         setElevationContext(undefined);
         openElevation(request);
       }} />}
-      {wizard && <LocalConnectionWizard {...wizard} groups={profileLoad.profiles?.groups ?? []} targets={profileLoad.profiles?.targets}
-        capabilities={connections.capabilities}
-        verifySshHost={connections.verifySshHost}
-        test={connections.test} cancelTest={connections.cancelTest} save={connections.save} onClose={closeWizard} />}
+      {sessionEditor && <SessionEditor key={sessionEditor.key} request={sessionEditor.request}
+        groups={profileLoad.profiles?.groups ?? []} targets={profileLoad.profiles?.targets} capabilities={connections.capabilities}
+        test={connections.test} cancelTest={connections.cancelTest} save={connections.save} saveTarget={connections.saveTarget}
+        onClose={closeSessionEditor} />}
+      {deleting && <DeleteDialog name={deleting.profile.displayName}
+        nameOf={id => profileLoad.profiles?.targets.find(({ profile }) => profile.id === id)?.profile.displayName ?? id}
+        onDelete={async () => {
+          await connections.deleteTarget(deleting.profile.id, deleting.revision);
+          reloadProfiles();
+        }}
+        onClose={() => setDeleting(undefined)} />}
     </main>
   );
 }

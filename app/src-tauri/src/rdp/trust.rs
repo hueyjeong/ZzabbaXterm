@@ -23,24 +23,36 @@ struct Pin {
     approved_at: u64,
 }
 
-fn key(dns: &str, endpoint: &str) -> String {
-    format!("{dns}\n{endpoint}")
+/// 고정 키다. 전달 경로(SSH, SSM)는 endpoint가 같은 루프백 주소여도 `route`(경로 대상 ID)로 구분한다.
+fn key(dns: &str, endpoint: &str, route: Option<&str>) -> String {
+    match route {
+        Some(route) => format!("{dns}\n{endpoint}\n{route}"),
+        None => format!("{dns}\n{endpoint}"),
+    }
 }
 
 /// 손상되거나 읽을 수 없는 파일은 빈 고정 목록으로 취급한다. 조용히 신뢰하지 않는다.
-pub(super) fn load(path: &Path, dns: &str, endpoint: &str) -> Option<String> {
+/// 새 키가 없으면 예전 형식의 키를 읽는다. 예전 키에는 경로 대상 ID가 없고, IPv6 endpoint를
+/// 괄호 없이(`::1:3389`) 적었다.
+pub(super) fn load(path: &Path, dns: &str, endpoint: &str, route: Option<&str>) -> Option<String> {
     let file: File = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
-    file.pins.get(&key(dns, endpoint)).map(|pin| pin.fingerprint.clone())
+    let unbracketed = endpoint.strip_prefix('[').and_then(|rest| rest.split_once("]:"))
+        .map(|(host, port)| format!("{host}:{port}"));
+    [Some(key(dns, endpoint, route)), route.map(|_| key(dns, endpoint, None)), unbracketed.map(|old| key(dns, &old, None))]
+        .into_iter().flatten()
+        .find_map(|key| file.pins.get(&key))
+        .map(|pin| pin.fingerprint.clone())
 }
 
-pub(super) fn save(path: &Path, dns: &str, endpoint: &str, fingerprint: &str) -> Result<(), Error> {
+/// 새 형식의 키로만 저장한다. 예전 키는 다른 경로의 고정일 수 있어 그대로 둔다.
+pub(super) fn save(path: &Path, dns: &str, endpoint: &str, route: Option<&str>, fingerprint: &str) -> Result<(), Error> {
     let mut file: File = fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default();
     file.version = 1;
     file.pins.insert(
-        key(dns, endpoint),
+        key(dns, endpoint, route),
         Pin {
             fingerprint: fingerprint.into(),
             approved_at: SystemTime::now()
@@ -76,35 +88,65 @@ pub(super) struct Trust<A> {
     pub path: PathBuf,
     pub dns: String,
     pub endpoint: String,
+    /// 전달 경로의 대상 ID다. 직접 연결은 `None`이다.
+    pub route: Option<String>,
     pub approve: A,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn path() -> PathBuf {
-        std::env::temp_dir().join(format!("zzabba-rdp-trust-{}", std::process::id()))
-    }
+    use crate::connections::tests::TestDir;
 
     #[test]
     fn stores_and_reloads_one_fingerprint_per_target() {
-        let path = path();
-        let _ = fs::remove_file(&path);
-        assert_eq!(load(&path, "rdp.example", "127.0.0.1:3389"), None);
-        save(&path, "rdp.example", "127.0.0.1:3389", "AA:BB").unwrap();
-        assert_eq!(load(&path, "rdp.example", "127.0.0.1:3389").as_deref(), Some("AA:BB"));
-        assert_eq!(load(&path, "other.example", "127.0.0.1:3389"), None);
-        fs::remove_file(&path).unwrap();
+        let dir = TestDir::new();
+        let path = dir.path().join("rdp-trust.json");
+        assert_eq!(load(&path, "rdp.example", "127.0.0.1:3389", None), None);
+        save(&path, "rdp.example", "127.0.0.1:3389", None, "AA:BB").unwrap();
+        assert_eq!(load(&path, "rdp.example", "127.0.0.1:3389", None).as_deref(), Some("AA:BB"));
+        assert_eq!(load(&path, "other.example", "127.0.0.1:3389", None), None);
     }
 
     #[test]
     fn corrupted_store_starts_empty_instead_of_trusting() {
-        let path = path();
+        let dir = TestDir::new();
+        let path = dir.path().join("rdp-trust.json");
         fs::write(&path, b"{not json").unwrap();
-        assert_eq!(load(&path, "rdp.example", "127.0.0.1:3389"), None);
-        save(&path, "rdp.example", "127.0.0.1:3389", "CC:DD").unwrap();
-        assert_eq!(load(&path, "rdp.example", "127.0.0.1:3389").as_deref(), Some("CC:DD"));
-        fs::remove_file(&path).unwrap();
+        assert_eq!(load(&path, "rdp.example", "127.0.0.1:3389", None), None);
+        save(&path, "rdp.example", "127.0.0.1:3389", None, "CC:DD").unwrap();
+        assert_eq!(load(&path, "rdp.example", "127.0.0.1:3389", None).as_deref(), Some("CC:DD"));
+    }
+
+    #[test]
+    fn forwarded_routes_on_the_same_loopback_endpoint_keep_separate_pins() {
+        let dir = TestDir::new();
+        let path = dir.path().join("rdp-trust.json");
+        save(&path, "rdp.example", "127.0.0.1:3390", Some("ssh-a"), "AA:AA").unwrap();
+        save(&path, "rdp.example", "127.0.0.1:3390", Some("ssh-b"), "BB:BB").unwrap();
+        assert_eq!(load(&path, "rdp.example", "127.0.0.1:3390", Some("ssh-a")).as_deref(), Some("AA:AA"));
+        assert_eq!(load(&path, "rdp.example", "127.0.0.1:3390", Some("ssh-b")).as_deref(), Some("BB:BB"));
+        assert_eq!(load(&path, "rdp.example", "127.0.0.1:3390", Some("ssh-c")), None);
+        assert_eq!(load(&path, "rdp.example", "127.0.0.1:3390", None), None);
+    }
+
+    #[test]
+    fn pins_saved_under_the_previous_key_format_still_load() {
+        let dir = TestDir::new();
+        let path = dir.path().join("rdp-trust.json");
+        // 예전 키: 경로 대상 ID 없이 `{dns}\n{host}:{port}`, IPv6 루프백은 괄호 없이 적었다.
+        fs::write(&path, serde_json::to_vec(&serde_json::json!({ "version": 1, "pins": {
+            "rdp.example\n127.0.0.1:3390": { "fingerprint": "V4:OLD", "approved_at": 1 },
+            "rdp.example\n::1:3391": { "fingerprint": "V6:OLD", "approved_at": 1 },
+        }})).unwrap()).unwrap();
+        assert_eq!(load(&path, "rdp.example", "127.0.0.1:3390", Some("ssh-a")).as_deref(), Some("V4:OLD"));
+        assert_eq!(load(&path, "rdp.example", "[::1]:3391", Some("ssh-a")).as_deref(), Some("V6:OLD"));
+        // 새 고정은 새 키로 저장하고, 같은 경로는 새 키를 먼저 읽는다. 예전 키는 남는다.
+        save(&path, "rdp.example", "[::1]:3391", Some("ssh-a"), "V6:NEW").unwrap();
+        assert_eq!(load(&path, "rdp.example", "[::1]:3391", Some("ssh-a")).as_deref(), Some("V6:NEW"));
+        assert_eq!(load(&path, "rdp.example", "[::1]:3391", Some("ssh-b")).as_deref(), Some("V6:OLD"));
+        let file: File = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(file.pins.contains_key("rdp.example\n[::1]:3391\nssh-a"));
+        assert!(file.pins.contains_key("rdp.example\n::1:3391"));
     }
 }

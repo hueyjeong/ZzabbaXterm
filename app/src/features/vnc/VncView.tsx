@@ -149,14 +149,14 @@ export function VncView({ active, source, preset, autoStart, ref }: {
   return <section className="remote-desktop-view" aria-label="VNC" hidden={!active} inert={!active}>
     <form className="remote-desktop-toolbar" onSubmit={open}>
       {source ? <span>SSH 터널 · [{source.destination.host}]:{source.destination.port}</span> : <>
-        <label>TLS 호스트 <input name="host" maxLength={253} required autoComplete="off" defaultValue={preset?.host} disabled={connecting || cleanupBlocked} /></label>
-        <label>TLS 포트 <input name="port" type="number" min={1} max={65535} defaultValue={preset?.port ?? 5900} required disabled={connecting || cleanupBlocked} /></label>
+        <label>호스트 <input name="host" maxLength={253} required autoComplete="off" defaultValue={preset?.host} disabled={connecting || cleanupBlocked} /></label>
+        <label>포트 <input name="port" type="number" min={1} max={65535} defaultValue={preset?.port ?? 5900} required disabled={connecting || cleanupBlocked} /></label>
       </>}
       <label>서비스 인증 <select name="auth" defaultValue="password" disabled={connecting || cleanupBlocked}>
         <option value="password">VNC 비밀번호</option>
         <option value="none">없음</option>
       </select></label>
-      <button type="submit" disabled={connecting || cleanupBlocked}>{source ? "SSH 터널로 연결" : session ? "직접 TLS 다시 연결" : "직접 TLS 연결"}</button>
+      <button type="submit" disabled={connecting || cleanupBlocked}>{source ? "SSH 터널로 연결" : session ? "다시 연결" : "직접 연결"}</button>
     </form>
     {connecting && <span role="status">VNC 연결 대기 중</span>}
     {cleanupBlocked ? <span role="alert">{CLOSE_UNCONFIRMED}</span> : notice && <span role="status">{notice}</span>}

@@ -143,13 +143,13 @@ export function RdpTab({ active, label, source, preset, autoStart, onSecurityMod
     </div>}
     {idle && editing && <form className="remote-desktop-toolbar" onSubmit={submit}>
       {forwardedAddress && <span>포워드 목적지: {forwardedAddress}</span>}
-      <label>{source ? "TLS 인증 DNS" : "서버 DNS"} <input value={host} onChange={(event) => setHost(event.target.value)} required maxLength={253} /></label>
+      <label>{source ? "TLS 인증 이름" : "서버 이름"} <input value={host} onChange={(event) => setHost(event.target.value)} required maxLength={253} /></label>
       {!source && <label>포트 <input type="number" value={port} min={1} max={65535} onChange={(event) => setPort(event.target.value)} required /></label>}
       <label><input type="checkbox" checked={tlsOnly} onChange={(event) => setTlsOnly(event.target.checked)} /> NLA를 지원하지 않는 서버(TLS 전용) 허용</label>
       <button type="submit" disabled={!active}>{source ? "터널 연결" : "직접 연결"}</button>
     </form>}
     {opening && <div className="remote-desktop-toolbar">
-      <span>{opening.forwardedAddress ? <>포워드 목적지: {opening.forwardedAddress} · TLS 인증 DNS: {opening.host} · {loginMode}</> : `${opening.host}:${opening.port} · ${loginMode}`}</span>
+      <span>{opening.forwardedAddress ? <>포워드 목적지: {opening.forwardedAddress} · TLS 인증 이름: {opening.host} · {loginMode}</> : `${opening.host}:${opening.port} · ${loginMode}`}</span>
       {!ready && <span role="status">연결 중</span>}
       <button type="button" onClick={() => { void requestClose(); }}>연결 종료</button>
       {connection && <>

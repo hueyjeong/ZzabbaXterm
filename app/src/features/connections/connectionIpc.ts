@@ -1,14 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ConnectionProfileDraft, ConnectionRequest, ConnectionTestDraft, ConnectionTestRun, LocalConnectionActions } from "./profiles";
+import type { ConnectionRequest, ConnectionTestDraft, ConnectionTestRun, LocalConnectionActions, SavedTarget, TargetDraft } from "./profiles";
+
+export type { SavedTarget, TargetDraft } from "./profiles";
 
 type SavedEntry<T> = Readonly<{ revision: number; profile: T }>;
 // parentId가 없으면 최상위 그룹, groupId가 없으면 그룹 없는 최상위 세션이다.
 /** 서버 키를 다시 받은 결과다. 핀이 없어 등록했으면 registered, 같으면 unchanged, 교체했으면 replaced다. */
 export type SshHostTrust = Readonly<{ fingerprint: string; status: "registered" | "unchanged" | "replaced" }>;
 
-export type SavedGroup = ConnectionProfileDraft["group"] & Readonly<{ parentId?: string }>;
-type WithoutGroup<T> = T extends unknown ? Omit<T, "groupId"> & Readonly<{ groupId?: string }> : never;
-export type SavedTarget = WithoutGroup<ConnectionProfileDraft["target"]>;
+export type SavedGroup = Readonly<{ id: string; displayName: string; parentId?: string }>;
 export type SavedConnections = Readonly<{
   version: 2;
   groups: readonly SavedEntry<SavedGroup>[];
@@ -16,7 +16,6 @@ export type SavedConnections = Readonly<{
 }>;
 
 export type GroupDraft = Readonly<{ version: 2; revision: number | null; group: SavedGroup }>;
-export type TargetDraft = Readonly<{ version: 2; targetRevision: number | null; target: SavedTarget }>;
 // 하위 포함 그룹 삭제에서 클라이언트가 본 하위 그룹과 세션이다. 저장본과 정확히 같아야 지운다.
 export type ExpectedEntry = Readonly<{ kind: "group" | "target"; id: string; revision: number }>;
 export type ConnectionEditError =
@@ -32,7 +31,7 @@ type Execution = {
   cancellation?: Promise<void>;
 };
 
-export function createLocalConnectionIpc(): Omit<LocalConnectionActions, "onClose"> & {
+export function createLocalConnectionIpc(): LocalConnectionActions & {
   load(): Promise<SavedConnections>;
   registerSavedSshHost(targetId: string): Promise<null>;
   trustSavedSshHost(targetId: string): Promise<SshHostTrust>;
@@ -55,40 +54,8 @@ export function createLocalConnectionIpc(): Omit<LocalConnectionActions, "onClos
     deleteGroup: (id, revision, expected) => invoke<null>("connection_group_delete", { id, revision, expected }),
     deleteTarget: (id, revision) => invoke<null>("connection_target_delete", { id, revision }),
     saveTarget: (draft) => invoke<{ revision: number }>("connection_target_save", { draft }),
-    async verifySshHost({ targetId, host, port, hostKeyFingerprint }, draft, attempt, signal) {
-      type Reply = { targetId: string; host: string; port: number; fingerprint: string };
-      const request = { targetId, host, port, expectedFingerprint: hostKeyFingerprint };
-      const cancel = () => { void invoke("cancel_ssh_host", { attempt }).catch(() => { }); };
-      const check = (result: Reply) => {
-        // 입력한 지문이 없으면 선택한 공개 키 파일의 지문이 그대로 돌아온다.
-        if (result?.targetId !== targetId || result.port !== port || result.host !== host
-          || (hostKeyFingerprint !== undefined && result.fingerprint !== hostKeyFingerprint)) {
-          throw new Error("SSH 호스트 키 확인 응답이 현재 초안과 일치하지 않습니다");
-        }
-      };
-      signal.addEventListener("abort", cancel, { once: true });
-      try {
-        signal.throwIfAborted();
-        const result = await invoke<Reply & { ticket: string }>("verify_ssh_host", { request, draft, attempt });
-        signal.throwIfAborted();
-        check(result);
-        if (!/^[a-f0-9]{32}$/.test(result.ticket)) throw new Error("SSH 호스트 키 확인 예약이 올바르지 않습니다");
-        check(await invoke<Reply>("commit_ssh_host", { attempt, ticket: result.ticket }));
-      } catch (error) {
-        if (!signal.aborted && error !== "busy") cancel();
-        switch (error) {
-          case "cancelled": case "stale_document": throw new Error("SSH 호스트 키 등록이 취소되었습니다");
-          case "busy": throw new Error("열려 있는 SSH 호스트 키 창을 먼저 닫으세요");
-          case "fingerprint_mismatch": throw new Error("선택한 SSH 호스트 키의 지문이 다릅니다");
-          case "existing_pin_conflict": throw new Error("다른 SSH 호스트 키가 이미 등록되어 있습니다");
-          case "store_unavailable": throw new Error("SSH 신뢰 저장소를 사용할 수 없습니다");
-          default: throw error;
-        }
-      } finally {
-        signal.removeEventListener("abort", cancel);
-      }
-    },
     async test(attempt, interactive) {
+      // 시작은 초안 검증 실패를 ConnectionEditError의 invalid로, 그 밖의 실패를 문자열로 거부한다.
       const started = invoke<ConnectionTestRun>("connection_test_start", attempt);
       const execution: Execution = { started, cancelled: false };
       attempts.set(attempt, execution);
@@ -135,20 +102,15 @@ export function createLocalConnectionIpc(): Omit<LocalConnectionActions, "onClos
     },
     async save(request: ConnectionRequest) {
       const success = tested.get(request.run);
-      // 저장 암호는 연결 시험이 승인 경로를 열 수 없어 호스트 키 확인 뒤 참조만 저장한다.
-      // 원격 화면 프로필은 비밀 없이 경로만 저장하며 Rust가 다시 검증한다.
-      const { target } = request.draft;
-      const stored = (target.defaultMethod === "ssh" && target.ssh.auth?.kind === "storedPassword")
-        || target.defaultMethod === "rdp" || target.defaultMethod === "vnc";
-      if (!stored && (!success || success.execution.cancelled || success.attempt.draft !== request.draft ||
-        attempts.get(success.attempt) !== success.execution)) {
+      // 시험하지 않은 초안은 saveTarget으로 저장한다. 티켓 저장은 같은 초안의 성공한 시험만 받는다.
+      if (!success || success.execution.cancelled || success.attempt.draft !== request.draft ||
+        attempts.get(success.attempt) !== success.execution) {
         throw new Error("현재 초안의 연결 테스트 성공이 필요합니다");
       }
+      // 실패하면 ConnectionEditError로 거부한다.
       await invoke<null>("connection_save", { request });
-      if (success) {
-        tested.delete(request.run);
-        attempts.delete(success.attempt);
-      }
+      tested.delete(request.run);
+      attempts.delete(success.attempt);
     },
   };
 }

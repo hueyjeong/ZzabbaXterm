@@ -104,6 +104,7 @@ fn no_trust() -> trust::Trust<impl FnOnce(trust::Request) -> std::future::Ready<
         path: std::path::PathBuf::new(),
         dns: "fixture".into(),
         endpoint: "fixture".into(),
+        route: None,
         approve: |_| std::future::ready(Ok(false)),
     }
 }
@@ -133,7 +134,8 @@ fn fixture_policy(_: &str, _: &[rustls::pki_types::CertificateDer<'_>]) -> Resul
 async fn exercise(
     listener: &TcpListener,
     protocol: SecurityProtocol,
-    forwarded: bool,
+    // 직접 연결의 서버 이름이다. 없으면 `REMOTE` 이름으로 전달 경로를 쓴다.
+    direct: Option<&str>,
     dns: &str,
     expired: bool,
     known: bool,
@@ -198,17 +200,16 @@ async fn exercise(
     };
     let calls = AtomicUsize::new(0);
     let size = DesktopSize { width: 800, height: 600 };
-    let target = if forwarded {
-        fixture_target(listener, size, false, REMOTE).await
-    } else {
-        Target {
+    let target = match direct {
+        None => fixture_target(listener, size, false, REMOTE).await,
+        Some(server_name) => Target {
             endpoint: Endpoint::Direct(listener.local_addr().unwrap().port()),
-            server_name: "localhost".into(),
+            server_name: server_name.into(),
             size,
             tls_only: false,
-        }
+        },
     };
-    let name = ServerName::try_from(target.server_name.clone()).unwrap();
+    let name = super::super::route::server_name(&target.server_name).unwrap();
     let slot = Slot::new(1);
     let client = connect(
         target,
@@ -251,7 +252,7 @@ async fn verifies_remote_name_chain_and_expiry_before_credentials() {
             exercise(
                 &listener,
                 SecurityProtocol::HYBRID,
-                true,
+                None,
                 name,
                 expired,
                 known,
@@ -263,7 +264,7 @@ async fn verifies_remote_name_chain_and_expiry_before_credentials() {
     }
     for protocol in [SecurityProtocol::HYBRID, SecurityProtocol::HYBRID_EX] {
         assert_eq!(
-            exercise(&listener, protocol, true, REMOTE, false, true, fixture_policy).await,
+            exercise(&listener, protocol, None, REMOTE, false, true, fixture_policy).await,
             (Error::Authentication, 1, true)
         );
     }
@@ -273,11 +274,25 @@ async fn verifies_remote_name_chain_and_expiry_before_credentials() {
 async fn direct_connection_verifies_the_dns_name_before_credentials() {
     let listener = listener();
     assert_eq!(
-        exercise(&listener, SecurityProtocol::HYBRID, false, REMOTE, false, true, fixture_policy).await,
+        exercise(&listener, SecurityProtocol::HYBRID, Some("localhost"), REMOTE, false, true, fixture_policy).await,
         (Error::TlsIdentity, 0, false)
     );
     assert_eq!(
-        exercise(&listener, SecurityProtocol::HYBRID, false, "localhost", false, true, fixture_policy).await,
+        exercise(&listener, SecurityProtocol::HYBRID, Some("localhost"), "localhost", false, true, fixture_policy).await,
+        (Error::Authentication, 1, true)
+    );
+}
+
+#[tokio::test]
+async fn direct_connection_verifies_an_ip_server_name_against_the_ip_san() {
+    let listener = listener();
+    // 같은 주소로 접속해도 인증서에 그 IP SAN이 없으면 자격 증명 전에 멈춘다.
+    assert_eq!(
+        exercise(&listener, SecurityProtocol::HYBRID, Some("127.0.0.1"), "localhost", false, true, fixture_policy).await,
+        (Error::TlsIdentity, 0, false)
+    );
+    assert_eq!(
+        exercise(&listener, SecurityProtocol::HYBRID, Some("127.0.0.1"), "127.0.0.1", false, true, fixture_policy).await,
         (Error::Authentication, 1, true)
     );
 }
@@ -299,12 +314,12 @@ async fn rejects_peer_policy_before_credentials_on_both_routes() {
         Err(Error::TlsIdentity)
     }
     let listener = listener();
-    for (forwarded, name, policy) in [
-        (true, REMOTE, deny_remote as TestPeerPolicy),
-        (false, "localhost", deny_localhost),
+    for (direct, name, policy) in [
+        (None, REMOTE, deny_remote as TestPeerPolicy),
+        (Some("localhost"), "localhost", deny_localhost),
     ] {
         assert_eq!(
-            exercise(&listener, SecurityProtocol::HYBRID, forwarded, name, false, true, policy).await,
+            exercise(&listener, SecurityProtocol::HYBRID, direct, name, false, true, policy).await,
             (Error::TlsIdentity, 0, false)
         );
     }
@@ -316,7 +331,7 @@ async fn rejects_non_nla_selection_without_opt_in_and_legacy_modes_without_resol
     let listener = listener();
     for protocol in [SecurityProtocol::empty(), SecurityProtocol::SSL, SecurityProtocol::SSL | SecurityProtocol::HYBRID] {
         assert_eq!(
-            exercise(&listener, protocol, true, REMOTE, false, true, fixture_policy).await,
+            exercise(&listener, protocol, None, REMOTE, false, true, fixture_policy).await,
             (Error::TlsOnlyRequired, 0, false)
         );
         assert!(
@@ -833,6 +848,7 @@ async fn unknown_certificate_requires_one_time_approval_and_is_pinned() {
             path: path.clone(),
             dns: REMOTE.into(),
             endpoint: "fixture".into(),
+            route: None,
             approve: move |_| {
                 approve.fetch_add(1, Ordering::Relaxed);
                 std::future::ready(Ok(true))
@@ -851,7 +867,7 @@ async fn unknown_certificate_requires_one_time_approval_and_is_pinned() {
     assert!(matches!(result, Err(Error::Authentication | Error::Transport)));
     assert_eq!(calls.load(Ordering::Relaxed), 1, "승인 뒤에만 자격 증명을 조회한다");
     assert_eq!(approvals.load(Ordering::Relaxed), 1);
-    assert_eq!(trust::load(&path, REMOTE, "fixture").as_deref(), Some(fingerprint.as_str()));
+    assert_eq!(trust::load(&path, REMOTE, "fixture", None).as_deref(), Some(fingerprint.as_str()));
     let _ = std::fs::remove_file(path);
 }
 
@@ -886,7 +902,7 @@ async fn rejecting_a_changed_fingerprint_keeps_the_old_pin_without_credentials()
     roots.add(unknown.der().clone()).unwrap();
     let path = std::env::temp_dir().join(format!("zzabba-rdp-pin-change-{}", std::process::id()));
     let _ = std::fs::remove_file(&path);
-    trust::save(&path, REMOTE, "fixture", "AA:BB").unwrap();
+    trust::save(&path, REMOTE, "fixture", None, "AA:BB").unwrap();
 
     let server = async {
         let (socket, _) = listener.accept().await.unwrap();
@@ -909,7 +925,7 @@ async fn rejecting_a_changed_fingerprint_keeps_the_old_pin_without_credentials()
         REMOTE.try_into().unwrap(),
         tls_config(roots),
         trust::Trust {
-            path: path.clone(), dns: REMOTE.into(), endpoint: "fixture".into(),
+            path: path.clone(), dns: REMOTE.into(), endpoint: "fixture".into(), route: None,
             approve: |_| std::future::ready(Ok(false)),
         },
         || async {
@@ -924,7 +940,7 @@ async fn rejecting_a_changed_fingerprint_keeps_the_old_pin_without_credentials()
     let (result, ()) = timeout(Duration::from_secs(5), async { tokio::join!(client, server) }).await.unwrap();
     assert!(matches!(result, Err(Error::TlsIdentity | Error::Transport)));
     assert_eq!(calls.load(Ordering::Relaxed), 0);
-    assert_eq!(trust::load(&path, REMOTE, "fixture").as_deref(), Some("AA:BB"));
+    assert_eq!(trust::load(&path, REMOTE, "fixture", None).as_deref(), Some("AA:BB"));
     let _ = std::fs::remove_file(path);
 }
 

@@ -160,12 +160,14 @@ impl Store {
 
     #[cfg(test)]
     pub(super) fn save(&self, draft: ValidatedDraft) -> Result<SaveStatus, StoreError> {
-        self.save_with_rename(draft, false, None, || Ok(()), || {}, |from, to| fs::rename(from, to))
+        self.save_with_rename(draft, false, |from, to| fs::rename(from, to))
     }
 
+    /// 연결 시험을 통과한 대상만 저장한다. `authorize`는 잠금 뒤와 교체 직전에 시험 실행이 유효한지 다시 확인하고,
+    /// `committed`는 교체 뒤 그 실행을 소진한다. SSM과 S3는 시험에서 확인한 계정을 기록한다.
     pub(super) fn save_authorized(
         &self,
-        draft: ValidatedDraft,
+        draft: ValidatedTarget,
         tested_account_id: Option<String>,
         authorize: impl FnMut() -> Result<(), String>,
         committed: impl FnOnce(),
@@ -173,11 +175,14 @@ impl Store {
         if draft.method().uses_tested_account() != tested_account_id.is_some() {
             return Err(StoreError::InvalidTestedAccount);
         }
-        self.save_with_rename(draft, false, tested_account_id, authorize, committed, |from, to| fs::rename(from, to))
+        self.save_target(draft, authorize, committed, |_, target| {
+            validate_tested_account(tested_account_id.as_deref(), target.method().uses_tested_account())?;
+            Ok(tested_account_id)
+        })
     }
 
     pub(super) fn register(&self, draft: ValidatedDraft) -> Result<SaveStatus, StoreError> {
-        self.save_with_rename(draft, true, None, || Ok(()), || {}, |from, to| fs::rename(from, to))
+        self.save_with_rename(draft, true, |from, to| fs::rename(from, to))
     }
 
     /// 그룹을 추가하거나 이름을 바꾸거나 상위 그룹을 바꾼다.
@@ -261,22 +266,33 @@ impl Store {
         configured_account: impl FnOnce(&str, &str) -> Option<String>,
         authorize: impl FnMut() -> Result<(), String>,
     ) -> Result<SaveStatus, StoreError> {
+        self.save_target(draft, authorize, || {}, |old, target| Ok(match (old, account_scope(target)) {
+            (_, None) => None,
+            // 저장된 계정이 없으면 같은 범위라도 로컬 SSO 설정을 다시 읽는다.
+            (Some(entry), scope) if account_scope(&entry.profile) == scope && entry.tested_account_id.is_some() => {
+                entry.tested_account_id.clone()
+            }
+            (_, Some((_, profile, region))) => configured_account(profile, region)
+                .filter(|account| validate_tested_account(Some(account), true).is_ok()),
+        }))
+    }
+
+    /// 대상의 개정이 저장본과 같을 때만 대상을 추가하거나 바꾼다. `account`는 기존 항목을 보고 기록할 계정을 정한다.
+    fn save_target(
+        &self,
+        draft: ValidatedTarget,
+        authorize: impl FnMut() -> Result<(), String>,
+        committed: impl FnOnce(),
+        account: impl FnOnce(Option<&Entry<Target>>, &Target) -> Result<Option<String>, StoreError>,
+    ) -> Result<SaveStatus, StoreError> {
         let (target, revision) = draft.into_parts();
         let id = target.id.clone();
-        self.modify(authorize, || {}, |from, to| fs::rename(from, to), |file| {
+        self.modify(authorize, committed, |from, to| fs::rename(from, to), |file| {
             let old = file.targets.iter_mut().find(|entry| entry.profile.id == target.id);
             if old.as_ref().map(|entry| entry.revision) != revision {
                 return Ok(SaveStatus::TargetConflict);
             }
-            let account = match (&old, account_scope(&target)) {
-                (_, None) => None,
-                // 저장된 계정이 없으면 같은 범위라도 로컬 SSO 설정을 다시 읽는다.
-                (Some(entry), scope) if account_scope(&entry.profile) == scope && entry.tested_account_id.is_some() => {
-                    entry.tested_account_id.clone()
-                }
-                (_, Some((_, profile, region))) => configured_account(profile, region)
-                    .filter(|account| validate_tested_account(Some(account), true).is_ok()),
-            };
+            let account = account(old.as_deref(), &target)?;
             let entry = match old {
                 Some(entry) => { entry.update(target)?; entry }
                 None => {
@@ -294,15 +310,11 @@ impl Store {
         &self,
         draft: ValidatedDraft,
         insert_only: bool,
-        tested_account_id: Option<String>,
-        authorize: impl FnMut() -> Result<(), String>,
-        committed: impl FnOnce(),
         rename: impl FnOnce(&Path, &Path) -> io::Result<()>,
     ) -> Result<SaveStatus, StoreError> {
         let (mut group, group_revision, target, target_revision) = draft.into_parts();
         let id = target.id.clone();
-        self.modify(authorize, committed, rename, |file| {
-            validate_tested_account(tested_account_id.as_deref(), target.method().uses_tested_account())?;
+        self.modify(|| Ok(()), || {}, rename, |file| {
             let old_group = file.groups.iter_mut().find(|entry| entry.profile.id == group.id);
             let old_target = file.targets.iter_mut().find(|entry| entry.profile.id == target.id);
 
@@ -336,7 +348,7 @@ impl Store {
                     file.targets.last_mut().unwrap()
                 }
             };
-            entry.tested_account_id = tested_account_id;
+            entry.tested_account_id = None;
             file.require_route(&id)?;
             Ok(SaveStatus::Saved)
         })
@@ -387,7 +399,7 @@ impl Store {
         &self,
         draft: ValidatedDraft,
     ) -> Result<SaveStatus, StoreError> {
-        self.save_with_rename(draft, false, None, || Ok(()), || {}, |from, to| {
+        self.save_with_rename(draft, false, |from, to| {
             // 일반 파일 아래의 경로에서는 권한과 관계없이 실제 rename이 ENOTDIR로 실패한다.
             fs::rename(from.join("not-a-directory"), to)
         })
