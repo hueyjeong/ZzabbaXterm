@@ -124,11 +124,11 @@ export function TerminalView({ active, focusRequested, focusSeq, clipboard, labe
     // 웹뷰 기본 메뉴 대신 복사·붙여넣기를 한다. 캡처 단계에서 멈춰 xterm의 우클릭 선택 처리도 막는다.
     // Shift 우클릭은 앱 전역처럼 기본 메뉴를 남긴다.
     const onContextMenu = (event: MouseEvent) => {
+      const allowPaste = focusedBeforePress;
+      focusedBeforePress = false;
       if (event.shiftKey) return;
       event.preventDefault();
       event.stopPropagation();
-      const allowPaste = focusedBeforePress;
-      focusedBeforePress = false;
       rightClick(term, clipboardRef.current ?? navigator.clipboard,
         () => allowPaste && !disposed && acceptsUserInput && !stopRequested.current && hasFocus());
     };
