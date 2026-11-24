@@ -712,6 +712,24 @@ describe("우클릭 메뉴", () => {
     expect(input().value).toBe("바뀐 값붙임");
   });
 
+  it("늦게 온 붙여넣기 응답은 값이 같아도 입력창에 포커스가 없으면 포커스를 옮기지 않고 값만 넣는다", async () => {
+    await render(setup());
+    const late = Promise.withResolvers<string>();
+    clipboard.readText.mockReturnValueOnce(late.promise);
+    await type("처음");
+    input().focus();
+    input().setSelectionRange(2, 2);
+    await contextMenu(input());
+    await choose("붙여넣기");
+    const other = button("전송")!;
+    await act(async () => { other.focus(); });
+    expect(document.activeElement).toBe(other);
+    await act(async () => { late.resolve("늦은 글자"); });
+    expect(input().value).toBe("처음늦은 글자");
+    expect(document.activeElement).toBe(other);
+    await click("전송");
+  });
+
   it("열린 메뉴는 상태가 바뀌면 사라진 동작을 바로 뺀다", async () => {
     const props = setup();
     const stop = vi.fn<NonNullable<AiPanelProps["onStopExecution"]>>().mockResolvedValue(undefined);
@@ -730,6 +748,24 @@ describe("우클릭 메뉴", () => {
     expect(items()).toEqual(["출력 복사", "중지"]);
     await render({ ...approved, execution: { ...running, phase: "exited", code: 0 } });
     expect(items()).toEqual(["출력 복사"]);
+    expect(stop).not.toHaveBeenCalled();
+  });
+
+  it("포커스가 있던 메뉴 항목이 상태 변화로 사라지면 남은 켜진 항목으로 포커스를 옮긴다", async () => {
+    const props = setup();
+    const stop = vi.fn<NonNullable<AiPanelProps["onStopExecution"]>>().mockResolvedValue(undefined);
+    const running: ExecutionStatus = { proposalId: "p1", approvalId: "3", phase: "running", output: "" };
+    const approved = { ...props, history: [{ proposal: card, decision: "approved" as const }], onStopExecution: stop };
+    await render({ ...approved, execution: running });
+    await select("조회 대상", "개발 (a)");
+    await contextMenu(host.querySelector(".a01-execution")!);
+    expect(items()).toEqual(["출력 복사", "중지"]);
+    const last = menuItems()[1];
+    await act(async () => { last.focus(); });
+    expect(document.activeElement).toBe(last);
+    await render({ ...approved, execution: { ...running, phase: "exited", code: 0 } });
+    expect(items()).toEqual(["출력 복사"]);
+    expect(document.activeElement?.textContent).toBe("출력 복사");
     expect(stop).not.toHaveBeenCalled();
   });
 

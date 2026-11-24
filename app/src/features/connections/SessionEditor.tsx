@@ -8,7 +8,7 @@ import { TerminalView } from "../terminal/TerminalView";
 import { sshTestIpc } from "../terminal/session";
 import { IconButton, ProtocolIcon } from "../ui/controls";
 import type { ConnectionMethod } from "./profiles";
-import { createSessionEditor, shownError, shownFields, testSupported, validate, type EditorActions, type EditorRequest } from "./sessionEditorState";
+import { createSessionEditor, DELETED_TEXT, shownError, shownFields, testSupported, validate, type EditorActions, type EditorRequest } from "./sessionEditorState";
 import { groupOptions } from "./groupTree";
 import { Field } from "./fields/Field";
 import { DesktopFields } from "./fields/DesktopFields";
@@ -126,7 +126,7 @@ export function SessionEditor(props: SessionEditorProps) {
   </>;
   // 화면에 있는 필드의 오류는 필드 아래에만, 화면에 없는 경로는 상태 줄에 "입력 오류"로 표시한다.
   const failure = status.kind === "saveFailed" || status.kind === "testFailed" ? status : undefined;
-  const failureText = failure && (!failure.field ? failure.error
+  const failureText = state.deleted ? DELETED_TEXT : failure && (!failure.field ? failure.error
     : shownFields(draft).includes(failure.field) ? undefined : "입력 오류");
   const submit = (event: FormEvent) => {
     event.preventDefault();

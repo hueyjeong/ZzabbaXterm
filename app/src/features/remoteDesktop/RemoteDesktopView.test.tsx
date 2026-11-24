@@ -322,6 +322,29 @@ it("조합 중 클릭은 조합을 먼저 확정해 글자를 클릭보다 먼�
   expect(dispatchTrusted(canvas, new MouseEvent("mousedown", { bubbles: true, cancelable: true }))).toBe(true);
 });
 
+it("조합 중 클릭 뒤 포커스를 돌려주기 전 틈에 온 키 이벤트도 원격에 보내 눌린 키를 남기지 않는다", async () => {
+  const { keyboard, sent } = connectedKeyboard();
+  const { press } = pointerCanvas();
+  dispatchTrusted(keyboard, new KeyboardEvent("keydown", { bubbles: true, cancelable: true, code: "KeyA", key: "a" }));
+  composeUntilBlur(keyboard, "하");
+  press("pointerdown", 1);
+  expect(document.activeElement).not.toBe(keyboard);
+  // 틈에서 뗀 키와 누른 키는 body가 받아도 입력칸 처리로 넘어간다.
+  dispatchTrusted(document.body, new KeyboardEvent("keyup", { bubbles: true, cancelable: true, code: "KeyA", key: "a" }));
+  dispatchTrusted(document.body, new KeyboardEvent("keydown", { bubbles: true, cancelable: true, code: "KeyB", key: "b" }));
+  press("pointerup", 0);
+  expect(sent()).toEqual(["KeyA down", "text 하", "pointer", "KeyA up", "KeyB down", "pointer"]);
+  await act(async () => { await new Promise((resolve) => setTimeout(resolve)); });
+  expect(document.activeElement).toBe(keyboard);
+  dispatchTrusted(keyboard, new KeyboardEvent("keyup", { bubbles: true, cancelable: true, code: "KeyB", key: "b" }));
+  expect(sent().slice(-1)).toEqual(["KeyB up"]);
+  // 틈이 지난 뒤 body가 받는 키 이벤트는 보내지 않는다.
+  act(() => keyboard.blur());
+  const before = sent().length;
+  dispatchTrusted(document.body, new KeyboardEvent("keydown", { bubbles: true, cancelable: true, code: "KeyC", key: "c" }));
+  expect(sent()).toHaveLength(before);
+});
+
 it("창이 포커스를 잃으면 조합 중인 글자를 한 번 보내고 눌린 상태를 해제한다", () => {
   const { keyboard, sent } = connectedKeyboard();
   dispatchTrusted(keyboard, new KeyboardEvent("keydown", { bubbles: true, cancelable: true, code: "ShiftLeft", key: "Shift", shiftKey: true }));

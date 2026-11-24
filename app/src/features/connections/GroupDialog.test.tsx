@@ -163,6 +163,28 @@ it("Rust 오류는 이름·상위 그룹 필드 아래나 상태 줄에 짧게 �
   }
 });
 
+it("저장 충돌 뒤 그룹이 이미 지워졌으면 삭제 문구를 보이고 저장을 막되 취소는 유지한다", async () => {
+  const save = vi.fn(async (_draft: GroupDraft): Promise<unknown> => { throw { kind: "conflict" }; });
+  const latestRevision = vi.fn(async (_id: string): Promise<number | undefined> => undefined);
+  const onClose = vi.fn();
+  const root = createRoot(host);
+  await act(async () => root.render(<GroupDialog request={{ group: groups[0] }} groups={groups} save={save} onClose={onClose} latestRevision={latestRevision} />));
+  const dialog = host.querySelector<HTMLDialogElement>("dialog")!;
+  const button = (label: string) => [...dialog.querySelectorAll<HTMLButtonElement>("button")].find(item => item.textContent === label)!;
+  try {
+    await act(async () => { button("저장").click(); });
+    expect(latestRevision).toHaveBeenCalledExactlyOnceWith("a");
+    expect(dialog.querySelector("[role=alert]")?.textContent).toBe("이미 삭제되었습니다");
+    expect(button("저장").disabled).toBe(true);
+    expect(button("취소").disabled).toBe(false);
+    await act(async () => { button("취소").click(); });
+    expect(onClose).toHaveBeenCalledExactlyOnceWith(false);
+    expect(save).toHaveBeenCalledTimes(1);
+  } finally {
+    await act(async () => root.unmount());
+  }
+});
+
 it("취소와 Escape는 저장하지 않고 닫는다", async () => {
   const view = await render({});
   try {

@@ -69,13 +69,15 @@ function selectedText(element: HTMLElement) {
 /**
  * 입력창의 범위를 글자로 바꾼다. execCommand가 되면 실행 취소 기록에 남고 브라우저가 input 이벤트를 보낸다.
  * 안 되면 setRangeText 뒤 input 이벤트를 직접 보내 React onChange가 값을 받게 한다.
+ * moveFocus가 false이면 포커스를 옮기지 않고 값만 넣는다.
  */
-function replaceRange(element: HTMLTextAreaElement, text: string, start: number, end: number) {
+function replaceRange(element: HTMLTextAreaElement, text: string, start: number, end: number, moveFocus = true) {
   if (!text && start === end) return;
-  element.focus();
-  element.setSelectionRange(start, end);
   const { ownerDocument } = element;
-  if (typeof ownerDocument.execCommand === "function" && ownerDocument.execCommand(text ? "insertText" : "delete", false, text)) return;
+  // 포커스를 옮기지 않으면 execCommand가 다른 요소에 적용되므로 값만 바꾼다.
+  if (moveFocus) element.focus();
+  element.setSelectionRange(start, end);
+  if (moveFocus && typeof ownerDocument.execCommand === "function" && ownerDocument.execCommand(text ? "insertText" : "delete", false, text)) return;
   element.setRangeText(text, start, end, "end");
   element.dispatchEvent(new Event("input", { bubbles: true }));
 }
@@ -286,9 +288,9 @@ function Composer({ models, model, onModelChange, input, chat, onSend, children 
     pasting.current = true;
     const { value, selectionStart, selectionEnd } = element;
     void readText().then((text) => {
-      // 권한 확인 등으로 늦게 온 응답은 그사이 입력창이 바뀌었으면 버린다.
+      // 권한 확인 등으로 늦게 온 응답은 그사이 입력창이 바뀌었으면 버린다. 포커스가 다른 곳에 있으면 값만 넣는다.
       if (!text || !element.isConnected || element.readOnly || element.value !== value) return;
-      replaceRange(element, text, selectionStart, selectionEnd);
+      replaceRange(element, text, selectionStart, selectionEnd, element.ownerDocument.activeElement === element);
     }).finally(() => { pasting.current = false; });
   }
 

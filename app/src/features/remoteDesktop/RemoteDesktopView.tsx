@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, useState, type KeyboardEvent, type PointerEvent } from "react";
+import { useLayoutEffect, useRef, useState, type PointerEvent } from "react";
 import { createRemoteDesktopViewSession, type RemoteDesktopSession, type RemoteDesktopSize, type RemoteDesktopStatus, type RemoteDesktopViewSession } from "./session";
 import { imeKeyDown, modifierEvents, releasedModifiers, textCharacters, type ModifierState } from "./input";
 import "./remoteDesktop.css";
@@ -9,6 +9,16 @@ interface RemoteDesktopViewProps {
   readonly label: string;
   /** 원격 화면을 그릴 영역의 CSS 픽셀 크기를 처음 한 번과 바뀔 때마다 알린다. 숨겨지면 0이다. */
   readonly onViewport?: (size: RemoteDesktopSize) => void;
+}
+
+/** 입력칸의 React 키 이벤트와, 포커스를 돌려주기 전 틈에 문서가 받은 키 이벤트가 함께 만족하는 모양이다. */
+interface KeyInput {
+  readonly key: string; readonly code: string; readonly location: number; readonly repeat: boolean; readonly keyCode: number;
+  readonly shiftKey: boolean; readonly ctrlKey: boolean; readonly altKey: boolean; readonly metaKey: boolean;
+  readonly currentTarget: EventTarget;
+  readonly nativeEvent: Pick<globalThis.KeyboardEvent, "isTrusted" | "isComposing">;
+  preventDefault(): void;
+  stopPropagation(): void;
 }
 
 function statusText(status: RemoteDesktopStatus) {
@@ -39,6 +49,7 @@ export function RemoteDesktopView({ session, active, label, onViewport }: Remote
   const [keyboardFocused, setKeyboardFocused] = useState(false);
   const typed = useRef<(text: string) => void>(() => { });
   const entered = useRef<() => void>(() => { });
+  const gapKey = useRef<(event: globalThis.KeyboardEvent, down: boolean) => void>(() => { });
 
   function release() {
     const id = pointer.current;
@@ -145,6 +156,24 @@ export function RemoteDesktopView({ session, active, label, onViewport }: Remote
     };
   }, []);
 
+  // 조합 중 클릭 뒤 포커스를 돌려주기 전 틈에는 키 이벤트가 body로 간다. 놓친 keyup으로 원격에 키가 눌린 채 남지 않게 입력칸 처리로 넘긴다.
+  useLayoutEffect(() => {
+    const document = keyboard.current?.ownerDocument;
+    if (!document) return;
+    const forward = (down: boolean) => (event: globalThis.KeyboardEvent) => {
+      const focus = document.activeElement;
+      if (ime.current.refocusing && (!focus || focus === document.body)) gapKey.current(event, down);
+    };
+    const keydown = forward(true);
+    const keyup = forward(false);
+    document.addEventListener("keydown", keydown, true);
+    document.addEventListener("keyup", keyup, true);
+    return () => {
+      document.removeEventListener("keydown", keydown, true);
+      document.removeEventListener("keyup", keyup, true);
+    };
+  }, []);
+
   useLayoutEffect(() => { viewport.current = onViewport; });
   useLayoutEffect(() => {
     const element = screen.current;
@@ -198,12 +227,19 @@ export function RemoteDesktopView({ session, active, label, onViewport }: Remote
       if (!active || !connection?.size) return;
       for (const down of [true, false]) connection.send({ kind: "key", down, code: "Enter", key: "Enter", location: 0, repeat: false });
     };
+    gapKey.current = (event, down) => sendKey({
+      key: event.key, code: event.code, location: event.location, repeat: event.repeat, keyCode: event.keyCode,
+      shiftKey: event.shiftKey, ctrlKey: event.ctrlKey, altKey: event.altKey, metaKey: event.metaKey,
+      currentTarget: keyboard.current!, nativeEvent: event,
+      preventDefault: () => event.preventDefault(), stopPropagation: () => event.stopPropagation(),
+    }, down, true);
   });
 
-  function sendKey(event: KeyboardEvent<HTMLTextAreaElement>, down: boolean) {
+  /** gap이면 입력칸이 포커스를 돌려받기 전의 틈에 문서가 받은 이벤트다. */
+  function sendKey(event: KeyInput, down: boolean, gap = false) {
     const connection = bound.current;
     if (!active || !connection?.size || !event.nativeEvent.isTrusted ||
-      event.currentTarget !== event.currentTarget.ownerDocument.activeElement) return;
+      (!gap && event.currentTarget !== (event.currentTarget as Node).ownerDocument?.activeElement)) return;
     // IME 키는 기본 동작을 막지 않아야 조합이 진행된다. 결과 글자는 compositionend에서 보낸다.
     if (down && imeKeyDown({ isComposing: event.nativeEvent.isComposing, key: event.key, keyCode: event.keyCode })) return;
     const id = `${event.code || event.key}:${event.location}`;

@@ -381,6 +381,34 @@ describe("편집 창 시험과 오류 표시", () => {
     expect(actions.saveTarget).toHaveBeenCalledExactlyOnceWith({ version: 2, targetRevision: 5, target: local });
   });
 
+  it("저장 충돌 뒤 세션이 이미 지워졌으면 삭제 상태로 저장을 막고 입력을 바꿔도 유지한다", async () => {
+    const actions = { ...fakeActions(), latestRevision: vi.fn(async (_id: string): Promise<number | undefined> => undefined) };
+    actions.saveTarget.mockRejectedValueOnce({ kind: "conflict" });
+    const { editor } = open({ target: local, revision: 3 }, actions);
+    editor.setName("바꾼 셸");
+    await editor.save();
+    expect(editor.getSnapshot()).toMatchObject({ deleted: true, status: { kind: "saveFailed", error: "이미 삭제되었습니다" } });
+    expect(editor.canSave()).toBe(false);
+    editor.setName("또 바꾼 셸");
+    expect(editor.getSnapshot().deleted).toBe(true);
+    expect(editor.canSave()).toBe(false);
+    await editor.save();
+    expect(actions.saveTarget).toHaveBeenCalledTimes(1);
+    await editor.close();
+    expect(actions.onClose).toHaveBeenCalledExactlyOnceWith({ kind: "cancelled", draftId: "draft" });
+  });
+
+  it("목록을 다시 읽지 못하면 삭제로 보지 않고 충돌 문구와 저장을 유지한다", async () => {
+    const actions = { ...fakeActions(), latestRevision: vi.fn(async (_id: string): Promise<number | undefined> => { throw new Error("읽기 실패"); }) };
+    actions.saveTarget.mockRejectedValueOnce({ kind: "conflict" });
+    const { editor } = open({ target: local, revision: 3 }, actions);
+    editor.setName("바꾼 셸");
+    await editor.save();
+    expect(editor.getSnapshot().deleted).toBeUndefined();
+    expect(editor.getSnapshot().status).toMatchObject({ kind: "saveFailed", error: "다른 작업이 세션을 변경했습니다" });
+    expect(editor.canSave()).toBe(true);
+  });
+
   it("로컬 시작 디렉터리는 비우면 통과하고 입력하면 절대 경로여야 한다", () => {
     const { editor } = open({});
     editor.setName("셸");

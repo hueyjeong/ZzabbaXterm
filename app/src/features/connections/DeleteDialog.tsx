@@ -1,5 +1,5 @@
 import { useLayoutEffect, useRef, useState } from "react";
-import { editError } from "./sessionEditorState";
+import { DELETED_TEXT, editError } from "./sessionEditorState";
 import "./editor.css";
 
 export type DeleteDialogProps = Readonly<{
@@ -20,6 +20,7 @@ export function DeleteDialog({ name, contents, conflictText, onDelete, onClose, 
   const cancel = useRef<HTMLButtonElement>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [gone, setGone] = useState(false);
   useLayoutEffect(() => {
     const modal = dialog.current;
     modal?.showModal();
@@ -38,6 +39,7 @@ export function DeleteDialog({ name, contents, conflictText, onDelete, onClose, 
       setError(referenced?.kind === "referenced" && referenced.targets
         ? `참조 중인 세션: ${referenced.targets.map(nameOf).join(", ")}`
         : referenced?.kind === "conflict" && conflictText ? conflictText : editError(failure).error);
+      setGone(editError(failure).error === DELETED_TEXT);
       setBusy(false);
       return;
     }
@@ -52,7 +54,7 @@ export function DeleteDialog({ name, contents, conflictText, onDelete, onClose, 
     {contents && <p className="delete-contents">하위 그룹 {contents.groups}개, 세션 {contents.targets}개</p>}
     {error && <div role="alert">{error}</div>}
     <footer>
-      <button type="button" className="danger" disabled={busy} onClick={() => void remove()}>삭제</button>
+      <button type="button" className="danger" disabled={busy || gone} onClick={() => void remove()}>삭제</button>
       <button ref={cancel} type="button" disabled={busy} onClick={onClose}>취소</button>
     </footer>
   </dialog>;

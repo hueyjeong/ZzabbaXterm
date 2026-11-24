@@ -9,7 +9,7 @@ import { GroupDialog, type GroupRequest } from "../connections/GroupDialog";
 import { groupContents } from "../connections/groupTree";
 import type { ConnectionClose, SshTransport } from "../connections/profiles";
 import { SessionEditor } from "../connections/SessionEditor";
-import type { EditorRequest } from "../connections/sessionEditorState";
+import { DELETED_TEXT, type EditorRequest } from "../connections/sessionEditorState";
 import { subscribeLocalCliOpen } from "../editor/cliOpen";
 import { EditorTab, type EditorTabActions } from "../editor/EditorTab";
 import { ElevationDialog } from "../elevation/ElevationDialog";
@@ -513,11 +513,11 @@ export function Workspace() {
     const id = deleting.entry.profile.id;
     if (deleting.kind === "group") {
       const entry = profiles.groups.find(({ profile }) => profile.id === id);
-      if (!entry) throw { kind: "failed", message: "이미 삭제되었습니다" };
+      if (!entry) throw { kind: "failed", message: DELETED_TEXT };
       setDeleting({ kind: "group", entry, contents: groupContents(profiles, id) });
     } else {
       const entry = profiles.targets.find(({ profile }) => profile.id === id);
-      if (!entry) throw { kind: "failed", message: "이미 삭제되었습니다" };
+      if (!entry) throw { kind: "failed", message: DELETED_TEXT };
       setDeleting({ kind: "target", entry });
     }
     throw failure;

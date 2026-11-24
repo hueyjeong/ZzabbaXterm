@@ -2715,6 +2715,23 @@ describe("세션 편집 창", () => {
     expect(host.querySelector("dialog")).toBeNull();
   });
 
+  it("세션 편집 창의 저장 충돌 뒤 세션이 이미 지워졌으면 삭제 문구를 보이고 저장을 막는다", async () => {
+    let gone = false;
+    loadProfiles = async () => ({ version: 2, groups: [], targets: gone ? [] : [shell(5)] });
+    runConnectionCommand = async (command) => {
+      if (command !== "connection_target_save") throw command;
+      gone = true;
+      throw { kind: "conflict" };
+    };
+    await restartWorkspace();
+    await treeMenuAction("작업 셸", "편집…");
+    await changeInput("이름", "바꾼 셸");
+    await press("저장");
+    expect(find("dialog[open] [role=alert]").textContent).toBe("이미 삭제되었습니다");
+    expect((find("dialog[open] button.primary") as HTMLButtonElement).disabled).toBe(true);
+    expect(connectionCalls("connection_target_save")).toHaveLength(1);
+  });
+
   it("세션 행의 편집…은 저장본과 개정으로 편집 창을 연다", async () => {
     loadProfiles = async () => ({ version: 2, groups: [], targets: [shell(5)] });
     runConnectionCommand = async (command) => {
