@@ -341,6 +341,25 @@ it("화면 영역 크기를 받은 뒤 그 크기로 연결을 시작한다", as
     .toEqual({ host: "rdp.example.invalid", port: 3389, size: { width: 1474, height: 812, scale: 125 } });
 });
 
+it("해상도 요청은 보냈는지, 다시 요청할지, 실패했는지 돌려주고 busy 알림은 띄우지 않는다", async () => {
+  const f = await fixture();
+  const size = { width: 1280, height: 720, scale: 125 };
+  // 첫 화면 전에는 보낼 화면 세대가 없다.
+  await expect(f.connection.resize(size)).resolves.toBe("retry");
+  const view = await f.live();
+  f.sendInput.mockResolvedValueOnce("busy");
+  await expect(f.connection.resize(size)).resolves.toBe("retry");
+  expect(f.notice).not.toHaveBeenCalledWith(BUSY_NOTICE);
+  await expect(f.connection.resize(size)).resolves.toBe("sent");
+  f.sendInput.mockResolvedValueOnce({ error: "서버가 허용하는 최대 화면 면적을 넘습니다" });
+  await expect(f.connection.resize(size)).resolves.toBe("failed");
+  expect(f.notice).toHaveBeenLastCalledWith("서버가 허용하는 최대 화면 면적을 넘습니다");
+  expect(f.ended).not.toHaveBeenCalled();
+  f.close();
+  await expect(f.connection.resize(size)).resolves.toBe("failed");
+  view.dispose();
+});
+
 it("복사가 busy이거나 진행 중이어도 다시 보내지 않고 뒤 키 입력을 계속 보낸다", async () => {
   const f = await fixture();
   const view = await f.live();

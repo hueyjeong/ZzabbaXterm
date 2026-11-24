@@ -80,13 +80,31 @@ pub(super) fn encode_resize(stage: &mut ActiveStage, width: u16, height: u16, pe
     stage.encode_dvc_messages(messages).map_err(|_| Error::Protocol)
 }
 
-/// 해상도 변경을 보낸 뒤에는 서버가 새 크기 좌표로 보낸 화면 갱신을 그리지 않고 버린다.
-/// xrdp 0.9.24는 Deactivate All보다 먼저 새 크기의 비트맵을 보낸다. 그 밖의 범위 오류는 그대로 세션을 끝낸다.
-pub(super) fn skip_while_resizing<T>(result: Result<T, Error>, resizing: bool) -> Result<Option<T>, Error> {
-    match result {
-        Ok(value) => Ok(Some(value)),
-        Err(Error::Bounds) if resizing => Ok(None),
-        Err(error) => Err(error),
+/// 보낸 해상도 변경이 재활성화로 끝나기 전까지의 상태다.
+/// xrdp 0.9.24는 Deactivate All보다 먼저 새 크기 좌표의 비트맵을 보낸다. 그 갱신만 그리지 않고 버린다.
+#[derive(Default)]
+pub(super) struct Resizing(Option<(std::time::Instant, u16, u16)>);
+
+impl Resizing {
+    /// 서버가 재활성화하지 않아도 이 시간이 지나면 다시 모든 범위 오류로 세션을 끝낸다.
+    const LIMIT: std::time::Duration = super::IO_TIMEOUT;
+
+    pub(super) fn requested(&mut self, width: u16, height: u16) {
+        self.0 = Some((std::time::Instant::now() + Self::LIMIT, width, height));
+    }
+
+    pub(super) fn reactivated(&mut self) {
+        self.0 = None;
+    }
+
+    /// 현재 화면 밖이지만 요청한 크기 안을 가리키는 화면 갱신이면 `None`이다. 형식·길이·채널 오류는 그대로 돌려준다.
+    pub(super) fn skip<T>(&self, result: Result<T, Error>) -> Result<Option<T>, Error> {
+        match (result, self.0) {
+            (Ok(value), _) => Ok(Some(value)),
+            (Err(Error::OutOfImage { right, bottom }), Some((until, width, height)))
+                if right < width && bottom < height && std::time::Instant::now() < until => Ok(None),
+            (Err(error), _) => Err(error),
+        }
     }
 }
 
@@ -141,19 +159,32 @@ mod tests {
     }
 
     #[test]
-    fn out_of_bounds_updates_are_dropped_only_while_a_resize_is_pending() {
-        use ironrdp::pdu::geometry::InclusiveRectangle;
-        use ironrdp::session::image::DecodedImage;
-        use ironrdp::graphics::image_processing::PixelFormat;
+    fn only_updates_inside_the_requested_size_are_dropped_until_reactivation() {
+        use crate::rdp::frame::{Inbound, Normalizer, tests::bitmap_frame};
+        use ironrdp::{graphics::image_processing::PixelFormat, pdu::geometry::InclusiveRectangle, session::image::DecodedImage};
 
         // R6b 재현: 644×633 화면에서 1280×720을 요청하면 xrdp가 재활성화 전에 새 크기 좌표의 비트맵을 보낸다.
         let image = DecodedImage::new(PixelFormat::RgbA32, 644, 633);
-        let beyond = crate::rdp::frame::tests::bitmap_frame(InclusiveRectangle { left: 1000, top: 0, right: 1000, bottom: 1 });
-        let action = ironrdp::pdu::Action::FastPath;
-        let mut normalizer = crate::rdp::frame::Normalizer::default();
-        assert_eq!(skip_while_resizing(normalizer.normalize(action, &beyond, &image).map(|_| ()), false), Err(Error::Bounds));
-        assert_eq!(skip_while_resizing(normalizer.normalize(action, &beyond, &image).map(|_| ()), true), Ok(None));
-        assert_eq!(skip_while_resizing(Err::<(), _>(Error::Protocol), true), Err(Error::Protocol));
-        assert_eq!(skip_while_resizing(Ok(7), true), Ok(Some(7)));
+        let tile = |left: u16, top: u16| bitmap_frame(InclusiveRectangle { left, top, right: left, bottom: top + 1 });
+        let normalize = |pdu: &[u8]| Normalizer::default().normalize(ironrdp::pdu::Action::FastPath, pdu, &image).map(|_| ());
+        let mut resizing = Resizing::default();
+        assert_eq!(resizing.skip(normalize(&tile(1000, 0))), Err(Error::OutOfImage { right: 1000, bottom: 1 }));
+        resizing.requested(1280, 720);
+        assert_eq!(resizing.skip(normalize(&tile(1000, 0))), Ok(None));
+        assert_eq!(resizing.skip(normalize(&tile(1279, 718))), Ok(None));
+        // 요청한 크기보다 큰 좌표와 형식 오류는 버리지 않는다.
+        assert_eq!(resizing.skip(normalize(&tile(1280, 0))), Err(Error::OutOfImage { right: 1280, bottom: 1 }));
+        assert_eq!(resizing.skip(normalize(&tile(0, 719))), Err(Error::OutOfImage { right: 0, bottom: 720 }));
+        assert_eq!(resizing.skip(Err::<(), _>(Error::Bounds)), Err(Error::Bounds));
+        // 해상도 변경 중에도 길이가 어긋난 클립보드 조각은 세션을 끝낸다.
+        let mut inbound = Inbound::default();
+        inbound.io_id = 1003;
+        inbound.clipboard_id = Some(1004);
+        let flags = ironrdp::pdu::rdp::vc::ChannelControlFlags::FLAG_FIRST | ironrdp::pdu::rdp::vc::ChannelControlFlags::FLAG_LAST;
+        let clipboard = crate::rdp::frame::tests::channel_pdu(1004, 8, flags, &[0; 4]);
+        assert_eq!(resizing.skip(inbound.check(ironrdp::pdu::Action::X224, &clipboard, &image)), Err(Error::Bounds));
+        // 재활성화가 끝나면 다시 모든 범위 오류로 세션을 끝낸다.
+        resizing.reactivated();
+        assert_eq!(resizing.skip(normalize(&tile(1000, 0))), Err(Error::OutOfImage { right: 1000, bottom: 1 }));
     }
 }

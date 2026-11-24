@@ -249,16 +249,14 @@ fn check_graphics(code: UpdateCode, data: &[u8], image: &DecodedImage) -> Result
         ),
         UpdateCode::SurfaceCommands => {
             let mut pixels = false;
+            let mut end = (0, 0);
             while !input.is_empty() {
                 match decode_cursor(&mut input).map_err(|_| Error::Protocol)? {
                     SurfaceCommand::SetSurfaceBits(bits)
                     | SurfaceCommand::StreamSurfaceBits(bits) => {
                         let dest = bits.destination;
                         let bitmap = bits.extended_bitmap_data;
-                        let bounds = dest.left < dest.right
-                            && dest.top < dest.bottom
-                            && dest.right <= image.width()
-                            && dest.bottom <= image.height();
+                        let bounds = dest.left < dest.right && dest.top < dest.bottom;
                         if !bounds
                             || bitmap.codec_id != 0
                             || bitmap.width != dest.right - dest.left
@@ -272,10 +270,14 @@ fn check_graphics(code: UpdateCode, data: &[u8], image: &DecodedImage) -> Result
                         {
                             return Err(Error::Bounds);
                         }
+                        end = (end.0.max(dest.right - 1), end.1.max(dest.bottom - 1));
                         pixels = true;
                     }
                     SurfaceCommand::FrameMarker(_) => {}
                 }
+            }
+            if pixels {
+                inside(image, end)?;
             }
             Ok(pixels)
         }
@@ -292,6 +294,7 @@ fn row_bytes(width: u16, bpp: u16) -> Result<usize, Error> {
 
 fn check_bitmaps(bitmap: BitmapUpdateData<'_>, image: &DecodedImage) -> Result<bool, Error> {
     let has_rects = !bitmap.rectangles.is_empty();
+    let mut end = (0, 0);
     for BitmapData {
         rectangle: rect,
         width,
@@ -304,13 +307,12 @@ fn check_bitmaps(bitmap: BitmapUpdateData<'_>, image: &DecodedImage) -> Result<b
     {
         if rect.left > rect.right
             || rect.top > rect.bottom
-            || rect.right >= image.width()
-            || rect.bottom >= image.height()
             || rect.bottom - rect.top + 1 != height
             || width < rect.right - rect.left + 1
         {
             return Err(Error::Bounds);
         }
+        end = (end.0.max(rect.right), end.1.max(rect.bottom));
         frame_len(width, height)?;
         let row = row_bytes(width, bits_per_pixel)?;
         let draw_row = row_bytes(rect.right - rect.left + 1, bits_per_pixel)?;
@@ -323,7 +325,19 @@ fn check_bitmaps(bitmap: BitmapUpdateData<'_>, image: &DecodedImage) -> Result<b
             return Err(Error::Bounds);
         }
     }
+    if has_rects {
+        inside(image, end)?;
+    }
     Ok(has_rects)
+}
+
+/// 형식 검사를 모두 통과한 갱신의 끝 좌표(포함)가 현재 화면 밖이면 `OutOfImage`로 알린다.
+/// 해상도 변경을 기다리는 동안 새 크기 안의 갱신만 버릴 수 있게 다른 범위 오류와 나눈다.
+fn inside(image: &DecodedImage, (right, bottom): (u16, u16)) -> Result<(), Error> {
+    if right >= image.width() || bottom >= image.height() {
+        return Err(Error::OutOfImage { right, bottom });
+    }
+    Ok(())
 }
 
 pub(super) enum Normalized {
@@ -335,6 +349,8 @@ pub(super) enum Normalized {
 #[derive(Default)]
 pub(super) struct Normalizer {
     fragment: Option<Vec<u8>>,
+    /// I/O 채널에서 온 Deactivate All만 고친다.
+    io_id: u16,
 }
 
 fn extend_fragment(buffer: &mut Vec<u8>, data: &[u8], limit: usize) -> Result<(), Error> {
@@ -346,19 +362,18 @@ fn extend_fragment(buffer: &mut Vec<u8>, data: &[u8], limit: usize) -> Result<()
 }
 
 fn validate(bitmap: &BitmapUpdateData<'_>, image: &DecodedImage) -> Result<(), Error> {
+    let mut end = None::<(u16, u16)>;
     for update in &bitmap.rectangles {
         let rect = &update.rectangle;
-        let width = rect.right - rect.left + 1;
         if rect.left > rect.right
             || rect.top > rect.bottom
-            || rect.right >= image.width()
-            || rect.bottom >= image.height()
             || update.height == 0
             || rect.bottom - rect.top + 1 != update.height
-            || update.width < width
+            || update.width < rect.right - rect.left + 1
         {
             return Err(Error::Bounds);
         }
+        end = Some(end.map_or((rect.right, rect.bottom), |(right, bottom)| (right.max(rect.right), bottom.max(rect.bottom))));
         // 원격이 선언한 크기로 디코드하기 전에 기존 프레임 한도를 먼저 적용한다.
         frame_len(update.width, update.height)?;
         if !update.compression_flags.contains(Compression::BITMAP_COMPRESSION) {
@@ -369,7 +384,7 @@ fn validate(bitmap: &BitmapUpdateData<'_>, image: &DecodedImage) -> Result<(), E
             }
         }
     }
-    Ok(())
+    end.map_or(Ok(()), |end| inside(image, end))
 }
 
 fn needs_crop(bitmap: &BitmapUpdateData<'_>) -> bool {
@@ -493,6 +508,10 @@ fn updates_pdu(updates: &[(Fragmentation, UpdateCode, Vec<u8>)]) -> Result<Bytes
 }
 
 impl Normalizer {
+    pub(super) fn new(io_id: u16) -> Self {
+        Self { fragment: None, io_id }
+    }
+
     pub(super) fn normalize(&mut self, action: Action, pdu: &[u8], image: &DecodedImage) -> Result<Normalized, Error> {
         match action {
             Action::FastPath => self.fastpath(pdu, image),
@@ -575,7 +594,7 @@ impl Normalizer {
 
     fn slowpath(&mut self, pdu: &[u8], image: &DecodedImage) -> Result<Normalized, Error> {
         let Ok(data) = decode_send_data_indication(pdu) else { return Ok(Normalized::Pass) };
-        if let Some(pdu) = full_deactivate(&data)? {
+        if let Some(pdu) = full_deactivate(&data, self.io_id)? {
             return Ok(Normalized::Replace(vec![(Action::X224, pdu)]));
         }
         let Ok(IoChannelPdu::Data(ctx)) = decode_io_channel(data).map_err(|_| Error::Protocol) else { return Ok(Normalized::Pass) };
@@ -599,12 +618,20 @@ impl Normalizer {
     }
 }
 
+/// 재활성화 순서에 넘길 PDU다. I/O 채널의 짧은 Deactivate All이면 고친 PDU를 돌려준다.
+pub(super) fn complete_deactivate(pdu: &[u8], io_id: u16) -> Result<Option<Bytes>, Error> {
+    match decode_send_data_indication(pdu) {
+        Ok(data) => full_deactivate(&data, io_id),
+        Err(_) => Ok(None),
+    }
+}
+
 /// xrdp 0.9.24는 해상도를 바꿀 때 Deactivate All을 ShareControlHeader 6바이트만으로 보낸다.
 /// IronRDP는 shareId까지 읽어야 하므로 shareId 0과 1바이트 sourceDescriptor를 붙인 정상 PDU로 바꿔 재활성화가 이어지게 한다.
-fn full_deactivate(data: &SendDataIndicationCtx<'_>) -> Result<Option<Bytes>, Error> {
+fn full_deactivate(data: &SendDataIndicationCtx<'_>, io_id: u16) -> Result<Option<Bytes>, Error> {
     const DEACTIVATE_ALL: u16 = 0x16;
     let user = data.user_data;
-    if user.len() != 6 || user[..2] != [6, 0] || u16::from_le_bytes([user[2], user[3]]) != DEACTIVATE_ALL {
+    if data.channel_id != io_id || user.len() != 6 || user[..2] != [6, 0] || u16::from_le_bytes([user[2], user[3]]) != DEACTIVATE_ALL {
         return Ok(None);
     }
     let mut fixed = Vec::with_capacity(13);

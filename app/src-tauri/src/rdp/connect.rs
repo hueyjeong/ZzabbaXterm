@@ -627,9 +627,11 @@ pub(super) async fn step<S: AsyncRead + AsyncWrite + Send + Sync + Unpin>(
 
 /// 재활성화 순서의 한 단계다. xrdp는 Deactivate All 뒤에도 화면 갱신(fast-path와 slow-path Update·Pointer)을 보내므로
 /// 활성화 PDU만 순서에 넘기고 화면 갱신은 버린다. 재활성화가 끝나면 서버가 새 크기의 전체 화면을 다시 보낸다.
+/// 재활성화 중에 온 xrdp의 짧은 Deactivate All도 세션 루프와 같이 고쳐 넘긴다.
 pub(super) async fn reactivation_step<S: AsyncRead + AsyncWrite + Send + Sync + Unpin>(
     transport: &mut TokioFramed<S>,
     sequence: &mut dyn Sequence,
+    io_id: u16,
 ) -> Result<(), Error> {
     if sequence.next_pdu_hint().is_none() {
         return apply(transport, sequence, None, Error::Activation).await;
@@ -637,6 +639,7 @@ pub(super) async fn reactivation_step<S: AsyncRead + AsyncWrite + Send + Sync + 
     loop {
         let pdu = read_bounded(transport, &ironrdp::pdu::RDP_HINT, Error::Activation, None).await?;
         if !graphics_update(&pdu) {
+            let pdu = super::frame::complete_deactivate(&pdu, io_id)?.unwrap_or(pdu);
             return apply(transport, sequence, Some(&pdu), Error::Activation).await;
         }
     }

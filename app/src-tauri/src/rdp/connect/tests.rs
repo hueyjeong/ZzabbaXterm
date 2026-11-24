@@ -362,6 +362,7 @@ async fn tls_only_server(
     size: DesktopSize,
     activate: bool,
     bitmaps: &[InclusiveRectangle],
+    acknowledged: bool,
 ) -> Option<ClientInfo> {
     let (socket, _) = listener.accept().await.unwrap();
     let mut framed = TokioFramed::new(socket);
@@ -429,6 +430,12 @@ async fn tls_only_server(
             .await
             .ok()?;
     }
+    if acknowledged {
+        // 프레임 끝 표식에 대한 클라이언트 응답은 앞서 보낸 PDU를 모두 처리했다는 뜻이다.
+        framed.write_all(&crate::rdp::frame::tests::marked_bitmap_frame()).await.ok()?;
+        let (action, _) = framed.read_pdu().await.ok()?;
+        assert_eq!(action, ironrdp::pdu::Action::X224);
+    }
     credentials
 }
 
@@ -451,7 +458,7 @@ async fn tls_only_retries_once_and_activates_with_client_info_credentials() {
         top: 0,
         right: 1,
         bottom: 1,
-    }]);
+    }], false);
     let client = async {
         let slot = Slot::new(1);
         let mut session = Session::open_with_tls(
@@ -513,7 +520,7 @@ async fn updates_received_while_the_tab_is_busy_are_merged_into_one_frame() {
     let tiles: Vec<_> = (0..32)
         .map(|index| InclusiveRectangle { left: index * 2, top: 0, right: index * 2, bottom: 1 })
         .collect();
-    let server = tls_only_server(&listener, tls_server(key, cert.der().clone()), size, true, &tiles);
+    let server = tls_only_server(&listener, tls_server(key, cert.der().clone()), size, true, &tiles, true);
     let client = async {
         let slot = Slot::new(1);
         let session = Session::open_with_tls(
@@ -540,8 +547,7 @@ async fn updates_received_while_the_tab_is_busy_are_merged_into_one_frame() {
         .unwrap();
     assert!(credentials.is_some());
     let mut session = session.unwrap();
-    // 서버가 모든 PDU를 보내고 닫았다. 세션 작업이 읽기를 마칠 때까지 이벤트를 받지 않는다.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // 서버는 세션 작업이 타일과 프레임 끝 표식을 모두 처리한 응답을 받은 뒤 닫았다. 그 전에는 이벤트를 받지 않았다.
     let mut frames = Vec::new();
     while let Some(event) = timeout(Duration::from_secs(5), session.next()).await.unwrap() {
         if let Event::Frame(frame) = event {
@@ -569,7 +575,7 @@ async fn tls_only_stops_before_credentials_when_the_certificate_name_differs() {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(ca.der().clone()).unwrap();
     let listener = listener();
-    let server = tls_only_server(&listener, tls_server(key, cert.der().clone()), size, false, &[]);
+    let server = tls_only_server(&listener, tls_server(key, cert.der().clone()), size, false, &[], false);
     let calls = AtomicUsize::new(0);
     let slot = Slot::new(1);
     let client = connect(

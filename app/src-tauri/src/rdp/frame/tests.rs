@@ -203,6 +203,14 @@ fn clipboard_fragments_cannot_exceed_the_declared_and_bounded_message() {
         .unwrap();
 }
 
+/// 정적 가상 채널 하나에 실린 X.224 Send Data Indication이다.
+pub(in crate::rdp) fn channel_pdu(channel_id: u16, length: u32, flags: Flags, payload: &[u8]) -> Vec<u8> {
+    use ironrdp::pdu::{mcs::SendDataIndication, x224::X224};
+    let mut user_data = encode_vec(&ChannelPduHeader { length, flags }).unwrap();
+    user_data.extend_from_slice(payload);
+    encode_vec(&X224(SendDataIndication { initiator_id: 1002, channel_id, user_data: std::borrow::Cow::Owned(user_data) })).unwrap()
+}
+
 fn test_image() -> DecodedImage {
     DecodedImage::new(PixelFormat::RgbA32, 1024, 768)
 }
@@ -461,7 +469,9 @@ fn xrdp_short_deactivate_all_is_completed_before_ironrdp_reads_it() {
     assert!(decode_io_channel(data).is_err());
 
     let image = DecodedImage::new(PixelFormat::RgbA32, 644, 633);
-    let Normalized::Replace(pdus) = Normalizer::default().normalize(Action::X224, &short, &image).unwrap() else {
+    // I/O 채널이 아닌 곳에서 온 같은 모양의 PDU는 고치지 않는다.
+    assert!(matches!(Normalizer::new(1004).normalize(Action::X224, &short, &image).unwrap(), Normalized::Pass));
+    let Normalized::Replace(pdus) = Normalizer::new(1003).normalize(Action::X224, &short, &image).unwrap() else {
         panic!("short Deactivate All must be completed")
     };
     assert_eq!(pdus.len(), 1);
@@ -469,4 +479,6 @@ fn xrdp_short_deactivate_all_is_completed_before_ironrdp_reads_it() {
     assert_eq!((data.initiator_id, data.channel_id), (1002, 1003));
     assert!(matches!(decode_io_channel(data).unwrap(), IoChannelPdu::DeactivateAll(_)));
     assert!(Inbound { io_id: 1003, ..Default::default() }.check(Action::X224, &pdus[0].1, &image).is_ok());
+    assert_eq!(complete_deactivate(&short, 1003).unwrap().as_deref(), Some(&pdus[0].1[..]));
+    assert!(complete_deactivate(&short, 1004).unwrap().is_none());
 }

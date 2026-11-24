@@ -6,7 +6,7 @@ import { createFitScheduler, fitSize, type DesktopFit } from "../remoteDesktop/f
 import type { RemoteDesktopSize } from "../remoteDesktop/session";
 import type { DesktopTunnelSource } from "../tunnels/tunnelIpc";
 import { IconButton } from "../ui/controls";
-import { connect, type Capabilities, type Connection } from "./session";
+import { BUSY_NOTICE, connect, type Capabilities, type Connection } from "./session";
 
 const noChannels: Capabilities = { copy: false, paste: false, resize: false };
 /** 창 크기 변경이 이 시간 동안 멈추면 원격 해상도를 맞춘다. */
@@ -17,6 +17,9 @@ const VIEWPORT_WAIT_MS = 1000;
 export const APPLY_WAIT_MS = 5000;
 export const NOT_APPLIED_NOTICE = "서버가 해상도를 바꾸지 않았습니다";
 const scaleOf = () => Math.round((window.devicePixelRatio || 1) * 100);
+/** 서버가 정한 크기를 다시 연결 크기로 쓸 때 Display Control 범위(짝수 폭, 200 이상)로 맞춘다. */
+const evenSize = ({ width, height }: RemoteDesktopSize): DesktopFit =>
+  ({ width: Math.max(200, width - (width % 2)), height: Math.max(200, height), scale: scaleOf() });
 
 type Draft = { host: string; port: number; tlsOnly: boolean; source?: DesktopTunnelSource };
 
@@ -56,7 +59,11 @@ export function RdpTab({ active, label, source, preset, autoStart, onSecurityMod
   const [remoteSize, setRemoteSize] = useState<RemoteDesktopSize>();
   /** 크기 변경 콜백과 타이머가 읽는 최신 값이다. */
   const latest = useRef({ connection, ready, resize: channels.resize, fit, active });
-  const display = useRef<{ view?: RemoteDesktopSize; remote?: RemoteDesktopSize; requested?: string; initial?: (size: DesktopFit | undefined) => void }>({});
+  /** `scale`은 서버에 마지막으로 알린 배율이다. `requested`는 크기와 배율을 합친 마지막 요청이다. */
+  const display = useRef<{
+    view?: RemoteDesktopSize; remote?: RemoteDesktopSize; scale?: number; requested?: string;
+    initial?: (size: DesktopFit | undefined) => void; wait?: ReturnType<typeof setTimeout>;
+  }>({});
   const fitter = useRef<ReturnType<typeof createFitScheduler>>(undefined);
   fitter.current ??= createFitScheduler(FIT_DELAY_MS, () => requestFit());
   const applyCheck = useRef<ReturnType<typeof setTimeout>>(undefined);
@@ -64,24 +71,41 @@ export function RdpTab({ active, label, source, preset, autoStart, onSecurityMod
   const loginMode = opening?.tlsOnly ? "NLA, 미지원 시 TLS 전용(표준 RDP 보안 없음)" : "NLA";
 
   useLayoutEffect(() => () => {
-    fitter.current?.cancel();
-    clearTimeout(applyCheck.current);
+    stopTimers();
     void cancel.current?.().catch(() => { });
   }, []);
   useLayoutEffect(() => { latest.current = { connection, ready, resize: channels.resize, fit, active }; });
   useEffect(() => { if (fit && ready) requestFit(); }, [fit, ready, remoteSize, channels.resize, active]);
   useImperativeHandle(ref, () => ({ requestClose }));
 
-  /** 창에 맞춤에서 화면 영역의 장치 픽셀 크기를 서버에 요청한다. 서버가 다른 크기를 적용해도 같은 요청을 되풀이하지 않는다. */
+  /**
+   * 창에 맞춤에서 화면 영역의 장치 픽셀 크기와 배율을 서버에 요청한다. 서버가 다른 크기를 적용해도 같은 요청을 되풀이하지 않는다.
+   * 화면 전환이나 작업 중이라 보내지 못한 요청은 잠시 뒤 다시 요청한다.
+   */
   function requestFit() {
     const { connection, ready, resize, fit, active } = latest.current;
-    const { view, remote, requested } = display.current;
+    const { view, remote, scale, requested } = display.current;
     const target = view && fitSize(view, window.devicePixelRatio);
     if (!fit || !target || !connection || !ready || !resize || !active) return;
-    const key = `${target.width}x${target.height}`;
-    if ((remote?.width === target.width && remote.height === target.height) || requested === key) return;
+    const key = `${target.width}x${target.height}@${target.scale}`;
+    if ((remote?.width === target.width && remote.height === target.height && scale === target.scale) || requested === key) return;
     display.current.requested = key;
-    connection.resize(target);
+    void connection.resize(target).then((result) => {
+      if (result === "sent") display.current.scale = target.scale;
+      if (result !== "retry" || display.current.requested !== key) return;
+      display.current.requested = undefined;
+      fitter.current?.schedule();
+    });
+  }
+
+  /** 첫 크기 대기, 창 맞춤 지연, 적용 확인 타이머를 멈춘다. 기다리던 첫 크기는 기본 크기로 끝낸다. */
+  function stopTimers() {
+    fitter.current?.cancel();
+    clearTimeout(applyCheck.current);
+    clearTimeout(display.current.wait);
+    const initial = display.current.initial;
+    display.current.initial = undefined;
+    initial?.(undefined);
   }
 
   /** 첫 측정은 연결 크기로 쓴다. 영역이 0이면 기본 크기로 연결하고, 숨겨진 동안의 0은 무시한다. */
@@ -89,16 +113,22 @@ export function RdpTab({ active, label, source, preset, autoStart, onSecurityMod
     const initial = display.current.initial;
     display.current.initial = undefined;
     if (size.width > 0 && size.height > 0) display.current.view = size;
-    if (initial) initial(fitSize(size, window.devicePixelRatio));
-    else if (latest.current.fit && display.current.view === size) fitter.current?.schedule();
+    if (initial) {
+      clearTimeout(display.current.wait);
+      initial(fitSize(size, window.devicePixelRatio));
+    } else if (latest.current.fit && display.current.view === size) fitter.current?.schedule();
   }
 
   function applyFixed(width: number, height: number) {
     const connection = latest.current.connection;
     if (!connection) return;
     const before = display.current.remote;
+    const scale = scaleOf();
     setNotice("");
-    connection.resize({ width, height, scale: scaleOf() });
+    void connection.resize({ width, height, scale }).then((result) => {
+      if (result === "sent") display.current.scale = scale;
+      else if (result === "retry") setNotice(BUSY_NOTICE);
+    });
     clearTimeout(applyCheck.current);
     applyCheck.current = setTimeout(() => {
       const now = display.current.remote;
@@ -109,8 +139,7 @@ export function RdpTab({ active, label, source, preset, autoStart, onSecurityMod
   }
 
   function reset() {
-    fitter.current?.cancel();
-    clearTimeout(applyCheck.current);
+    stopTimers();
     setOpening(undefined);
     setConnection(undefined);
     setChannels(noChannels);
@@ -154,10 +183,11 @@ export function RdpTab({ active, label, source, preset, autoStart, onSecurityMod
     const initial = Promise.withResolvers<DesktopFit | undefined>();
     const fixed = display.current.remote;
     display.current.requested = undefined;
-    if (!fit && fixed) initial.resolve({ ...fixed, scale: scaleOf() });
+    void initial.promise.then((size) => { display.current.scale = size?.scale; });
+    if (!fit && fixed) initial.resolve(evenSize(fixed));
     else {
       display.current.initial = initial.resolve;
-      setTimeout(() => {
+      display.current.wait = setTimeout(() => {
         if (display.current.initial !== initial.resolve) return;
         display.current.initial = undefined;
         initial.resolve(undefined);
@@ -257,8 +287,10 @@ export function RdpTab({ active, label, source, preset, autoStart, onSecurityMod
     </div>}
     {closeStatus === "closing" && <div role="status">종료 중</div>}
     {closeStatus === "unconfirmed" && <button type="button" onClick={() => { void requestClose(); }}>종료 다시 확인</button>}
-    {notice && <div role="status">{notice}</div>}
-    {error && <div role="alert">{error}</div>}
+    {(notice || error) && <div className="remote-desktop-notices">
+      {notice && <div role="status">{notice}</div>}
+      {error && <div role="alert">{error}</div>}
+    </div>}
     {connection && <RemoteDesktopView key={connection.sessionId} session={connection} active={active} label={`${label} 화면`} onViewport={viewport} />}
   </section>;
 }

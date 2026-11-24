@@ -72,6 +72,8 @@ struct Account {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     Bounds,
+    /// 형식은 맞지만 현재 화면 밖을 가리키는 화면 갱신이다. 끝 좌표(포함)를 담는다.
+    OutOfImage { right: u16, bottom: u16 },
     Busy,
     /// 요청한 크기가 서버가 Display Control 능력으로 알린 최대 면적을 넘는다.
     DisplayLimit,
@@ -242,14 +244,13 @@ impl Session {
                 let mut pending = VecDeque::new();
                 let mut dirty: Option<InclusiveRectangle> = None;
                 let mut display_generation = 1_u64;
-                let mut normalizer = frame::Normalizer::default();
-                // 서버 연결이 끊겨도 이미 받은 화면을 탭에 넘긴 뒤 끝낸다.
-                let mut ended = None;
-                // 해상도 변경을 보낸 뒤 IO_TIMEOUT 동안이다. xrdp는 Deactivate All 전에 새 크기 좌표의 화면 갱신을 보낸다.
-                let mut resizing: Option<tokio::time::Instant> = None;
-                loop {
-                    if let Some(error) = ended.filter(|_| pending.is_empty() && dirty.is_none()) {
-                        return Err(error);
+                let mut normalizer = frame::Normalizer::new(inbound.io_id);
+                // 서버 연결이 끊기거나 서버가 세션을 끝내도 이미 받은 화면을 탭에 넘긴 뒤 끝낸다.
+                let mut ended: Option<Result<(), Error>> = None;
+                let mut resizing = display::Resizing::default();
+                'session: loop {
+                    if let Some(result) = ended.filter(|_| pending.is_empty() && dirty.is_none()) {
+                        return result;
                     }
                     let clipboard_deadline = clipboard::deadline(&mut active);
                     // 탭이 이벤트를 받을 수 있으면 먼저 보낸다. 탭이 앞 화면을 처리하는 동안에는 서버를 계속 읽어 바뀐 영역을 합친다.
@@ -279,13 +280,13 @@ impl Session {
                                 let _ = ack.send(Err(Error::Busy));
                                 continue;
                             }
-                            let resize = matches!(command, Input::Resize { .. });
+                            let resize = match command { Input::Resize { width, height, .. } => Some((width, height)), _ => None };
                             let data = encode(&mut active, &graphics, channels, command);
                             let outcome = match data {
                                 Ok(data) => write(&mut transport, &data).await,
                                 Err(error) => Err(error),
                             };
-                            if resize && outcome.is_ok() { resizing = Some(tokio::time::Instant::now() + IO_TIMEOUT); }
+                            if let (Some((width, height)), Ok(())) = (resize, outcome) { resizing.requested(width, height); }
                             let _ = ack.send(outcome);
                             if matches!(outcome, Err(Error::Transport | Error::Timeout)) { outcome?; }
                         }
@@ -295,17 +296,16 @@ impl Session {
                         next = connect::read_bounded(&mut transport, &ironrdp::pdu::RDP_HINT, Error::Transport, None), if pending.is_empty() && ended.is_none() => {
                             let pdu = match next {
                                 Ok(pdu) => pdu,
-                                Err(error) => { ended = Some(error); continue; }
+                                Err(error) => { ended = Some(Err(error)); continue; }
                             };
                             let action = ironrdp::pdu::find_size(&pdu).map_err(|_| Error::Protocol)?.ok_or(Error::Protocol)?.action;
-                            let resizing_now = resizing.is_some_and(|until| tokio::time::Instant::now() < until);
-                            let pdus = match display::skip_while_resizing(normalizer.normalize(action, &pdu, &graphics.image), resizing_now)? {
+                            let pdus = match resizing.skip(normalizer.normalize(action, &pdu, &graphics.image))? {
                                 Some(frame::Normalized::Pass) => vec![(action, pdu)],
                                 Some(frame::Normalized::Drop) | None => Vec::new(),
                                 Some(frame::Normalized::Replace(pdus)) => pdus,
                             };
                             for (action, pdu) in pdus {
-                                let Some(pixels) = display::skip_while_resizing(inbound.check(action, &pdu, &graphics.image), resizing_now)? else { continue };
+                                let Some(pixels) = resizing.skip(inbound.check(action, &pdu, &graphics.image))? else { continue };
                                 let outputs = active.process(&mut graphics.image, action, &pdu).map_err(|_| Error::Protocol)?;
                                 for output in outputs {
                                     match output {
@@ -315,14 +315,18 @@ impl Session {
                                             dirty = Some(dirty.take().map_or_else(|| rect.clone(), |previous| previous.union(&rect)));
                                         }
                                         ActiveStageOutput::DeactivateAll => {
-                                            graphics = timeout(IO_TIMEOUT, reactivate(&mut transport, &mut active, &result.activation_factory))
+                                            graphics = timeout(IO_TIMEOUT, reactivate(&mut transport, &mut active, &result.activation_factory, inbound.io_id))
                                                 .await.map_err(|_| Error::Timeout)??;
                                             display_generation += 1;
                                             inbound.reset_graphics();
-                                            normalizer = frame::Normalizer::default();
+                                            normalizer = frame::Normalizer::new(inbound.io_id);
+                                            resizing.reactivated();
                                             dirty = None;
                                         }
-                                        ActiveStageOutput::Terminate(_) => return Ok(()),
+                                        ActiveStageOutput::Terminate(_) => {
+                                            ended = Some(Ok(()));
+                                            continue 'session;
+                                        }
                                         _ => {}
                                     }
                                 }
@@ -468,10 +472,11 @@ async fn reactivate(
     transport: &mut connect::Transport,
     stage: &mut ActiveStage,
     factory: &ConnectionActivationFactory,
+    io_id: u16,
 ) -> Result<Graphics, Error> {
     let mut sequence = factory.create();
     loop {
-        connect::reactivation_step(transport, &mut sequence).await?;
+        connect::reactivation_step(transport, &mut sequence, io_id).await?;
         if let ConnectionActivationState::Finalized {
             desktop_size,
             share_id,

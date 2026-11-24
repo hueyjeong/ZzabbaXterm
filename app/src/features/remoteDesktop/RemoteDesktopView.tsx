@@ -71,10 +71,25 @@ export function RemoteDesktopView({ session, active, label, onViewport }: Remote
       viewport.current?.({ width, height });
     };
     report();
-    if (typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(report);
-    observer.observe(element);
-    return () => observer.disconnect();
+    const observer = typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(report);
+    observer?.observe(element);
+    // 창을 배율이 다른 모니터로 옮기면 CSS 크기는 그대로여도 장치 픽셀 크기가 바뀐다.
+    const view = element.ownerDocument.defaultView;
+    let media: MediaQueryList | undefined;
+    const rescaled = () => {
+      watch();
+      report();
+    };
+    const watch = () => {
+      media?.removeEventListener("change", rescaled);
+      media = view?.matchMedia?.(`(resolution: ${view.devicePixelRatio}dppx)`);
+      media?.addEventListener("change", rescaled);
+    };
+    watch();
+    return () => {
+      observer?.disconnect();
+      media?.removeEventListener("change", rescaled);
+    };
   }, []);
 
   const connected = status.kind === "connected";

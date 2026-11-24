@@ -646,7 +646,7 @@ async fn input_batch(slot: &Slot, commands: Vec<Command>) -> Result<Vec<Reply>, 
 
 pub(super) fn message(error: Error) -> &'static str {
     match error {
-        Error::Bounds => "RDP 화면 또는 입력 범위가 올바르지 않습니다",
+        Error::Bounds | Error::OutOfImage { .. } => "RDP 화면 또는 입력 범위가 올바르지 않습니다",
         Error::Busy => "RDP 세션이 작업 중입니다",
         Error::DisplayLimit => "서버가 허용하는 최대 화면 면적을 넘습니다",
         Error::CopyPending => "RDP 복사가 진행 중입니다",
