@@ -25,6 +25,11 @@ use profile::Profiles;
 use serde::{Deserialize, de::DeserializeOwned};
 use std::{path::Path, sync::Arc};
 
+/// 실제 노드 시험 전용이다. 이 프로필은 SSO 직접 프로필이 아니어도 사용자 AWS 설정으로 자격만 내보내고,
+/// 신원 확인·노드 조회·세션 시작과 종료는 앱 경로를 그대로 쓴다.
+#[cfg(test)]
+pub(crate) static LIVE_EXPORT_PROFILE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 pub struct AwsCli(Arc<Path>);
 
 #[derive(Clone, Eq, PartialEq)]
@@ -127,6 +132,16 @@ impl AwsCli {
         scope: &Scope,
         cancel: &CancellationToken,
     ) -> Result<Vec<OnlineNode>, CliError> {
+        #[cfg(test)]
+        if LIVE_EXPORT_PROFILE.get().is_some_and(|live| live == scope.profile()) {
+            return self.online_nodes_with(scope, "", Arc::new(home::CliHome::new()?), |spec| async move {
+                if spec.args().get(1).is_some_and(|arg| arg == "export-credentials") {
+                    let args = ["configure", "export-credentials", "--profile", scope.profile(), "--format", "process"];
+                    return CommandSpec::aws(&self.0, &args).capture(cancel).await;
+                }
+                spec.capture(cancel).await
+            }).await;
+        }
         let profiles = Profiles::load()?;
         let config = profiles.export_config(scope.profile())?;
         let home = home::CliHome::new()?;
