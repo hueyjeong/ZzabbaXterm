@@ -17,14 +17,17 @@ const input = { kind: "key", down: true, code: "KeyA", key: "a", location: 0, re
 
 afterEach(() => { vi.resetAllMocks(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
-function frameBuffer(sequence: number, frameSequence: number, width: number, displayGeneration: number, rect: { x: number; y: number; w: number; h: number }) {
+function frameBuffer(sequence: number, frameSequence: number, width: number, displayGeneration: number,
+  rect: { x: number; y: number; w: number; h: number }, height = 1) {
   const buffer = new ArrayBuffer(36 + 4 * rect.w * rect.h);
   const binary = new DataView(buffer);
   [sequence, frameSequence, displayGeneration].forEach((value, index) => binary.setBigUint64(index * 8, BigInt(value), true));
-  [width, 1, rect.x, rect.y, rect.w, rect.h].forEach((value, index) => binary.setUint16(24 + index * 2, value, true));
+  [width, height, rect.x, rect.y, rect.w, rect.h].forEach((value, index) => binary.setUint16(24 + index * 2, value, true));
   new Uint8Array(buffer, 36).fill(255);
   return buffer;
 }
+
+type Fixture = Awaited<ReturnType<typeof fixture>>;
 
 async function fixture() {
   vi.stubGlobal("__ZZABBA_RDP_DOCUMENT__", { proof });
@@ -263,6 +266,8 @@ it.each([
   ["건너뛴 화면 순번", frameBuffer(1, 2, 1, 1, { x: 0, y: 0, w: 1, h: 1 })],
   ["화면 밖 사각형", frameBuffer(1, 1, 1, 1, { x: 1, y: 0, w: 1, h: 1 })],
   ["머리만 있는 패킷", new ArrayBuffer(36)],
+  ["너비 상한을 넘는 화면", frameBuffer(1, 1, 4097, 1, { x: 0, y: 0, w: 4097, h: 1 })],
+  ["화소 수 상한을 넘는 화면", frameBuffer(1, 1, 4096, 1, { x: 0, y: 0, w: 4096, h: 2048 }, 2048)],
 ])("%s는 그리거나 ACK하지 않고 세션을 닫는다", async (_, buffer) => {
   const f = await fixture();
   const view = createRemoteDesktopViewSession(f.connection, f.canvas, vi.fn());
@@ -270,6 +275,35 @@ it.each([
   await vi.waitFor(() => expect(f.ended).toHaveBeenCalledWith("RDP 화면 또는 상태를 적용할 수 없습니다", true));
   expect(f.draw).not.toHaveBeenCalled();
   expect(f.calls("rdp_ack")).toEqual([]);
+  view.dispose();
+});
+
+it.each([
+  ["되감긴 패킷 순번", (f: Fixture) => f.frame(2, 2, 1, 2)],
+  ["역행한 화면 세대", (f: Fixture) => f.frame(3, 2, 1, 1)],
+])("첫 화면 뒤 %s는 그리거나 ACK하지 않고 세션을 닫는다", async (_, next) => {
+  const f = await fixture();
+  const view = createRemoteDesktopViewSession(f.connection, f.canvas, vi.fn());
+  f.frame(1, 1, 1, 2);
+  await vi.waitFor(() => expect(f.calls("rdp_ack")).toHaveLength(1));
+  f.display(2, 2);
+  await vi.waitFor(() => expect(f.calls("rdp_ack")).toHaveLength(2));
+  next(f);
+  await vi.waitFor(() => expect(f.ended).toHaveBeenCalledWith("RDP 화면 또는 상태를 적용할 수 없습니다", true));
+  expect(f.draw).toHaveBeenCalledOnce();
+  expect(f.calls("rdp_ack")).toHaveLength(2);
+  view.dispose();
+});
+
+it("구독 전에 도착한 화면은 구독한 뒤 그리고 ACK한다", async () => {
+  const f = await fixture();
+  f.frame(1, 1);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  expect(f.calls("rdp_ack")).toEqual([]);
+  const view = createRemoteDesktopViewSession(f.connection, f.canvas, vi.fn());
+  await vi.waitFor(() => expect(f.calls("rdp_ack")).toEqual([{ id, sequence: 1 }]));
+  expect(f.draw).toHaveBeenCalledOnce();
+  expect(f.ended).not.toHaveBeenCalled();
   view.dispose();
 });
 

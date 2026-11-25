@@ -23,6 +23,8 @@ use ironrdp_tokio::bytes::Bytes;
 use super::{Error, SessionId};
 
 pub(super) const MAX_FRAME: usize = 3840 * 2160 * 4;
+/// IPC 화면 패킷 머리 길이다. 픽셀 버퍼 앞에 이만큼 비워 두어 머리를 채운 뒤 복사 없이 그대로 보낸다.
+pub(super) const PACKET_HEADER: usize = 36;
 const MAX_CHANNEL: u32 = 256 * 1024;
 
 pub(super) fn frame_len(width: u16, height: u16) -> Result<usize, Error> {
@@ -49,8 +51,14 @@ pub struct Frame {
     pub width: u16,
     pub height: u16,
     pub rect: Rect,
-    /// Tightly packed RGBA8 pixels, top-down, with no row padding.
-    pub rgba: Vec<u8>,
+    /// 앞 `PACKET_HEADER` 바이트는 IPC 머리 자리이고, 그 뒤가 행 여백 없이 위에서 아래로 채운 RGBA8 픽셀이다.
+    pub(super) packet: Vec<u8>,
+}
+
+impl Frame {
+    pub fn rgba(&self) -> &[u8] {
+        &self.packet[PACKET_HEADER..]
+    }
 }
 
 pub(super) fn patch(
@@ -80,12 +88,13 @@ pub(super) fn patch(
     let row_len = usize::from(rect.width) * 4;
     let x = usize::from(rect.x) * 4;
     let start = usize::from(rect.y);
-    let mut rgba = Vec::with_capacity(row_len * usize::from(rect.height));
+    let mut packet = Vec::with_capacity(PACKET_HEADER + row_len * usize::from(rect.height));
+    packet.resize(PACKET_HEADER, 0);
     for y in start..start + usize::from(rect.height) {
-        rgba.extend_from_slice(&image.data()[y * stride + x..y * stride + x + row_len]);
+        packet.extend_from_slice(&image.data()[y * stride + x..y * stride + x + row_len]);
     }
     // Some RDP bitmap encodings carry no alpha; the desktop is opaque.
-    for alpha in rgba.iter_mut().skip(3).step_by(4) {
+    for alpha in packet[PACKET_HEADER..].iter_mut().skip(3).step_by(4) {
         *alpha = 255;
     }
     Ok(Frame {
@@ -93,7 +102,7 @@ pub(super) fn patch(
         width,
         height,
         rect,
-        rgba,
+        packet,
     })
 }
 

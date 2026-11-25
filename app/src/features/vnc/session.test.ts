@@ -141,6 +141,51 @@ it("Canvas에 그린 뒤에만 화면 패킷을 ACK한다", async () => {
   }
 });
 
+function frame(kind: number, sequence: number, size: [number, number], rect: [number, number, number, number]) {
+  const buffer = new ArrayBuffer(29 + rect[2] * rect[3] * 4);
+  const view = new DataView(buffer);
+  view.setUint8(0, kind);
+  view.setBigUint64(1, BigInt(sequence), true);
+  view.setBigUint64(9, 1n, true);
+  [...size, ...rect].forEach((value, index) => view.setUint16(17 + index * 2, value, true));
+  new Uint8Array(buffer, 29).fill(kind * 100);
+  return buffer;
+}
+
+it("부분 화면 패킷은 사각형 위치에 그린 뒤 ACK한다", async () => {
+  invoke.mockReset().mockResolvedValue(undefined);
+  const owner = { tab: "viewer", document: 1 };
+  const identity = { sessionId: "viewer", generation: 1 };
+  const canvas = document.createElement("canvas");
+  const draw = vi.fn();
+  vi.spyOn(canvas, "getContext").mockReturnValue({ putImageData: draw } as unknown as CanvasRenderingContext2D);
+  vi.stubGlobal("ImageData", class {
+    constructor(readonly data: Uint8ClampedArray, readonly width: number, readonly height: number) { }
+  });
+  let view: RemoteDesktopViewSession | undefined;
+  const dispose = connect(owner, { host: "localhost", port: 5900, password: false }, (session) => {
+    view = createRemoteDesktopViewSession(session, canvas, vi.fn());
+  }, vi.fn(), vi.fn(), { readText: vi.fn(), writeText: vi.fn() });
+  try {
+    const { output } = invoke.mock.calls[0][1] as { output: { onmessage(message: unknown): void } };
+    output.onmessage({ identity, kind: "started", serial: 0 });
+    await Promise.resolve();
+    output.onmessage({ identity, kind: "waiting", value: 1, serial: 1 });
+    await Promise.resolve();
+    output.onmessage(frame(1, 1, [3, 2], [0, 0, 3, 2]));
+    await Promise.resolve();
+    expect(invoke).toHaveBeenLastCalledWith("vnc_ack", { owner, generation: 1, sequence: 1, offset: 0 });
+    output.onmessage(frame(2, 2, [3, 2], [1, 1, 2, 1]));
+    await Promise.resolve();
+    expect(draw).toHaveBeenLastCalledWith(expect.objectContaining({ data: new Uint8ClampedArray(8).fill(200), width: 2, height: 1 }), 1, 1);
+    expect(invoke).toHaveBeenLastCalledWith("vnc_ack", { owner, generation: 1, sequence: 2, offset: 0 });
+  } finally {
+    dispose();
+    view?.dispose();
+    vi.unstubAllGlobals();
+  }
+});
+
 it.each([
   ["길이가 사각형과 다른 화면 패킷", full(1, 1).slice(0, 32)],
   ["머리만 있는 화면 패킷", full(1, 1).slice(0, 29)],

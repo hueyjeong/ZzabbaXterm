@@ -59,6 +59,7 @@ pub(super) struct Output {
 impl Output {
     pub(super) async fn send(&self, raw: bool, bytes: Vec<u8>, sequence: u64, offset: u32, painted_epoch: Option<u64>) -> Result<(), Error> {
         if bytes.len() > if raw { HEADER + MAX_FRAME_BYTES } else { MAX_BODY } { return Err(Error::LengthLimit); }
+        let deadline = ack_deadline(bytes.len());
         let ticket = opaque_id().map_err(|_| Error::Disconnected)?;
         let (confirm, reply) = oneshot::channel();
         self.life.live(|| {
@@ -68,8 +69,13 @@ impl Output {
             *pending = Some(Packet { ticket: ticket.clone(), sequence, offset, painted_epoch, body: Some((raw, bytes)), confirm });
             self.notify.send(ticket).map_err(|_| Error::Disconnected)
         }).ok_or(Error::Disconnected)??;
-        tokio::time::timeout(Duration::from_secs(10), reply).await.map_err(|_| Error::Timeout)?.map_err(|_| Error::Disconnected)
+        tokio::time::timeout(deadline, reply).await.map_err(|_| Error::Timeout)?.map_err(|_| Error::Disconnected)
     }
+}
+
+/// 패킷을 꺼내 그린 뒤 ACK할 때까지 기다리는 시간이다. 큰 화면 패킷은 전달과 그리기가 길어 MiB당 250ms를 더하고 30초를 넘기지 않는다.
+pub(super) fn ack_deadline(len: usize) -> Duration {
+    Duration::from_millis(10_000 + (len as u64 >> 20) * 250).min(Duration::from_secs(30))
 }
 
 pub(crate) fn protocol(ctx: UriSchemeContext<'_, tauri::Wry>, request: Request<Vec<u8>>, responder: UriSchemeResponder) {

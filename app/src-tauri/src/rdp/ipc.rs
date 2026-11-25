@@ -16,8 +16,8 @@ use input::{Command, Controls};
 const COMMANDS: [&str; 6] = ["rdp_prepare", "rdp_connect", "rdp_input", "rdp_input_batch", "rdp_ack", "rdp_close"];
 const CLOSED: &str = "RDP 세션이 닫혔습니다";
 const MAX_SAFE: u64 = (1 << 53) - 1;
-/// 화면 패킷 머리다. 순번, 화면 순번, 화면 세대(u64 셋)와 화면 크기, 사각형(u16 여섯)이며 정수는 little-endian이다.
-const FRAME_HEADER: usize = 36;
+/// 화면 패킷 머리 길이다. 순번, 화면 순번, 화면 세대(u64 셋)와 화면 크기, 사각형(u16 여섯)이며 정수는 little-endian이다.
+const FRAME_HEADER: usize = super::frame::PACKET_HEADER;
 const MAX_JSON: usize = 6 * super::clipboard::MAX_TEXT + 4096;
 const MAX_BATCH: usize = 64;
 /// 묶음 처리 중 이 개수마다 controls 잠금을 놓아 화면 이벤트 처리가 오래 기다리지 않게 한다.
@@ -221,6 +221,7 @@ impl Slot {
 
     async fn emit(&self, notify: &Channel<String>, sequence: u64, content_type: &'static str, bytes: Vec<u8>) -> Result<(), Error> {
         if bytes.len() > if content_type == "application/json" { MAX_JSON } else { FRAME_HEADER + super::frame::MAX_FRAME } { return Err(Error::Bounds); }
+        let bytes_len = bytes.len();
         let ticket = opaque().ok_or(Error::Closed)?;
         let (done, reply) = oneshot::channel();
         {
@@ -229,7 +230,7 @@ impl Slot {
             *packet = Some(Packet { ticket: ticket.clone(), sequence, body: Some((content_type, bytes)), done });
         }
         notify.send(ticket).map_err(|_| Error::Closed)?;
-        tokio::time::timeout(Duration::from_secs(10), reply).await.map_err(|_| Error::Timeout)?.map_err(|_| Error::Closed)
+        tokio::time::timeout(ack_deadline(bytes_len), reply).await.map_err(|_| Error::Timeout)?.map_err(|_| Error::Closed)
     }
 
     async fn json(&self, notify: &Channel<String>, sequence: u64, body: serde_json::Value) -> Result<(), Error> {
@@ -237,19 +238,24 @@ impl Slot {
     }
 
     /// 화면 하나를 머리와 픽셀을 묶은 패킷 하나로 보낸다. 프런트는 fetch 한 번으로 받아 그린 뒤 ACK한다.
-    async fn frame(&self, notify: &Channel<String>, sequence: u64, frame_sequence: u64, display_generation: u64, frame: &super::Frame) -> Result<(), Error> {
+    async fn frame(&self, notify: &Channel<String>, sequence: u64, frame_sequence: u64, display_generation: u64, frame: super::Frame) -> Result<(), Error> {
         self.emit(notify, sequence, "application/octet-stream", frame_packet(sequence, frame_sequence, display_generation, frame)).await
     }
 }
 
-fn frame_packet(sequence: u64, frame_sequence: u64, display_generation: u64, frame: &super::Frame) -> Vec<u8> {
-    let mut packet = Vec::with_capacity(FRAME_HEADER + frame.rgba.len());
-    for value in [sequence, frame_sequence, display_generation] { packet.extend_from_slice(&value.to_le_bytes()); }
-    for value in [frame.width, frame.height, frame.rect.x, frame.rect.y, frame.rect.width, frame.rect.height] {
-        packet.extend_from_slice(&value.to_le_bytes());
-    }
-    packet.extend_from_slice(&frame.rgba);
+/// 프레임 버퍼 앞에 비워 둔 자리에 머리를 채워 픽셀을 복사하지 않고 패킷으로 쓴다.
+fn frame_packet(sequence: u64, frame_sequence: u64, display_generation: u64, frame: super::Frame) -> Vec<u8> {
+    let mut packet = frame.packet;
+    let fields = [frame.width, frame.height, frame.rect.x, frame.rect.y, frame.rect.width, frame.rect.height];
+    let header = [sequence, frame_sequence, display_generation].into_iter().flat_map(u64::to_le_bytes)
+        .chain(fields.into_iter().flat_map(u16::to_le_bytes));
+    for (slot, byte) in packet[..FRAME_HEADER].iter_mut().zip(header) { *slot = byte; }
     packet
+}
+
+/// 패킷을 꺼내 그린 뒤 ACK할 때까지 기다리는 시간이다. 큰 화면 패킷은 전달과 그리기가 길어 MiB당 250ms를 더하고 30초를 넘기지 않는다.
+fn ack_deadline(len: usize) -> Duration {
+    Duration::from_millis(10_000 + (len as u64 >> 20) * 250).min(Duration::from_secs(30))
 }
 
 impl Sessions {
@@ -301,6 +307,8 @@ pub(crate) fn protocol(ctx: UriSchemeContext<'_, tauri::Wry>, request: Request<V
             let mut pending = slot.mailbox.lock().unwrap();
             pending.as_mut().filter(|p| p.ticket == ticket)?.body.take()
         })?;
+        // 큰 본문을 응답으로 넘기는 동안 다른 탭의 명령이 전역 잠금을 기다리지 않게 먼저 놓는다.
+        drop(state);
         responder.take()?.respond(Response::builder().header("Cache-Control", "no-store")
             .header("Access-Control-Allow-Origin", origin).header("Content-Type", kind).body(body).unwrap());
         Some(())
@@ -541,10 +549,10 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
                     let full = rect.x == 0 && rect.y == 0 && rect.width == frame.width && rect.height == frame.height;
                     if usize::from(rect.x) + usize::from(rect.width) > usize::from(frame.width) ||
                         usize::from(rect.y) + usize::from(rect.height) > usize::from(frame.height) ||
-                        frame.rgba.is_empty() || frame.rgba.len() != usize::from(rect.width) * usize::from(rect.height) * 4 ||
-                        frame.rgba.len() > length || ((new_display || size != next_size) && !full) ||
+                        frame.rgba().is_empty() || frame.rgba().len() != usize::from(rect.width) * usize::from(rect.height) * 4 ||
+                        frame.rgba().len() > length || ((new_display || size != next_size) && !full) ||
                         (!new_display && size != next_size) || frame.session != session.id() { return Err(Error::Bounds); }
-                    slot.frame(notify, sequence, frame_sequence, generation, &frame).await?;
+                    slot.frame(notify, sequence, frame_sequence, generation, frame).await?;
                     if new_display {
                         display_generation = generation;
                         size = next_size;
@@ -850,29 +858,36 @@ mod tests {
             Ok(())
         });
         let (width, height) = (3840, 2160);
+        let pixels: Vec<u8> = (0..usize::from(width) * usize::from(height) * 4).map(|n| n as u8).collect();
         let frame = super::super::Frame { session: super::super::SessionId(1), width, height,
             rect: super::super::Rect { x: 0, y: 0, width, height },
-            rgba: (0..usize::from(width) * usize::from(height) * 4).map(|n| n as u8).collect() };
+            packet: [vec![0; FRAME_HEADER], pixels.clone()].concat() };
+        // 프레임 버퍼를 복사하지 않고 그대로 응답 본문으로 넘긴다.
+        let address = frame.packet.as_ptr() as usize;
         let receive = async {
             let ticket = tickets.recv().await.unwrap();
             assert!(slot.ack(5).is_none());
             let (kind, body) = slot.mailbox.lock().unwrap().as_mut().filter(|p| p.ticket == ticket).unwrap().body.take().unwrap();
             assert_eq!(kind, "application/octet-stream");
-            assert_eq!(body.len(), FRAME_HEADER + frame.rgba.len());
+            assert_eq!(body.as_ptr() as usize, address);
+            assert_eq!(body.len(), FRAME_HEADER + pixels.len());
             let mut header = Vec::new();
             for value in [5_u64, 2, 3] { header.extend_from_slice(&value.to_le_bytes()); }
             for value in [width, height, 0, 0, width, height] { header.extend_from_slice(&value.to_le_bytes()); }
             assert_eq!(&body[..FRAME_HEADER], header.as_slice());
-            assert_eq!(&body[FRAME_HEADER..], frame.rgba.as_slice());
+            assert_eq!(&body[FRAME_HEADER..], pixels.as_slice());
             assert!(slot.ack(4).is_none());
             assert_eq!(slot.ack(5), Some(()));
             assert!(tickets.try_recv().is_err());
         };
-        let (result, ()) = tokio::join!(slot.frame(&notify, 5, 2, 3, &frame), receive);
+        let (result, ()) = tokio::join!(slot.frame(&notify, 5, 2, 3, frame), receive);
         assert_eq!(result, Ok(()));
         let oversized = vec![0; FRAME_HEADER + super::super::frame::MAX_FRAME + 1];
         assert_eq!(slot.emit(&notify, 6, "application/octet-stream", oversized).await, Err(Error::Bounds));
         assert!(slot.mailbox.lock().unwrap().is_none());
+        assert_eq!(ack_deadline(4096), Duration::from_secs(10));
+        assert_eq!(ack_deadline(FRAME_HEADER + 4096 * 1797 * 4), Duration::from_millis(10_000 + 28 * 250));
+        assert_eq!(ack_deadline(usize::MAX), Duration::from_secs(30));
     }
 
     #[test]

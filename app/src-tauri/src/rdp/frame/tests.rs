@@ -136,7 +136,7 @@ fn decoded_server_pixels_and_dirty_patch_match_the_display() {
         (SessionId(9), 2, 2)
     );
     assert_eq!(
-        full.rgba,
+        full.rgba(),
         [0, 0, 0, 255, 255, 0, 0, 255, 0, 0, 0, 255, 0, 0, 255, 255]
     );
     let delta = patch(SessionId(9), &image, &decoded, false).unwrap();
@@ -149,7 +149,7 @@ fn decoded_server_pixels_and_dirty_patch_match_the_display() {
             height: 2
         }
     );
-    assert_eq!(delta.rgba, [255, 0, 0, 255, 0, 0, 255, 255]);
+    assert_eq!(delta.rgba(), [255, 0, 0, 255, 0, 0, 255, 255]);
     let outside = InclusiveRectangle {
         right: 2,
         ..dirty.clone()

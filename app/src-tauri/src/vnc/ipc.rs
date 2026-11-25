@@ -121,6 +121,8 @@ impl Sessions {
         if state.document_for(proof).is_none() || state.document_proof.as_ref()?.1 != origin { return None; }
         let (raw, bytes) = state.tabs.values().filter_map(|slot| slot.current.as_ref())
             .find_map(|active| active.life.live(|| active.mailbox.take(ticket)).flatten())?;
+        // 큰 본문을 응답으로 넘기는 동안 다른 탭의 명령이 전역 잠금을 기다리지 않게 먼저 놓는다.
+        drop(state);
         Some(deliver(raw, bytes))
     }
 }
@@ -667,6 +669,10 @@ mod tests {
         let oversized = vec![0; super::super::presentation::HEADER + super::super::wire::MAX_FRAME_BYTES + 1];
         assert_eq!(output.send(true, oversized, 8, 0, None).await, Err(Error::LengthLimit));
         assert!(packets.try_recv().is_err());
+        use super::super::output::ack_deadline;
+        assert_eq!(ack_deadline(4096), Duration::from_secs(10));
+        assert_eq!(ack_deadline(super::super::presentation::HEADER + pixels.len()), Duration::from_millis(10_000 + 31 * 250));
+        assert_eq!(ack_deadline(usize::MAX), Duration::from_secs(30));
     }
 
     #[tokio::test]
