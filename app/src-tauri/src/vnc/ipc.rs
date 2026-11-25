@@ -7,7 +7,7 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::tunnels::ipc::{DesktopCleanupError, DesktopLease, TunnelTabs};
 
-use super::{Change, Error, Event, Input, ResizeResult, Size, Tab, approved::{Draft, route_lost}, lifetime::Lifetime, output::{Mailbox, Output}, presentation::{CHUNK, Image, Surface}};
+use super::{Change, Error, Event, Input, ResizeResult, Size, Tab, approved::{Draft, route_lost}, lifetime::Lifetime, output::{Mailbox, Output}, presentation::{Image, Surface}};
 
 pub(crate) const COMMANDS: [&str; 5] = ["vnc_create", "vnc_connect", "vnc_input", "vnc_ack", "vnc_close"];
 const CLOSED: &str = "VNC 세션이 닫혔습니다";
@@ -121,6 +121,8 @@ impl Sessions {
         if state.document_for(proof).is_none() || state.document_proof.as_ref()?.1 != origin { return None; }
         let (raw, bytes) = state.tabs.values().filter_map(|slot| slot.current.as_ref())
             .find_map(|active| active.life.live(|| active.mailbox.take(ticket)).flatten())?;
+        // 큰 본문을 응답으로 넘기는 동안 다른 탭의 명령이 전역 잠금을 기다리지 않게 먼저 놓는다.
+        drop(state);
         Some(deliver(raw, bytes))
     }
 }
@@ -466,11 +468,7 @@ async fn control(output: &Output, identity: &Identity, kind: &str, value: serde_
 }
 
 async fn send_image(output: &Output, image: &Image<'_>, sequence: u64, epoch: u64) -> Result<(), Error> {
-    for offset in (0..image.rgba.len()).step_by(CHUNK) {
-        let painted = (offset + CHUNK >= image.rgba.len()).then_some(epoch);
-        output.send(true, image.packet(sequence, epoch, offset), sequence, offset as u32, painted).await?;
-    }
-    Ok(())
+    output.send(true, image.packet(sequence, epoch), sequence, 0, Some(epoch)).await
 }
 
 fn message(error: &Error) -> String {
@@ -646,28 +644,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vnc_binary_chunk_requires_single_retrieval_then_ack() {
+    async fn vnc_binary_frame_is_one_packet_retrieved_once_then_acked() {
         let (output, mut packets) = test_output();
-        let size = Size { width: 512, height: 129 };
-        let pixels = vec![255; usize::from(size.width) * usize::from(size.height) * 4];
+        let size = Size { width: 3840, height: 2160 };
+        let pixels: Vec<u8> = (0..usize::from(size.width) * usize::from(size.height) * 4).map(|n| n as u8).collect();
         let image = Image { kind: 1, size, rect: super::super::Rect { x: 0, y: 0, size }, rgba: &pixels };
         let receive = async {
-            for (offset, len) in [(0, CHUNK), (CHUNK, pixels.len() - CHUNK)] {
-                let ticket = packets.recv().await.unwrap();
-                assert!(output.mailbox.ack(7, offset as u32).is_none());
-                let (raw, packet) = output.mailbox.take(&ticket).unwrap();
-                assert!(raw);
-                assert_eq!(packet.len(), 33 + len);
-                assert_eq!(&packet[29..33], &(offset as u32).to_le_bytes());
-                assert!(output.mailbox.take(&ticket).is_none());
-                assert!(packets.try_recv().is_err());
-                assert_eq!(output.mailbox.painted.load(std::sync::atomic::Ordering::Relaxed), 0);
-                assert_eq!(output.mailbox.ack(7, offset as u32), Some(()));
-                assert_eq!(output.mailbox.painted.load(std::sync::atomic::Ordering::Relaxed), u64::from(offset == CHUNK));
-            }
+            let ticket = packets.recv().await.unwrap();
+            assert!(output.mailbox.ack(7, 0).is_none());
+            let (raw, packet) = output.mailbox.take(&ticket).unwrap();
+            assert!(raw);
+            assert_eq!(packet.len(), super::super::presentation::HEADER + pixels.len());
+            assert_eq!(&packet[..17], &[[1].as_slice(), &7u64.to_le_bytes(), &1u64.to_le_bytes()].concat());
+            assert_eq!(&packet[super::super::presentation::HEADER..], &pixels);
+            assert!(output.mailbox.take(&ticket).is_none());
+            assert!(packets.try_recv().is_err());
+            assert_eq!(output.mailbox.painted.load(std::sync::atomic::Ordering::Relaxed), 0);
+            assert_eq!(output.mailbox.ack(7, 0), Some(()));
+            assert_eq!(output.mailbox.painted.load(std::sync::atomic::Ordering::Relaxed), 1);
+            assert!(packets.try_recv().is_err());
         };
         let (result, ()) = tokio::join!(send_image(&output, &image, 7, 1), receive);
         assert_eq!(result, Ok(()));
+        let oversized = vec![0; super::super::presentation::HEADER + super::super::wire::MAX_FRAME_BYTES + 1];
+        assert_eq!(output.send(true, oversized, 8, 0, None).await, Err(Error::LengthLimit));
+        assert!(packets.try_recv().is_err());
+        use super::super::output::ack_deadline;
+        assert_eq!(ack_deadline(4096), Duration::from_secs(10));
+        assert_eq!(ack_deadline(super::super::presentation::HEADER + pixels.len()), Duration::from_millis(10_000 + 31 * 250));
+        assert_eq!(ack_deadline(usize::MAX), Duration::from_secs(30));
     }
 
     #[tokio::test]

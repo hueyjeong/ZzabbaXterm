@@ -11,8 +11,8 @@ export type Draft = Readonly<{ password: boolean } & (
 )>;
 
 type Frame = Extract<RemoteDesktopEvent, { kind: "full" | "patch" }>;
-const HEADER = 33;
-const CHUNK = 256 * 1024;
+/** 화면 하나가 패킷 하나로 온다. 머리는 종류, 순번, 화면 세대, 화면 크기, 사각형이다. */
+const HEADER = 29;
 const MAX_PIXELS = 8_294_400;
 const MAX_QUEUE = 32;
 export const DROPPED_NOTICE = "VNC 입력 일부를 버렸습니다";
@@ -70,7 +70,6 @@ export function connect(
   let clipboardText: string | undefined;
   let lastFrame = 0;
   let serial = 0;
-  let assembling: { frame: Frame; epoch: number; length: number } | undefined;
   let sending = false;
   const queued: { action: Action; epoch: number }[] = [];
   let pendingFrame: { frame: Frame; ack: () => void } | undefined;
@@ -85,7 +84,6 @@ export function connect(
     done = true;
     lifetime.abort();
     ready = false;
-    assembling = undefined;
     pendingFrame = undefined;
     queued.length = 0;
     clipboardText = undefined;
@@ -201,40 +199,24 @@ export function connect(
   }
 
   function binary(buffer: ArrayBuffer) {
-    if (!identity || buffer.byteLength <= HEADER || buffer.byteLength > HEADER + CHUNK) throw new Error();
+    if (!identity || buffer.byteLength <= HEADER) throw new Error();
     const data = new DataView(buffer);
     const kind = data.getUint8(0);
     const sequence = Number(data.getBigUint64(1, true));
     const screen = Number(data.getBigUint64(9, true));
     const [width, height, x, y, w, h] = [17, 19, 21, 23, 25, 27].map((pos) => data.getUint16(pos, true));
-    const offset = data.getUint32(29, true);
-    const total = w * h * 4;
     if (!Number.isSafeInteger(sequence) || sequence !== lastFrame + 1 || screen !== epoch ||
       !width || !height || width > 8192 || height > 8192 || width * height > MAX_PIXELS ||
       !w || !h || x + w > width || y + h > height || (kind !== 1 && kind !== 2) ||
       (kind === 1 ? x !== 0 || y !== 0 || w !== width || h !== height : !ready) ||
-      offset >= total || buffer.byteLength !== HEADER + Math.min(total - offset, CHUNK)) throw new Error();
-    const bytes = new Uint8Array(buffer, HEADER);
-    if (offset === 0) {
-      if (assembling) throw new Error();
-      const frame: Frame = {
-        ...identity, sequence, kind: kind === 1 ? "full" : "patch", size: { width, height },
-        rect: { x, y, width: w, height: h }, rgba: total === bytes.length ? bytes : new Uint8Array(total)
-      };
-      assembling = { frame, epoch: screen, length: 0 };
-    }
-    const current = assembling;
-    if (!current || current.length !== offset || current.epoch !== screen || (current.frame.kind === "full") !== (kind === 1) ||
-      current.frame.size.width !== width || current.frame.size.height !== height || current.frame.rect.x !== x || current.frame.rect.y !== y ||
-      current.frame.rect.width !== w || current.frame.rect.height !== h) throw new Error();
-    if (current.frame.rgba !== bytes) current.frame.rgba.set(bytes, offset);
-    current.length += bytes.length;
-    const ack = () => void invoke("vnc_ack", { owner, generation: identity?.generation, sequence, offset })
-      .catch((error) => terminate(String(error), true));
-    if (current.length === total) {
-      assembling = undefined;
-      applyFrame(current.frame, ack);
-    } else ack();
+      buffer.byteLength !== HEADER + w * h * 4) throw new Error();
+    // 픽셀은 복사하지 않고 받은 버퍼를 그대로 그린다.
+    const frame: Frame = {
+      ...identity, sequence, kind: kind === 1 ? "full" : "patch", size: { width, height },
+      rect: { x, y, width: w, height: h }, rgba: new Uint8Array(buffer, HEADER)
+    };
+    applyFrame(frame, () => void invoke("vnc_ack", { owner, generation: identity?.generation, sequence, offset: 0 })
+      .catch((error) => terminate(String(error), true)));
   }
 
   function dispose() {
@@ -244,7 +226,6 @@ export function connect(
     receive = undefined;
     pending = undefined;
     pendingFrame = undefined;
-    assembling = undefined;
     clipboardText = undefined;
     queued.length = 0;
   }

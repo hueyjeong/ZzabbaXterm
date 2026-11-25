@@ -13,7 +13,8 @@ export interface Connection extends RemoteDesktopSession {
   resize(size: DesktopFit): Promise<ResizeResult>;
 }
 
-const CHUNK = 256 * 1024;
+/** 화면 패킷 머리다. 순번, 화면 순번, 화면 세대(u64 셋)와 화면 크기, 사각형(u16 여섯)이며 정수는 little-endian이다. */
+const FRAME_HEADER = 36;
 const MAX_PIXELS = 3840 * 2160;
 const MAX_CLIPBOARD_BYTES = 64 * 1024;
 const MAX_QUEUE = 512;
@@ -33,7 +34,6 @@ function proof(): string | undefined {
   if (typeof value === "string" && token.test(value)) return value;
 }
 const positive = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) > 0;
-const nonnegative = (value: unknown): value is number => value === 0 || positive(value);
 const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null;
 
 type Action = { kind: "active"; active: boolean } | { kind: "release" } | { kind: "copy" } |
@@ -73,7 +73,6 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
   let id: RemoteDesktopIdentity | undefined;
   let receive: ((event: RemoteDesktopEvent) => boolean) | undefined;
   let waiting: (() => void) | undefined;
-  let pending: { frame: Frame; packet: number; bytes: number } | undefined;
   let reading = false;
   let done = false;
   let active = false;
@@ -108,7 +107,6 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
     queue.length = 0;
     inFlight = [];
     sweep("failed");
-    pending = undefined;
   };
   const close = () => {
     stop();
@@ -282,58 +280,46 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
       const response = await fetch(convertFileSrc(`${document}-${ticket}`, "rdp-packet"), { cache: "no-store", signal: life.signal });
       if (!response.ok || done || proof() !== document) throw new Error();
       let sequence: number;
-      let offset = 0;
       const type = response.headers.get("content-type");
       if (type === "application/octet-stream") {
+        // 화면 하나가 머리와 픽셀을 묶은 패킷 하나로 온다. 픽셀은 복사하지 않고 받은 버퍼를 그대로 그린다.
         const buffer = await response.arrayBuffer();
-        if (done || proof() !== document || !pending || buffer.byteLength <= 12 || buffer.byteLength > CHUNK + 12) throw new Error();
+        if (done || proof() !== document || buffer.byteLength <= FRAME_HEADER) throw new Error();
         const view = new DataView(buffer);
+        const [frameSequence, generation] = [8, 16].map((at) => Number(view.getBigUint64(at, true)));
+        const [width, height, x, y, w, h] = [24, 26, 28, 30, 32, 34].map((at) => view.getUint16(at, true));
         sequence = Number(view.getBigUint64(0, true));
-        const start = view.getUint32(8, true);
-        const chunk = new Uint8Array(buffer, 12);
-        if (sequence !== pending.packet || start !== pending.bytes || chunk.byteLength !== Math.min(CHUNK, pending.frame.rgba.length - start)) throw new Error();
-        pending.frame.rgba.set(chunk, start);
-        pending.bytes += chunk.length;
-        offset = start + 1;
-        if (pending.bytes === pending.frame.rgba.length) {
-          if (!receive) {
-            const gate = Promise.withResolvers<void>();
-            waiting = gate.resolve;
-            await gate.promise;
-          }
-          if (done || proof() !== document) return;
-          if (!receive?.(pending.frame)) throw new Error();
-          lastFrame = pending.frame.sequence;
-          lastSize = pending.frame.size;
-          pending = undefined;
+        const full = x === 0 && y === 0 && w === width && h === height;
+        if (!positive(sequence) || sequence <= lastPacket || !width || !height || width > 4096 || height > 4096 || width * height > MAX_PIXELS ||
+          !w || !h || w > width - x || h > height - y || buffer.byteLength !== FRAME_HEADER + w * h * 4 ||
+          frameSequence !== lastFrame + 1 || !positive(generation) || generation < frameGeneration ||
+          (generation !== frameGeneration && !full)) throw new Error();
+        lastPacket = sequence;
+        if (generation !== frameGeneration) {
+          frameGeneration = generation;
+          displayGeneration = 0;
+          queue.length = 0;
+          sweep();
+          epoch++;
         }
+        const frame: Frame = {
+          ...id, sequence: frameSequence, kind: full ? "full" : "patch",
+          size: { width, height }, rect: { x, y, width: w, height: h }, rgba: new Uint8Array(buffer, FRAME_HEADER)
+        };
+        if (!receive) {
+          const gate = Promise.withResolvers<void>();
+          waiting = gate.resolve;
+          await gate.promise;
+        }
+        if (done || proof() !== document) return;
+        if (!receive?.(frame)) throw new Error();
+        lastFrame = frame.sequence;
+        lastSize = frame.size;
       } else if (type === "application/json") {
         const value: unknown = await response.json();
-        if (done || proof() !== document || pending || !record(value) || !positive(value.sequence) || value.sequence <= lastPacket) throw new Error();
+        if (done || proof() !== document || !record(value) || !positive(value.sequence) || value.sequence <= lastPacket) throw new Error();
         sequence = lastPacket = value.sequence;
         switch (value.kind) {
-          case "frame": {
-            const { width, height, x, y, w, h, full, frameSequence, displayGeneration: generation } = value;
-            if (!positive(width) || !positive(height) || width > 4096 || height > 4096 || width * height > MAX_PIXELS ||
-              !nonnegative(x) || !nonnegative(y) || !positive(w) || !positive(h) || w > width - x || h > height - y ||
-              frameSequence !== lastFrame + 1 || typeof full !== "boolean" || !positive(generation) || generation < frameGeneration ||
-              (generation !== frameGeneration && !full) ||
-              (full && (x !== 0 || y !== 0 || w !== width || h !== height))) throw new Error();
-            if (generation !== frameGeneration) {
-              frameGeneration = generation;
-              displayGeneration = 0;
-              queue.length = 0;
-              sweep();
-              epoch++;
-            }
-            pending = {
-              packet: sequence, bytes: 0, frame: {
-                ...id, sequence: frameSequence, kind: full ? "full" : "patch",
-                size: { width, height }, rect: { x, y, width: w, height: h }, rgba: new Uint8Array(w * h * 4)
-              }
-            };
-            break;
-          }
           case "display":
             if (!lastFrame || value.displayGeneration !== frameGeneration || displayGeneration) throw new Error();
             displayGeneration = frameGeneration;
@@ -357,7 +343,7 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
         }
       } else throw new Error();
       reading = false;
-      await run("rdp_ack", { id, sequence, offset });
+      await run("rdp_ack", { id, sequence });
     } catch { end("RDP 화면 또는 상태를 적용할 수 없습니다"); }
   }
 

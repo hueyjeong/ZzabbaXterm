@@ -521,7 +521,7 @@ async fn tls_only_retries_once_and_activates_with_client_info_credentials() {
             }
         };
         assert_eq!((frame.width, frame.height), (size.width, size.height));
-        assert_eq!(&frame.rgba[4..8], &[255, 0, 0, 255]);
+        assert_eq!(&frame.rgba()[4..8], &[255, 0, 0, 255]);
         session.close().await;
         Ok::<_, Error>(())
     };
@@ -596,7 +596,7 @@ async fn updates_received_while_the_tab_is_busy_are_merged_into_one_frame() {
     let last = frames.last().unwrap();
     assert!(last.rect.x <= 62 && last.rect.x + last.rect.width > 62 && last.rect.y == 0);
     let offset = usize::from(62 - last.rect.x) * 4;
-    assert_eq!(&last.rgba[offset..offset + 4], &[255, 0, 0, 255]);
+    assert_eq!(&last.rgba()[offset..offset + 4], &[255, 0, 0, 255]);
 }
 
 #[tokio::test]
@@ -917,7 +917,7 @@ async fn activates_and_delivers_pixels_and_key_input_only_for_the_authenticated_
                 panic!("first display event must come from server pixels")
             };
             assert_eq!((frame.session, frame.width, frame.height), (id, 800, 600));
-            assert_eq!(&frame.rgba[4..8], &[255, 0, 0, 255]);
+            assert_eq!(&frame.rgba()[4..8], &[255, 0, 0, 255]);
             // The marked third frame is processed with the second still in the event queue.
             frames_sent.notified().await;
             assert_eq!(input.input(SessionId(0), key()).await, Err(Error::Closed));
