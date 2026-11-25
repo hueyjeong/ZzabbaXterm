@@ -139,7 +139,7 @@ it("그리기 실패를 연결 완료 대신 오류로 표시한다", async () =
   await Promise.resolve();
   act(() => root.render(<RemoteDesktopView session={session} active label="원격 데스크톱" />));
   putImageData.mockImplementationOnce(() => { throw new Error("draw error"); });
-  const frame = new ArrayBuffer(37);
+  const frame = new ArrayBuffer(33);
   const header = new DataView(frame);
   header.setUint8(0, 1);
   header.setBigUint64(1, 1n, true);

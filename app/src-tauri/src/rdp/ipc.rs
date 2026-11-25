@@ -16,7 +16,8 @@ use input::{Command, Controls};
 const COMMANDS: [&str; 6] = ["rdp_prepare", "rdp_connect", "rdp_input", "rdp_input_batch", "rdp_ack", "rdp_close"];
 const CLOSED: &str = "RDP 세션이 닫혔습니다";
 const MAX_SAFE: u64 = (1 << 53) - 1;
-const CHUNK: usize = 256 * 1024;
+/// 화면 패킷 머리다. 순번, 화면 순번, 화면 세대(u64 셋)와 화면 크기, 사각형(u16 여섯)이며 정수는 little-endian이다.
+const FRAME_HEADER: usize = 36;
 const MAX_JSON: usize = 6 * super::clipboard::MAX_TEXT + 4096;
 const MAX_BATCH: usize = 64;
 /// 묶음 처리 중 이 개수마다 controls 잠금을 놓아 화면 이벤트 처리가 오래 기다리지 않게 한다.
@@ -94,7 +95,6 @@ enum CleanupFailure {
 struct Packet {
     ticket: String,
     sequence: u64,
-    offset: usize,
     body: Option<(&'static str, Vec<u8>)>,
     done: oneshot::Sender<()>,
 }
@@ -213,28 +213,43 @@ impl Slot {
         result
     }
 
-    fn ack(&self, sequence: u64, offset: usize) -> Option<()> {
+    fn ack(&self, sequence: u64) -> Option<()> {
         let mut mailbox = self.mailbox.lock().unwrap();
-        if !mailbox.as_ref().is_some_and(|p| p.sequence == sequence && p.offset == offset && p.body.is_none()) { return None; }
+        if !mailbox.as_ref().is_some_and(|p| p.sequence == sequence && p.body.is_none()) { return None; }
         mailbox.take()?.done.send(()).ok()
     }
 
-    async fn emit(&self, notify: &Channel<String>, sequence: u64, offset: usize, content_type: &'static str, bytes: Vec<u8>) -> Result<(), Error> {
-        if bytes.len() > if content_type == "application/json" { MAX_JSON } else { CHUNK + 12 } { return Err(Error::Bounds); }
+    async fn emit(&self, notify: &Channel<String>, sequence: u64, content_type: &'static str, bytes: Vec<u8>) -> Result<(), Error> {
+        if bytes.len() > if content_type == "application/json" { MAX_JSON } else { FRAME_HEADER + super::frame::MAX_FRAME } { return Err(Error::Bounds); }
         let ticket = opaque().ok_or(Error::Closed)?;
         let (done, reply) = oneshot::channel();
         {
             let mut packet = self.mailbox.lock().unwrap();
             if self.life.is_cancelled() || packet.is_some() { return Err(Error::Closed); }
-            *packet = Some(Packet { ticket: ticket.clone(), sequence, offset, body: Some((content_type, bytes)), done });
+            *packet = Some(Packet { ticket: ticket.clone(), sequence, body: Some((content_type, bytes)), done });
         }
         notify.send(ticket).map_err(|_| Error::Closed)?;
         tokio::time::timeout(Duration::from_secs(10), reply).await.map_err(|_| Error::Timeout)?.map_err(|_| Error::Closed)
     }
 
     async fn json(&self, notify: &Channel<String>, sequence: u64, body: serde_json::Value) -> Result<(), Error> {
-        self.emit(notify, sequence, 0, "application/json", serde_json::to_vec(&body).map_err(|_| Error::Protocol)?).await
+        self.emit(notify, sequence, "application/json", serde_json::to_vec(&body).map_err(|_| Error::Protocol)?).await
     }
+
+    /// 화면 하나를 머리와 픽셀을 묶은 패킷 하나로 보낸다. 프런트는 fetch 한 번으로 받아 그린 뒤 ACK한다.
+    async fn frame(&self, notify: &Channel<String>, sequence: u64, frame_sequence: u64, display_generation: u64, frame: &super::Frame) -> Result<(), Error> {
+        self.emit(notify, sequence, "application/octet-stream", frame_packet(sequence, frame_sequence, display_generation, frame)).await
+    }
+}
+
+fn frame_packet(sequence: u64, frame_sequence: u64, display_generation: u64, frame: &super::Frame) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(FRAME_HEADER + frame.rgba.len());
+    for value in [sequence, frame_sequence, display_generation] { packet.extend_from_slice(&value.to_le_bytes()); }
+    for value in [frame.width, frame.height, frame.rect.x, frame.rect.y, frame.rect.width, frame.rect.height] {
+        packet.extend_from_slice(&value.to_le_bytes());
+    }
+    packet.extend_from_slice(&frame.rgba);
+    packet
 }
 
 impl Sessions {
@@ -341,8 +356,7 @@ pub(crate) fn dispatch(invoke: Invoke) {
         }
         "rdp_ack" => {
             let sequence = read!(u64, "sequence");
-            let offset = read!(usize, "offset");
-            if slot.ack(sequence, offset).is_some() { invoke.resolver.resolve(()); } else { invoke.resolver.reject(CLOSED); }
+            if slot.ack(sequence).is_some() { invoke.resolver.resolve(()); } else { invoke.resolver.reject(CLOSED); }
         }
         "rdp_input" => {
             let command = read!(Command, "input");
@@ -521,7 +535,7 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
                     let generation = session.display_generation;
                     let new_display = generation != display_generation;
                     frame_sequence += 1;
-                    let rect = frame.rect;
+                    let rect = &frame.rect;
                     let length = super::frame::frame_len(frame.width, frame.height)?;
                     let next_size = (frame.width, frame.height);
                     let full = rect.x == 0 && rect.y == 0 && rect.width == frame.width && rect.height == frame.height;
@@ -530,17 +544,7 @@ async fn run(window: &WebviewWindow, slot: &Slot, notify: &Channel<String>, draf
                         frame.rgba.is_empty() || frame.rgba.len() != usize::from(rect.width) * usize::from(rect.height) * 4 ||
                         frame.rgba.len() > length || ((new_display || size != next_size) && !full) ||
                         (!new_display && size != next_size) || frame.session != session.id() { return Err(Error::Bounds); }
-                    slot.json(notify, sequence, serde_json::json!({"sequence": sequence, "frameSequence": frame_sequence, "kind": "frame", "full": full,
-                        "displayGeneration": generation, "width": frame.width, "height": frame.height,
-                        "x": rect.x, "y": rect.y, "w": rect.width, "h": rect.height})).await?;
-                    for (i, chunk) in frame.rgba.chunks(CHUNK).enumerate() {
-                        let offset = i * CHUNK;
-                        let mut packet = Vec::with_capacity(chunk.len() + 12);
-                        packet.extend_from_slice(&sequence.to_le_bytes());
-                        packet.extend_from_slice(&(offset as u32).to_le_bytes());
-                        packet.extend_from_slice(chunk);
-                        slot.emit(notify, sequence, offset + 1, "application/octet-stream", packet).await?;
-                    }
+                    slot.frame(notify, sequence, frame_sequence, generation, &frame).await?;
                     if new_display {
                         display_generation = generation;
                         size = next_size;
@@ -836,6 +840,41 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn rdp_frame_is_one_packet_with_header_retrieved_once_then_acked() {
+        let slot = Slot::new(1);
+        let (sent, mut tickets) = tokio::sync::mpsc::unbounded_channel();
+        let notify = Channel::new(move |ticket| {
+            let tauri::ipc::InvokeResponseBody::Json(json) = ticket else { panic!("알림은 티켓만 전달") };
+            sent.send(serde_json::from_str::<String>(&json).unwrap()).unwrap();
+            Ok(())
+        });
+        let (width, height) = (3840, 2160);
+        let frame = super::super::Frame { session: super::super::SessionId(1), width, height,
+            rect: super::super::Rect { x: 0, y: 0, width, height },
+            rgba: (0..usize::from(width) * usize::from(height) * 4).map(|n| n as u8).collect() };
+        let receive = async {
+            let ticket = tickets.recv().await.unwrap();
+            assert!(slot.ack(5).is_none());
+            let (kind, body) = slot.mailbox.lock().unwrap().as_mut().filter(|p| p.ticket == ticket).unwrap().body.take().unwrap();
+            assert_eq!(kind, "application/octet-stream");
+            assert_eq!(body.len(), FRAME_HEADER + frame.rgba.len());
+            let mut header = Vec::new();
+            for value in [5_u64, 2, 3] { header.extend_from_slice(&value.to_le_bytes()); }
+            for value in [width, height, 0, 0, width, height] { header.extend_from_slice(&value.to_le_bytes()); }
+            assert_eq!(&body[..FRAME_HEADER], header.as_slice());
+            assert_eq!(&body[FRAME_HEADER..], frame.rgba.as_slice());
+            assert!(slot.ack(4).is_none());
+            assert_eq!(slot.ack(5), Some(()));
+            assert!(tickets.try_recv().is_err());
+        };
+        let (result, ()) = tokio::join!(slot.frame(&notify, 5, 2, 3, &frame), receive);
+        assert_eq!(result, Ok(()));
+        let oversized = vec![0; FRAME_HEADER + super::super::frame::MAX_FRAME + 1];
+        assert_eq!(slot.emit(&notify, 6, "application/octet-stream", oversized).await, Err(Error::Bounds));
+        assert!(slot.mailbox.lock().unwrap().is_none());
+    }
+
     #[test]
     fn rdp_document_retirement_discards_unclaimed_output_and_rejects_old_generations() {
         let sessions = Sessions::default();
@@ -849,9 +888,9 @@ mod tests {
             assert!(state.get(&id, 0).is_some());
             assert!(state.get(&Identity { session_id: id.session_id.clone(), generation: 2 }, 0).is_none());
         }
-        *slot.mailbox.lock().unwrap() = Some(Packet { ticket: "one".into(), sequence: 2, offset: 1,
+        *slot.mailbox.lock().unwrap() = Some(Packet { ticket: "one".into(), sequence: 2,
             body: Some(("application/octet-stream", vec![7])), done });
-        assert!(slot.ack(2, 1).is_none());
+        assert!(slot.ack(2).is_none());
         assert!(matches!(acknowledged.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
         sessions.retire();
         assert!(matches!(acknowledged.try_recv(), Err(oneshot::error::TryRecvError::Closed)));

@@ -1,9 +1,8 @@
 use super::{Change, Error, Rect, Size};
 
-// 한 번에 한 청크만 IPC에 보낸다. 헤더는 프레임 종류, 순번, 화면 세대,
-// 화면 크기, 사각형, 바이트 오프셋 순서이며 정수는 모두 little-endian이다.
-pub(super) const CHUNK: usize = 256 * 1024;
-const HEADER: usize = 33;
+// 화면 하나를 패킷 하나로 IPC에 보낸다. 헤더는 프레임 종류, 순번, 화면 세대,
+// 화면 크기, 사각형 순서이며 정수는 모두 little-endian이다.
+pub(super) const HEADER: usize = 29;
 
 pub(super) struct Image<'a> {
     pub kind: u8,
@@ -13,17 +12,15 @@ pub(super) struct Image<'a> {
 }
 
 impl Image<'_> {
-    pub(super) fn packet(&self, sequence: u64, epoch: u64, offset: usize) -> Vec<u8> {
-        let chunk = &self.rgba[offset..(offset + CHUNK).min(self.rgba.len())];
-        let mut packet = Vec::with_capacity(HEADER + chunk.len());
+    pub(super) fn packet(&self, sequence: u64, epoch: u64) -> Vec<u8> {
+        let mut packet = Vec::with_capacity(HEADER + self.rgba.len());
         packet.push(self.kind);
         packet.extend(sequence.to_le_bytes());
         packet.extend(epoch.to_le_bytes());
         for field in [self.size.width, self.size.height, self.rect.x, self.rect.y, self.rect.size.width, self.rect.size.height] {
             packet.extend(field.to_le_bytes());
         }
-        packet.extend((offset as u32).to_le_bytes());
-        packet.extend_from_slice(chunk);
+        packet.extend_from_slice(self.rgba);
         packet
     }
 }

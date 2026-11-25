@@ -3,7 +3,7 @@ use std::{sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}}, time::Duration};
 use tauri::{Manager, UriSchemeContext, UriSchemeResponder, http::{Request, Response}};
 use tokio::sync::oneshot;
 
-use super::{Error, ipc::{Sessions, opaque_id}, lifetime::Lifetime, presentation::CHUNK};
+use super::{Error, ipc::{Sessions, opaque_id}, lifetime::Lifetime, presentation::HEADER, wire::MAX_FRAME_BYTES};
 
 const MAX_BODY: usize = 2 * 1024 * 1024 + 4096;
 
@@ -58,7 +58,7 @@ pub(super) struct Output {
 
 impl Output {
     pub(super) async fn send(&self, raw: bool, bytes: Vec<u8>, sequence: u64, offset: u32, painted_epoch: Option<u64>) -> Result<(), Error> {
-        if bytes.len() > if raw { CHUNK + 33 } else { MAX_BODY } { return Err(Error::LengthLimit); }
+        if bytes.len() > if raw { HEADER + MAX_FRAME_BYTES } else { MAX_BODY } { return Err(Error::LengthLimit); }
         let ticket = opaque_id().map_err(|_| Error::Disconnected)?;
         let (confirm, reply) = oneshot::channel();
         self.life.live(|| {

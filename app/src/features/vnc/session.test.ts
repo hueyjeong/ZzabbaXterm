@@ -20,13 +20,13 @@ vi.mock("./document", () => ({
 }));
 
 function full(sequence: number, epoch: number) {
-  const buffer = new ArrayBuffer(37);
+  const buffer = new ArrayBuffer(33);
   const view = new DataView(buffer);
   view.setUint8(0, 1);
   view.setBigUint64(1, BigInt(sequence), true);
   view.setBigUint64(9, BigInt(epoch), true);
   for (const offset of [17, 19, 25, 27]) view.setUint16(offset, 1, true);
-  new Uint8Array(buffer, 33).set([20, 40, 60, 255]);
+  new Uint8Array(buffer, 29).set([20, 40, 60, 255]);
   return buffer;
 }
 
@@ -107,7 +107,7 @@ it("비활성화는 보내지 않은 입력과 늦은 붙여넣기를 버리고 
   ]);
 });
 
-it("Canvas에 그린 뒤에만 마지막 화면 조각을 ACK한다", async () => {
+it("Canvas에 그린 뒤에만 화면 패킷을 ACK한다", async () => {
   invoke.mockReset().mockResolvedValue(undefined);
   const owner = { tab: "viewer", document: 1 };
   const identity = { sessionId: "viewer", generation: 1 };
@@ -139,6 +139,27 @@ it("Canvas에 그린 뒤에만 마지막 화면 조각을 ACK한다", async () =
     view?.dispose();
     vi.unstubAllGlobals();
   }
+});
+
+it.each([
+  ["길이가 사각형과 다른 화면 패킷", full(1, 1).slice(0, 32)],
+  ["머리만 있는 화면 패킷", full(1, 1).slice(0, 29)],
+])("%s는 그리거나 ACK하지 않고 세션을 닫는다", async (_, packet) => {
+  invoke.mockReset().mockResolvedValue(undefined);
+  const owner = { tab: "viewer", document: 1 };
+  const identity = { sessionId: "viewer", generation: 1 };
+  const receive = vi.fn<Parameters<Connection["subscribe"]>[0]>(() => true);
+  connect(owner, { host: "localhost", port: 5900, password: false }, (session) => { session.subscribe(receive); },
+    vi.fn(), vi.fn(), { readText: vi.fn(), writeText: vi.fn() });
+  const { output } = invoke.mock.calls[0][1] as { output: { onmessage(message: unknown): void } };
+  output.onmessage({ identity, kind: "started", serial: 0 });
+  await Promise.resolve();
+  output.onmessage({ identity, kind: "waiting", value: 1, serial: 1 });
+  await Promise.resolve();
+  output.onmessage(packet);
+  await vi.waitFor(() => expect(invoke).toHaveBeenCalledWith("vnc_close", { owner, generation: 1 }));
+  expect(receive.mock.calls.map(([event]) => event.kind)).toEqual(["waiting", "disconnected"]);
+  expect(invoke).not.toHaveBeenCalledWith("vnc_ack", expect.objectContaining({ sequence: 1 }));
 });
 
 it("터널 요청은 원격 목적지만 전달하고 실패 후 직접 TLS를 시도하지 않는다", async () => {

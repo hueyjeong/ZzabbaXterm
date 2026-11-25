@@ -10,7 +10,7 @@ use super::{Auth, Error, IO_TIMEOUT, Rect, Secrets, Size, Target};
 
 pub(super) const MAX_TEXT: usize = 1024 * 1024;
 const MAX_PIXELS: usize = 8_294_400;
-const MAX_FRAME_BYTES: usize = MAX_PIXELS * 4;
+pub(super) const MAX_FRAME_BYTES: usize = MAX_PIXELS * 4;
 const RAW: i32 = 0;
 const COPY_RECT: i32 = 1;
 const DESKTOP_SIZE: i32 = -223;

@@ -17,6 +17,15 @@ const input = { kind: "key", down: true, code: "KeyA", key: "a", location: 0, re
 
 afterEach(() => { vi.resetAllMocks(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
+function frameBuffer(sequence: number, frameSequence: number, width: number, displayGeneration: number, rect: { x: number; y: number; w: number; h: number }) {
+  const buffer = new ArrayBuffer(36 + 4 * rect.w * rect.h);
+  const binary = new DataView(buffer);
+  [sequence, frameSequence, displayGeneration].forEach((value, index) => binary.setBigUint64(index * 8, BigInt(value), true));
+  [width, 1, rect.x, rect.y, rect.w, rect.h].forEach((value, index) => binary.setUint16(24 + index * 2, value, true));
+  new Uint8Array(buffer, 36).fill(255);
+  return buffer;
+}
+
 async function fixture() {
   vi.stubGlobal("__ZZABBA_RDP_DOCUMENT__", { proof });
   const opened = Promise.withResolvers<Connection>();
@@ -54,16 +63,12 @@ async function fixture() {
     });
     notify("c".repeat(32));
   }
-  const header = (sequence: number, frameSequence: number, width = 1, displayGeneration = 1) => packet({
-    sequence, kind: "frame", full: true, frameSequence, displayGeneration, width, height: 1, x: 0, y: 0, w: width, h: 1
-  });
   const display = (sequence: number, displayGeneration = 1) => packet({ kind: "display", sequence, displayGeneration });
-  const pixels = (sequence: number, width = 1) => {
-    const buffer = new ArrayBuffer(12 + 4 * width);
-    const binary = new DataView(buffer);
-    binary.setBigUint64(0, BigInt(sequence), true);
-    new Uint8Array(buffer, 12).fill(255);
+  /** 머리와 픽셀을 묶은 화면 패킷 하나를 보낸다. 사각형을 주지 않으면 전체 화면이다. */
+  const frame = (sequence: number, frameSequence: number, width = 1, displayGeneration = 1, rect = { x: 0, y: 0, w: width, h: 1 }) => {
+    const buffer = frameBuffer(sequence, frameSequence, width, displayGeneration, rect);
     packet(buffer);
+    return buffer;
   };
   const canvas = document.createElement("canvas");
   const draw = vi.fn();
@@ -73,16 +78,14 @@ async function fixture() {
   async function live() {
     const view = createRemoteDesktopViewSession(connection, canvas, vi.fn());
     connection.setActive(true);
-    header(1, 1);
+    frame(1, 1);
     await vi.waitFor(() => expect(calls("rdp_ack")).toHaveLength(1));
-    pixels(1);
-    await vi.waitFor(() => expect(calls("rdp_ack")).toHaveLength(2));
     display(2);
     await vi.waitFor(() => expect(inputs()).toHaveLength(1));
     return view;
   }
   return {
-    calls, inputs, live, packet, header, pixels, display, sendInput, sendBatch, close, connection, ended, ready, caps, notice,
+    calls, inputs, live, packet, frame, display, sendInput, sendBatch, close, connection, ended, ready, caps, notice,
     clipboard, canvas, draw, signal: (ticket: string) => notify(ticket),
   };
 }
@@ -162,11 +165,13 @@ it("Canvas 적용 ACK 뒤에만 키를 전달하고 서버가 보낸 크기와 �
   f.connection.setActive(true);
   view.send(input);
   expect(f.calls("rdp_input")).toEqual([]);
-  f.header(1, 1);
-  await vi.waitFor(() => expect(f.calls("rdp_ack")).toEqual([{ id, sequence: 1, offset: 0 }]));
-  f.pixels(1);
-  await vi.waitFor(() => expect(f.calls("rdp_ack")[1]).toEqual({ id, sequence: 1, offset: 1 }));
+  const sent = f.frame(1, 1);
+  await vi.waitFor(() => expect(f.calls("rdp_ack")).toEqual([{ id, sequence: 1 }]));
   expect(f.draw).toHaveBeenCalledOnce();
+  // 받은 버퍼를 복사하지 않고 머리 뒤의 픽셀을 그대로 그린다.
+  const drawn = (f.draw.mock.calls[0][0] as unknown as { rgba: Uint8ClampedArray }).rgba;
+  expect(drawn.buffer).toBe(sent);
+  expect([drawn.byteOffset, drawn.byteLength]).toEqual([36, 4]);
   expect(f.draw.mock.invocationCallOrder[0]).toBeLessThan(Math.max(...invoke.mock.invocationCallOrder));
   expect(f.ready).not.toHaveBeenCalled();
   f.display(2);
@@ -178,10 +183,9 @@ it("Canvas 적용 ACK 뒤에만 키를 전달하고 서버가 보낸 크기와 �
   f.connection.resize({ width: 800, height: 600, scale: 125 });
   await vi.waitFor(() => expect(f.calls("rdp_input")[2]).toMatchObject({ input: { action: { kind: "resize", width: 800, height: 600, scale: 125 } } }));
   expect(f.canvas.width).toBe(1);
-  f.header(4, 2, 2, 2);
-  await vi.waitFor(() => expect(f.calls("rdp_ack")).toContainEqual({ id, sequence: 4, offset: 0 }));
-  f.pixels(4, 2);
-  await vi.waitFor(() => expect(f.canvas.width).toBe(2));
+  f.frame(4, 2, 2, 2);
+  await vi.waitFor(() => expect(f.calls("rdp_ack")).toContainEqual({ id, sequence: 4 }));
+  expect(f.canvas.width).toBe(2);
   f.display(5, 2);
   await vi.waitFor(() => expect(f.ready).toHaveBeenLastCalledWith(true, { width: 2, height: 1 }));
   await vi.waitFor(() => expect(f.calls("rdp_input")[3]).toMatchObject({ input: { displayGeneration: 2, action: { kind: "active" } } }));
@@ -202,12 +206,10 @@ it("이전 화면 입력은 폐기하고 같은 크기의 새 화면 ACK 후 입
   const f = await fixture();
   const view = createRemoteDesktopViewSession(f.connection, f.canvas, vi.fn());
   f.connection.setActive(true);
-  f.header(1, 1);
+  f.frame(1, 1);
   await vi.waitFor(() => expect(f.calls("rdp_ack")).toHaveLength(1));
-  f.pixels(1);
-  await vi.waitFor(() => expect(f.calls("rdp_ack")).toHaveLength(2));
   f.display(2);
-  await vi.waitFor(() => expect(f.calls("rdp_ack")).toHaveLength(3));
+  await vi.waitFor(() => expect(f.calls("rdp_ack")).toHaveLength(2));
   const discarded = Promise.withResolvers<string>();
   f.sendInput.mockReturnValueOnce(discarded.promise);
   view.send(input);
@@ -215,11 +217,8 @@ it("이전 화면 입력은 폐기하고 같은 크기의 새 화면 ACK 후 입
   discarded.resolve("stale");
   await discarded.promise;
   view.send(input);
-  f.header(3, 2, 1, 2);
-  await vi.waitFor(() => expect(f.calls("rdp_ack")).toHaveLength(4));
-  view.send(input);
-  f.pixels(3);
-  await vi.waitFor(() => expect(f.calls("rdp_ack")).toHaveLength(5));
+  f.frame(3, 2, 1, 2);
+  await vi.waitFor(() => expect(f.calls("rdp_ack")).toHaveLength(3));
   view.send(input);
   expect(f.calls("rdp_input")).toHaveLength(2);
   expect(f.ended).not.toHaveBeenCalled();
@@ -232,31 +231,57 @@ it("이전 화면 입력은 폐기하고 같은 크기의 새 화면 ACK 후 입
   view.dispose();
 });
 
-it("Canvas 적용 실패 시 최종 ACK 없이 세션을 닫는다", async () => {
+it("Canvas 적용 실패 시 ACK 없이 세션을 닫는다", async () => {
   const f = await fixture();
   const view = createRemoteDesktopViewSession(f.connection, f.canvas, vi.fn());
   f.draw.mockImplementationOnce(() => { throw new Error("draw error"); });
-  f.header(1, 1);
-  await vi.waitFor(() => expect(f.calls("rdp_ack")).toHaveLength(1));
-  f.pixels(1);
+  f.frame(1, 1);
   await vi.waitFor(() => expect(f.ended).toHaveBeenCalledOnce());
-  expect(f.calls("rdp_ack")).toEqual([{ id, sequence: 1, offset: 0 }]);
+  expect(f.calls("rdp_ack")).toEqual([]);
   expect(f.calls("rdp_close")).toEqual([{ id }]);
   expect(f.canvas.width).toBe(0);
+  view.dispose();
+});
+
+it("부분 화면 패킷은 사각형 위치에 그리고 ACK한다", async () => {
+  const f = await fixture();
+  const view = createRemoteDesktopViewSession(f.connection, f.canvas, vi.fn());
+  f.frame(1, 1, 2);
+  await vi.waitFor(() => expect(f.calls("rdp_ack")).toHaveLength(1));
+  f.display(2);
+  await vi.waitFor(() => expect(f.calls("rdp_ack")).toHaveLength(2));
+  f.frame(3, 2, 2, 1, { x: 1, y: 0, w: 1, h: 1 });
+  await vi.waitFor(() => expect(f.calls("rdp_ack")[2]).toEqual({ id, sequence: 3 }));
+  expect(f.draw).toHaveBeenLastCalledWith(expect.anything(), 1, 0);
+  expect(f.ended).not.toHaveBeenCalled();
+  view.dispose();
+});
+
+it.each([
+  ["길이가 머리와 다른 패킷", frameBuffer(1, 1, 1, 1, { x: 0, y: 0, w: 1, h: 1 }).slice(0, 39)],
+  ["새 화면 세대의 부분 화면", frameBuffer(1, 1, 2, 1, { x: 1, y: 0, w: 1, h: 1 })],
+  ["건너뛴 화면 순번", frameBuffer(1, 2, 1, 1, { x: 0, y: 0, w: 1, h: 1 })],
+  ["화면 밖 사각형", frameBuffer(1, 1, 1, 1, { x: 1, y: 0, w: 1, h: 1 })],
+  ["머리만 있는 패킷", new ArrayBuffer(36)],
+])("%s는 그리거나 ACK하지 않고 세션을 닫는다", async (_, buffer) => {
+  const f = await fixture();
+  const view = createRemoteDesktopViewSession(f.connection, f.canvas, vi.fn());
+  f.packet(buffer);
+  await vi.waitFor(() => expect(f.ended).toHaveBeenCalledWith("RDP 화면 또는 상태를 적용할 수 없습니다", true));
+  expect(f.draw).not.toHaveBeenCalled();
+  expect(f.calls("rdp_ack")).toEqual([]);
   view.dispose();
 });
 
 it("폐기한 탭의 픽셀은 Canvas에 그리거나 ACK하지 않는다", async () => {
   const f = await fixture();
   const view = createRemoteDesktopViewSession(f.connection, f.canvas, vi.fn());
-  f.header(1, 1);
-  await vi.waitFor(() => expect(f.calls("rdp_ack")).toHaveLength(1));
-  f.pixels(1);
+  f.frame(1, 1);
   f.close();
   view.dispose();
   await vi.waitFor(() => expect(f.calls("rdp_close")).toEqual([{ id }]));
   expect(f.draw).not.toHaveBeenCalled();
-  expect(f.calls("rdp_ack")).toEqual([{ id, sequence: 1, offset: 0 }]);
+  expect(f.calls("rdp_ack")).toEqual([]);
 });
 
 it("터널 연결 거부 시 목적지와 TLS DNS를 구분해 전달하고 직접 연결로 재시도하지 않는다", async () => {

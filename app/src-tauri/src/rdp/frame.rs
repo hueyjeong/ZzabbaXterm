@@ -22,7 +22,7 @@ use ironrdp_tokio::bytes::Bytes;
 
 use super::{Error, SessionId};
 
-const MAX_FRAME: usize = 3840 * 2160 * 4;
+pub(super) const MAX_FRAME: usize = 3840 * 2160 * 4;
 const MAX_CHANNEL: u32 = 256 * 1024;
 
 pub(super) fn frame_len(width: u16, height: u16) -> Result<usize, Error> {
