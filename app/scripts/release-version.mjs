@@ -20,6 +20,7 @@ function current() {
 
 function next(bump, explicit) {
   const [major, minor, patch] = current().split('.').map(Number);
+  explicit = explicit?.trim().replace(/^v/, '');
   if (explicit) {
     if (!SEMVER.test(explicit)) throw new Error(`버전 형식 오류: ${explicit}`);
     const [a, b, c] = explicit.split('.').map(Number);

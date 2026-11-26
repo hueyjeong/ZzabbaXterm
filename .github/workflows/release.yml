@@ -24,6 +24,7 @@ concurrency:
 jobs:
   version:
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     outputs:
       version: ${{ steps.next.outputs.version }}
       sha: ${{ steps.next.outputs.sha }}
@@ -38,10 +39,15 @@ jobs:
         env:
           BUMP: ${{ inputs.bump }}
           REQUESTED: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           version="$(node scripts/release-version.mjs next "$BUMP" "$REQUESTED")"
           if git ls-remote --exit-code origin "refs/tags/v$version" "refs/heads/release/v$version" >/dev/null; then
             echo "::error::v$version 태그나 release/v$version 브랜치가 이미 있습니다"
+            exit 1
+          fi
+          if gh release view "v$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::v$version 릴리스(초안 포함)가 이미 있습니다"
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -59,6 +65,7 @@ jobs:
           - os: ubuntu-24.04
             pattern: bundle/deb/*.deb
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     env:
       VERSION: ${{ needs.version.outputs.version }}
     steps:
@@ -89,7 +96,6 @@ jobs:
       - working-directory: app
         run: npm ci
       - name: 프런트 시험
-        if: runner.os == 'Linux'
         working-directory: app
         run: npx vitest run
       - name: 설치 파일 빌드
@@ -113,6 +119,7 @@ jobs:
   release:
     needs: [version, build]
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: write
     env:
