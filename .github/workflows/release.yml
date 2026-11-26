@@ -1,0 +1,138 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 올릴 단계
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      version:
+        description: 직접 지정할 버전 (예 1.2.3, 비우면 단계대로)
+        type: string
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.next.outputs.version }}
+      sha: ${{ steps.next.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - id: next
+        working-directory: app
+        env:
+          BUMP: ${{ inputs.bump }}
+          REQUESTED: ${{ inputs.version }}
+        run: |
+          version="$(node scripts/release-version.mjs next "$BUMP" "$REQUESTED")"
+          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null || git ls-remote --exit-code origin "refs/heads/release/v$version" >/dev/null; then
+            echo "::error::v$version 태그나 release/v$version 브랜치가 이미 있습니다"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "## ZXT v$version ($(git rev-parse --short HEAD))" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: version
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: windows-latest
+            pattern: bundle/nsis/*.exe
+          - os: ubuntu-24.04
+            pattern: bundle/deb/*.deb
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+      - name: Linux 빌드 패키지
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev libxdo-dev patchelf
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri
+      - name: 버전 적용
+        working-directory: app
+        shell: bash
+        run: node scripts/release-version.mjs apply "${{ needs.version.outputs.version }}"
+      - working-directory: app
+        run: npm ci
+      - name: 프런트 시험
+        if: runner.os == 'Linux'
+        working-directory: app
+        run: npx vitest run
+      - name: 설치 파일 빌드
+        working-directory: app
+        run: npm run bundle
+      - name: 설치 파일 찾기
+        id: find
+        working-directory: app
+        shell: bash
+        run: |
+          target_dir="$(cargo metadata --locked --no-deps --format-version 1 --manifest-path src-tauri/Cargo.toml | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).target_directory))')"
+          triple="$(rustc --print host-tuple)"
+          echo "dir=$target_dir/$triple/release" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer-${{ runner.os }}
+          path: ${{ steps.find.outputs.dir }}/${{ matrix.pattern }}
+          if-no-files-found: error
+
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: 버전 커밋, 태그, 브랜치
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          (cd app && node scripts/release-version.mjs apply "$VERSION")
+          git commit -am "chore(release): v$VERSION"
+          git tag -a "v$VERSION" -m "ZXT v$VERSION"
+          git push origin "HEAD:refs/heads/release/v$VERSION" "refs/tags/v$VERSION"
+          # 빌드하는 동안 main이 움직였으면 버전 커밋을 병합해 올린다.
+          if ! git push origin HEAD:main; then
+            git fetch origin main
+            git checkout -B main origin/main
+            git merge --no-ff -m "Merge release v$VERSION" "v$VERSION"
+            git push origin main
+          fi
+      - name: 릴리스 게시
+        run: |
+          (cd dist && sha256sum -- * > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          gh release create "v$VERSION" dist/* --title "ZXT v$VERSION" --generate-notes --verify-tag
