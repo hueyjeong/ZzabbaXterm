@@ -563,7 +563,7 @@ fn desktop_status_serializes_only_ready_approved_loopback() {
 
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "격리 Ubuntu OpenSSH 서버와 ZZABBA_R01_LOOPBACK_FIXTURE 필요"]
+#[ignore = "격리 Ubuntu OpenSSH 서버와 ZXT_R01_LOOPBACK_FIXTURE 필요"]
 fn isolated_openssh_desktop_lease_outlives_source_tab() {
     use crate::tunnels::tests::loopback::{Fixture, SERVER};
     use std::{io::{ErrorKind, Read, Write}, net::TcpListener, time::Instant};

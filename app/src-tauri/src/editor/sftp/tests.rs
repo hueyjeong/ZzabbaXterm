@@ -22,7 +22,7 @@ const REDIRECT: &str = "redirect";
 const ORIGINAL: &str = "처음 글\r\n";
 const EXTERNAL: &str = "외부 글\r\n";
 const EDITED: &str = "내 수정\r\n";
-const UNRELATED: &str = ".zzabba-edit-other";
+const UNRELATED: &str = ".zxt-edit-other";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Scenario {
@@ -238,7 +238,7 @@ impl Fixture {
                 let path = request.filename.into_string().unwrap();
                 let (parent, name) = path.rsplit_once('/').unwrap();
                 assert_eq!(parent, DIR);
-                assert!(name.starts_with(".zzabba-edit-"));
+                assert!(name.starts_with(".zxt-edit-"));
                 if self.scenario == Scenario::CreateRefused {
                     fs::write(self.root.join(name), "이미 존재하는 파일").unwrap();
                     self.temp = Some(name.into());
@@ -465,7 +465,7 @@ async fn nano_open_is_read_only_and_does_not_require_atomic_replace() {
         let root = tempfile::tempdir().unwrap();
         let plan = plan(&root.path().join("trust"), "editor");
         let (mut connection, server) = connect(plan, Fixture::new(root.path().into(), scenario)).await;
-        for path in ["/", "한글.txt", "C:/workspace/한글.txt", "/workspace/../한글.txt", "/workspace/.zzabba-edit-other"] {
+        for path in ["/", "한글.txt", "C:/workspace/한글.txt", "/workspace/../한글.txt", "/workspace/.zxt-edit-other"] {
             assert!(matches!(connection.open_nano(path).await, Err(Error::InvalidPath)), "{path}");
         }
         match (scenario, connection.open_nano(FILE).await) {

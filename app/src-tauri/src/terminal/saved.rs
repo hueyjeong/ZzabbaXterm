@@ -191,8 +191,8 @@ fn local(shell: Shell, directory: &Path) -> Result<CommandBuilder, String> {
             let mut command = CommandBuilder::new(executable);
             command.args(["-NoLogo", "-NoProfile", "-NoExit", "-Command"]);
             command.arg(format!(r#"
-                $directory = $env:ZZABBA_C01_CWD
-                Remove-Item Env:ZZABBA_C01_CWD
+                $directory = $env:ZXT_C01_CWD
+                Remove-Item Env:ZXT_C01_CWD
                 try {{
                     if (({}) -and [IO.Directory]::Exists($directory)) {{ return }}
                 }} catch {{ [Console]::Error.WriteLine($_.Exception.Message) }}
@@ -206,11 +206,11 @@ fn local(shell: Shell, directory: &Path) -> Result<CommandBuilder, String> {
             let mut command = CommandBuilder::new("/bin/bash");
             command.env_remove("BASH_ENV");
             command.args(["--noprofile", "--norc", "-c", r#"
-                if [[ ! . -ef "$ZZABBA_C01_CWD" ]]; then
+                if [[ ! . -ef "$ZXT_C01_CWD" ]]; then
                     builtin printf '%s\n' 'Could not start in the saved working directory.' >&2
                     exit 23
                 fi
-                unset ZZABBA_C01_CWD
+                unset ZXT_C01_CWD
                 exec /bin/bash --noprofile --norc -i
             "#]);
             command
@@ -219,7 +219,7 @@ fn local(shell: Shell, directory: &Path) -> Result<CommandBuilder, String> {
     };
     super::strip_inherited_agent_env(&mut command);
     command.cwd(directory);
-    command.env("ZZABBA_C01_CWD", directory);
+    command.env("ZXT_C01_CWD", directory);
     command.env("TERM", "xterm-256color");
     Ok(command)
 }

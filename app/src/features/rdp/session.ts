@@ -30,7 +30,7 @@ export type EndKind = "transport";
 const token = /^[a-f0-9]{32}$/;
 function proof(): string | undefined {
   if (window !== top) return;
-  const value = (window as Window & { __ZZABBA_RDP_DOCUMENT__?: { proof?: unknown } }).__ZZABBA_RDP_DOCUMENT__?.proof;
+  const value = (window as Window & { __ZXT_RDP_DOCUMENT__?: { proof?: unknown } }).__ZXT_RDP_DOCUMENT__?.proof;
   if (typeof value === "string" && token.test(value)) return value;
 }
 const positive = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) > 0;
@@ -68,7 +68,7 @@ export function connect(draft: Draft, opened: (connection: Connection) => void,
   let output: Channel<string> | undefined;
   const run = <T = void>(name: string, args: InvokeArgs = {}) => {
     if (!document || proof() !== document) return Promise.reject("RDP 문서가 교체되었거나 아직 준비되지 않았습니다");
-    return invoke<T>(name, args, { headers: { "x-zzabba-rdp-document": document } });
+    return invoke<T>(name, args, { headers: { "x-zxt-rdp-document": document } });
   };
   let id: RemoteDesktopIdentity | undefined;
   let receive: ((event: RemoteDesktopEvent) => boolean) | undefined;

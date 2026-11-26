@@ -6,7 +6,7 @@ use std::{collections::VecDeque, ffi::OsStr};
 const OWNER: &str = "arn:aws:sts::123456789012:assumed-role/Sample/Sample";
 const ROLE_ID: &str = "AROADBQP57FF2AEXAMPLE";
 const TARGET: &str = "i-01234567";
-const REASON: &str = "zzabbaxterm-0123456789abcdef0123456789abcdef";
+const REASON: &str = "zxt-0123456789abcdef0123456789abcdef";
 const SESSION_ID: &str = "Sample-0123456789abcdef0";
 
 fn request() -> StartRequest {
@@ -131,7 +131,7 @@ fn ownership_uses_only_complete_exact_service_matches() {
     for (key, value) in [
         ("SessionId", "--debug"),
         ("SessionId", ""),
-        ("Reason", "zzabbaxterm-lookalike"),
+        ("Reason", "zxt-lookalike"),
         ("Owner", "arn:aws:iam::123456789012:role/Sample"),
         ("Target", "i-11111111"),
     ] {
@@ -154,7 +154,7 @@ fn ownership_uses_only_complete_exact_service_matches() {
     ));
     let mut unrelated = session();
     unrelated["SessionId"] = json!("Forged-0123456789abcdef0");
-    unrelated["Reason"] = json!("zzabbaxterm-0123456789abcdef0123456789abcdef-extra");
+    unrelated["Reason"] = json!("zxt-0123456789abcdef0123456789abcdef-extra");
     cases.push((
         "unrelated nonce",
         json!({"Sessions": [unrelated, session()]}),
@@ -406,7 +406,7 @@ async fn start_requires_an_online_node_from_the_same_scope() {
         let mut expected = vec!["ssm", "start-session", "--region", "us-west-2", "--output", "json",
             "--target", TARGET, "--reason", start.reason.as_str()];
         if uses_shared_document {
-            expected.extend(["--document-name", "ZzabbaAiSharedControl"]);
+            expected.extend(["--document-name", "ZxtAiSharedControl"]);
         }
         expected.extend(["--no-cli-pager", "--no-cli-auto-prompt"]);
         assert_eq!(&permit.0.get_argv()[1..], expected.as_slice());
@@ -420,7 +420,7 @@ async fn start_requires_an_online_node_from_the_same_scope() {
         );
         assert!(Arc::ptr_eq(&permit.1, &node.credentials));
         assert_eq!(start.target(), TARGET);
-        let nonce = start.reason.strip_prefix("zzabbaxterm-").unwrap();
+        let nonce = start.reason.strip_prefix("zxt-").unwrap();
         assert_eq!(nonce.len(), 32);
         assert!(nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert!(
@@ -650,7 +650,7 @@ async fn readiness_retries_only_reads_after_timeout() {
 #[tokio::test]
 async fn shared_control_rejects_unowned_session_records() {
     let mut request = request();
-    request.document_name = Some("ZzabbaAiSharedControl");
+    request.document_name = Some("ZxtAiSharedControl");
     let scope = request.scope.clone();
     for (field, value) in [("Target", "i-11111111"), ("Owner", "another-owner")] {
         let mut wrong = active_session();

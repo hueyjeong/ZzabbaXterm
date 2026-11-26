@@ -1,4 +1,4 @@
-# F00 · 새 개발 PC에서 ZzabbaXterm 창 열기
+# F00 · 새 개발 PC에서 ZXT 창 열기
 
 선행: 없음
 
@@ -8,7 +8,7 @@
 
 | Given | When | Then |
 |---|---|---|
-| `docs/`만 있고 `app/`가 없는 저장소와 준비된 네이티브 PC | 아래 절차대로 앱을 만들고 실행한다 | `ZzabbaXterm`이라는 독립된 데스크톱 창이 열리고 닫힌다. 일반 브라우저 탭은 합격 증거가 아니다. |
+| `docs/`만 있고 `app/`가 없는 저장소와 준비된 네이티브 PC | 아래 절차대로 앱을 만들고 실행한다 | `ZXT`라는 독립된 데스크톱 창이 열리고 닫힌다. 일반 브라우저 탭은 합격 증거가 아니다. |
 | 다른 개발자가 잠금 파일까지 포함된 같은 소스를 받았다 | 기존 `app/`에서 복구 절차로 실행한다 | 템플릿을 다시 생성하거나 기존 문서를 덮어쓰지 않고 같은 창이 열린다. |
 
 ### 준비물
@@ -22,6 +22,6 @@
 1. **초기 상태(수동 Red):** F00 구현 전에는 `app/package.json`과 실행할 앱이 없었다. F00에서 [공식 `create-tauri-app` React TypeScript 템플릿](https://v2.tauri.app/start/create-project/)으로 `app/`을 생성했다. 이후에는 저장소의 `app/`과 두 잠금 파일을 사용한다.
 2. **의존성 복구:** 저장소 루트에서 `cd app`을 실행한 뒤 `npm ci`로 `package-lock.json`에 고정된 의존성을 설치한다.
 3. **빌드 확인:** `npm run build`로 TypeScript 검사와 `dist/` 생성을 확인한다. 이어서 `cargo check --locked --manifest-path src-tauri/Cargo.toml`로 `Cargo.lock`에 고정된 Rust 의존성을 확인한다. `npm run tauri info`에서 네이티브 도구와 WebView 런타임을 확인한다. F00에는 테스트 파일이 없어 `npm test`는 테스트가 없다는 오류로 종료된다.
-4. **실기기 시연:** `npm run tauri dev`로 `ZzabbaXterm` 창이 열리는 것을 확인하고 닫은 뒤 개발 명령을 끝낸다. 두 번째 OS에서는 2단계부터 반복한다. 창 대신 브라우저만 열렸다면 `npm run dev`와 `npm run tauri dev`를 구분한다. 빈 창이면 Vite 출력 URL과 Tauri의 `devUrl`(포트 `5173`)을 비교한다. Rust 링크 오류가 나면 해당 OS의 사전 요구 사항을 확인한다.
+4. **실기기 시연:** `npm run tauri dev`로 `ZXT` 창이 열리는 것을 확인하고 닫은 뒤 개발 명령을 끝낸다. 두 번째 OS에서는 2단계부터 반복한다. 창 대신 브라우저만 열렸다면 `npm run dev`와 `npm run tauri dev`를 구분한다. 빈 창이면 Vite 출력 URL과 Tauri의 `devUrl`(포트 `5173`)을 비교한다. Rust 링크 오류가 나면 해당 OS의 사전 요구 사항을 확인한다.
 
 **완료 증거:** 두 OS의 도구 버전, 실행한 명령과 빌드 결과, 실제 주 창 제목·종료 관찰. AWS 계정이나 AI 모델은 필요 없다. 다음은 [L01 · 실제 셸](../01-local/01-shell.md)이다.

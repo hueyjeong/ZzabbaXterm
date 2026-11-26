@@ -367,7 +367,7 @@ fn f01_ssh_and_sftp_use_one_pinned_config_with_exclusive_authentication() {
         assert!(ssh.program.is_absolute() && ssh.program.is_file());
         assert_eq!(sftp.program, ssh.program);
         assert_eq!(ssh.program.file_stem().unwrap(), "ssh");
-        assert_eq!(ssh.args, [OsStr::new("-F"), plan.config.as_os_str(), OsStr::new("--"), OsStr::new("zzabba-target")]);
+        assert_eq!(ssh.args, [OsStr::new("-F"), plan.config.as_os_str(), OsStr::new("--"), OsStr::new("zxt-target")]);
         assert_eq!(sftp.args[..3], ["-T", "-oBatchMode=yes", "-s"].map(OsStr::new));
         assert_eq!(sftp.args[3..7], ssh.args);
         assert_eq!(sftp.args[7], "sftp");

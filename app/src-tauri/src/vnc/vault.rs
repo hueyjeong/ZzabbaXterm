@@ -1,7 +1,7 @@
 use zeroize::Zeroizing;
 
 #[cfg(target_os = "linux")]
-pub(super) const SERVICE: &str = "dev.zzabbaxterm.desktop.vnc";
+pub(super) const SERVICE: &str = "dev.zxt.desktop.vnc";
 
 #[cfg(target_os = "linux")]
 mod linux {

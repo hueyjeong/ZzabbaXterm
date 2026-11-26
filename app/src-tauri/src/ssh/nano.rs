@@ -13,7 +13,7 @@ use crate::editor::{
 
 use super::ConnectionPlan;
 
-pub(super) const HELPER: &str = "/usr/local/libexec/zzabba-editor-bridge";
+pub(super) const HELPER: &str = "/usr/local/libexec/zxt-editor-bridge";
 const PREPARE_LIMIT: Duration = Duration::from_secs(3);
 const QUEUE: usize = 8;
 const WORK_QUEUE: usize = 1;
@@ -55,7 +55,7 @@ impl Running {
                 None => command.env_remove(name),
             };
         }
-        for name in ["BW_SESSION", "ZZABBA_ASKPASS_ENDPOINT", "ZZABBA_ASKPASS_BROKER_PID"] {
+        for name in ["BW_SESSION", "ZXT_ASKPASS_ENDPOINT", "ZXT_ASKPASS_BROKER_PID"] {
             command.env_remove(name);
         }
         #[cfg(windows)]

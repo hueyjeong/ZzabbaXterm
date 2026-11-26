@@ -31,7 +31,7 @@ impl CliHome {
             builder.permissions(fs::Permissions::from_mode(0o700));
         }
         builder
-            .prefix("zzabba-aws-")
+            .prefix("zxt-aws-")
             .tempdir()
             .map(|dir| Self { dir, login_cache: None, _refresh: None })
             .map_err(|_| CliError::ProcessIo)
@@ -51,7 +51,7 @@ impl CliHome {
     fn create_in(parent: &Path) -> Result<Self, CliError> {
         let mut nonce = [0; 16];
         getrandom::fill(&mut nonce).map_err(|_| CliError::RandomUnavailable)?;
-        let path = parent.join(format!("zzabba-aws-{:032x}", u128::from_ne_bytes(nonce)));
+        let path = parent.join(format!("zxt-aws-{:032x}", u128::from_ne_bytes(nonce)));
         super::windows_acl::private_dir(&path).map_err(|_| CliError::ProcessIo)?;
         Ok(Self { dir: path, login_cache: None, _refresh: None })
     }

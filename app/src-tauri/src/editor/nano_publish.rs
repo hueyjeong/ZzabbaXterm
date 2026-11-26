@@ -167,7 +167,7 @@ impl GuardedFile {
     fn check_recovery<'a>(&self, path: &'a Path) -> Option<&'a str> {
         let dir = path.parent()?;
         let name = dir.file_name()?.to_str()?;
-        let suffix = name.strip_prefix(".zzabba-edit-")?.strip_suffix(".tmp")?;
+        let suffix = name.strip_prefix(".zxt-edit-")?.strip_suffix(".tmp")?;
         if path.file_name()? != "original" || dir.parent()? != self.parent.path.as_path()
             || suffix.len() != 32 || !suffix.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         {
@@ -514,9 +514,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an ext4 parent owned by the test account; set ZZABBA_NANO_EXT4_FIXTURE"]
+    #[ignore = "requires an ext4 parent owned by the test account; set ZXT_NANO_EXT4_FIXTURE"]
     fn guarded_ext4_round_trip() {
-        let parent = PathBuf::from(env::var_os("ZZABBA_NANO_EXT4_FIXTURE").expect("ext4 fixture path"));
+        let parent = PathBuf::from(env::var_os("ZXT_NANO_EXT4_FIXTURE").expect("ext4 fixture path"));
         let root = tempfile::tempdir_in(parent).unwrap();
         let path = root.path().join("한글.txt");
         fs::write(&path, "처음").unwrap();
@@ -570,10 +570,10 @@ mod tests {
 
         let file = File::open(&path).unwrap();
         for value in [b"attribute".as_slice(), &[b'x'; 768]] {
-            set_xattr(&file, c"user.zzabba_test", value);
+            set_xattr(&file, c"user.zxt_test", value);
             assert_eq!(GuardedFile::prepare(&path).err().unwrap().kind(), io::ErrorKind::Unsupported);
             // SAFETY: the test owns the file and the test-only attribute.
-            assert_eq!(unsafe { libc::fremovexattr(file.as_raw_fd(), c"user.zzabba_test".as_ptr()) }, 0);
+            assert_eq!(unsafe { libc::fremovexattr(file.as_raw_fd(), c"user.zxt_test".as_ptr()) }, 0);
         }
         fs::set_permissions(&path, fs::Permissions::from_mode(0o440)).unwrap();
         assert_eq!(GuardedFile::prepare(&path).err().unwrap().kind(), io::ErrorKind::Unsupported);
@@ -613,7 +613,7 @@ mod tests {
         assert_eq!(fs::read(&held).unwrap(), "다른글".as_bytes());
         assert!(!path.exists());
         let moved_external = fs::read_dir(root.path()).unwrap().map(Result::unwrap)
-            .find(|entry| entry.file_name().to_string_lossy().starts_with(".zzabba-edit-")).unwrap();
+            .find(|entry| entry.file_name().to_string_lossy().starts_with(".zxt-edit-")).unwrap();
         assert_eq!(fs::read(moved_external.path().join("original")).unwrap(), b"external");
         assert!(matches!(guarded.compare(), Err(Error::Unknown(None))));
         assert!(matches!(guarded.reload(snapshot.observation), Err(Error::Unknown(None))));

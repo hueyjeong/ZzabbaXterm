@@ -27,9 +27,9 @@ impl Endpoint {
                     ));
                 }
                 check_private_directory(&path, uid)?;
-                path.join("zzabbaxterm")
+                path.join("zxt")
             }
-            None => Path::new("/tmp").join(format!("zzabbaxterm-{uid}")),
+            None => Path::new("/tmp").join(format!("zxt-{uid}")),
         };
         Self::in_directory(&directory, service)
     }
@@ -181,7 +181,7 @@ mod tests {
 
     #[test]
     fn endpoint_requires_private_directory_and_socket() {
-        let directory = env::temp_dir().join(format!("zzabba-unix-test-{}", std::process::id()));
+        let directory = env::temp_dir().join(format!("zxt-unix-test-{}", std::process::id()));
         let endpoint = Endpoint::in_directory(&directory, "ai").unwrap();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()

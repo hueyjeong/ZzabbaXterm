@@ -8,7 +8,7 @@ import type { ApprovedEditorFile } from "./contract";
 self.MonacoEnvironment = { getWorker: () => new EditorWorker() };
 
 // ui/tokens.css와 같은 배경·강조색을 쓴다.
-export const EDITOR_THEME = "zzabba-dark";
+export const EDITOR_THEME = "zxt-dark";
 let themeDefined = false;
 /** 편집기를 만들기 직전에 한 번 등록한다. 모듈 로드 시 등록하면 Monaco 서비스가 미리 초기화된다. */
 export function defineEditorTheme() {
@@ -27,7 +27,7 @@ export function defineEditorTheme() {
 
 export function createFileModel(file: ApprovedEditorFile) {
   return editor.createModel(file.text, "plaintext", Uri.from({
-    scheme: "zzabba-editor",
+    scheme: "zxt-editor",
     path: "/file",
     query: file.handle,
   }));

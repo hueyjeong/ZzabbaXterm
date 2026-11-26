@@ -73,13 +73,13 @@ pub enum CliError {
 impl std::fmt::Display for CliError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Usage => f.write_str("사용법: zzabba-edit [--wait] [--] <파일>"),
+            Self::Usage => f.write_str("사용법: zxt-edit [--wait] [--] <파일>"),
             Self::InvalidPath => f.write_str("로컬 절대 파일 경로가 필요합니다."),
             Self::RequestTooLarge => f.write_str("파일 열기 요청이 너무 깁니다."),
-            Self::AppNotRunning => f.write_str("ZzabbaXterm 앱이 실행 중이 아닙니다."),
-            Self::Disconnected => f.write_str("ZzabbaXterm 앱과 연결이 끊겼습니다."),
+            Self::AppNotRunning => f.write_str("ZXT 앱이 실행 중이 아닙니다."),
+            Self::Disconnected => f.write_str("ZXT 앱과 연결이 끊겼습니다."),
             Self::Transport(error) => write!(f, "로컬 IPC 오류: {error}"),
-            Self::InvalidResponse => f.write_str("ZzabbaXterm 앱의 응답이 올바르지 않습니다."),
+            Self::InvalidResponse => f.write_str("ZXT 앱의 응답이 올바르지 않습니다."),
             Self::Expired => f.write_str("파일 열기 시간이 초과되었습니다."),
             Self::OpenFailed => f.write_str("앱에서 파일 또는 편집 탭을 열지 못했습니다."),
             Self::AppExited => f.write_str("편집 탭 완료 전에 앱 또는 편집 창이 종료되었습니다."),

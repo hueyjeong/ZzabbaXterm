@@ -86,7 +86,7 @@ fn helper() -> PathBuf {
         .parent()
         .unwrap()
         .join(super::super::HELPER);
-    assert!(path.is_file(), "zzabba-askpass를 먼저 빌드해야 합니다: {}", path.display());
+    assert!(path.is_file(), "zxt-askpass를 먼저 빌드해야 합니다: {}", path.display());
     path
 }
 
@@ -294,9 +294,9 @@ fn elevation_rejects_a_helper_outside_the_sudo_child_lineage() {
         .unwrap();
         let mut foreign = Command::new(helper())
             .env("SUDO_ASKPASS", helper())
-            .env("ZZABBA_ASKPASS_MODE", "sudo")
-            .env("ZZABBA_ASKPASS_ENDPOINT", endpoint)
-            .env("ZZABBA_ASKPASS_BROKER_PID", std::process::id().to_string())
+            .env("ZXT_ASKPASS_MODE", "sudo")
+            .env("ZXT_ASKPASS_ENDPOINT", endpoint)
+            .env("ZXT_ASKPASS_BROKER_PID", std::process::id().to_string())
             .env_remove("SSH_ASKPASS")
             .env_remove("SSH_ASKPASS_REQUIRE")
             .env_remove("BW_SESSION")
@@ -333,10 +333,10 @@ fn elevation_helper_rejects_wrong_mode_environment() {
     let helper = helper();
     let other = std::env::current_exe().unwrap();
     for environment in [
-        vec![("SUDO_ASKPASS", other.as_os_str()), ("ZZABBA_ASKPASS_MODE", "sudo".as_ref())],
+        vec![("SUDO_ASKPASS", other.as_os_str()), ("ZXT_ASKPASS_MODE", "sudo".as_ref())],
         vec![
             ("SUDO_ASKPASS", helper.as_os_str()),
-            ("ZZABBA_ASKPASS_MODE", "sudo".as_ref()),
+            ("ZXT_ASKPASS_MODE", "sudo".as_ref()),
             ("SSH_ASKPASS_REQUIRE", "force".as_ref()),
         ],
         vec![
@@ -347,8 +347,8 @@ fn elevation_helper_rejects_wrong_mode_environment() {
     ] {
         let mut command = Command::new(&helper);
         command
-            .env("ZZABBA_ASKPASS_ENDPOINT", "/nonexistent")
-            .env("ZZABBA_ASKPASS_BROKER_PID", "1")
+            .env("ZXT_ASKPASS_ENDPOINT", "/nonexistent")
+            .env("ZXT_ASKPASS_BROKER_PID", "1")
             .env_remove("BW_SESSION")
             .env_remove("SSH_ASKPASS_PROMPT");
         for (key, value) in environment {

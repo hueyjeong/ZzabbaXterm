@@ -4,7 +4,7 @@ fn main() {
     let args = env::args_os().skip(1).collect::<Vec<_>>();
     assert_eq!(args.len(), 8);
     assert_eq!(&args[..4], &["-T", "-oBatchMode=yes", "-s", "-F"]);
-    assert_eq!(&args[5..], &["--", "zzabba-target", "sftp"]);
+    assert_eq!(&args[5..], &["--", "zxt-target", "sftp"]);
     assert!(!io::IsTerminal::is_terminal(&io::stdin()));
     assert!(!io::IsTerminal::is_terminal(&io::stdout()));
     assert_eq!(env::var_os("SSH_ASKPASS"), None);
@@ -17,13 +17,13 @@ fn main() {
     }
     assert!(std::fs::read_to_string(config.with_file_name("known_hosts")).unwrap()
         .starts_with("[editor.example.invalid]:22 ssh-ed25519 "));
-    if env::var_os("ZZABBA_FIXTURE_DENY").is_some() {
+    if env::var_os("ZXT_FIXTURE_DENY").is_some() {
         eprintln!("fixture: subsystem denied");
         process::exit(42);
     }
 
     io::stderr().write_all(&[b'!'; 128 * 1024]).unwrap();
-    let mut stream = TcpStream::connect(env::var("ZZABBA_FIXTURE_ADDR").unwrap()).unwrap();
+    let mut stream = TcpStream::connect(env::var("ZXT_FIXTURE_ADDR").unwrap()).unwrap();
     let mut outgoing = stream.try_clone().unwrap();
     std::thread::spawn(move || {
         let _ = io::copy(&mut io::stdin().lock(), &mut outgoing);

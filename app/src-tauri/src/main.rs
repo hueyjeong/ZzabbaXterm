@@ -21,5 +21,5 @@ fn main() {
         }
     }
 
-    zzabbaxterm_lib::run()
+    zxt_lib::run()
 }

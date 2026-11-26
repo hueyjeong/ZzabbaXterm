@@ -12,7 +12,7 @@ fn main() {
     assert_eq!(env::var("AWS_MAX_ATTEMPTS").unwrap(), "1");
     let record = |name: &str| fs::write(dir.join(name), b"called").unwrap();
     if action == "start-session" {
-        assert_eq!(&args[6..10], ["--target", "i-01234567", "--reason", "zzabbaxterm-0123456789abcdef0123456789abcdef"]);
+        assert_eq!(&args[6..10], ["--target", "i-01234567", "--reason", "zxt-0123456789abcdef0123456789abcdef"]);
         assert_eq!(args.len(), 12);
         assert_eq!(env::var("AWS_CLI_ERROR_FORMAT").unwrap(), "legacy");
         assert_eq!(env::var("PATH").unwrap(), "fixture-plugin-path");
@@ -51,7 +51,7 @@ fn main() {
         _ => panic!("unexpected state"),
     };
     if let Some(status) = status {
-        println!(r#"{{"Sessions":[{{"SessionId":"Sample-0123456789abcdef0","Reason":"zzabbaxterm-0123456789abcdef0123456789abcdef","Owner":"arn:aws:sts::123456789012:assumed-role/Sample/Sample","Target":"i-01234567","Status":"{status}"}}]}}"#);
+        println!(r#"{{"Sessions":[{{"SessionId":"Sample-0123456789abcdef0","Reason":"zxt-0123456789abcdef0123456789abcdef","Owner":"arn:aws:sts::123456789012:assumed-role/Sample/Sample","Target":"i-01234567","Status":"{status}"}}]}}"#);
     } else {
         // 빠르게 끝나는 자식의 연결 확인이 먼저 실패하지 않도록 빈 목록을 반환한다.
         thread::sleep(Duration::from_millis(10));

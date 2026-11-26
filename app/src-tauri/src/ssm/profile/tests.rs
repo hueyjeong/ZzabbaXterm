@@ -10,7 +10,7 @@ fn sso(profiles: &Profiles, name: &str) -> DirectSsoConfig {
 
 #[test]
 fn profile_fixture() {
-    if env::var_os("ZZABBA_SSM_PROFILE_FIXTURE").is_none() {
+    if env::var_os("ZXT_SSM_PROFILE_FIXTURE").is_none() {
         return;
     }
     let profiles = Profiles::load().unwrap();
@@ -91,7 +91,7 @@ fn profile_fixture() {
 fn selected_profile_is_validated_against_isolated_config_and_shared_credentials() {
     const SSO: &str =
         "sso_account_id = 123456789012\nsso_role_name = Fixture\nsso_session = corp\n";
-    let root = env::temp_dir().join(format!("zzabba-profile-fixture-{}", std::process::id()));
+    let root = env::temp_dir().join(format!("zxt-profile-fixture-{}", std::process::id()));
     std::fs::create_dir(&root).unwrap();
     let config = root.join("config");
     let credentials = root.join("credentials");
@@ -145,7 +145,7 @@ sso_session = absent
     .unwrap();
     let status = std::process::Command::new(env::current_exe().unwrap())
         .args(["--exact", "ssm::profile::tests::profile_fixture"])
-        .env("ZZABBA_SSM_PROFILE_FIXTURE", "1")
+        .env("ZXT_SSM_PROFILE_FIXTURE", "1")
         .env("AWS_CONFIG_FILE", &config)
         .env("AWS_SHARED_CREDENTIALS_FILE", &credentials)
         .env("PATH", &root)

@@ -465,7 +465,7 @@ describe("파일 편집 버퍼", () => {
       await act(async () => root.render(createElement(EditorTab, { ...props, active: true })));
       const section = host.querySelector("section")!;
       const status = section.querySelector('output[role="status"]')!;
-      const model = editor.getModel(Uri.from({ scheme: "zzabba-editor", path: "/file", query: approved.handle }))!;
+      const model = editor.getModel(Uri.from({ scheme: "zxt-editor", path: "/file", query: approved.handle }))!;
       const view = editor.getEditors().find((candidate) => candidate.getModel() === model)!;
       expect(view.getOption(editor.EditorOption.readOnly)).toBe(false);
       await act(async () => model.setValue("미저장"));
@@ -557,7 +557,7 @@ describe("파일 편집 버퍼", () => {
       tab.close();
     }
     expect(disconnect).toBeUndefined();
-    expect(editor.getModel(Uri.from({ scheme: "zzabba-editor", path: "/file", query: approved.handle }))).toBeNull();
+    expect(editor.getModel(Uri.from({ scheme: "zxt-editor", path: "/file", query: approved.handle }))).toBeNull();
   });
 
   it("다시 읽기가 단절되면 늦은 읽기 응답은 버퍼나 실제 오류를 바꾸지 못한다", async () => {

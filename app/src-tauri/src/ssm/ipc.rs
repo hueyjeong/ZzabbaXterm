@@ -401,7 +401,7 @@ pub fn lifecycle<R: Runtime>() -> TauriPlugin<R> {
             let key = format!("{:032x}", u128::from_ne_bytes(nonce));
             // 문서마다 새 키를 주입한다. JS가 보낸 창 이름이나 세대 값으로 새 문서를 등록하지 않는다.
             let script = format!(
-                "window.__ZZABBA_SSM_DOCUMENT__ = '{key}'; window.dispatchEvent(new Event('zzabba:ssm-document'));"
+                "window.__ZXT_SSM_DOCUMENT__ = '{key}'; window.dispatchEvent(new Event('zxt:ssm-document'));"
             );
             requests.documents.insert(owner.to_owned(), Document { key, requests: HashMap::new() });
             drop(requests);

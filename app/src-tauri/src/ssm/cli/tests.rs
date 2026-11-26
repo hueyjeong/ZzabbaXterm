@@ -136,14 +136,14 @@ async fn missing_tool_is_attributed_and_pre_cancel_wins() {
         (Tool::Aws, CliError::AwsCliMissing),
         (Tool::Plugin, CliError::PluginMissing),
     ] {
-        let cmd = Command::new(".zzabbaxterm-no-such-test-executable/nonexistent");
+        let cmd = Command::new(".zxt-no-such-test-executable/nonexistent");
         assert_eq!(
             capture(cmd, tool, LOOKUP_TIMEOUT, &cancel).await.err(),
             Some(expected)
         );
     }
     cancel.cancel();
-    let cmd = Command::new(".zzabbaxterm-no-such-test-executable/nonexistent");
+    let cmd = Command::new(".zxt-no-such-test-executable/nonexistent");
     assert_eq!(
         capture(cmd, Tool::Aws, LOOKUP_TIMEOUT, &cancel).await.err(),
         Some(CliError::Cancelled)
@@ -213,7 +213,7 @@ fn executable_resolution_skips_relative_path_and_pins_the_chosen_file() {
 #[test]
 fn process_fixture() {
     use std::io::Write;
-    match std::env::var("ZZABBA_SSM_TEST_FIXTURE").as_deref() {
+    match std::env::var("ZXT_SSM_TEST_FIXTURE").as_deref() {
         Ok("both") => {
             let stdout =
                 std::thread::spawn(|| io::stdout().write_all(&[b'a'; 256 * 1024]).unwrap());
@@ -259,7 +259,7 @@ fn process_fixture() {
 fn fixture(mode: &str) -> Command {
     let mut cmd = Command::new(std::env::current_exe().unwrap());
     cmd.args(["--exact", "ssm::cli::tests::process_fixture", "--nocapture"])
-        .env("ZZABBA_SSM_TEST_FIXTURE", mode);
+        .env("ZXT_SSM_TEST_FIXTURE", mode);
     cmd
 }
 
@@ -271,7 +271,7 @@ async fn isolated_cli_child_receives_only_bound_credentials() {
         .with_credentials(&scope, &fixture_credentials());
     spec.args = vec!["--exact".into(), "ssm::cli::tests::process_fixture".into()];
     let mut cmd = spec.command();
-    cmd.env("ZZABBA_SSM_TEST_FIXTURE", "bound-credentials");
+    cmd.env("ZXT_SSM_TEST_FIXTURE", "bound-credentials");
     let result = capture(cmd, Tool::Aws, LOOKUP_TIMEOUT, &CancellationToken::new()).await;
     assert_eq!(result.unwrap().exit_code, Some(0));
 }

@@ -6,7 +6,7 @@ fn main() {
     }
     let config: tauri_utils::config::Config = serde_json::from_value(config).unwrap();
     assert!(config.app.app_directories_override.is_none(), "CLI 등록은 Tauri 기본 설정 디렉터리를 사용합니다");
-    println!("cargo:rustc-env=ZZABBA_APP_IDENTIFIER={}", config.identifier);
+    println!("cargo:rustc-env=ZXT_APP_IDENTIFIER={}", config.identifier);
 
     let app = tauri_build::AppManifest::new().commands(&[
         "terminal_open", "terminal_start", "terminal_input", "terminal_resize", "terminal_ack",

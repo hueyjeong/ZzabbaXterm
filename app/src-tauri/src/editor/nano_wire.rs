@@ -19,7 +19,7 @@ pub(crate) const ADMIT_NANO: [u8; 2] = [VERSION, 12];
 pub(crate) const PROOF_LEN: usize = 16;
 pub(crate) const CHALLENGE_LEN: usize = 2 + 4 + 4 + PROOF_LEN;
 pub(crate) const CONFIRM_LEN: usize = 2 + PROOF_LEN;
-pub(crate) const PTY_PREFIX: &[u8] = b"\x1b]7777;zzabba-nano-3;";
+pub(crate) const PTY_PREFIX: &[u8] = b"\x1b]7777;zxt-nano-3;";
 pub(crate) const PTY_FRAME_LEN: usize = PTY_PREFIX.len() + PROOF_LEN * 2 + 1;
 pub(crate) const NO_PROOF: [u8; PROOF_LEN] = [0; PROOF_LEN];
 
@@ -34,7 +34,7 @@ impl Lease {
 
     pub(crate) fn proof(&self, pid: i32, sid: i32) -> [u8; PROOF_LEN] {
         let mut digest = Sha256::new();
-        digest.update(b"zzabba-nano-3/startup");
+        digest.update(b"zxt-nano-3/startup");
         digest.update(&self.0[..]);
         digest.update(pid.to_be_bytes());
         digest.update(sid.to_be_bytes());

@@ -26,8 +26,8 @@ use crate::ssh::ConnectionPlan;
 use super::{Document, Request};
 
 /// 관리자가 설치한 고정 경로다. 앱은 이 파일을 설치하지 않는다.
-pub(crate) const HELPER: &str = "/usr/local/libexec/zzabba-elevate";
-const VERSION: &str = "zzabba-elevate 1";
+pub(crate) const HELPER: &str = "/usr/local/libexec/zxt-elevate";
+const VERSION: &str = "zxt-elevate 1";
 const VERIFY_TTL: Duration = Duration::from_secs(10);
 const BRIDGE_TTL: Duration = Duration::from_secs(120);
 const MAX_LINE: usize = 4096;
@@ -201,7 +201,7 @@ pub(crate) fn run_frame(id: &str, nonce: &str, program: &str, args: &[String]) -
         return Err("원격 승격 요청이 올바르지 않습니다".into());
     }
     let mut frame = format!(
-        "ZZABBA-ELEVATE 1 {id} {nonce} {} {}",
+        "ZXT-ELEVATE 1 {id} {nonce} {} {}",
         STANDARD.encode(program.as_bytes()),
         args.len()
     );

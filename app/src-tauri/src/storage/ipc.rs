@@ -1557,7 +1557,7 @@ mod tests {
 
     #[test]
     fn storage_open_uses_only_current_saved_direct_sso() {
-        const CHILD: &str = "ZZABBA_S01_OPEN_FIXTURE";
+        const CHILD: &str = "ZXT_S01_OPEN_FIXTURE";
         let Some(root) = std::env::var_os(CHILD).map(PathBuf::from) else {
             let root = tempfile::tempdir().unwrap();
             let result = std::process::Command::new(std::env::current_exe().unwrap())

@@ -92,7 +92,7 @@ fn parse(lines: &[&str]) -> Result<Option<(u16, String)>, OutputFault> {
 
 #[test]
 fn plugin_output_requires_session_port_and_waiting_in_order() {
-    let session = "zzabba-0a1b2c3d4e5f67890";
+    let session = "zxt-0a1b2c3d4e5f67890";
     let ready = parse(&["\r\n", &format!("Starting session with SessionId: {session}\r\n"),
         &format!("Port 50000 opened for sessionId {session}.\r\n"), "Waiting for connections...\r\n", "\n"]);
     assert_eq!(ready, Ok(Some((50000, session.into()))));
@@ -337,9 +337,9 @@ fn listener_outside_the_tree_is_not_ready_and_streams_are_refused() {
 }
 
 /// 실기 확인용. 대상은 환경 변수로만 받는다.
-/// 필수: `ZZABBA_SSM_FORWARD_PROFILE`, `ZZABBA_SSM_FORWARD_REGION`, `ZZABBA_SSM_FORWARD_NODE`
-/// 선택: `ZZABBA_SSM_FORWARD_LISTEN`(기본 50091), `ZZABBA_SSM_FORWARD_PORT`(기본 9009), `ZZABBA_SSM_FORWARD_HOST`,
-/// `ZZABBA_SSM_FORWARD_HOLD_SECS`(주면 실제 전달을 열어 그 시간 동안 유지)
+/// 필수: `ZXT_SSM_FORWARD_PROFILE`, `ZXT_SSM_FORWARD_REGION`, `ZXT_SSM_FORWARD_NODE`
+/// 선택: `ZXT_SSM_FORWARD_LISTEN`(기본 50091), `ZXT_SSM_FORWARD_PORT`(기본 9009), `ZXT_SSM_FORWARD_HOST`,
+/// `ZXT_SSM_FORWARD_HOLD_SECS`(주면 실제 전달을 열어 그 시간 동안 유지)
 /// cargo test --lib tunnels::ssm::tests::real_cli_forward -- --ignored --nocapture
 #[test]
 #[ignore = "로컬 AWS CLI·Session Manager 플러그인과 SSO 로그인 필요"]
@@ -347,15 +347,15 @@ fn real_cli_forward() {
     let env = |key: &str, default: &str| std::env::var(key).unwrap_or_else(|_| default.into());
     let required = |key: &str| std::env::var(key).ok().filter(|value| !value.is_empty())
         .unwrap_or_else(|| panic!("{key} 환경 변수가 필요합니다"));
-    let listen = SocketAddr::from((Ipv4Addr::LOCALHOST, env("ZZABBA_SSM_FORWARD_LISTEN", "50091").parse().unwrap()));
-    let port = env("ZZABBA_SSM_FORWARD_PORT", "9009").parse().unwrap();
-    let host = std::env::var("ZZABBA_SSM_FORWARD_HOST").ok().filter(|host| !host.is_empty());
+    let listen = SocketAddr::from((Ipv4Addr::LOCALHOST, env("ZXT_SSM_FORWARD_LISTEN", "50091").parse().unwrap()));
+    let port = env("ZXT_SSM_FORWARD_PORT", "9009").parse().unwrap();
+    let host = std::env::var("ZXT_SSM_FORWARD_HOST").ok().filter(|host| !host.is_empty());
     let saved = SavedSsm {
         revision: std::num::NonZeroU64::MIN,
         target: Ssm {
-            profile: required("ZZABBA_SSM_FORWARD_PROFILE"),
-            region: required("ZZABBA_SSM_FORWARD_REGION"),
-            instance_id: required("ZZABBA_SSM_FORWARD_NODE"),
+            profile: required("ZXT_SSM_FORWARD_PROFILE"),
+            region: required("ZXT_SSM_FORWARD_REGION"),
+            instance_id: required("ZXT_SSM_FORWARD_NODE"),
         },
         desktop: None,
     };
@@ -366,7 +366,7 @@ fn real_cli_forward() {
         Ok(prepared) => prepared,
         Err(error) => { println!("준비 실패: {error}"); return; }
     };
-    let Some(hold) = std::env::var("ZZABBA_SSM_FORWARD_HOLD_SECS").ok().and_then(|secs| secs.parse().ok()) else {
+    let Some(hold) = std::env::var("ZXT_SSM_FORWARD_HOLD_SECS").ok().and_then(|secs| secs.parse().ok()) else {
         println!("준비 완료: 실행 인가 발급(세션 미시작)");
         return;
     };

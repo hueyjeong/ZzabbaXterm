@@ -394,7 +394,7 @@ describe("승인된 작업 실행", () => {
 
     const status: ExecutionStatus = {
       proposalId: "p1", approvalId: "3", jobId: "3", taskId: "uptime", sessionId: "7", selectionId: "2",
-      node: "dev-01", account: "zzabba-ai-control", program: "/usr/bin/uptime", args: [], policy: "allowed",
+      node: "dev-01", account: "zxt-ai-control", program: "/usr/bin/uptime", args: [], policy: "allowed",
       phase: "running", output: " 10:32 up 2 days\n",
     };
     const rerender = async (next: ExecutionStatus) => act(async () => {

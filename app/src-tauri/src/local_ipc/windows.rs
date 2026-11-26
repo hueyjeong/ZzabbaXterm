@@ -33,7 +33,7 @@ impl Endpoint {
         let service = super::service_name(service)?;
         let sid = current_user_sid()?;
         Ok(Self {
-            name: format!(r"\\.\pipe\zzabbaxterm-{sid}-{service}"),
+            name: format!(r"\\.\pipe\zxt-{sid}-{service}"),
             sid,
         })
     }

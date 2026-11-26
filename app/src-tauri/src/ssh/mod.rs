@@ -68,7 +68,7 @@ pub(crate) enum Client {
     Sftp,
 }
 
-const DESTINATION: &str = "zzabba-target";
+const DESTINATION: &str = "zxt-target";
 const NO_ASKPASS: [(&str, Option<&str>); 2] = [
     ("SSH_ASKPASS", None),
     ("SSH_ASKPASS_REQUIRE", Some("never")),
@@ -331,7 +331,7 @@ impl ConnectionPlan {
 fn sealed_snapshot(contents: &[u8]) -> io::Result<fs::File> {
     use std::os::fd::FromRawFd;
     // SAFETY: 커널이 새 파일 디스크립터의 소유권을 반환한다.
-    let fd = unsafe { libc::memfd_create(c"zzabba-ssh-plan".as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
+    let fd = unsafe { libc::memfd_create(c"zxt-ssh-plan".as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }

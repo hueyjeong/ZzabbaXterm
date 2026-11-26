@@ -89,7 +89,7 @@ impl<T> Refusal for Result<T, ExecError> {
 fn task_table_exposes_only_the_fixed_absolute_uptime() {
     assert_eq!(task("uptime").unwrap().program, "/usr/bin/uptime");
     assert!(task("uptime").unwrap().args.is_empty());
-    assert_eq!(task("uptime").unwrap().account, "zzabba-ai-control");
+    assert_eq!(task("uptime").unwrap().account, "zxt-ai-control");
     assert!(task("rm").is_none());
     assert!(task("uptime ").is_none());
 }
@@ -466,8 +466,8 @@ fn driver_refuses_a_pairing_without_the_selected_session_key_and_writes_no_reser
     assert!(!fake.writes.iter().any(|bytes| serde_json::from_slice::<Client<'_>>(bytes).is_ok()));
 }
 
-// 실기기 시험은 승인된 비운영 노드와 배포된 ZzabbaAiSharedControl 문서에서만 확인한다.
-// `ZZABBA_AI_LIVE_PROFILE`·`ZZABBA_AI_LIVE_REGION`·`ZZABBA_AI_LIVE_NODE`를 채우고
+// 실기기 시험은 승인된 비운영 노드와 배포된 ZxtAiSharedControl 문서에서만 확인한다.
+// `ZXT_AI_LIVE_PROFILE`·`ZXT_AI_LIVE_REGION`·`ZXT_AI_LIVE_NODE`를 채우고
 // `cargo test -- --ignored live_control_document`로 실행한다.
 #[test]
 #[ignore = "실제 AWS SSM 노드·플러그인·배포된 제어 문서가 필요합니다"]
@@ -476,19 +476,19 @@ fn live_control_document_reaches_the_node_executor() {
     use std::sync::mpsc;
 
     let (Ok(profile), Ok(region), Ok(node)) = (
-        std::env::var("ZZABBA_AI_LIVE_PROFILE"),
-        std::env::var("ZZABBA_AI_LIVE_REGION"),
-        std::env::var("ZZABBA_AI_LIVE_NODE"),
+        std::env::var("ZXT_AI_LIVE_PROFILE"),
+        std::env::var("ZXT_AI_LIVE_REGION"),
+        std::env::var("ZXT_AI_LIVE_NODE"),
     ) else {
         return;
     };
     assert!(node.starts_with("i-"), "노드 ID가 필요합니다");
     let mut command = portable_pty::CommandBuilder::new(
-        std::env::var("ZZABBA_AI_LIVE_AWS").unwrap_or_else(|_| "aws".into()),
+        std::env::var("ZXT_AI_LIVE_AWS").unwrap_or_else(|_| "aws".into()),
     );
     command.args([
         "ssm", "start-session", "--profile", &profile, "--region", &region,
-        "--target", &node, "--document-name", "ZzabbaAiSharedControl",
+        "--target", &node, "--document-name", "ZxtAiSharedControl",
     ]);
     let pty = portable_pty::native_pty_system().openpty(portable_pty::PtySize::default()).unwrap();
     let mut child = pty.slave.spawn_command(command).unwrap();

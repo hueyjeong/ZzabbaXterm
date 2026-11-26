@@ -30,7 +30,7 @@ function frameBuffer(sequence: number, frameSequence: number, width: number, dis
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 
 async function fixture() {
-  vi.stubGlobal("__ZZABBA_RDP_DOCUMENT__", { proof });
+  vi.stubGlobal("__ZXT_RDP_DOCUMENT__", { proof });
   const opened = Promise.withResolvers<Connection>();
   const ended = vi.fn();
   const ready = vi.fn();
@@ -319,7 +319,7 @@ it("폐기한 탭의 픽셀은 Canvas에 그리거나 ACK하지 않는다", asyn
 });
 
 it("터널 연결 거부 시 목적지와 TLS DNS를 구분해 전달하고 직접 연결로 재시도하지 않는다", async () => {
-  vi.stubGlobal("__ZZABBA_RDP_DOCUMENT__", { proof });
+  vi.stubGlobal("__ZXT_RDP_DOCUMENT__", { proof });
   const ended = vi.fn();
   const source = { tabHandle: "owned-tab", tunnelId: "7", targetId: "ssh-server", destination: { host: "::1", port: 3390 } };
   const draft = { host: "rdp.example.invalid", port: 3390, source };
@@ -332,11 +332,11 @@ it("터널 연결 거부 시 목적지와 TLS DNS를 구분해 전달하고 직�
   await vi.waitFor(() => expect(ended).toHaveBeenCalledWith("승인된 터널 목적지가 일치하지 않습니다", true));
   expect(invoke.mock.calls.map(([name]) => name)).toEqual(["rdp_prepare", "rdp_connect", "rdp_close"]);
   expect(invoke.mock.calls[1]?.[1]).toMatchObject({ id, draft });
-  expect(invoke.mock.calls[1]?.[2]).toEqual({ headers: { "x-zzabba-rdp-document": proof } });
+  expect(invoke.mock.calls[1]?.[2]).toEqual({ headers: { "x-zxt-rdp-document": proof } });
 });
 
 it("준비 중 닫기는 발급된 세션의 종료를 기다리고 연결을 시작하지 않는다", async () => {
-  vi.stubGlobal("__ZZABBA_RDP_DOCUMENT__", { proof });
+  vi.stubGlobal("__ZXT_RDP_DOCUMENT__", { proof });
   const prepared = Promise.withResolvers<typeof id>();
   const released = Promise.withResolvers<void>();
   invoke.mockImplementation((name) => name === "rdp_prepare" ? prepared.promise : released.promise);
@@ -369,7 +369,7 @@ it("종료 실패 후 다시 확인하면 같은 세션으로만 요청한다", 
 });
 
 it("TLS 전용 opt-in을 연결 초안에 전달한다", async () => {
-  vi.stubGlobal("__ZZABBA_RDP_DOCUMENT__", { proof });
+  vi.stubGlobal("__ZXT_RDP_DOCUMENT__", { proof });
   const ended = vi.fn();
   invoke.mockImplementation((name) => {
     if (name === "rdp_prepare") return Promise.resolve(id);
@@ -383,7 +383,7 @@ it("TLS 전용 opt-in을 연결 초안에 전달한다", async () => {
 });
 
 it("화면 영역 크기를 받은 뒤 그 크기로 연결을 시작한다", async () => {
-  vi.stubGlobal("__ZZABBA_RDP_DOCUMENT__", { proof });
+  vi.stubGlobal("__ZXT_RDP_DOCUMENT__", { proof });
   invoke.mockImplementation((name) => {
     if (name === "rdp_prepare") return Promise.resolve(id);
     if (name === "rdp_connect") return Promise.withResolvers<void>().promise;
@@ -482,7 +482,7 @@ it("큐가 넘쳐도 마지막 포인터 위치는 버리지 않는다", async (
 });
 
 it("연결 종료 이벤트의 전송 끊김 종류를 탭에 넘긴다", async () => {
-  vi.stubGlobal("__ZZABBA_RDP_DOCUMENT__", { proof });
+  vi.stubGlobal("__ZXT_RDP_DOCUMENT__", { proof });
   const ended = vi.fn();
   invoke.mockImplementation((name) => {
     if (name === "rdp_prepare") return Promise.resolve(id);

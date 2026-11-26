@@ -1,6 +1,6 @@
 use std::process::ExitCode;
 
-use zzabbaxterm_lib::editor_cli::{CliError, run};
+use zxt_lib::editor_cli::{CliError, run};
 
 fn main() -> ExitCode {
     let runtime = tokio::runtime::Builder::new_current_thread()

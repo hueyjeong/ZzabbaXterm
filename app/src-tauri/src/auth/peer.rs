@@ -23,9 +23,9 @@ pub(crate) fn installed_helper() -> Result<TrustedFile, Error> {
     let _app = TrustedFile::check(
         &app,
         if cfg!(windows) {
-            "zzabbaxterm.exe"
+            "zxt-app.exe"
         } else {
-            "zzabbaxterm"
+            "zxt-app"
         },
     )?;
     TrustedFile::check(&app.with_file_name(super::HELPER), super::HELPER)

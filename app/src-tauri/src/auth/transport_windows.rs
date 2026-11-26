@@ -28,7 +28,7 @@ pub(in crate::local_auth) struct Listener {
 
 impl Listener {
     pub(in crate::local_auth) fn bind() -> io::Result<Self> {
-        let address = OsString::from(format!(r"\\.\pipe\zzabba-askpass-{}", address_id()?));
+        let address = OsString::from(format!(r"\\.\pipe\zxt-askpass-{}", address_id()?));
         let sid = crate::ssm::windows_acl::user_sid_text()?;
         let sddl = format!("O:{sid}D:P(A;;FA;;;{sid})");
         let wide: Vec<_> = OsStr::new(&sddl).encode_wide().chain([0]).collect();
@@ -116,7 +116,7 @@ impl std::ops::DerefMut for Stream {
 pub(super) fn connect(endpoint: &OsStr, broker: u32) -> io::Result<File> {
     let endpoint = endpoint.to_str().ok_or(io::ErrorKind::InvalidInput)?;
     let suffix = endpoint
-        .strip_prefix(r"\\.\pipe\zzabba-askpass-")
+        .strip_prefix(r"\\.\pipe\zxt-askpass-")
         .ok_or(io::ErrorKind::InvalidInput)?;
     if suffix.len() != 32 || !suffix.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(io::ErrorKind::InvalidInput.into());

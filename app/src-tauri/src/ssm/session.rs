@@ -44,7 +44,7 @@ pub struct StartRequest {
 /// PTY를 시작할 때 소비하는 인가다.
 ///
 /// ```compile_fail
-/// use zzabbaxterm_lib::ssm::StartPermit;
+/// use zxt_lib::ssm::StartPermit;
 /// fn duplicate(permit: StartPermit) { let _ = permit.clone(); }
 /// ```
 pub struct StartPermit(CommandBuilder, Arc<Credentials>, plugin::CheckedPlugin);
@@ -174,7 +174,7 @@ pub(crate) fn fixture_start(program: &Path) -> (AwsCli, Scope, StartRequest, Sta
         target: "i-01234567".into(),
         document_name: None,
         parameters: None,
-        reason: "zzabbaxterm-0123456789abcdef0123456789abcdef".into(),
+        reason: "zxt-0123456789abcdef0123456789abcdef".into(),
         owner: "arn:aws:sts::123456789012:assumed-role/Sample/Sample".into(),
         role: None,
         credentials: credentials.clone(),
@@ -842,7 +842,7 @@ fn prepare_start(scope: &Scope, node: &OnlineNode, document: SessionDocument<'_>
             if node.role.as_deref() != Some(role) {
                 return Err(CliError::CallerChanged);
             }
-            (Some("ZzabbaAiSharedControl"), None)
+            (Some("ZxtAiSharedControl"), None)
         }
         SessionDocument::PortForward { document, parameters } => {
             if !FORWARD_DOCUMENTS.contains(&document) || parameters.is_empty() {
@@ -858,7 +858,7 @@ fn prepare_start(scope: &Scope, node: &OnlineNode, document: SessionDocument<'_>
         target: node.instance_id.clone(),
         document_name,
         parameters,
-        reason: format!("zzabbaxterm-{:032x}", u128::from_be_bytes(nonce)),
+        reason: format!("zxt-{:032x}", u128::from_be_bytes(nonce)),
         owner: node.owner.clone(),
         role: node.role.clone(),
         credentials: node.credentials.clone(),

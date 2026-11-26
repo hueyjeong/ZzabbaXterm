@@ -91,7 +91,7 @@ fn storage_local_root_restriction_covers_system_credentials_home_and_drive_roots
     for path in [home.clone(), home.join(".ssh"), home.join(".config").join("app"), home.join(".local")] {
         assert!(restricted_root(&path), "{path:?}");
     }
-    assert!(!restricted_root(&home.join("zzabba 작업")));
+    assert!(!restricted_root(&home.join("zxt 작업")));
     #[cfg(windows)]
     {
         for name in ["windir", "ProgramFiles", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA"] {
@@ -100,7 +100,7 @@ fn storage_local_root_restriction_covers_system_credentials_home_and_drive_roots
             assert!(restricted_root(&path.join("하위")), "{name}");
         }
         let local = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap());
-        assert!(restricted_root(&local.join("Temp").join("zzabba")), "LOCALAPPDATA 하위");
+        assert!(restricted_root(&local.join("Temp").join("zxt")), "LOCALAPPDATA 하위");
     }
     #[cfg(unix)]
     for path in ["/", "/etc", "/etc/ssh", "/usr", "/usr/bin"] {

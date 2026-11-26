@@ -13,7 +13,7 @@ use super::{
 const START_BANNER: &[u8] = b"Starting session with SessionId: ";
 const HISTORY_WARNING: &[u8] = b"Warning: Unable to record CLI history. Check file permissions for ./.";
 // SSM 에이전트는 셸 프로필을 `sh`의 PTY에 입력하므로 배너 뒤에 프로필 명령이 한 번 에코된다.
-const PROFILE_COMMAND: &[u8] = b"exec /usr/local/libexec/zzabba-ai-control --shared-control";
+const PROFILE_COMMAND: &[u8] = b"exec /usr/local/libexec/zxt-ai-control --shared-control";
 const PROFILE_PROMPTS: [&[u8]; 2] = [b"$ ", b"# "];
 
 /// `/bin/sh`의 기본 프롬프트 한 개만 벗긴다. dash는 `$ `·`# `, bash가 `sh`로 실행되면 `sh-5.2$ ` 꼴이다.

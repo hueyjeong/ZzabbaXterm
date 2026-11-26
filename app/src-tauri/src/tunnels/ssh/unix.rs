@@ -12,7 +12,7 @@ pub(super) struct Readiness {
 
 impl Readiness {
     pub(super) fn configure(command: &mut Command, program: &Path, plan: &SshPlan) -> Result<Self, String> {
-        let directory = tempfile::Builder::new().prefix("zzabba-ssh-")
+        let directory = tempfile::Builder::new().prefix("zxt-ssh-")
             .permissions(Permissions::from_mode(0o700)).tempdir_in("/tmp")
             .map_err(|error| format!("SSH 전달 제어 경로: {error}"))?;
         let options = plan.approved_options();

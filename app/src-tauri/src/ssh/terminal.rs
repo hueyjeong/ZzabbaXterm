@@ -119,7 +119,7 @@ impl DirectLaunch {
     pub(crate) fn for_probe(mut self, nonce: u128) -> Self {
         self.command.get_argv_mut().insert(1, "-T".into());
         // 원격 명령의 출력에만 완성된 표식이 나타난다.
-        self.command.arg(format!("printf 'ZZABBA-F01:%s%s\\n' '{:016x}' '{:016x}'", (nonce >> 64) as u64, nonce as u64));
+        self.command.arg(format!("printf 'ZXT-F01:%s%s\\n' '{:016x}' '{:016x}'", (nonce >> 64) as u64, nonce as u64));
         self
     }
 
@@ -131,7 +131,7 @@ impl DirectLaunch {
     #[cfg(test)]
     pub(crate) fn fixture(&mut self, executable: &Path) -> std::path::PathBuf {
         self.command.get_argv_mut()[0] = executable.as_os_str().to_owned();
-        self.command.env("ZZABBA_F01_FIXTURE_WAIT", "1");
+        self.command.env("ZXT_F01_FIXTURE_WAIT", "1");
         self.plan.config.clone()
     }
 }
@@ -268,7 +268,7 @@ pub(crate) fn remote_channel(plan: &Arc<ConnectionPlan>, remote: &[String]) -> R
     }
     terminal.env_remove("BW_SESSION");
     piped.env_remove("BW_SESSION");
-    for name in ["ZZABBA_ASKPASS_ENDPOINT", "ZZABBA_ASKPASS_BROKER_PID", "ZZABBA_ASKPASS_MODE"] {
+    for name in ["ZXT_ASKPASS_ENDPOINT", "ZXT_ASKPASS_BROKER_PID", "ZXT_ASKPASS_MODE"] {
         terminal.env_remove(name);
         piped.env_remove(name);
     }
@@ -645,7 +645,7 @@ pub(crate) fn command(invocation: Invocation<'_>) -> CommandBuilder {
         }
     }
     command.env_remove("BW_SESSION");
-    for name in ["ZZABBA_ASKPASS_ENDPOINT", "ZZABBA_ASKPASS_BROKER_PID"] {
+    for name in ["ZXT_ASKPASS_ENDPOINT", "ZXT_ASKPASS_BROKER_PID"] {
         command.env_remove(name);
     }
     // ConPTY의 실행기 검색이 ssh.exe 부재 시 PATHEXT의 다른 확장자를 시도한다.

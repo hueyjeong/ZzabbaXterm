@@ -346,7 +346,7 @@ fn keyscan_args_ignore_user_config_disable_auth_and_end_with_the_host() {
     // 호스트는 `--` 바로 뒤 한 곳에만 있다.
     assert_eq!(options.last().map(String::as_str), Some("--"));
     assert!(!options.contains(host));
-    assert_eq!(&args[..8], ["-F", "none", "-T", "-N", "-p", "2222", "-l", "zzabba-host-key"]);
+    assert_eq!(&args[..8], ["-F", "none", "-T", "-N", "-p", "2222", "-l", "zxt-host-key"]);
     let options: Vec<_> = options.chunks(2).skip(4).filter(|pair| pair[0] == "-o").map(|pair| pair[1].as_str()).collect();
     for expected in ["BatchMode=yes", "StrictHostKeyChecking=accept-new", "UserKnownHostsFile=\"C:/trust/ssh plan 1/known_hosts\"",
         "GlobalKnownHostsFile=none", "KnownHostsCommand=none", "ProxyCommand=none", "ProxyJump=none", "VerifyHostKeyDNS=no",
@@ -359,22 +359,22 @@ fn keyscan_args_ignore_user_config_disable_auth_and_end_with_the_host() {
 }
 
 /// 실제 sshd로 첫 연결 확인, 접속, 키 변경 차단, 교체를 확인한다.
-/// `ZZABBA_LIVE_SSH_PHASE=trust`로 핀을 만들고 접속한 뒤, 서버 호스트 키를 바꾸고 `changed`로 다시 실행한다.
-/// 나머지 입력: `ZZABBA_LIVE_SSH_DIR`(두 단계가 함께 쓰는 빈 디렉터리), `ZZABBA_LIVE_SSH_PORT`(127.0.0.1의 포트),
-/// `ZZABBA_LIVE_SSH_USER`, `ZZABBA_LIVE_SSH_KEY`(개인 키 경로).
+/// `ZXT_LIVE_SSH_PHASE=trust`로 핀을 만들고 접속한 뒤, 서버 호스트 키를 바꾸고 `changed`로 다시 실행한다.
+/// 나머지 입력: `ZXT_LIVE_SSH_DIR`(두 단계가 함께 쓰는 빈 디렉터리), `ZXT_LIVE_SSH_PORT`(127.0.0.1의 포트),
+/// `ZXT_LIVE_SSH_USER`, `ZXT_LIVE_SSH_KEY`(개인 키 경로).
 #[test]
 #[ignore = "실제 sshd 필요"]
 fn live_first_connect_trusts_then_blocks_a_changed_key() {
     let var = |name: &str| std::env::var(name).unwrap();
-    let directory = std::path::PathBuf::from(var("ZZABBA_LIVE_SSH_DIR"));
+    let directory = std::path::PathBuf::from(var("ZXT_LIVE_SSH_DIR"));
     let root = directory.join(TRUST_DIRECTORY);
     if !root.exists() {
         TrustStore::create(&root).unwrap();
     }
-    let user = var("ZZABBA_LIVE_SSH_USER");
+    let user = var("ZXT_LIVE_SSH_USER");
     let ssh: Ssh = serde_json::from_value(serde_json::json!({
-        "host": "127.0.0.1", "port": var("ZZABBA_LIVE_SSH_PORT").parse::<u16>().unwrap(), "account": user,
-        "transport": {"kind": "direct"}, "auth": {"kind": "keyFile", "privateKeyPath": var("ZZABBA_LIVE_SSH_KEY")},
+        "host": "127.0.0.1", "port": var("ZXT_LIVE_SSH_PORT").parse::<u16>().unwrap(), "account": user,
+        "transport": {"kind": "direct"}, "auth": {"kind": "keyFile", "privateKeyPath": var("ZXT_LIVE_SSH_KEY")},
     })).unwrap();
     let endpoint = Endpoint::new(&ssh.host, ssh.port).unwrap();
     let whoami = |trust: Option<&Confirm>| -> Result<String, String> {
@@ -389,7 +389,7 @@ fn live_first_connect_trusts_then_blocks_a_changed_key() {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
     };
     let refuse = refuse_prompt();
-    match var("ZZABBA_LIVE_SSH_PHASE").as_str() {
+    match var("ZXT_LIVE_SSH_PHASE").as_str() {
         "trust" => {
             assert_eq!(whoami(None).unwrap_err(), "호스트 키 확인 필요");
             let (declined, _) = answering(false);

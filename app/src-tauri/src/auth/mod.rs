@@ -34,12 +34,12 @@ const EXCHANGE_TTL: Duration = Duration::from_secs(60);
 const ACK: u8 = 1;
 const MAX_PASSWORD: usize = 1022; // OpenSSH의 1024바이트 askpass 버퍼에서 개행과 NUL을 제외한다.
 const HELPER: &str = if cfg!(windows) {
-    "zzabba-askpass.exe"
+    "zxt-askpass.exe"
 } else {
-    "zzabba-askpass"
+    "zxt-askpass"
 };
-const ENDPOINT_ENV: &str = "ZZABBA_ASKPASS_ENDPOINT";
-const BROKER_ENV: &str = "ZZABBA_ASKPASS_BROKER_PID";
+const ENDPOINT_ENV: &str = "ZXT_ASKPASS_ENDPOINT";
+const BROKER_ENV: &str = "ZXT_ASKPASS_BROKER_PID";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Document {

@@ -323,7 +323,7 @@ mod tests {
     #[test]
     fn c01_first_load_initializes_only_the_config_parent_before_store_runs() {
         let temp = TestDir::new();
-        let directory = temp.path().join("missing").join("config").join("dev.zzabbaxterm.desktop");
+        let directory = temp.path().join("missing").join("config").join("dev.zxt.desktop");
         let store = store_at(&directory).unwrap();
         assert!(directory.parent().unwrap().is_dir());
         assert!(!directory.exists());

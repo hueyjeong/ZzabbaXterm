@@ -5,7 +5,7 @@ fn main() {
     assert_eq!(args.len(), 4);
     assert_eq!(args[0], "-F");
     assert_eq!(args[2], "--");
-    assert_eq!(args[3], "zzabba-target");
+    assert_eq!(args[3], "zxt-target");
     let config = Path::new(&args[1]);
     assert!(config.is_absolute());
     assert_eq!(config.file_name(), Some(OsStr::new("ssh_config")));
@@ -37,7 +37,7 @@ fn main() {
     check();
     assert_eq!(line.trim_end(), "fixture-input");
     println!("F01-INPUT-OK");
-    if env::var_os("ZZABBA_F01_FIXTURE_WAIT").is_some() {
+    if env::var_os("ZXT_F01_FIXTURE_WAIT").is_some() {
         loop { std::thread::park(); }
     }
     std::process::exit(7);

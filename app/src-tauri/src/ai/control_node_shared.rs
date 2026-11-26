@@ -38,7 +38,7 @@ fn socket_path(locator: &str) -> io::Result<PathBuf> {
     if !meta.is_dir() || meta.uid() != uid() || meta.mode() & 0o7777 != 0o700 {
         return Err(invalid());
     }
-    Ok(dir.join(format!("zzabba-ai-{locator}.sock")))
+    Ok(dir.join(format!("zxt-ai-{locator}.sock")))
 }
 
 struct SocketPath(PathBuf);

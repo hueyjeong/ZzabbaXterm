@@ -290,11 +290,11 @@ async fn nano_save_requires_exact_submitted_bytes_and_reload_clears_unknown() {
 
     let (result, ()) = tokio::join!(attached.save(&handle, "셋째", mounted), async {
         let job = work.recv().await.unwrap();
-        job.respond(Err(PublishError::Unknown(Some(".zzabba-edit-stage/original".into()))));
+        job.respond(Err(PublishError::Unknown(Some(".zxt-edit-stage/original".into()))));
     });
     assert_eq!(serde_json::to_value(result.unwrap()).unwrap(), json!({
         "status": "unknown", "error": { "kind": "remoteFailure" },
-        "recoveryPath": "/workspace/.zzabba-edit-stage/original"
+        "recoveryPath": "/workspace/.zxt-edit-stage/original"
     }));
 }
 

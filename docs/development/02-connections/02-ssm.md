@@ -29,7 +29,7 @@ AWS의 [Session Manager 플러그인 릴리스 기록](https://docs.aws.amazon.c
 
 Tauri 빌더는 `ssm::ipc::lifecycle()`을 플러그인으로 등록한다. 앱 호출 처리기는 `ssm::ipc::COMMAND`를 받으면 `ssm::ipc::dispatch(invoke)`를 동기적으로 호출하고 `true`를 반환한다. 빌드의 `AppManifest`는 `ssm_discovery`를 등록하며, `allow-ssm-discovery`는 로컬 `main` 웹뷰에만 부여한다. 수명 플러그인에는 별도 호출 명령이 없다.
 
-JS는 문서에서 `window.__ZZABBA_SSM_DOCUMENT__`를 읽는다. 아직 값이 없으면 `zzabba:ssm-document`를 기다린 뒤 읽고, 대기 중 취소되면 호출하지 않는다. 호출 형식은 `invoke("ssm_discovery", { document, request })`이며, 하나의 작업에는 시작 시 읽은 문서 값을 끝까지 사용한다.
+JS는 문서에서 `window.__ZXT_SSM_DOCUMENT__`를 읽는다. 아직 값이 없으면 `zxt:ssm-document`를 기다린 뒤 읽고, 대기 중 취소되면 호출하지 않는다. 호출 형식은 `invoke("ssm_discovery", { document, request })`이며, 하나의 작업에는 시작 시 읽은 문서 값을 끝까지 사용한다.
 
 | `request` | 성공 값 |
 |---|---|
