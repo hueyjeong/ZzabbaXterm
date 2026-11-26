@@ -126,8 +126,8 @@ fn with_ready(prefix: &[u8], prompt_before_ready: &[u8]) -> Vec<u8> {
 
 #[test]
 fn ssm_shell_profile_echo_after_the_banner_is_skipped_once() {
-    // 실제 StartSession(ZxtAiSharedControl) 출력: 배너 뒤 프로필 에코 한 줄, 프롬프트는 에코 앞이나 Ready 앞.
-    let banner = b"\nStarting session with SessionId: zxt-demo-qxk634b92i3hb53lsdfs22ab64\r\n";
+    // 실제 StartSession(ZxtAiSharedControl) 출력(SessionId 접두사는 옛 이름 ZzabbaXterm 시절 측정): 배너 뒤 프로필 에코 한 줄, 프롬프트는 에코 앞이나 Ready 앞.
+    let banner = b"\nStarting session with SessionId: zzabba-demo-qxk634b92i3hb53lsdfs22ab64\r\n";
     let echo = b"exec /usr/local/libexec/zxt-ai-control --shared-control\r\n";
     let cases: [(&[u8], &[u8]); 8] = [
         (b"$ ", b""), (b"# ", b""), (b"", b"$ "), (b"", b"# "), (b"", b""),
@@ -146,7 +146,7 @@ fn conpty_profile_echo_with_the_prompt_before_ready_is_accepted() {
     // Windows 앱에서 관찰한 ConPTY 출력 순서.
     let prefix = [
         &b"\x1b[6n\x1b[?9001h\x1b[?1004h\x1b[m\x1b]0;C:\\Program Files\\Amazon\\AWSCLIV2\\aws.exe\x07\x1b[?25h\r\n"[..],
-        b"Starting session with SessionId: zxt-demo-v34xzel7qn25ut4eba2fnyn8vi\r\n",
+        b"Starting session with SessionId: zzabba-demo-v34xzel7qn25ut4eba2fnyn8vi\r\n",
         b"exec /usr/local/libexec/zxt-ai-control --shared-control\r\n",
     ]
     .concat();

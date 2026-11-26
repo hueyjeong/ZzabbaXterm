@@ -46,7 +46,7 @@
 - 로컬·원격 승격 명령과 UI는 `stored-auth` feature와 Windows/Linux에서만 컴파일된다. `connection_capabilities`는 `storedAuth` camelCase 키로 응답하며(백엔드 직렬화 시험 고정), 기본 빌드·`--no-default-features`·macOS에서는 false여서 승격 메뉴가 보이지 않고 남은 호출도 한국어 거부 메시지를 받는다. Windows에서는 로컬 메뉴만 플랫폼 조건으로 숨긴다.
 - 로컬은 앱과 같은 디렉터리의 `zxt-askpass`가 root 소유·비쓰기여야 한다. 배포 번들에 `zxt-askpass`를 포함해야 한다. 원격 서버에는 `zxt-elevate`를 관리자가 별도로 설치해야 하며, 앱은 sudoers·helper를 수정하지 않는다.
 
-실측(`zxt-sudo-remote:latest`, Ubuntu 24.04.5 기반. `zxt-demo-remote:latest`에 `apt-get install sudo`로 실제 sudo를 넣고 `demo`를 sudo 그룹에 추가; 컨테이너 `zxt-sudo-remote`, `127.0.0.1:2300`, 계정 `demo` uid 1001, 암호 요구 sudo):
+실측(`zzabbaxterm-sudo-remote:latest`, Ubuntu 24.04.5 기반. `zzabbaxterm-demo-remote:latest`에 `apt-get install sudo`로 실제 sudo를 넣고 `demo`를 sudo 그룹에 추가; 컨테이너 `zzabba-sudo-remote`, `127.0.0.1:2300`, 계정 `demo` uid 1001, 암호 요구 sudo; 옛 이름 ZzabbaXterm 시절 측정):
 
 - 사용자 uid 1001로 `SUDO_ASKPASS=… sudo -A -- /usr/bin/id -u`를 실행하면 `0`이 출력된다. askpass 프로세스는 `uid=1001 euid=1001`, `ppid=<sudo>`, `SUDO_ASKPASS`·`SSH_ASKPASS`·`ZXT_*` 환경을 상속한다. 따라서 Linux 전송의 `peer.uid == geteuid()` 검사는 `sudo -A` helper에도 성립하며 자식 계보 정책으로 다시 설계할 필요가 없다.
 - setuid 부모의 `/proc/<sudo>/exe`와 fd는 helper 사용자 권한으로 읽을 수 없으므로, sudo 경로는 루트 실행 파일·출력 파이프 대신 자식 계보와 helper 신원으로 검증한다. 이 때문에 helper는 `sudo`의 직계 자식이어야 한다.
