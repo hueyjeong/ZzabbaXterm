@@ -636,22 +636,24 @@ describe("중앙 원격 화면", () => {
     expect(pane.textContent).not.toContain("연결됨");
 
     if (protocol === "rdp") {
-      await deliver({ sequence: 1, kind: "frame", displayGeneration: 1, full: true, frameSequence: 1, width: 1, height: 1, x: 0, y: 0, w: 1, h: 1 });
-      const chunk = new ArrayBuffer(16);
-      new DataView(chunk).setBigUint64(0, 1n, true);
-      new Uint8Array(chunk, 12).set([1, 2, 3, 255]);
-      await deliver(chunk);
+      // 머리(순번, 화면 순번, 화면 세대, 화면 크기, 사각형)와 픽셀을 묶은 화면 패킷 하나다.
+      const frame = new ArrayBuffer(40);
+      const header = new DataView(frame);
+      for (const offset of [0, 8, 16]) header.setBigUint64(offset, 1n, true);
+      for (const offset of [24, 26, 32, 34]) header.setUint16(offset, 1, true);
+      new Uint8Array(frame, 36).set([1, 2, 3, 255]);
+      await deliver(frame);
       await deliver({ sequence: 2, kind: "display", displayGeneration: 1 });
     } else {
       await deliver({ identity, kind: "waiting", value: 1, serial: 1 });
-      const chunk = new ArrayBuffer(37);
-      const header = new DataView(chunk);
+      const frame = new ArrayBuffer(33);
+      const header = new DataView(frame);
       header.setUint8(0, 1);
       header.setBigUint64(1, 1n, true);
       header.setBigUint64(9, 1n, true);
       for (const offset of [17, 19, 25, 27]) header.setUint16(offset, 1, true);
-      new Uint8Array(chunk, 33).set([1, 2, 3, 255]);
-      await deliver(chunk);
+      new Uint8Array(frame, 29).set([1, 2, 3, 255]);
+      await deliver(frame);
     }
     expect(draw).toHaveBeenCalledOnce();
     expect(draw).toHaveBeenCalledWith(expect.objectContaining({ data: Uint8ClampedArray.of(1, 2, 3, 255) }), 0, 0);
