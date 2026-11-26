@@ -42,13 +42,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           version="$(node scripts/release-version.mjs next "$BUMP" "$REQUESTED")"
-          if git ls-remote --exit-code origin "refs/tags/v$version" "refs/heads/release/v$version" >/dev/null; then
-            echo "::error::v$version 태그나 release/v$version 브랜치가 이미 있습니다"
-            exit 1
-          fi
-          if gh release view "v$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "::error::v$version 릴리스(초안 포함)가 이미 있습니다"
-            exit 1
+          # ls-remote: 0은 있음, 2는 없음, 그 밖의 값은 조회 실패다. 조회 실패를 없음으로 보지 않는다.
+          rc=0; git ls-remote --exit-code origin "refs/tags/v$version" "refs/heads/release/v$version" >/dev/null || rc=$?
+          if [ "$rc" -eq 0 ]; then echo "::error::v$version 태그나 release/v$version 브랜치가 이미 있습니다"; exit 1; fi
+          if [ "$rc" -ne 2 ]; then echo "::error::원격 ref 조회 실패($rc)"; exit 1; fi
+          # 읽기 토큰은 초안 릴리스를 보지 못한다. 남은 초안은 release 잡이 자산을 덮어써 게시한다.
+          if out="$(gh release view "v$version" --repo "$GITHUB_REPOSITORY" 2>&1)"; then
+            echo "::error::v$version 릴리스가 이미 있습니다"; exit 1
+          elif ! grep -qi "not found" <<<"$out"; then
+            echo "::error::릴리스 조회 실패: $out"; exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
@@ -137,9 +139,19 @@ jobs:
           merge-multiple: true
       - name: 버전 커밋, 태그, 브랜치
         run: |
-          if git ls-remote --exit-code origin "refs/tags/v$VERSION" >/dev/null; then
-            echo "v$VERSION 태그가 이미 원격에 있어 ref 단계를 건너뜁니다"
-            exit 0
+          rc=0; git ls-remote --exit-code origin "refs/tags/v$VERSION" >/dev/null || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            # 이번 실행이 앞서 올린 태그(빌드한 커밋의 버전 커밋)일 때만 건너뛴다.
+            git fetch -q origin tag "v$VERSION"
+            if [ "$(git rev-parse "v$VERSION^{commit}^1")" = "$SHA" ]; then
+              echo "v$VERSION 태그가 이미 원격에 있어 ref 단계를 건너뜁니다"
+              exit 0
+            fi
+            echo "::error::v$VERSION 태그가 이번에 빌드한 커밋이 아닌 곳을 가리킵니다"
+            exit 1
+          elif [ "$rc" -ne 2 ]; then
+            echo "::error::원격 태그 조회 실패($rc)"
+            exit 1
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
