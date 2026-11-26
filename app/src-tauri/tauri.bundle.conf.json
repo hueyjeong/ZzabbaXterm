@@ -1,6 +1,6 @@
 {
   "bundle": {
     "active": true,
-    "externalBin": ["binaries/zzabba", "binaries/zzabba-edit"]
+    "externalBin": ["binaries/zxt", "binaries/zxt-edit"]
   }
 }

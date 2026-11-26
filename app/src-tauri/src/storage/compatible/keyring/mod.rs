@@ -25,8 +25,8 @@ pub(crate) fn read_approved(
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) const APPLICATION: &str = "dev.zzabbaxterm.desktop.s3";
-const PREFIX: &str = "dev.zzabbaxterm.desktop.s3:v1:";
+pub(crate) const APPLICATION: &str = "dev.zxt.desktop.s3";
+const PREFIX: &str = "dev.zxt.desktop.s3:v1:";
 
 /// 제품 등록 경계에서도 같은 이름을 사용한다. 해시 입력은 비밀이 아닌 대상과 항목 ID뿐이다.
 pub(crate) fn target_name(

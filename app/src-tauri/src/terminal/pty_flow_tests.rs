@@ -775,7 +775,7 @@ fn c02_native_start_outcomes() {
 fn c02_native_pty_creation_failure_stays_local() {
     #[cfg(unix)]
     {
-        const CHILD: &str = "ZZABBA_C02_PTY_LIMIT_TEST";
+        const CHILD: &str = "ZXT_C02_PTY_LIMIT_TEST";
         if std::env::var_os(CHILD).is_none() {
             let result = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "terminal::pty_flow_tests::c02_native_pty_creation_failure_stays_local", "--nocapture"])

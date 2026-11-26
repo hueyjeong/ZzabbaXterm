@@ -150,7 +150,7 @@ pub(crate) fn issue_document(webview: &Webview, url: &tauri::Url) {
     let generation = state.document;
     let origin = if bundled && !cfg!(windows) { "tauri://localhost".to_owned() } else { url.origin().ascii_serialization() };
     let url = serde_json::to_string(url.as_str()).unwrap();
-    let script = format!("if (window === top && location.href === {url} && (window.__ZZABBA_VNC_DOCUMENT__?.generation ?? -1) < {generation}) {{ window.__ZZABBA_VNC_DOCUMENT__ = Object.freeze({{ generation: {generation}, proof: '{proof}' }}); }}");
+    let script = format!("if (window === top && location.href === {url} && (window.__ZXT_VNC_DOCUMENT__?.generation ?? -1) < {generation}) {{ window.__ZXT_VNC_DOCUMENT__ = Object.freeze({{ generation: {generation}, proof: '{proof}' }}); }}");
     if webview.eval(script).is_ok() { state.document_proof = Some((proof, origin, tunnel_epoch)); }
 }
 
@@ -167,7 +167,7 @@ pub(crate) fn dispatch(invoke: Invoke) {
     let sessions = caller.state::<Sessions>();
     let (document, tunnel_epoch) = {
         let state = sessions.0.lock().unwrap();
-        let proof = invoke.message.headers().get("x-zzabba-vnc-document").and_then(|header| header.to_str().ok());
+        let proof = invoke.message.headers().get("x-zxt-vnc-document").and_then(|header| header.to_str().ok());
         let Some(epochs) = proof.and_then(|proof| state.document_for(proof)) else {
             invoke.resolver.reject(CLOSED);
             return;

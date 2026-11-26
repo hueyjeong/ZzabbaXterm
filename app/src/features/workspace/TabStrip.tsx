@@ -2,7 +2,7 @@ import { useLayoutEffect, useRef, useState, type DragEvent } from "react";
 import { ArrowLeftToLine, ArrowRightToLine, Columns2, Copy, Merge, X, type LucideIcon } from "lucide-react";
 import { IconButton, Menu, ProtocolIcon, type MenuItem, type ProtocolKind } from "../ui/controls";
 
-export const TAB_DRAG_TYPE = "application/x-zzabba-tab";
+export const TAB_DRAG_TYPE = "application/x-zxt-tab";
 
 export type TabView = Readonly<{
   id: number;

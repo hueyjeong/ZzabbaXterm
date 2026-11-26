@@ -379,8 +379,8 @@ mod tests {
         assert_eq!(routed_scope(unpinned(), &destination), format!("ssh://operator@[server.example]:22#{new_sha}|vnc://[127.0.0.1]:5900"));
 
         let ssm = SavedRoute::Ssm(SavedSsm { revision: std::num::NonZeroU64::MIN, desktop: None,
-            target: Ssm { profile: "zzabba-demo".into(), region: "ap-northeast-1".into(), instance_id: "i-07c8e1d461943e5f3".into() } });
+            target: Ssm { profile: "zxt-demo".into(), region: "ap-northeast-1".into(), instance_id: "i-07c8e1d461943e5f3".into() } });
         assert_eq!(super::routed_scope(&ssm, &destination, directory.path()),
-            "ssm://zzabba-demo@ap-northeast-1/i-07c8e1d461943e5f3|vnc://[127.0.0.1]:5900");
+            "ssm://zxt-demo@ap-northeast-1/i-07c8e1d461943e5f3|vnc://[127.0.0.1]:5900");
     }
 }

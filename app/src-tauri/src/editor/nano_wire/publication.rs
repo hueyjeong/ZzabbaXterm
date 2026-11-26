@@ -23,7 +23,7 @@ const SAVED: u8 = 18;
 const CONFLICT: u8 = 19;
 const UNAVAILABLE: u8 = 20;
 const UNKNOWN: u8 = 21;
-const RECOVERY_PREFIX: &str = ".zzabba-edit-";
+const RECOVERY_PREFIX: &str = ".zxt-edit-";
 const RECOVERY_SUFFIX: &str = ".tmp/original";
 const RECOVERY_LEN: usize = RECOVERY_PREFIX.len() + 32 + RECOVERY_SUFFIX.len();
 

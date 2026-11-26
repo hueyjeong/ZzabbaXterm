@@ -91,7 +91,7 @@ async fn enroll_reserved<R: tauri::Runtime>(
     let document = document.clone();
     let session_id = session_id.to_owned();
     let closed = closed.clone();
-    let label = format!("ZzabbaXterm S3 · {item_id}");
+    let label = format!("ZXT S3 · {item_id}");
     let outcome = tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<StorageIpc>();
         keyring::write_new(&target, &label, &mut payload, || {

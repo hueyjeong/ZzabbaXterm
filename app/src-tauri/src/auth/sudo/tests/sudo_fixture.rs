@@ -55,7 +55,7 @@ fn main() {
     event(&format!("askpass={:?}", env::var_os("SUDO_ASKPASS").is_some()));
     event(&format!(
         "endpoint={}",
-        env::var("ZZABBA_ASKPASS_ENDPOINT").unwrap_or_default()
+        env::var("ZXT_ASKPASS_ENDPOINT").unwrap_or_default()
     ));
     event(&format!("ssh_askpass={:?}", env::var_os("SSH_ASKPASS").is_some()));
     if mode == "cached" {

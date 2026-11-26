@@ -264,7 +264,7 @@ fn approved_execution(state: &mut ReviewState, target: &SelectedTarget, local: &
     let wire = serde_json::to_value(card).unwrap();
     assert_eq!(wire["program"], "/usr/bin/uptime");
     assert_eq!(wire["args"], json!([]));
-    assert_eq!(wire["account"], "zzabba-ai-control");
+    assert_eq!(wire["account"], "zxt-ai-control");
     assert_eq!(wire["policy"], "allowed");
     assert_eq!(wire["sessionId"], "7");
     assert_eq!(wire["selectionId"], "2");

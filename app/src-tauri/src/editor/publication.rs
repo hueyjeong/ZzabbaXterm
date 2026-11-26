@@ -20,7 +20,7 @@ impl From<io::Error> for PublicationError {
 pub(super) fn temporary_name() -> io::Result<OsString> {
     let mut random = [0; 16];
     getrandom::fill(&mut random).map_err(|error| io::Error::other(error.to_string()))?;
-    Ok(format!(".zzabba-edit-{:032x}.tmp", u128::from_ne_bytes(random)).into())
+    Ok(format!(".zxt-edit-{:032x}.tmp", u128::from_ne_bytes(random)).into())
 }
 
 pub(super) fn verify_bytes(mut file: &File, expected: &[u8]) -> io::Result<()> {

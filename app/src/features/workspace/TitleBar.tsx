@@ -52,7 +52,7 @@ export function TitleBar({ focused, sidebar, aiPanel, newTabItems, onNewTerminal
   return (
     <header className="workspace-titlebar">
       <div className="workspace-handle" onMouseDown={moveWindow}>
-        {!focused && <><span className="workspace-logo" aria-hidden="true"><SquareTerminal /></span><span className="workspace-name">ZzabbaXterm</span></>}
+        {!focused && <><span className="workspace-logo" aria-hidden="true"><SquareTerminal /></span><span className="workspace-name">ZXT</span></>}
       </div>
       <div className="workspace-new-tab" role="group" aria-label="새 탭">
         <IconButton icon={Plus} label="새 로컬 터미널" onMouseDown={keepFocus} onClick={onNewTerminal} />

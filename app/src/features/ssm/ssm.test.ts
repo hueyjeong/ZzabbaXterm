@@ -217,7 +217,7 @@ describe("SSM 선택", () => {
 
 describe("SSM 검색 IPC", () => {
   beforeEach(() => { invokeSsm.mockReset(); });
-  afterEach(() => { delete window.__ZZABBA_SSM_DOCUMENT__; });
+  afterEach(() => { delete window.__ZXT_SSM_DOCUMENT__; });
 
   it("문서 또는 ID가 나오기 전 취소를 처리하고 작업마다 문서 값을 고정한다", async () => {
     const adapter = createSsmDiscovery();
@@ -231,11 +231,11 @@ describe("SSM 검색 IPC", () => {
 
     const reserved = Promise.withResolvers<string>();
     invokeSsm.mockReturnValueOnce(reserved.promise).mockResolvedValueOnce(null);
-    window.__ZZABBA_SSM_DOCUMENT__ = "old-document";
-    window.dispatchEvent(new Event("zzabba:ssm-document"));
+    window.__ZXT_SSM_DOCUMENT__ = "old-document";
+    window.dispatchEvent(new Event("zxt:ssm-document"));
     await Promise.resolve();
     expect(invokeSsm.mock.calls).toEqual([["ssm_discovery", { document: "old-document", request: { action: "reserve" } }]]);
-    window.__ZZABBA_SSM_DOCUMENT__ = "new-document";
+    window.__ZXT_SSM_DOCUMENT__ = "new-document";
     ready.abort();
     reserved.resolve("15");
     await expect(pending).resolves.toEqual({ ok: false, error: "Unknown" });
@@ -246,7 +246,7 @@ describe("SSM 검색 IPC", () => {
   });
 
   it("늦은 만료 응답에는 재로그인 권한이 없고 구조적 오류 코드만 구별한다", async () => {
-    window.__ZZABBA_SSM_DOCUMENT__ = "document";
+    window.__ZXT_SSM_DOCUMENT__ = "document";
     const adapter = createSsmDiscovery();
     const scope = { profile: "alpha", region: east };
     const controller = new AbortController();
@@ -275,7 +275,7 @@ describe("SSM 검색 IPC", () => {
   });
 
   it("설치 또는 구성 오류에서 Linux 시스템 설치 요건을 표시한다", async () => {
-    window.__ZZABBA_SSM_DOCUMENT__ = "document";
+    window.__ZXT_SSM_DOCUMENT__ = "document";
     invokeSsm.mockResolvedValueOnce("1").mockRejectedValueOnce({ code: "InvalidConfiguration" });
     await render(createSsmDiscovery());
     expect(error()).toContain("AWS CLI v2와 Session Manager 플러그인의 관리자 관리 시스템 설치가 필요합니다");
@@ -283,7 +283,7 @@ describe("SSM 검색 IPC", () => {
   });
 
   it("화면에서 만료된 조회 ID만 한 번 사용하고 성공 뒤 새 ID로 동일 범위를 조회한다", async () => {
-    window.__ZZABBA_SSM_DOCUMENT__ = "document";
+    window.__ZXT_SSM_DOCUMENT__ = "document";
     invokeSsm.mockResolvedValueOnce("1").mockResolvedValueOnce(["alpha"])
       .mockResolvedValueOnce("2").mockResolvedValueOnce(east)
       .mockResolvedValueOnce("3").mockRejectedValueOnce({ code: "SsoLoginRequired" })
@@ -307,7 +307,7 @@ describe("SSM 검색 IPC", () => {
   });
 
   it("다른 범위 객체에서 만료 ID를 사용할 수 없고 실행 중 취소는 같은 ID에만 적용된다", async () => {
-    window.__ZZABBA_SSM_DOCUMENT__ = "document";
+    window.__ZXT_SSM_DOCUMENT__ = "document";
     const adapter = createSsmDiscovery();
     const scope = { profile: "alpha", region: east };
     const lookup = new AbortController();
@@ -330,7 +330,7 @@ describe("SSM 검색 IPC", () => {
   });
 
   it("리전 전환과 마법사 닫기에서 사용하지 않은 만료 ID를 취소한다", async () => {
-    window.__ZZABBA_SSM_DOCUMENT__ = "document";
+    window.__ZXT_SSM_DOCUMENT__ = "document";
     invokeSsm.mockResolvedValueOnce("1").mockResolvedValueOnce(["alpha"])
       .mockResolvedValueOnce("2").mockResolvedValueOnce(east)
       .mockResolvedValueOnce("3").mockRejectedValueOnce({ code: "SsoLoginRequired" })

@@ -277,7 +277,7 @@ impl Connection {
                         let Ok(name) = entry.filename.into_string() else {
                             continue;
                         };
-                        if !valid_component(&name) || name.starts_with(".zzabba-edit-") {
+                        if !valid_component(&name) || name.starts_with(".zxt-edit-") {
                             continue;
                         }
                         let is_directory = entry.attrs.is_dir();
@@ -311,7 +311,7 @@ impl Connection {
     pub(super) async fn open_nano(&mut self, path: &str) -> Result<(File, String)> {
         validate_absolute(path)?;
         let (parent, name) = path.rsplit_once('/').ok_or(Error::InvalidPath)?;
-        if name.is_empty() || name.starts_with(".zzabba-edit-") {
+        if name.is_empty() || name.starts_with(".zxt-edit-") {
             return Err(Error::InvalidPath);
         }
         let parent = if parent.is_empty() { "/" } else { parent };
@@ -670,7 +670,7 @@ fn child_path(dir: &str, name: &str) -> String {
 fn temporary_path(dir: &str) -> Result<String> {
     let mut random = [0; 16];
     getrandom::fill(&mut random).map_err(Error::Random)?;
-    let mut path = child_path(dir, ".zzabba-edit-");
+    let mut path = child_path(dir, ".zxt-edit-");
     for byte in random {
         write!(path, "{byte:02x}").expect("String 쓰기");
     }

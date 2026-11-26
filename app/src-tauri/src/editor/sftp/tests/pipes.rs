@@ -43,7 +43,7 @@ fn stored_ssh_password_is_rejected_before_building_sftp_command() {
 async fn peer(plan: &ConnectionPlan, fixture: &Path, root: &Path, scenario: Scenario) -> (Command, JoinHandle<Fixture>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut cmd = command(plan, fixture);
-    cmd.env("ZZABBA_FIXTURE_ADDR", listener.local_addr().unwrap().to_string());
+    cmd.env("ZXT_FIXTURE_ADDR", listener.local_addr().unwrap().to_string());
     let fixture = Fixture::new(root.to_owned(), scenario);
     let server = tokio::spawn(async move {
         let (stream, _) = timeout(LIMIT, listener.accept()).await.unwrap().unwrap();
@@ -101,7 +101,7 @@ async fn isolated_binary_pipes_keep_paths_revisions_and_children_separate() {
 
     let workers = TaskTracker::new();
     let mut denied = command(&plan, &fixture);
-    denied.env("ZZABBA_FIXTURE_DENY", "1");
+    denied.env("ZXT_FIXTURE_DENY", "1");
     let result = Session::spawn(plan.clone(), CancellationToken::new(), workers.token(), denied, LIMIT).await;
     assert!(matches!(result, Err(Error::Prepare { status, stderr, .. })
         if status.code() == Some(42) && stderr.contains("fixture: subsystem denied")));
@@ -109,7 +109,7 @@ async fn isolated_binary_pipes_keep_paths_revisions_and_children_separate() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut stalled = command(&plan, &fixture);
-    stalled.env("ZZABBA_FIXTURE_ADDR", listener.local_addr().unwrap().to_string());
+    stalled.env("ZXT_FIXTURE_ADDR", listener.local_addr().unwrap().to_string());
     let server = tokio::spawn(async move {
         let (mut stream, _) = timeout(LIMIT, listener.accept()).await.unwrap().unwrap();
         let mut init = [0; 9];
@@ -125,7 +125,7 @@ async fn isolated_binary_pipes_keep_paths_revisions_and_children_separate() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let plan = super::plan(&root.path().join("timeout-trust"), "editor");
     let mut stalled = command(&plan, &fixture);
-    stalled.env("ZZABBA_FIXTURE_ADDR", listener.local_addr().unwrap().to_string());
+    stalled.env("ZXT_FIXTURE_ADDR", listener.local_addr().unwrap().to_string());
     let server = tokio::spawn(async move {
         let (mut stream, _) = timeout(LIMIT, listener.accept()).await.unwrap().unwrap();
         let mut init = [0; 9];

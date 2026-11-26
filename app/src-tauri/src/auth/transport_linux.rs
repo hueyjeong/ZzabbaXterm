@@ -21,7 +21,7 @@ pub(in crate::local_auth) struct Listener {
 impl Listener {
     pub(in crate::local_auth) fn bind() -> io::Result<Self> {
         let directory = tempfile::Builder::new()
-            .prefix(&format!("zzabba-{}-", address_id()?))
+            .prefix(&format!("zxt-{}-", address_id()?))
             .permissions(std::fs::Permissions::from_mode(0o700))
             .tempdir_in("/tmp")?;
         let path = directory.path().join("askpass");

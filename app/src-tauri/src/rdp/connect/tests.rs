@@ -688,7 +688,7 @@ async fn tls_only_stops_before_credentials_when_the_certificate_name_differs() {
 #[cfg(any(windows, target_os = "linux"))]
 #[test]
 fn os_roots_ignore_ssl_cert_environment() {
-    const CHILD: &str = "ZZABBA_RDP_ROOT_TEST_CHILD";
+    const CHILD: &str = "ZXT_RDP_ROOT_TEST_CHILD";
     if let Some(path) = std::env::var_os(CHILD) {
         let der = rustls::pki_types::CertificateDer::from(std::fs::read(path).unwrap());
         let mut approved = rustls::RootCertStore::empty();
@@ -706,7 +706,7 @@ fn os_roots_ignore_ssl_cert_environment() {
         return;
     }
     let fixture = root();
-    let dir = std::env::temp_dir().join(format!("zzabba-rdp-roots-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("zxt-rdp-roots-{}", std::process::id()));
     std::fs::create_dir(&dir).unwrap();
     let der = dir.join("fixture.der");
     let pem = dir.join("fixture.pem");
@@ -965,7 +965,7 @@ async fn unknown_certificate_requires_one_time_approval_and_is_pinned() {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(unknown.der().clone()).unwrap();
     let fingerprint = trust::fingerprint(cert.der());
-    let approval_path = std::env::temp_dir().join(format!("zzabba-rdp-pin-{}", std::process::id()));
+    let approval_path = std::env::temp_dir().join(format!("zxt-rdp-pin-{}", std::process::id()));
     let _ = std::fs::remove_file(&approval_path);
 
     let server = async {
@@ -1050,7 +1050,7 @@ async fn rejecting_a_changed_fingerprint_keeps_the_old_pin_without_credentials()
     let tls_server = tls_server(key, cert.der().clone());
     let mut roots = rustls::RootCertStore::empty();
     roots.add(unknown.der().clone()).unwrap();
-    let path = std::env::temp_dir().join(format!("zzabba-rdp-pin-change-{}", std::process::id()));
+    let path = std::env::temp_dir().join(format!("zxt-rdp-pin-change-{}", std::process::id()));
     let _ = std::fs::remove_file(&path);
     trust::save(&path, REMOTE, "fixture", None, "AA:BB").unwrap();
 

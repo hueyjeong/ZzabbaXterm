@@ -1,9 +1,9 @@
 [package]
-name = "zzabbaxterm"
+name = "zxt-app"
 version = "0.1.0"
-description = "ZzabbaXterm"
+description = "ZXT"
 edition = "2024"
-default-run = "zzabbaxterm"
+default-run = "zxt-app"
 
 [features]
 default = ["local-cli"]
@@ -14,36 +14,36 @@ remote-editor-bridge = []
 
 # 배포 빌드에서는 Cargo 타깃 대신 준비된 sidecar를 넣는다.
 [[bin]]
-name = "zzabba"
-path = "src/bin/zzabba.rs"
+name = "zxt"
+path = "src/bin/zxt.rs"
 required-features = ["local-cli"]
 
 # Linux 노드에 별도로 배포한다.
 [[bin]]
-name = "zzabba-editor-bridge"
-path = "src/bin/zzabba-editor-bridge.rs"
+name = "zxt-editor-bridge"
+path = "src/bin/zxt-editor-bridge.rs"
 required-features = ["remote-editor-bridge"]
 
 [[bin]]
-name = "zzabba-edit"
-path = "src/bin/zzabba-edit.rs"
+name = "zxt-edit"
+path = "src/bin/zxt-edit.rs"
 required-features = ["local-cli"]
 
 # Linux 노드에 별도로 배포한다.
 [[bin]]
-name = "zzabba-ai-control"
-path = "src/bin/zzabba-ai-control.rs"
+name = "zxt-ai-control"
+path = "src/bin/zxt-ai-control.rs"
 required-features = ["ai-control"]
 
 [[bin]]
-name = "zzabba-askpass"
-path = "src/bin/zzabba-askpass.rs"
+name = "zxt-askpass"
+path = "src/bin/zxt-askpass.rs"
 required-features = ["stored-auth"]
 
-# Linux 원격 sudo 승격 helper. 관리자가 /usr/local/libexec/zzabba-elevate에 설치한다.
+# Linux 원격 sudo 승격 helper. 관리자가 /usr/local/libexec/zxt-elevate에 설치한다.
 [[bin]]
-name = "zzabba-elevate"
-path = "src/bin/zzabba-elevate.rs"
+name = "zxt-elevate"
+path = "src/bin/zxt-elevate.rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -51,7 +51,7 @@ path = "src/bin/zzabba-elevate.rs"
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
-name = "zzabbaxterm_lib"
+name = "zxt_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

@@ -26,16 +26,16 @@
 구현한 로컬 경로:
 
 - `app/src-tauri/src/elevation/`가 명시적 요청에서 대상(`내 PC`), 호출 계정(OS 사용자), 실행 계정(`root`), 정규화한 절대 실행 파일, 인자 배열, 32자 요청 ID를 고정한다. 승인은 30초 만료, 문서 세대·요청 ID·대상·계정·실행 파일·인자 전체 일치, 1회 소비다. 승인 창은 인자를 `1.`, `2.`처럼 경계별로 표시한다.
-- `app/src-tauri/src/auth/sudo.rs`는 승인 뒤 그 자식에만 `SUDO_ASKPASS`·`ZZABBA_ASKPASS_MODE=sudo`를 설정하고 `sudo -A -- <실행파일> <인자…>`를 시작한다. 교환은 `sudo` 자식의 직계 askpass(자식 계보·helper 실행 파일·pidfd 생존)만 받고, 실제 askpass 요청이 온 뒤에만 금고를 조회해 1회 응답하고 ACK 뒤 수신을 닫는다. 캐시된 인증이면 자식 종료로 끝나 금고 조회는 0회다.
-- `app/src-tauri/src/auth/transport.rs`의 helper는 `SUDO_ASKPASS` 모드를 추가로 허용하되 `SUDO_ASKPASS`가 현재 helper와 같고 `SSH_ASKPASS`·`SSH_ASKPASS_REQUIRE`가 없으며 `BW_SESSION`이 없을 때만 동작한다. SSH 저장 암호 자식은 상속 환경의 `SUDO_ASKPASS`·`ZZABBA_ASKPASS_MODE`를 제거한다.
+- `app/src-tauri/src/auth/sudo.rs`는 승인 뒤 그 자식에만 `SUDO_ASKPASS`·`ZXT_ASKPASS_MODE=sudo`를 설정하고 `sudo -A -- <실행파일> <인자…>`를 시작한다. 교환은 `sudo` 자식의 직계 askpass(자식 계보·helper 실행 파일·pidfd 생존)만 받고, 실제 askpass 요청이 온 뒤에만 금고를 조회해 1회 응답하고 ACK 뒤 수신을 닫는다. 캐시된 인증이면 자식 종료로 끝나 금고 조회는 0회다.
+- `app/src-tauri/src/auth/transport.rs`의 helper는 `SUDO_ASKPASS` 모드를 추가로 허용하되 `SUDO_ASKPASS`가 현재 helper와 같고 `SSH_ASKPASS`·`SSH_ASKPASS_REQUIRE`가 없으며 `BW_SESSION`이 없을 때만 동작한다. SSH 저장 암호 자식은 상속 환경의 `SUDO_ASKPASS`·`ZXT_ASKPASS_MODE`를 제거한다.
 - `app/src-tauri/src/terminal/{ipc.rs,process.rs}`에 `elevation_open` 명령, 네이티브 "sudo 승격 승인" 창, `Launch::Elevated`, 탭 종료 시 교환 취소, 금고 오류 알림을 연결했다. `app/src/features/elevation/`은 실행 파일·인자(줄 단위)·금고 항목을 입력받고 인자 경계를 나눈 승인 카드를 표시한다. 터미널 출력이나 AI 제안은 이 명령을 부르지 않는다.
 - 승인 30초는 모달을 닫은 뒤 `Pending`을 만들 때 시작한다. 헬퍼·금고 상태 확인과 사용자가 창을 읽는 시간은 예산에 넣지 않는다.
 
 구현한 원격 경로:
 
-- 서버 helper는 `app/src-tauri/src/bin/zzabba-elevate.rs`이며 관리자가 `/usr/local/libexec/zzabba-elevate`에 root:root·0755·그룹/월드 쓰기 없이 설치한다. 앱은 이 파일을 설치하지 않는다. `--verify`는 자기 소유자·권한·경로와 실행 계정을 출력하고, `serve`는 run 프레임을 받아 `sudo -A -- <실행파일> <인자…>`를 띄우며, `bridge`는 전용 SSH 채널에서 askpass 요청을 중계한다. askpass 모드는 자기 자신이 `SUDO_ASKPASS`일 때만 FIFO를 통해 1회 응답한다.
+- 서버 helper는 `app/src-tauri/src/bin/zxt-elevate.rs`이며 관리자가 `/usr/local/libexec/zxt-elevate`에 root:root·0755·그룹/월드 쓰기 없이 설치한다. 앱은 이 파일을 설치하지 않는다. `--verify`는 자기 소유자·권한·경로와 실행 계정을 출력하고, `serve`는 run 프레임을 받아 `sudo -A -- <실행파일> <인자…>`를 띄우며, `bridge`는 전용 SSH 채널에서 askpass 요청을 중계한다. askpass 모드는 자기 자신이 `SUDO_ASKPASS`일 때만 FIFO를 통해 1회 응답한다.
 - 앱은 F01과 같은 `ConnectionPlan`(같은 서버·계정·고정 호스트 키)에서 **확인·run·bridge 세 개의 별도 SSH `-T` 채널**을 연다. 계획은 승격 `State`가 보관해 run/bridge가 여는 임시 `ssh_config`·`known_hosts`가 세션 수명보다 먼저 삭제되지 않는다. 확인 채널은 helper 설치·계정을 먼저 검증하고 실패하면 승인 창 없이 "직접 입력"을 안내한다. 승인 카드는 서버(`계정@호스트:포트`)·호출 계정·실행 계정·실행 파일·인자를 표시하고, 승인 뒤 저장 프로필이 바뀌지 않았는지 다시 대조한다.
-- run 채널은 메인 PTY에서 `serve`를 실행하고 `ZZABBA-ELEVATE 1 <ID> <난수> <b64 실행 파일> <인자 수> <b64 인자…>` 프레임을 쓴다. 프레임에는 암호가 없다. bridge 채널은 `REQUEST 2 <ID> <난수>`를 받은 뒤에만 금고를 조회하고 `PASSWORD 2 <ID> <난수> <b64 암호>`를 1회 쓴다. 메인 PTY·공용 포트·셸 프롬프트에는 암호를 쓰지 않는다.
+- run 채널은 메인 PTY에서 `serve`를 실행하고 `ZXT-ELEVATE 1 <ID> <난수> <b64 실행 파일> <인자 수> <b64 인자…>` 프레임을 쓴다. 프레임에는 암호가 없다. bridge 채널은 `REQUEST 2 <ID> <난수>`를 받은 뒤에만 금고를 조회하고 `PASSWORD 2 <ID> <난수> <b64 암호>`를 1회 쓴다. 메인 PTY·공용 포트·셸 프롬프트에는 암호를 쓰지 않는다.
 - helper는 승인 ID·난수·프레임 순번(1/2)을 검증하고, 잘린 프레임·순번 역행·다른 승인 ID·다른 난수를 거부한다. askpass는 `pw` FIFO 응답을 15초까지만 기다려 bridge가 응답 없이 죽어도 sudo가 매달리지 않는다.
 - bridge가 암호를 건네기 전에 끊기면 앱은 run 자식을 중단하고 최종 상태를 `결과 미확인`으로 표시한다. 암호를 이미 건넸거나 run이 정상 종료했으면 실제 종료 코드를 유지하고 bridge 손실은 알림으로만 남긴다. 정상 종료하지 못한 FIFO 디렉터리는 다음 `serve`가 6시간 뒤 정리한다.
 - 원격은 직접 SSH의 Agent·키 파일(배치 로그인)만 지원한다. 수동 암호·저장 암호 SSH·SSH-over-SSM은 "터미널에서 직접 입력하세요" 안내로 끝난다. helper가 없거나 `--verify`가 실패하면 금고 조회 0회다.
@@ -44,13 +44,13 @@
 기능·배포 조건:
 
 - 로컬·원격 승격 명령과 UI는 `stored-auth` feature와 Windows/Linux에서만 컴파일된다. `connection_capabilities`는 `storedAuth` camelCase 키로 응답하며(백엔드 직렬화 시험 고정), 기본 빌드·`--no-default-features`·macOS에서는 false여서 승격 메뉴가 보이지 않고 남은 호출도 한국어 거부 메시지를 받는다. Windows에서는 로컬 메뉴만 플랫폼 조건으로 숨긴다.
-- 로컬은 앱과 같은 디렉터리의 `zzabba-askpass`가 root 소유·비쓰기여야 한다. 배포 번들에 `zzabba-askpass`를 포함해야 한다. 원격 서버에는 `zzabba-elevate`를 관리자가 별도로 설치해야 하며, 앱은 sudoers·helper를 수정하지 않는다.
+- 로컬은 앱과 같은 디렉터리의 `zxt-askpass`가 root 소유·비쓰기여야 한다. 배포 번들에 `zxt-askpass`를 포함해야 한다. 원격 서버에는 `zxt-elevate`를 관리자가 별도로 설치해야 하며, 앱은 sudoers·helper를 수정하지 않는다.
 
-실측(`zzabbaxterm-sudo-remote:latest`, Ubuntu 24.04.5 기반. `zzabbaxterm-demo-remote:latest`에 `apt-get install sudo`로 실제 sudo를 넣고 `demo`를 sudo 그룹에 추가; 컨테이너 `zzabba-sudo-remote`, `127.0.0.1:2300`, 계정 `demo` uid 1001, 암호 요구 sudo):
+실측(`zxt-sudo-remote:latest`, Ubuntu 24.04.5 기반. `zxt-demo-remote:latest`에 `apt-get install sudo`로 실제 sudo를 넣고 `demo`를 sudo 그룹에 추가; 컨테이너 `zxt-sudo-remote`, `127.0.0.1:2300`, 계정 `demo` uid 1001, 암호 요구 sudo):
 
-- 사용자 uid 1001로 `SUDO_ASKPASS=… sudo -A -- /usr/bin/id -u`를 실행하면 `0`이 출력된다. askpass 프로세스는 `uid=1001 euid=1001`, `ppid=<sudo>`, `SUDO_ASKPASS`·`SSH_ASKPASS`·`ZZABBA_*` 환경을 상속한다. 따라서 Linux 전송의 `peer.uid == geteuid()` 검사는 `sudo -A` helper에도 성립하며 자식 계보 정책으로 다시 설계할 필요가 없다.
+- 사용자 uid 1001로 `SUDO_ASKPASS=… sudo -A -- /usr/bin/id -u`를 실행하면 `0`이 출력된다. askpass 프로세스는 `uid=1001 euid=1001`, `ppid=<sudo>`, `SUDO_ASKPASS`·`SSH_ASKPASS`·`ZXT_*` 환경을 상속한다. 따라서 Linux 전송의 `peer.uid == geteuid()` 검사는 `sudo -A` helper에도 성립하며 자식 계보 정책으로 다시 설계할 필요가 없다.
 - setuid 부모의 `/proc/<sudo>/exe`와 fd는 helper 사용자 권한으로 읽을 수 없으므로, sudo 경로는 루트 실행 파일·출력 파이프 대신 자식 계보와 helper 신원으로 검증한다. 이 때문에 helper는 `sudo`의 직계 자식이어야 한다.
-- helper는 `/usr/local/libexec/zzabba-elevate`에 root:root 0755로 설치했고, `--verify`가 `zzabba-elevate 1`, `user=demo`, `owner=0`, `mode=755`, `path=/usr/local/libexec/zzabba-elevate`를 출력했다.
+- helper는 `/usr/local/libexec/zxt-elevate`에 root:root 0755로 설치했고, `--verify`가 `zxt-elevate 1`, `user=demo`, `owner=0`, `mode=755`, `path=/usr/local/libexec/zxt-elevate`를 출력했다.
 - Windows 클라이언트에서 앱과 같은 `ConnectionPlan`·`verify`·`Launch`·`Bridge` 코드로 원격 `sudo -A -- /usr/bin/id -u`를 실행했다. sudo 캐시를 지운 뒤 승인 1건, 금고 `status`+`get` 각 1회, 암호 프레임 1회, 종료 코드 0, stdout `0`, stderr 없음, 출력에 암호 없음을 확인했다. `state.sent`도 1회였다.
 - 자동 시험(`elevation_remote_real_container_approves_once_and_runs_sudo`, ignored)은 `.omc/demo-remote/sudo/remote.json`의 호스트·포트·키·호스트 키·암호를 읽는다. 컨테이너·키·암호는 저장소에 커밋하지 않는다.
 
@@ -59,7 +59,7 @@
 - `cargo test --manifest-path app/src-tauri/Cargo.toml --features stored-auth --lib elevation` → 22 passed, 0 failed, 2 ignored(원격 컨테이너 실측·askpass 기한). 승인 대상 불일치·만료·다른 세션/계정/실행 파일/인자, 재응답 거부, 취소, 캐시 인증 0회 조회, 신뢰되지 않은 helper, 계보 밖 helper, 원격 확인·프레임 절단·순번 역행·다른 승인 ID·채널 단절(`결과 미확인`), 금고 오류 시 run 중단, 정상 종료 코드 유지를 검사한다.
 - `cargo test … --lib elevation_remote_real_container -- --ignored` → 1 passed. 계획 원본을 버린 뒤에도 임시 설정이 남는지 단언하고, 승인 1회·응답 1회·`id -u` 0을 고정한다.
 - `cargo test … --lib elevation_remote_askpass_times_out -- --ignored` → 1 passed. bridge가 응답하지 않으면 15초 뒤 askpass가 실패해 run이 40초 안에 종료한다.
-- `cargo test … --lib auth` → 26 passed(상속 `SUDO_ASKPASS`·`ZZABBA_ASKPASS_MODE`가 SSH 모드를 깨지 않는 회귀 포함), `--lib ssh` → 57 passed, `--lib terminal` → 44 passed, `capabilities_serialize` → 1 passed. 기본 빌드 `cargo check --lib` 통과.
+- `cargo test … --lib auth` → 26 passed(상속 `SUDO_ASKPASS`·`ZXT_ASKPASS_MODE`가 SSH 모드를 깨지 않는 회귀 포함), `--lib ssh` → 57 passed, `--lib terminal` → 44 passed, `capabilities_serialize` → 1 passed. 기본 빌드 `cargo check --lib` 통과.
 - `npx vitest run` → 272 passed, 28 files. `tsc --noEmit` 통과. 승인 카드가 인자를 나눠 표시하고, `[sudo] password for demo:` 출력만으로는 승격 요청이 생기지 않으며, 저장 인증 capability가 없으면 승격 메뉴가 보이지 않음을 검사한다.
 - helper 단위 시험은 Linux에서 `rustc --edition=2024 --test`로 2 passed(run 프레임·askpass·password 프레임 검증).
 
@@ -68,7 +68,7 @@
 1. **Tauri 창·PTY 경로의 GUI 자동 시험은 미실행.** 원격 실측은 앱의 계획·확인·run·bridge 코드를 Windows에서 실행했지만 run 채널은 파이프로 돌렸다. 제품 탭은 같은 run 명령을 로컬 PTY에서 실행하고 프레임을 PTY에 쓴다. 프레임은 암호가 아니지만 로컬 터미널 에코에 보일 수 있다. 계획 수명은 `State` 보관과 실측 단언으로 고정했다.
 2. 원격 실측은 실제 Bitwarden 항목 대신 컨테이너 암호를 돌려주는 시험 금고를 썼다. 제품의 금고 조회 경로(`Bitwarden::password`)는 같다.
 3. helper는 관리자가 root:root·비쓰기로 설치해야 한다. 앱은 설치하지 않으며, 원격은 직접 SSH의 Agent·키 파일만 지원한다. 수동 암호·저장 암호 SSH·SSM·helper 없음은 "직접 입력" 안내로 끝난다.
-4. SSH 채널이 강제로 끊기면 서버의 sudo/FIFO 정리가 늦어질 수 있고, 앱은 `결과 미확인`으로 끝낸다. 로컬은 앱과 같은 디렉터리의 `zzabba-askpass`를 배포 번들에 포함하고 root 소유·비쓰기로 설치해야 한다.
+4. SSH 채널이 강제로 끊기면 서버의 sudo/FIFO 정리가 늦어질 수 있고, 앱은 `결과 미확인`으로 끝낸다. 로컬은 앱과 같은 디렉터리의 `zxt-askpass`를 배포 번들에 포함하고 root 소유·비쓰기로 설치해야 한다.
 
 
 **완료 증거:** 대상/계정은 별칭으로, 증거는 승인·조회·응답 횟수와 종료 상태로 남긴다. 암호, 세션 키, 전체 PTY 녹화는 수집하지 않는다. [F01](01-ssh.md)의 Bitwarden 취소, [F02](02-editor.md)의 파일 충돌·단절·래퍼·대기 결과, 이 티켓의 sudo 수동 입력·명시적 1회 승인 결과를 함께 대조한 뒤에만 [T4](../../ops-shell-blueprint.md#검증)를 완료로 기록한다.

@@ -362,7 +362,7 @@ mod tests {
         use tauri::ipc::{Channel, InvokeResponseBody};
 
         // 이 검증은 테스트 전용 Python/Paramiko 경로를 명시한 환경에서 실행한다.
-        let python = std::env::var_os("ZZABBA_F01_FIXTURE_PYTHON").expect("격리된 Python 실행 파일을 지정합니다");
+        let python = std::env::var_os("ZXT_F01_FIXTURE_PYTHON").expect("격리된 Python 실행 파일을 지정합니다");
         struct Server(Child);
         impl Drop for Server {
             fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }

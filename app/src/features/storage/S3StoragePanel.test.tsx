@@ -99,7 +99,7 @@ it("승인 대기 중 탭과 객체를 바꿔도 최초 전체 키로 다운로�
 });
 
 it("원래 이름으로 복구를 확인할 수 없으면 미완료와 보존 파일 경로를 표시한다", async () => {
-  const recoveryPath = "C:\\시험  폴더\\.zzabba-보존\\원본.txt";
+  const recoveryPath = "C:\\시험  폴더\\.zxt-보존\\원본.txt";
   await render({
     listBuckets: unused,
     listObjects: async () => ({ ok: true, value: { rows: [{ kind: "object", key, bytes: 7 }], nextToken: null } }),

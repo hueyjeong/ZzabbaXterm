@@ -2,7 +2,7 @@
 
 fn main() -> std::process::ExitCode {
     #[cfg(any(windows, target_os = "linux"))]
-    if zzabbaxterm_lib::local_auth::run_askpass() {
+    if zxt_lib::local_auth::run_askpass() {
         return std::process::ExitCode::SUCCESS;
     }
     std::process::ExitCode::FAILURE

@@ -1,12 +1,12 @@
-//! ZzabbaXterm 서버 측 sudo 승격 helper.
+//! ZXT 서버 측 sudo 승격 helper.
 //!
-//! 관리자가 고정 경로(`/usr/local/libexec/zzabba-elevate`)에 root 소유·비쓰기로 설치한다.
+//! 관리자가 고정 경로(`/usr/local/libexec/zxt-elevate`)에 root 소유·비쓰기로 설치한다.
 //! 앱은 이 파일을 설치하지 않는다. Linux에서만 동작하며, Windows 빌드에는 실행되지 않는
 //! stub만 둔다.
 
 #[cfg(not(target_os = "linux"))]
 fn main() -> std::process::ExitCode {
-    eprintln!("zzabba-elevate는 Linux에서만 실행됩니다");
+    eprintln!("zxt-elevate는 Linux에서만 실행됩니다");
     std::process::ExitCode::FAILURE
 }
 
@@ -31,7 +31,7 @@ mod linux {
         time::Duration,
     };
 
-    const VERSION: &str = "zzabba-elevate 1";
+    const VERSION: &str = "zxt-elevate 1";
     const SUDO: &str = "/usr/bin/sudo";
     const MKFIFO: &str = "/usr/bin/mkfifo";
     const ID: &str = "/usr/bin/id";
@@ -52,7 +52,7 @@ mod linux {
         match result {
             Ok(code) => code,
             Err(error) => {
-                eprintln!("zzabba-elevate: {error}");
+                eprintln!("zxt-elevate: {error}");
                 ExitCode::from(125)
             }
         }
@@ -105,8 +105,8 @@ mod linux {
         command.env("SHELL", "/bin/bash");
         command.env("TERM", "xterm-256color");
         command.env("SUDO_ASKPASS", canonical_exe()?);
-        command.env("ZZABBA_ELEVATE_DIR", directory.path());
-        command.env("ZZABBA_ELEVATE_NONCE", &nonce);
+        command.env("ZXT_ELEVATE_DIR", directory.path());
+        command.env("ZXT_ELEVATE_NONCE", &nonce);
         command.stdin(Stdio::null());
         command.stdout(Stdio::inherit());
         command.stderr(Stdio::inherit());
@@ -180,8 +180,8 @@ mod linux {
         {
             return Err("SUDO_ASKPASS가 이 helper가 아닙니다".into());
         }
-        let directory = env::var_os("ZZABBA_ELEVATE_DIR").ok_or("승격 디렉터리 없음")?;
-        let nonce = env::var("ZZABBA_ELEVATE_NONCE").map_err(|_| "승격 난수 없음")?;
+        let directory = env::var_os("ZXT_ELEVATE_DIR").ok_or("승격 디렉터리 없음")?;
+        let nonce = env::var("ZXT_ELEVATE_NONCE").map_err(|_| "승격 난수 없음")?;
         if !valid_token(&nonce) {
             return Err("승격 난수가 올바르지 않습니다".into());
         }
@@ -253,7 +253,7 @@ mod linux {
 
     fn parse_run(line: &str, expected_id: &str, expected_nonce: &str) -> Result<RunFrame, String> {
         let fields: Vec<&str> = line.trim_end_matches(['\r', '\n']).split(' ').collect();
-        if fields.len() < 6 || fields[0] != "ZZABBA-ELEVATE" || fields[1] != "1" {
+        if fields.len() < 6 || fields[0] != "ZXT-ELEVATE" || fields[1] != "1" {
             return Err("run 프레임 형식이 아닙니다".into());
         }
         if fields[2] != expected_id || fields[3] != expected_nonce {
@@ -441,9 +441,9 @@ mod linux {
         let uid = euid()?;
         let run_user = PathBuf::from(format!("/run/user/{uid}"));
         if fs::metadata(&run_user).is_ok_and(|meta| meta.is_dir()) {
-            return Ok(run_user.join("zzabba-elevate"));
+            return Ok(run_user.join("zxt-elevate"));
         }
-        Ok(PathBuf::from(format!("/tmp/zzabba-elevate-{uid}")))
+        Ok(PathBuf::from(format!("/tmp/zxt-elevate-{uid}")))
     }
 
     fn split_directory(directory: &Path, nonce: &str) -> Result<(String, String), String> {
@@ -600,7 +600,7 @@ mod linux {
         #[test]
         fn run_frame_requires_id_nonce_absolute_program_and_boundaries() {
             let good = format!(
-                "ZZABBA-ELEVATE 1 {ID} {NONCE} {} 2 {} {}\n",
+                "ZXT-ELEVATE 1 {ID} {NONCE} {} 2 {} {}\n",
                 encode("/usr/bin/printf"),
                 encode("a b"),
                 encode("c")
@@ -609,11 +609,11 @@ mod linux {
             assert_eq!(frame.program, "/usr/bin/printf");
             assert_eq!(frame.args, ["a b", "c"]);
             for bad in [
-                format!("ZZABBA-ELEVATE 1 {ID} {NONCE} {}\n", encode("/usr/bin/id")),
-                format!("ZZABBA-ELEVATE 1 {ID} {} {} 0\n", "0".repeat(32), encode("/usr/bin/id")),
-                format!("ZZABBA-ELEVATE 1 {ID} {NONCE} {} 1\n", encode("relative/id")),
-                format!("ZZABBA-ELEVATE 1 {ID} {NONCE} {} 2 {}\n", encode("/usr/bin/id"), encode("a")),
-                format!("ZZABBA-ELEVATE 2 {ID} {NONCE} {} 0\n", encode("/usr/bin/id")),
+                format!("ZXT-ELEVATE 1 {ID} {NONCE} {}\n", encode("/usr/bin/id")),
+                format!("ZXT-ELEVATE 1 {ID} {} {} 0\n", "0".repeat(32), encode("/usr/bin/id")),
+                format!("ZXT-ELEVATE 1 {ID} {NONCE} {} 1\n", encode("relative/id")),
+                format!("ZXT-ELEVATE 1 {ID} {NONCE} {} 2 {}\n", encode("/usr/bin/id"), encode("a")),
+                format!("ZXT-ELEVATE 2 {ID} {NONCE} {} 0\n", encode("/usr/bin/id")),
             ] {
                 assert!(parse_run(&bad, ID, NONCE).is_err(), "{bad:?}");
             }

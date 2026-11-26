@@ -17,9 +17,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
-const SOCKET_ENV: &str = "ZZABBA_EDITOR_SOCKET";
+const SOCKET_ENV: &str = "ZXT_EDITOR_SOCKET";
 const ORIGINAL_NANO: &str = "/usr/bin/nano";
-const DIRECTORY_PREFIX: &str = "zzabba-editor-";
+const DIRECTORY_PREFIX: &str = "zxt-editor-";
 const SOCKET_NAME: &str = "session.sock";
 const IO: Duration = Duration::from_secs(2);
 // 앱은 게시 요청(10초)과 SFTP 재검증(10초)을 마친 뒤에야 취소 응답을 정리한다.
@@ -677,9 +677,9 @@ mod tests {
     fn separate_login(path: &Path, mode: &str) -> std::process::Child {
         let mut child = Command::new(env::current_exe().unwrap());
         child.args(["--exact", "nano_node::tests::separate_login_fixture"])
-            .env("ZZABBA_NANO_LOGIN_FIXTURE", path)
-            .env("ZZABBA_NANO_LOGIN_MODE", mode)
-            .env("ZZABBA_NANO_PARENT_SID", unsafe { libc::getsid(0) }.to_string());
+            .env("ZXT_NANO_LOGIN_FIXTURE", path)
+            .env("ZXT_NANO_LOGIN_MODE", mode)
+            .env("ZXT_NANO_PARENT_SID", unsafe { libc::getsid(0) }.to_string());
         // SAFETY: Only the async-signal-safe setsid syscall runs between fork and exec.
         unsafe { child.pre_exec(|| checked(libc::setsid()).map(|_| ())); }
         child.spawn().unwrap()
@@ -834,12 +834,12 @@ mod tests {
 
     #[test]
     fn separate_login_fixture() {
-        let Some(path) = env::var_os("ZZABBA_NANO_LOGIN_FIXTURE") else { return; };
-        let parent_sid: libc::pid_t = env::var("ZZABBA_NANO_PARENT_SID").unwrap().parse().unwrap();
+        let Some(path) = env::var_os("ZXT_NANO_LOGIN_FIXTURE") else { return; };
+        let parent_sid: libc::pid_t = env::var("ZXT_NANO_PARENT_SID").unwrap().parse().unwrap();
         assert_ne!(parent_sid, unsafe { libc::getsid(0) });
         let mut stream = UnixStream::connect(path).unwrap();
         stream.set_nonblocking(true).unwrap();
-        if env::var("ZZABBA_NANO_LOGIN_MODE").unwrap() == "registration" {
+        if env::var("ZXT_NANO_LOGIN_MODE").unwrap() == "registration" {
             let deadline = Some(Instant::now() + IO);
             send(&mut stream, &REGISTER).unwrap();
             let mut proof = Zeroizing::new([0; PROOF_LEN]);

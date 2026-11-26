@@ -18,9 +18,9 @@ fn main() -> std::process::ExitCode {
     #[cfg(target_os = "linux")]
     match nano_node::run() {
         Ok(()) => return std::process::ExitCode::SUCCESS,
-        Err(error) => eprintln!("zzabba-editor-bridge: {error}"),
+        Err(error) => eprintln!("zxt-editor-bridge: {error}"),
     }
     #[cfg(not(target_os = "linux"))]
-    eprintln!("zzabba-editor-bridge requires Linux");
+    eprintln!("zxt-editor-bridge requires Linux");
     std::process::ExitCode::FAILURE
 }

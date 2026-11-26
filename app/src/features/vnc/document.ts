@@ -2,13 +2,13 @@ import { convertFileSrc, invoke, type InvokeArgs } from "@tauri-apps/api/core";
 
 export function documentProof(): string | undefined {
   if (window !== top) return;
-  const proof = (window as Window & { __ZZABBA_VNC_DOCUMENT__?: { proof?: unknown } }).__ZZABBA_VNC_DOCUMENT__?.proof;
+  const proof = (window as Window & { __ZXT_VNC_DOCUMENT__?: { proof?: unknown } }).__ZXT_VNC_DOCUMENT__?.proof;
   return typeof proof === "string" && /^[a-f0-9]{32}$/.test(proof) ? proof : undefined;
 }
 
 export function invokeVnc<T = void>(name: string, args?: InvokeArgs, proof = documentProof()): Promise<T> {
   if (!proof || documentProof() !== proof) return Promise.reject("VNC 문서가 교체되었거나 아직 준비되지 않았습니다");
-  return invoke<T>(name, args, { headers: { "x-zzabba-vnc-document": proof } });
+  return invoke<T>(name, args, { headers: { "x-zxt-vnc-document": proof } });
 }
 
 export async function readPacket(proof: string | undefined, ticket: unknown, signal: AbortSignal): Promise<unknown> {

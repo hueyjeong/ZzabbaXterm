@@ -563,7 +563,7 @@ describe("중앙 원격 화면", () => {
     const identity = { sessionId: "b".repeat(32), generation: 1 };
     const owner = { tab: identity.sessionId, document: 1 };
     const proof = "a".repeat(32);
-    vi.stubGlobal(`__ZZABBA_${protocol.toUpperCase()}_DOCUMENT__`, { proof });
+    vi.stubGlobal(`__ZXT_${protocol.toUpperCase()}_DOCUMENT__`, { proof });
     const fetchPacket = vi.fn<(url: string) => Promise<Pick<Response, "ok" | "headers" | "arrayBuffer" | "json">>>();
     vi.stubGlobal("fetch", fetchPacket);
     vi.stubGlobal("ImageData", class {
@@ -626,7 +626,7 @@ describe("중앙 원격 화면", () => {
       `${protocol}_connect`, protocol === "rdp"
         ? { id: identity, draft: { host: "desktop.example.invalid", port: 3389, tlsOnly: false }, output }
         : { owner, draft: { host: "desktop.example.invalid", port: 5900, password: true }, output },
-      { headers: { [`x-zzabba-${protocol}-document`]: proof } },
+      { headers: { [`x-zxt-${protocol}-document`]: proof } },
     ]]);
     if (protocol === "vnc") await deliver({ identity, kind: "started", serial: 0 });
     const canvas = find<HTMLCanvasElement>('canvas[aria-label="원격 화면"]');
@@ -699,7 +699,7 @@ describe("중앙 원격 화면", () => {
 
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
     const closeArgs = protocol === "rdp" ? { id: identity } : { owner, generation: null };
-    const closeOptions = { headers: { [`x-zzabba-${protocol}-document`]: proof } };
+    const closeOptions = { headers: { [`x-zxt-${protocol}-document`]: proof } };
     if (!confirmed) await press("로컬 2");
     await press(`${label} 닫기`);
     expect(connectionCalls(`${protocol}_close`)).toEqual([[`${protocol}_close`, closeArgs, closeOptions]]);
@@ -1298,7 +1298,7 @@ describe("C02 SSM 연결", () => {
   });
 
   it("선택한 노드 참조만 시험하고 실패 후에도 선택을 보존하며 저장은 비활성화한다", async () => {
-    vi.stubGlobal("__ZZABBA_SSM_DOCUMENT__", "test-document");
+    vi.stubGlobal("__ZXT_SSM_DOCUMENT__", "test-document");
     let requestId = 0;
     runDiscovery = async (args) => {
       const { request } = args as { request: { action: string; operation?: { kind: string } } };
@@ -1348,7 +1348,7 @@ describe("C02 SSM 연결", () => {
   });
 
   it.each(["응답 대기", "시험 성공"])("A가 %s 상태에서 B를 선택하면 A 시험을 취소하고 A로 돌아가도 A의 티켓으로 저장하지 않는다", async (when) => {
-    vi.stubGlobal("__ZZABBA_SSM_DOCUMENT__", "test-document");
+    vi.stubGlobal("__ZXT_SSM_DOCUMENT__", "test-document");
     const otherNode = "i-00000002";
     const reply = Promise.withResolvers<ConnectionTestRun & { sessionId: string }>();
     let requestId = 0;
@@ -1395,7 +1395,7 @@ describe("C02 SSM 연결", () => {
   });
 
   it("늦은 SSM 시험 ID를 기다리고 종료 미확인에서 동일 실행을 다시 확인한다", async () => {
-    vi.stubGlobal("__ZZABBA_SSM_DOCUMENT__", "test-document");
+    vi.stubGlobal("__ZXT_SSM_DOCUMENT__", "test-document");
     const start = Promise.withResolvers<ConnectionTestRun>();
     const cancel = Promise.withResolvers<null>();
     let attempt: ConnectionTestDraft | undefined;

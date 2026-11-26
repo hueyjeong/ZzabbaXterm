@@ -44,10 +44,10 @@ class Fixture(ServerInterface):
         return True
 
     def check_channel_exec_request(self, channel, command):
-        match = re.fullmatch(rb"printf 'ZZABBA-F01:%s%s\\n' '([0-9a-f]{16})' '([0-9a-f]{16})'", command)
+        match = re.fullmatch(rb"printf 'ZXT-F01:%s%s\\n' '([0-9a-f]{16})' '([0-9a-f]{16})'", command)
         if not match:
             return False
-        self.result = b"ZZABBA-F01:" + b"".join(match.groups()) + b"\n"
+        self.result = b"ZXT-F01:" + b"".join(match.groups()) + b"\n"
         self.ready.set()
         return True
 

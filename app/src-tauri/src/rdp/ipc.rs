@@ -289,7 +289,7 @@ pub(crate) fn issue_document(webview: &Webview, url: &tauri::Url) {
     let tunnel_epoch = webview.state::<TunnelTabs>().epoch();
     let origin = if bundled && !cfg!(windows) { "tauri://localhost".into() } else { url.origin().ascii_serialization() };
     let href = serde_json::to_string(url.as_str()).unwrap();
-    let script = format!("if (window === top && location.href === {href} && (window.__ZZABBA_RDP_DOCUMENT__?.epoch ?? -1) < {epoch}) {{ window.__ZZABBA_RDP_DOCUMENT__ = Object.freeze({{epoch: {epoch}, proof: '{proof}'}}); }}");
+    let script = format!("if (window === top && location.href === {href} && (window.__ZXT_RDP_DOCUMENT__?.epoch ?? -1) < {epoch}) {{ window.__ZXT_RDP_DOCUMENT__ = Object.freeze({{epoch: {epoch}, proof: '{proof}'}}); }}");
     if webview.eval(script).is_ok() { state.proof = Some(DocumentProof { key: proof, origin, tunnel_epoch }); }
 }
 
@@ -326,7 +326,7 @@ pub(crate) fn dispatch(invoke: Invoke) {
     let Some(name) = COMMANDS.into_iter().find(|name| *name == invoke.message.command()) else { invoke.resolver.reject(CLOSED); return; };
     let sessions = caller.state::<Sessions>();
     let mut state = sessions.0.lock().unwrap();
-    let proof = invoke.message.headers().get("x-zzabba-rdp-document").and_then(|v| v.to_str().ok());
+    let proof = invoke.message.headers().get("x-zxt-rdp-document").and_then(|v| v.to_str().ok());
     let Some(proof) = state.proof.as_ref().filter(|expected| Some(expected.key.as_str()) == proof) else {
         invoke.resolver.reject(CLOSED); return;
     };

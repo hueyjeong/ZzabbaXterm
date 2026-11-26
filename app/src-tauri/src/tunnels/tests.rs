@@ -350,7 +350,7 @@ pub(super) mod loopback {
     impl Fixture {
         pub(in crate::tunnels) fn new() -> Self {
             // 격리 서버의 일회 키와 루프백 리슨 포트만 받는다.
-            let root = std::env::var_os("ZZABBA_R01_LOOPBACK_FIXTURE").expect("격리 SSH 시험 디렉터리 필요");
+            let root = std::env::var_os("ZXT_R01_LOOPBACK_FIXTURE").expect("격리 SSH 시험 디렉터리 필요");
             let root = Path::new(&root);
             let port = fs::read_to_string(root.join("port")).unwrap().trim().parse::<u16>().unwrap();
             let key = fs::read_to_string(root.join("host.pub")).unwrap();

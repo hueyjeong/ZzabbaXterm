@@ -64,9 +64,9 @@ fn direct_ssh_fixture_receives_exact_plan_and_pty_input() {
         // 시험에서만 실행 파일을 교체하며 앱이 만든 인자와 환경은 그대로 둔다.
         command.get_argv_mut()[0] = fixture.as_os_str().to_owned();
         if close {
-            command.env("ZZABBA_F01_FIXTURE_WAIT", "1");
+            command.env("ZXT_F01_FIXTURE_WAIT", "1");
         } else {
-            command.env_remove("ZZABBA_F01_FIXTURE_WAIT");
+            command.env_remove("ZXT_F01_FIXTURE_WAIT");
         }
         let pair = native_pty_system().openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }).unwrap();
         let mut reader = pair.master.try_clone_reader().unwrap();

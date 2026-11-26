@@ -62,9 +62,9 @@ it("SSH 세션에 한 번 붙고 불투명 ID로 이동하며 편집 메뉴에�
   await expect(transport.save(approved.handle, "초안")).resolves.toMatchObject({ kind: "conflict", current: undefined });
   ipc.mockRejectedValueOnce("IPC 응답 소실");
   await expect(transport.save(approved.handle, "초안")).resolves.toEqual({ kind: "unknown", message: "IPC 응답 소실" });
-  ipc.mockResolvedValueOnce({ status: "unknown", error: { kind: "remoteFailure" }, recoveryPath: "/home/test/.zzabba-edit-0123456789abcdef0123456789abcdef.tmp/original" });
+  ipc.mockResolvedValueOnce({ status: "unknown", error: { kind: "remoteFailure" }, recoveryPath: "/home/test/.zxt-edit-0123456789abcdef0123456789abcdef.tmp/original" });
   await expect(transport.save(approved.handle, "보존할 초안")).resolves.toEqual({
-    kind: "unknown", message: "원격 작업 실패 · 복구 파일: /home/test/.zzabba-edit-0123456789abcdef0123456789abcdef.tmp/original"
+    kind: "unknown", message: "원격 작업 실패 · 복구 파일: /home/test/.zxt-edit-0123456789abcdef0123456789abcdef.tmp/original"
   });
   ipc.mockResolvedValueOnce({ status: "conflict", remote: { kind: "text", text: "외부 변경" } });
   await expect(transport.save(approved.handle, "보존할 초안")).resolves.toMatchObject({ kind: "conflict", current: "외부 변경" });

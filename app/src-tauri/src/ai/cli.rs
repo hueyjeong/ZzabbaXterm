@@ -25,7 +25,7 @@ use super::ipc::State;
 
 const MAX_STDIN: usize = MAX_FRAME - 64;
 const MAX_EDITS: usize = 32;
-const USAGE: &str = "사용법: zzabba list | zzabba register | zzabba propose";
+const USAGE: &str = "사용법: zxt list | zxt register | zxt propose";
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -57,9 +57,9 @@ impl fmt::Display for Error {
         f.write_str(match self {
             Self::Usage => USAGE,
             Self::InvalidRequest => "잘못된 요청입니다.",
-            Self::Unavailable => "ZzabbaXterm 앱에 연결할 수 없습니다.",
-            Self::InvalidResponse => "ZzabbaXterm 앱의 응답이 올바르지 않습니다.",
-            Self::Rejected => "ZzabbaXterm 앱이 요청을 거부했습니다.",
+            Self::Unavailable => "ZXT 앱에 연결할 수 없습니다.",
+            Self::InvalidResponse => "ZXT 앱의 응답이 올바르지 않습니다.",
+            Self::Rejected => "ZXT 앱이 요청을 거부했습니다.",
             Self::StoreUnavailable => "저장된 연결 설정에 접근할 수 없습니다.",
             Self::GroupConflict => "저장된 연결 그룹이 입력과 일치하지 않습니다.",
             Self::TargetConflict => "새 대상 ID와 비어 있는 대상 개정이 필요합니다.",
@@ -411,7 +411,7 @@ pub fn run() -> std::process::ExitCode {
         }
         let output = match parse(command.to_str().ok_or(Error::Usage)?, io::stdin().lock())? {
             Command::Register(draft) => {
-                let directory = dirs::config_dir().ok_or(Error::StoreUnavailable)?.join(env!("ZZABBA_APP_IDENTIFIER"));
+                let directory = dirs::config_dir().ok_or(Error::StoreUnavailable)?.join(env!("ZXT_APP_IDENTIFIER"));
                 register(&directory, draft)?
             }
             Command::Request(request) => {

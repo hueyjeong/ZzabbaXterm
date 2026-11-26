@@ -8,10 +8,10 @@ use std::{
 
 use super::{Event, process::{Launch, Session, Stop}, remote, size};
 
-const MARKER: &[u8] = b"ZZABBA-C01:314159";
-const SSM_MARKER: &[u8] = b"ZZABBA-C02:314159";
+const MARKER: &[u8] = b"ZXT-C01:314159";
+const SSM_MARKER: &[u8] = b"ZXT-C02:314159";
 // 표식의 완성 문자열은 PTY가 되비추는 입력에 없다.
-const SSM_CHECK: &[u8] = b"[ \"$(uname -s)\" = Linux ] || exit 19; printf 'ZZABBA-C02:%d\\n' \"$((314000+159))\" && exit 0; exit 19\r";
+const SSM_CHECK: &[u8] = b"[ \"$(uname -s)\" = Linux ] || exit 19; printf 'ZXT-C02:%d\\n' \"$((314000+159))\" && exit 0; exit 19\r";
 const TIMEOUT: Duration = Duration::from_secs(8);
 const SSM_TIMEOUT: Duration = Duration::from_secs(60);
 const S3_TIMEOUT: Duration = Duration::from_secs(60);
@@ -149,7 +149,7 @@ impl Probe {
         let mut nonce = [0; 16];
         getrandom::fill(&mut nonce).map_err(|_| "SSH 시험 난수를 생성할 수 없습니다")?;
         let nonce = u128::from_ne_bytes(nonce);
-        let marker = format!("ZZABBA-F01:{nonce:032x}");
+        let marker = format!("ZXT-F01:{nonce:032x}");
         let (sender, receiver) = mpsc::sync_channel(1);
         let matched = std::cell::Cell::new(0);
         let opened = self.session.begin_launch(size, Launch::Ssh(launch.for_probe(nonce)), move |event| {
@@ -348,7 +348,7 @@ fn command(shell: Shell, directory: &std::path::Path) -> Result<CommandBuilder, 
             let mut command = CommandBuilder::new(executable);
             command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]);
             command.arg(format!(
-                "$directory = $env:ZZABBA_C01_CWD; if (-not ({})) {{ exit 23 }}; [Console]::WriteLine(('ZZABBA-C01:{{0}}' -f (314000+159))); exit 0",
+                "$directory = $env:ZXT_C01_CWD; if (-not ({})) {{ exit 23 }}; [Console]::WriteLine(('ZXT-C01:{{0}}' -f (314000+159))); exit 0",
                 super::POWERSHELL_CWD_MATCH,
             ));
             command
@@ -358,7 +358,7 @@ fn command(shell: Shell, directory: &std::path::Path) -> Result<CommandBuilder, 
             let mut command = CommandBuilder::new("/bin/bash");
             command.env_remove("BASH_ENV");
             command.args(["--noprofile", "--norc", "-c",
-                "[[ . -ef $ZZABBA_C01_CWD ]] || exit 23; builtin printf 'ZZABBA-C01:%d\\n' \"$((314000+159))\""]);
+                "[[ . -ef $ZXT_C01_CWD ]] || exit 23; builtin printf 'ZXT-C01:%d\\n' \"$((314000+159))\""]);
             command
         }
         #[allow(unreachable_patterns)]
@@ -366,7 +366,7 @@ fn command(shell: Shell, directory: &std::path::Path) -> Result<CommandBuilder, 
     };
     super::strip_inherited_agent_env(&mut command);
     command.cwd(directory);
-    command.env("ZZABBA_C01_CWD", directory);
+    command.env("ZXT_C01_CWD", directory);
     Ok(command)
 }
 
@@ -378,9 +378,9 @@ mod tests {
     fn c01_probe_times_out_and_reaps_a_shell_that_does_not_exit() {
         let mut command = super::super::shell();
         #[cfg(windows)]
-        command.args(["-NonInteractive", "-Command", "[Console]::WriteLine('ZZABBA-C01:314159'); Start-Sleep 60"]);
+        command.args(["-NonInteractive", "-Command", "[Console]::WriteLine('ZXT-C01:314159'); Start-Sleep 60"]);
         #[cfg(unix)]
-        command.args(["-c", "builtin printf 'ZZABBA-C01:314159\\n'; read -rt 60"]);
+        command.args(["-c", "builtin printf 'ZXT-C01:314159\\n'; read -rt 60"]);
         let probe = Probe::with_timeout("timeout", Duration::from_secs(1), false, false);
         assert_eq!(probe.measure(Launch::Local(command)), Err(TIMED_OUT.into()));
     }

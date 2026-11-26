@@ -125,7 +125,7 @@ async fn exact_cancel_keeps_started_save_ahead_of_detach_and_drops_unsent_work()
         assert!(matches!(peer.requests.recv().await, Some(BridgeRequest::Cancel(ID))));
         peer.responses.send(Response::Closed { id: ID }).await.unwrap();
         assert!(timeout(Duration::from_millis(10), peer.output.read(&mut [0])).await.is_err());
-        let recovery = ".zzabba-edit-00000000000000000000000000000001.tmp/original".to_owned();
+        let recovery = ".zxt-edit-00000000000000000000000000000001.tmp/original".to_owned();
         peer.input.write_all(&Outcome::Unknown(Some(recovery.clone())).encode(ID, 1).unwrap()).await.unwrap();
         assert_eq!(reply.await.unwrap(), Err(PublishError::Unknown(Some(recovery))));
         assert_eq!(queued.await.unwrap(), Err(PublishError::Unavailable));

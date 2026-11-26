@@ -51,7 +51,7 @@ fn config(size: DesktopSize, scale: u32, tls_only: bool) -> connector::Config {
         // xrdp는 빌드 번호 419 이하를 크기를 바꿀 수 없는 옛 클라이언트로 보고 Deactivate All 없이 화면만 바꾼다.
         // Windows 10 22H2(19045)로 알려 Display Control 해상도 변경이 재활성화로 이어지게 한다.
         client_build: 19045,
-        client_name: "ZzabbaXterm".into(),
+        client_name: "ZXT".into(),
         keyboard_type: KeyboardType::IbmEnhanced,
         keyboard_subtype: 0,
         keyboard_functional_keys_count: 12,

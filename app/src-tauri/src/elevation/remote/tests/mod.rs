@@ -104,14 +104,14 @@ fn state() -> Arc<State> {
 
 #[test]
 fn elevation_remote_verify_requires_root_helper_and_same_account() {
-    let good = "zzabba-elevate 1\nuser=demo\nuid=1001\nowner=0\nmode=755\npath=/usr/local/libexec/zzabba-elevate\n";
+    let good = "zxt-elevate 1\nuser=demo\nuid=1001\nowner=0\nmode=755\npath=/usr/local/libexec/zxt-elevate\n";
     assert!(parse_verify(good, "demo").is_some());
     for (text, account) in [
         (good.replace("user=demo", "user=other"), "demo"),
         (good.replace("owner=0", "owner=1001"), "demo"),
         (good.replace("mode=755", "mode=775"), "demo"),
-        (good.replace(HELPER, "/tmp/zzabba-elevate"), "demo"),
-        (good.replace("zzabba-elevate 1", "zzabba-elevate 2"), "demo"),
+        (good.replace(HELPER, "/tmp/zxt-elevate"), "demo"),
+        (good.replace("zxt-elevate 1", "zxt-elevate 2"), "demo"),
         (String::new(), "demo"),
     ] {
         assert!(parse_verify(&text, account).is_none(), "{text}");
@@ -123,7 +123,7 @@ fn elevation_remote_run_frame_keeps_approval_id_nonce_and_argument_boundaries() 
     let frame = run_frame(ID, NONCE, "/usr/bin/printf", &["a b".into(), "c".into()]).unwrap();
     let fields: Vec<&str> = frame.trim_end().split(' ').collect();
     assert_eq!(fields.len(), 8);
-    assert_eq!(&fields[..4], ["ZZABBA-ELEVATE", "1", ID, NONCE]);
+    assert_eq!(&fields[..4], ["ZXT-ELEVATE", "1", ID, NONCE]);
     assert_eq!(fields[5], "2");
     assert!(fields[6..].iter().all(|field| field.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"+/=".contains(&byte))));
     assert!(!frame.contains("a b"));
@@ -224,7 +224,7 @@ fn elevation_remote_real_container_approves_once_and_runs_sudo() {
     use std::{fs, path::PathBuf};
     use ssh_key::HashAlg;
 
-    let path = std::env::var("ZZABBA_SUDO_REMOTE").expect("ZZABBA_SUDO_REMOTE JSON 경로");
+    let path = std::env::var("ZXT_SUDO_REMOTE").expect("ZXT_SUDO_REMOTE JSON 경로");
     let data: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
     let host = data["host"].as_str().unwrap();
     let port: u16 = data["port"].as_u64().unwrap() as u16;
@@ -336,7 +336,7 @@ fn elevation_remote_askpass_times_out_when_bridge_never_answers() {
     use std::{fs, io::Write, path::PathBuf};
     use ssh_key::HashAlg;
 
-    let path = std::env::var("ZZABBA_SUDO_REMOTE").expect("ZZABBA_SUDO_REMOTE JSON 경로");
+    let path = std::env::var("ZXT_SUDO_REMOTE").expect("ZXT_SUDO_REMOTE JSON 경로");
     let data: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
     let host = data["host"].as_str().unwrap();
     let port: u16 = data["port"].as_u64().unwrap() as u16;

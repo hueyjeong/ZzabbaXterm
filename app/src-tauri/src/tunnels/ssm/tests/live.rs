@@ -1,7 +1,7 @@
 //! 실제 AWS SSM 노드 시험이다. 대상은 환경 변수로만 받는다.
-//! - `ZZABBA_LIVE_PROFILE`, `ZZABBA_LIVE_REGION`, `ZZABBA_LIVE_NODE`: AWS CLI 프로필, 리전, 관리 노드 ID
-//! - `ZZABBA_LIVE_KEY`: 노드 `authorized_keys`에 등록한 개인 키 경로(암호 없음). 같은 경로의 `.pub`를 틀린 호스트 키로 쓴다.
-//! - `ZZABBA_LIVE_HOSTKEY`: 노드 `/etc/ssh/ssh_host_ed25519_key.pub` 사본 경로
+//! - `ZXT_LIVE_PROFILE`, `ZXT_LIVE_REGION`, `ZXT_LIVE_NODE`: AWS CLI 프로필, 리전, 관리 노드 ID
+//! - `ZXT_LIVE_KEY`: 노드 `authorized_keys`에 등록한 개인 키 경로(암호 없음). 같은 경로의 `.pub`를 틀린 호스트 키로 쓴다.
+//! - `ZXT_LIVE_HOSTKEY`: 노드 `/etc/ssh/ssh_host_ed25519_key.pub` 사본 경로
 //!
 //! 시험 B는 노드 127.0.0.1:9009 에코 서버가 필요하다(`tests/ssm_forward_bytes.py node-params`).
 //! 실행: `cargo test --lib tunnels::ssm::tests::live -- --ignored --nocapture --test-threads=1`
@@ -39,17 +39,17 @@ fn live() -> Live {
     let required = |key: &str| std::env::var(key).ok().filter(|value| !value.is_empty())
         .unwrap_or_else(|| panic!("{key} 환경 변수가 필요합니다"));
     let target = Ssm {
-        profile: required("ZZABBA_LIVE_PROFILE"),
-        region: required("ZZABBA_LIVE_REGION"),
-        instance_id: required("ZZABBA_LIVE_NODE"),
+        profile: required("ZXT_LIVE_PROFILE"),
+        region: required("ZXT_LIVE_REGION"),
+        instance_id: required("ZXT_LIVE_NODE"),
     };
     let scope = crate::ssm::Scope::new(target.profile.clone(), target.region.clone()).unwrap();
     if let Err(error) = scope.auth() {
         println!("앱 프로필 검증 거부: {error:?} · 시험 안에서 자격 내보내기만 우회");
         let _ = crate::ssm::LIVE_EXPORT_PROFILE.set(target.profile.clone());
     }
-    let host_key = std::fs::read_to_string(required("ZZABBA_LIVE_HOSTKEY")).unwrap().trim().to_owned();
-    Live { target, key: required("ZZABBA_LIVE_KEY").into(), host_key }
+    let host_key = std::fs::read_to_string(required("ZXT_LIVE_HOSTKEY")).unwrap().trim().to_owned();
+    Live { target, key: required("ZXT_LIVE_KEY").into(), host_key }
 }
 
 fn fingerprint(key: &str) -> String {
@@ -158,18 +158,18 @@ fn live_ssh_over_ssm_end_to_end() {
     let plan = Arc::new(ConnectionPlan::prepare(&store, &approved, "ubuntu",
         Transport::Ssm { port, forward: Box::new(forward) }, Authentication::KeyFile { private_key: &live.key }).unwrap());
 
-    let output = command(plan.invocation(Client::Ssh).unwrap(), &BATCH, "echo zzabba-ok; uname -m").output().unwrap();
+    let output = command(plan.invocation(Client::Ssh).unwrap(), &BATCH, "echo zxt-ok; uname -m").output().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     println!("A ssh 종료 {:?} · 출력 {:?} · 오류 {:?}", output.status.code(), stdout, String::from_utf8_lossy(&output.stderr));
     assert!(output.status.success());
-    assert_eq!(stdout.lines().collect::<Vec<_>>(), ["zzabba-ok", "aarch64"]);
+    assert_eq!(stdout.lines().collect::<Vec<_>>(), ["zxt-ok", "aarch64"]);
 
     // ssh 세션을 열어 둔 채 같은 계획으로 SFTP를 붙인다. 두 번째 TCP 연결이 같은 전달을 지난다.
-    let mut held = command(plan.invocation(Client::Ssh).unwrap(), &BATCH, "echo zzabba-hold; sleep 20")
+    let mut held = command(plan.invocation(Client::Ssh).unwrap(), &BATCH, "echo zxt-hold; sleep 20")
         .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
     let mut line = String::new();
     BufReader::new(held.stdout.take().unwrap()).read_line(&mut line).unwrap();
-    assert_eq!(line.trim_end(), "zzabba-hold");
+    assert_eq!(line.trim_end(), "zxt-hold");
     let names = tauri::async_runtime::block_on(async {
         let tracker = tokio_util::task::TaskTracker::new();
         let mut session = crate::editor::sftp::Session::connect(plan.clone(), CancellationToken::new(), tracker.token())
@@ -193,11 +193,11 @@ fn live_ssh_over_ssm_end_to_end() {
     wrong_store.register(&wrong, other.trim()).unwrap();
     let wrong_plan = ConnectionPlan::prepare(&wrong_store, &wrong, "ubuntu", FakeForward::transport(port).0,
         Authentication::KeyFile { private_key: &live.key }).unwrap();
-    let rejected = command(wrong_plan.invocation(Client::Ssh).unwrap(), &BATCH, "echo zzabba-ok").output().unwrap();
+    let rejected = command(wrong_plan.invocation(Client::Ssh).unwrap(), &BATCH, "echo zxt-ok").output().unwrap();
     let stderr = String::from_utf8_lossy(&rejected.stderr);
     println!("A 틀린 호스트 키: 종료 {:?} · {}", rejected.status.code(), stderr.trim());
     assert_eq!(rejected.status.code(), Some(255));
-    assert!(!String::from_utf8_lossy(&rejected.stdout).contains("zzabba-ok"));
+    assert!(!String::from_utf8_lossy(&rejected.stdout).contains("zxt-ok"));
     assert!(stderr.contains("Host key verification failed"), "{stderr}");
     drop(wrong_plan);
 

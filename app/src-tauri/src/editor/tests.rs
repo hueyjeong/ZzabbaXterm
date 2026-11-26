@@ -164,7 +164,7 @@ fn changed_parent_during_staging_is_not_written_or_cleaned_by_path() {
 fn sync_error_preserves_original_and_allows_retry_with_same_buffer() {
     let dir = Sandbox::new();
     let path = dir.path("target.txt");
-    let unrelated = dir.path(".zzabba-edit-unrelated.tmp");
+    let unrelated = dir.path(".zxt-edit-unrelated.tmp");
     fs::write(&path, "old\n").unwrap();
     fs::write(&unrelated, "keep\n").unwrap();
     let (mut file, _) = LocalFile::open(&path).unwrap();

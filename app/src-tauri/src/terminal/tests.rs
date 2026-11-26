@@ -151,7 +151,7 @@ fn l01_terminal_closing_one_pid_leaves_the_other_shell_alive() {
 #[test]
 fn l01_terminal_failed_opens_report_the_stage() {
     let sessions = Sessions::default();
-    let missing = CommandBuilder::new("zzabbaxterm-l01-does-not-exist-2d3987.exe");
+    let missing = CommandBuilder::new("zxt-l01-does-not-exist-2d3987.exe");
     let err = sessions.open("main", SIZE, missing, |_| Ok(())).unwrap_err();
     assert!(err.starts_with("spawn:"), "{err}");
     for size in [PtySize { rows: 0, ..SIZE }, PtySize { cols: 0, ..SIZE }] {
@@ -293,7 +293,7 @@ fn empty_saved_start_directory_starts_in_the_home_directory() {
     assert_eq!(start_directory(std::path::Path::new("")).unwrap().as_ref(), home.as_path());
     let dir = std::env::temp_dir();
     assert_eq!(start_directory(&dir).unwrap().as_ref(), dir.as_path());
-    assert!(start_directory(&dir.join("zzabba-missing-start-directory")).is_err());
+    assert!(start_directory(&dir.join("zxt-missing-start-directory")).is_err());
 }
 
 #[test]

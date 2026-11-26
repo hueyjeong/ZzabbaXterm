@@ -407,7 +407,7 @@ pub(super) mod tests {
         let temp = tempfile::tempdir().unwrap();
         let install = temp.path().join("install");
         private_dir(&install).unwrap();
-        let executable = install.join("zzabba-askpass.exe");
+        let executable = install.join("zxt-askpass.exe");
         std::fs::write(&executable, b"fixture").unwrap();
 
         with_install_validator(|check| {

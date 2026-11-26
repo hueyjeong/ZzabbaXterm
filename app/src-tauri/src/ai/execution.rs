@@ -41,7 +41,7 @@ pub(crate) struct Task {
 
 pub(crate) const UPTIME: Task = Task {
     id: "uptime",
-    account: "zzabba-ai-control",
+    account: "zxt-ai-control",
     program: "/usr/bin/uptime",
     args: &[],
     operation: WireOperation::Uptime,

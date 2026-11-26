@@ -6,9 +6,9 @@ import type { LocalFailure, LocalFileActions, LocalListing, LocalRoot } from "./
 import { localFailureText } from "./StorageStatus";
 
 /** 로컬 창에서 S3 창으로 끄는 파일. 탭 끌기(TAB_DRAG_TYPE)와 OS 파일 놓기("Files")와 겹치지 않는다. */
-export const LOCAL_DRAG_TYPE = "application/x-zzabba-local-file";
+export const LOCAL_DRAG_TYPE = "application/x-zxt-local-file";
 /** S3 창에서 로컬 창으로 끄는 객체. */
-export const S3_DRAG_TYPE = "application/x-zzabba-s3-object";
+export const S3_DRAG_TYPE = "application/x-zxt-s3-object";
 
 export type LocalDrag = Readonly<{ sessionId: string; rootId: string; path: string; name: string; bytes: number | null }>;
 export type S3Drag = Readonly<{ sessionId: string; key: string }>;

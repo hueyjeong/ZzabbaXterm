@@ -108,7 +108,7 @@ fn approval_is_bound_to_document_target_user_and_item() {
 #[test]
 fn ssh_askpass_ignores_inherited_sudo_environment() {
     let mut command = CommandBuilder::new("ssh");
-    command.env("SUDO_ASKPASS", "/tmp/zzabba-elevate");
+    command.env("SUDO_ASKPASS", "/tmp/zxt-elevate");
     command.env(super::sudo::MODE_ENV, "sudo");
     command.env("BW_SESSION", "inherited-session");
     super::remove_ssh_inherited(&mut command);
@@ -189,9 +189,9 @@ fn writable_install_and_missing_cli_are_distinct() {
 }
 
 #[test]
-#[ignore = "로컬 OpenSSH, 제품 askpass 바이너리, ZZABBA_FIXTURE_PYTHON의 Paramiko가 필요하다"]
+#[ignore = "로컬 OpenSSH, 제품 askpass 바이너리, ZXT_FIXTURE_PYTHON의 Paramiko가 필요하다"]
 fn isolated_openssh_password_contract() {
-    let python = std::env::var_os("ZZABBA_FIXTURE_PYTHON").expect("Paramiko Python executable");
+    let python = std::env::var_os("ZXT_FIXTURE_PYTHON").expect("Paramiko Python executable");
     let helper = std::env::current_exe()
         .unwrap()
         .parent()

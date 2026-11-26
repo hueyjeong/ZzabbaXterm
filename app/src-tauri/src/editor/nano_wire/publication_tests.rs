@@ -116,7 +116,7 @@ fn responses_require_the_exact_request_operation_and_kind() {
             }
         }
     }
-    for name in ["../original", "/original", ".zzabba-edit-0000000000000000000000000000000A.tmp/original"] {
+    for name in ["../original", "/original", ".zxt-edit-0000000000000000000000000000000A.tmp/original"] {
         assert!(Outcome::Unknown(Some(name.to_owned())).encode(9, 1).is_err());
         let bytes = frame(UNKNOWN, &[&9u64.to_be_bytes(), &1u64.to_be_bytes(), name.as_bytes()]);
         assert!(Outcome::decode(&bytes[4..], 9, 1, Save).is_err());

@@ -16,11 +16,11 @@ from contextlib import ExitStack
 UID = 21017
 OTHER = 21018
 RUNTIME = Path(f'/run/user/{UID}')
-BIN = '/usr/local/libexec/zzabba-ai-control'
-HOOK = '/usr/local/share/zzabba/shared.bash'
+BIN = '/usr/local/libexec/zxt-ai-control'
+HOOK = '/usr/local/share/zxt/shared.bash'
 KEY_PAIR = b'\x18p'
 KEY_CLAIM = b'\x18u'
-COUNT = Path('/tmp/zzabba-shared-uptime-count')
+COUNT = Path('/tmp/zxt-shared-uptime-count')
 
 
 class Terminal:
@@ -31,7 +31,7 @@ class Terminal:
             os.setgid(uid)
             os.setuid(uid)
             os.chdir('/tmp')
-            os.execve(argv[0], argv, {'PATH': '/usr/bin:/bin', 'TERM': 'xterm', 'HOME': '/tmp', 'PS1': 'zzabba$ ', 'LANG': 'C.UTF-8', 'INPUTRC': '/dev/null'})
+            os.execve(argv[0], argv, {'PATH': '/usr/bin:/bin', 'TERM': 'xterm', 'HOME': '/tmp', 'PS1': 'zxt$ ', 'LANG': 'C.UTF-8', 'INPUTRC': '/dev/null'})
         self.buffer = b''
         self.transcript = b''
 
@@ -91,7 +91,7 @@ class Control(Terminal):
         pairing = self.event('pairing', 1)
         self.code = pairing['code'].encode()
         assert re.fullmatch(rb'[a-f0-9]{64}', self.code)
-        self.path = RUNTIME / f'zzabba-ai-{self.code[:32].decode()}.sock'
+        self.path = RUNTIME / f'zxt-ai-{self.code[:32].decode()}.sock'
         assert self.path.stat().st_uid == UID and self.path.stat().st_mode & 0o777 == 0o600
 
     def event(self, kind, seq=None):
@@ -108,10 +108,10 @@ class Control(Terminal):
 
     def pair(self, tab, enter=b'\r'):
         tab.send(KEY_PAIR)
-        tab.read(rb'Zzabba pairing code: ')
+        tab.read(rb'ZXT pairing code: ')
         # bind -x 처리기 안에서는 Enter가 클라이언트에 따라 CR 또는 LF로 그대로 온다.
         tab.send(self.code + enter)
-        tab.read(rb'zzabba\$ ')
+        tab.read(rb'zxt\$ ')
 
     def ticket(self, job):
         return dict(main_id=1, main_generation=2, document=3, control_id=4, control_generation=5,
@@ -125,11 +125,11 @@ class Control(Terminal):
 
 def bash(stack, uid=UID):
     term = stack.enter_context(Terminal(['/usr/bin/bash', '--noprofile', '--norc', '-i'], uid))
-    term.read(rb'zzabba\$ ')
+    term.read(rb'zxt\$ ')
     term.send(f'set -o emacs; source {HOOK} && bind -X\n'.encode())
-    term.read(rb'"\\C-xp": "__zzabba_shared_key pair"\r\n')
-    term.read(rb'"\\C-xu": "__zzabba_shared_key claim"\r\n')
-    term.read(rb'zzabba\$ ')
+    term.read(rb'"\\C-xp": "__zxt_shared_key pair"\r\n')
+    term.read(rb'"\\C-xu": "__zxt_shared_key claim"\r\n')
+    term.read(rb'zxt\$ ')
     return term
 
 
@@ -190,8 +190,8 @@ def main():
         control.quiet()
         ticket = control.ticket(1)
         control.approval('reserve', ticket)
-        other.send(f'__zzabba_shared_locator={control.code[:32].decode()}\n'.encode())
-        other.read(rb'zzabba\$ ')
+        other.send(f'__zxt_shared_locator={control.code[:32].decode()}\n'.encode())
+        other.read(rb'zxt\$ ')
         other.send(KEY_CLAIM)
         control.quiet()
         other.send(b'echo other-unchanged\n')
@@ -242,7 +242,7 @@ def main():
         control.wait()
         absent(control.path)
         tab.send(KEY_CLAIM)
-        tab.read(rb'zzabba\$ ')
+        tab.read(rb'zxt\$ ')
         tab.send(b'echo after-disconnect\n')
         tab.read(rb'\rafter-disconnect\r\n')
         assert b'/usr/bin/uptime' not in tab.transcript
@@ -272,7 +272,7 @@ def main():
         assert control.wait() == 1 << 8
         absent(control.path)
         tab.send(KEY_CLAIM)
-        tab.read(rb'zzabba\$ ')
+        tab.read(rb'zxt\$ ')
         assert b'/usr/bin/uptime' not in tab.transcript
 
     with ExitStack() as stack:
@@ -283,26 +283,26 @@ def main():
                         control.code[:8] + b'\recho RAW-RAN\r',
                         control.code + control.code[:40] + b'echo LONG-RAN\r'):
             tab.send(KEY_PAIR)
-            tab.read(rb'Zzabba pairing code: ')
+            tab.read(rb'ZXT pairing code: ')
             tab.send(attempt)
-            tab.read(rb'zzabba\$ ')
+            tab.read(rb'zxt\$ ')
             control.quiet()
         # 붙여넣기가 나뉘어 도착해도 끝 표지까지 읽어 버린다.
         tab.send(KEY_PAIR)
-        tab.read(rb'Zzabba pairing code: ')
+        tab.read(rb'ZXT pairing code: ')
         tab.send(b'\x1b[200~' + control.code[:8] + b'\r')
         time.sleep(0.3)
         tab.send(b'echo SPLIT-RAN\r\x1b[201~')
-        tab.read(rb'zzabba\$ ')
+        tab.read(rb'zxt\$ ')
         control.quiet()
         tab.send(b'echo paste-safe\n')
         tab.read(rb'\rpaste-safe\r\n')
         assert b'-RAN' not in tab.transcript
         # 괄호 붙여넣기는 끝 표지에서 입력을 마치고, 줄 단위 복사의 끝 줄바꿈 한 개는 허용한다.
         tab.send(KEY_PAIR)
-        tab.read(rb'Zzabba pairing code: ')
+        tab.read(rb'ZXT pairing code: ')
         tab.send(b'\x1b[200~' + control.code + b'\r\x1b[201~')
-        tab.read(rb'zzabba\$ ')
+        tab.read(rb'zxt\$ ')
         assert control.event('paired', 2)['uid'] == UID
         tab.send(b'exit\n')
         tab.wait()

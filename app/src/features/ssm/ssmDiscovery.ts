@@ -1,11 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { SsmDiscovery, SsmOnlineNode, SsmResult, SsmScope } from "./ssm";
 
-const documentEvent = "zzabba:ssm-document";
+const documentEvent = "zxt:ssm-document";
 
 declare global {
   interface Window {
-    __ZZABBA_SSM_DOCUMENT__?: string;
+    __ZXT_SSM_DOCUMENT__?: string;
   }
 }
 
@@ -32,7 +32,7 @@ function failure(error: unknown, allowsRelogin: boolean): SsmResult<never> {
 
 function waitForDocument(signal: AbortSignal): Promise<string | undefined> {
   if (signal.aborted || typeof window === "undefined") return Promise.resolve(undefined);
-  const current = window.__ZZABBA_SSM_DOCUMENT__;
+  const current = window.__ZXT_SSM_DOCUMENT__;
   if (typeof current === "string" && current) return Promise.resolve(current);
 
   const { promise, resolve } = Promise.withResolvers<string | undefined>();
@@ -42,7 +42,7 @@ function waitForDocument(signal: AbortSignal): Promise<string | undefined> {
     resolve(value);
   }
   function onDocument() {
-    const value = window.__ZZABBA_SSM_DOCUMENT__;
+    const value = window.__ZXT_SSM_DOCUMENT__;
     if (typeof value === "string" && value) finish(value);
   }
   function onAbort() { finish(); }

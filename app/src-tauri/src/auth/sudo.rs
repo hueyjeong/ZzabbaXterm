@@ -27,7 +27,7 @@ pub(crate) fn program() -> Result<peer::TrustedFile, Error> {
 }
 
 const SUDO_ASKPASS_ENV: &str = "SUDO_ASKPASS";
-pub(crate) const MODE_ENV: &str = "ZZABBA_ASKPASS_MODE";
+pub(crate) const MODE_ENV: &str = "ZXT_ASKPASS_MODE";
 pub(crate) const SUDO_MODE: &str = "sudo";
 // 승인 뒤 금고 조회와 sudo의 askpass 시작을 모두 기다린다.
 const EXCHANGE_TTL: Duration = Duration::from_secs(60);

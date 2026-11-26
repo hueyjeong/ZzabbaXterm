@@ -268,7 +268,7 @@ fn keyscan_args(host: &str, port: u16, known_hosts_value: &str) -> Vec<String> {
         "ClearAllForwardings=yes".to_owned(), "LogLevel=ERROR".to_owned(),
         "HostKeyAlgorithms=ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,rsa-sha2-512,rsa-sha2-256".to_owned(),
     ];
-    let mut args: Vec<String> = ["-F", "none", "-T", "-N", "-p", &port.to_string(), "-l", "zzabba-host-key"]
+    let mut args: Vec<String> = ["-F", "none", "-T", "-N", "-p", &port.to_string(), "-l", "zxt-host-key"]
         .into_iter().map(str::to_owned).collect();
     for option in options {
         args.push("-o".into());
