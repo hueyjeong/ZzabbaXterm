@@ -13,8 +13,9 @@ on:
         type: string
         required: false
 
+# 쓰기 권한은 release 잡에만 준다. build 잡은 의존 패키지 스크립트를 실행하기 때문이다.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release
@@ -27,10 +28,11 @@ jobs:
       version: ${{ steps.next.outputs.version }}
       sha: ${{ steps.next.outputs.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: main
           fetch-depth: 0
+          persist-credentials: false
       - id: next
         working-directory: app
         env:
@@ -38,7 +40,7 @@ jobs:
           REQUESTED: ${{ inputs.version }}
         run: |
           version="$(node scripts/release-version.mjs next "$BUMP" "$REQUESTED")"
-          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null || git ls-remote --exit-code origin "refs/heads/release/v$version" >/dev/null; then
+          if git ls-remote --exit-code origin "refs/tags/v$version" "refs/heads/release/v$version" >/dev/null; then
             echo "::error::v$version 태그나 release/v$version 브랜치가 이미 있습니다"
             exit 1
           fi
@@ -57,28 +59,33 @@ jobs:
           - os: ubuntu-24.04
             pattern: bundle/deb/*.deb
     runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ needs.version.outputs.sha }}
+          persist-credentials: false
       - name: Linux 빌드 패키지
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev libxdo-dev patchelf
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: app/package-lock.json
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: app/src-tauri
       - name: 버전 적용
         working-directory: app
         shell: bash
-        run: node scripts/release-version.mjs apply "${{ needs.version.outputs.version }}"
+        run: node scripts/release-version.mjs apply "$VERSION"
       - working-directory: app
         run: npm ci
       - name: 프런트 시험
@@ -96,43 +103,71 @@ jobs:
           target_dir="$(cargo metadata --locked --no-deps --format-version 1 --manifest-path src-tauri/Cargo.toml | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).target_directory))')"
           triple="$(rustc --print host-tuple)"
           echo "dir=$target_dir/$triple/release" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: installer-${{ runner.os }}
           path: ${{ steps.find.outputs.dir }}/${{ matrix.pattern }}
           if-no-files-found: error
 
+  # 이 잡은 "실패한 작업 다시 실행"으로 다시 돌려도 안전하다. 원격에 태그가 있으면 ref 단계를 건너뛰고 릴리스만 만든다.
   release:
     needs: [version, build]
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     env:
       VERSION: ${{ needs.version.outputs.version }}
+      SHA: ${{ needs.version.outputs.sha }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ needs.version.outputs.sha }}
           fetch-depth: 0
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
       - name: 버전 커밋, 태그, 브랜치
         run: |
+          if git ls-remote --exit-code origin "refs/tags/v$VERSION" >/dev/null; then
+            echo "v$VERSION 태그가 이미 원격에 있어 ref 단계를 건너뜁니다"
+            exit 0
+          fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           (cd app && node scripts/release-version.mjs apply "$VERSION")
           git commit -am "chore(release): v$VERSION"
           git tag -a "v$VERSION" -m "ZXT v$VERSION"
-          git push origin "HEAD:refs/heads/release/v$VERSION" "refs/tags/v$VERSION"
-          # 빌드하는 동안 main이 움직였으면 버전 커밋을 병합해 올린다.
-          if ! git push origin HEAD:main; then
+          # 빌드하는 동안 main이 움직였으면 main에만 병합 커밋을 올리고, 태그와 release 브랜치는 빌드한 버전 커밋을 가리킨다.
+          main_ref=HEAD
+          for attempt in 1 2 3; do
             git fetch origin main
-            git checkout -B main origin/main
-            git merge --no-ff -m "Merge release v$VERSION" "v$VERSION"
-            git push origin main
-          fi
+            if git merge-base --is-ancestor origin/main HEAD; then
+              main_ref=HEAD
+            else
+              git checkout -q -B release-main origin/main
+              if ! git merge --no-ff -m "Merge release v$VERSION" "v$VERSION"; then
+                echo "::error::main과 버전 커밋을 병합하다 충돌했습니다. 원격에는 아무것도 올리지 않았습니다"
+                exit 1
+              fi
+              main_ref=release-main
+              git checkout -q "v$VERSION"
+            fi
+            # 세 ref를 한 번에 올린다. 하나라도 거부되면 아무것도 바뀌지 않는다.
+            if git push --atomic origin "$main_ref:refs/heads/main" "v$VERSION^{commit}:refs/heads/release/v$VERSION" "refs/tags/v$VERSION"; then
+              exit 0
+            fi
+            sleep $((attempt * 5))
+          done
+          echo "::error::main, release 브랜치, 태그를 올리지 못했습니다. 원격에는 아무것도 올리지 않았습니다"
+          exit 1
       - name: 릴리스 게시
         run: |
           (cd dist && sha256sum -- * > SHA256SUMS.txt && cat SHA256SUMS.txt)
-          gh release create "v$VERSION" dist/* --title "ZXT v$VERSION" --generate-notes --verify-tag
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            gh release upload "v$VERSION" dist/* --clobber
+            gh release edit "v$VERSION" --draft=false
+          else
+            gh release create "v$VERSION" dist/* --title "ZXT v$VERSION" --generate-notes --verify-tag
+          fi
